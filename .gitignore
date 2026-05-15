@@ -1,0 +1,49 @@
+target/
+**/*.rs.bk
+**/node_modules/
+**/dist/
+**/auth/
+
+# runtime data — Tier 1 per-bot state
+memory/*
+!memory/.gitkeep
+
+# secrets
+.env
+.env.*
+!.env.example
+secrets/
+
+# sqlite leftovers
+*.db
+*.db-shm
+*.db-wal
+
+# logs
+*.log
+
+# os
+.DS_Store
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# local-only configs
+nucleus.toml
+tools/cloudflared/*.yaml
+!tools/cloudflared/*.yaml.example
+tools/launchd/*.plist
+!tools/launchd/*.plist.example
+
+# personal project state — see docs/SECRETS.md
+docs/ROADMAP.md
+docs/TODO.md
+docs/PRIVATE.md
+
+# design exploration / throwaway mocks
+design-mocks/
+
+# playwright-mcp screenshot + snapshot artifacts
+.playwright-mcp/

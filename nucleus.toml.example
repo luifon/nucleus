@@ -1,0 +1,46 @@
+# Copy to nucleus.toml. This file contains ONLY non-identifying tunables —
+# anything that uniquely identifies a user, channel, account, or path lives
+# in `.env` (gitignored). See `.env.example`.
+
+[claude]
+binary = "claude"
+# auto = per-call classifier (recommended). Other choices:
+# default, acceptEdits, plan, dontAsk, bypassPermissions
+permission_mode = "auto"
+disallowed_tools = [
+  "Bash(rm *)",
+  "Bash(sudo *)",
+  "Bash(diskutil *)",
+  "Bash(dd *)",
+  "Bash(shutdown *)",
+  "Bash(reboot *)",
+  "Bash(launchctl *)",
+]
+
+[discord]
+# How the Discord bot decides whether to respond.
+mention_only_in_channels = true
+dms_always_respond = true
+
+[obsidian]
+# Path to your Obsidian vault. Tilde-expanded at load.
+vault_path = "~/Documents/Obsidian"
+
+[news]
+# Once daily at 9am local time. Adjust to taste.
+fetch_cron = "0 9 * * *"
+
+[diary]
+root = "memory/diaries"
+retain_days = 7
+
+[distiller]
+metabolism_cron = "0 * * * *"
+contemplation_cron = "0 4 * * 0"
+metabolism_model = "claude-haiku-4-5"
+contemplation_model = "claude-sonnet-4-6"
+
+[ports]
+news_api = 8080
+dashboard = 8090
+chat = 8091

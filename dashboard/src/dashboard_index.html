@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" id="favicon" type="image/svg+xml" href="/favicon-light.svg">
+  <script>
+    (function () {
+      var mq = window.matchMedia('(prefers-color-scheme: dark)');
+      function apply() {
+        document.getElementById('favicon').href = mq.matches ? '/favicon-dark.svg' : '/favicon-light.svg';
+      }
+      apply();
+      mq.addEventListener ? mq.addEventListener('change', apply) : mq.addListener(apply);
+    })();
+  </script>
+  <title>nucleus / dashboard</title>
+  <style>
+    :root {
+      --bg: #0a0a0a;
+      --bg-elev: #111111;
+      --bg-deep: #050505;
+      --fg: #e8e6df;
+      --muted: #6c6a63;
+      --dim: #3a3833;
+      --border: #2a2823;
+
+      --amber: #ffb95c;
+      --phosphor: #a3d977;
+      --cyan: #7dd9cc;
+      --red: #e26d6d;
+
+      /* status fills — muted CRT phosphor tones, readable as a chip */
+      --ok-bg: #1c2614;
+      --ok-fg: #a3d977;
+      --ok-border: #4d6b34;
+
+      --degraded-bg: #2a1f0f;
+      --degraded-fg: #ffb95c;
+      --degraded-border: #6b4d1f;
+
+      --down-bg: #2a1414;
+      --down-fg: #e26d6d;
+      --down-border: #6b2828;
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      background: var(--bg); color: var(--fg);
+      font-family: 'JetBrains Mono', 'Berkeley Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    /* Desktop: viewport-fitted layout. Body owns the full viewport, the grid
+       fills remaining space, and each widget body scrolls internally if its
+       content overflows. */
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      display: flex;
+      flex-direction: column;
+      padding: 0.9rem 1rem 0.6rem;
+    }
+    a { color: var(--amber); text-decoration: none; }
+    a:hover { color: var(--fg); }
+
+    /* page header */
+    .page-head {
+      display: flex; justify-content: space-between; align-items: baseline;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 0.5rem; margin-bottom: 0.6rem;
+      flex: 0 0 auto;
+    }
+    .brand { font-weight: 700; letter-spacing: 0.04em; }
+    .brand .accent { color: var(--amber); }
+    .meta { color: var(--muted); font-size: 12px; }
+    .meta .age { color: var(--dim); margin-left: 0.5rem; }
+    .nav {
+      color: var(--muted); margin-bottom: 0.7rem; font-size: 12px;
+      flex: 0 0 auto;
+      display: flex; gap: 1rem; flex-wrap: wrap;
+    }
+
+    /* widget grid — fills remaining viewport on desktop */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      grid-auto-rows: minmax(150px, 1fr);
+      gap: 0.6rem;
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .w-12 { grid-column: span 12; }
+    .w-8 { grid-column: span 8; }
+    .w-6 { grid-column: span 6; }
+    .w-4 { grid-column: span 4; }
+
+    /* tray for hidden widgets */
+    .tray {
+      flex: 0 0 auto;
+      padding-top: 0.5rem; margin-top: 0.5rem;
+      border-top: 1px dashed var(--border);
+      font-size: 11px; color: var(--muted);
+      min-height: 0;
+    }
+    .tray-chip {
+      display: inline-block;
+      margin: 0.2rem 0.3rem 0.2rem 0;
+      padding: 0.05rem 0.4rem;
+      border: 1px dashed var(--muted);
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .tray-chip:hover { color: var(--amber); border-color: var(--amber); border-style: solid; }
+
+    /* Mobile: stack widgets, allow both page and per-widget scroll. */
+    @media (max-width: 820px) {
+      html, body { height: auto; overflow: auto; }
+      body { min-height: 100vh; }
+      .grid {
+        grid-template-columns: 1fr;
+        grid-auto-rows: auto;
+        flex: none;
+        overflow: visible;
+      }
+      .w-12, .w-8, .w-6, .w-4 { grid-column: span 1; }
+      .widget { max-height: 70vh; }
+    }
+
+    /* widget chrome — bordered, ASCII title bar */
+    .widget {
+      border: 1px solid var(--border);
+      background: var(--bg-elev);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .widget.collapsed .widget-body { display: none; }
+    .widget-head {
+      display: flex; align-items: center; gap: 0.4rem;
+      padding: 0.25rem 0.5rem;
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      flex: 0 0 auto;
+    }
+    .widget.collapsed .widget-head { border-bottom: none; }
+    .widget-head .corner { color: var(--dim); }
+    .widget-head .name { color: var(--amber); font-weight: 600; }
+    .widget-head .count {
+      color: var(--dim); font-weight: 400;
+      margin-left: 0.4rem;
+    }
+    .widget-head .fill {
+      flex: 1; color: var(--dim);
+      overflow: hidden; white-space: nowrap;
+      letter-spacing: 0; /* dashes look right without tracking */
+    }
+    .widget-head .ctrls { display: flex; gap: 0.3rem; }
+    .widget-head .ctrls button {
+      background: none; border: 1px solid var(--border); color: var(--muted);
+      font: inherit; font-size: 10px; cursor: pointer;
+      padding: 0 0.3rem; line-height: 1.3;
+    }
+    .widget-head .ctrls button:hover { color: var(--fg); border-color: var(--muted); }
+    .widget-body {
+      padding: 0.55rem 0.7rem;
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+    .widget-body.empty {
+      color: var(--muted); font-style: italic;
+      display: flex; align-items: center; justify-content: center;
+      text-align: center;
+    }
+
+    /* scrollbar styling — keep it terminal-flat */
+    .widget-body::-webkit-scrollbar { width: 8px; height: 8px; }
+    .widget-body::-webkit-scrollbar-track { background: transparent; }
+    .widget-body::-webkit-scrollbar-thumb {
+      background: var(--border); border: 1px solid var(--bg-elev);
+    }
+    .widget-body::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+
+    /* SERVICES — tile grid with colored status fills */
+    .svc-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+      gap: 0.45rem;
+    }
+    .svc-tile {
+      border: 1px solid var(--border);
+      background: var(--bg-deep);
+      padding: 0.45rem 0.6rem;
+    }
+    .svc-tile.ok { background: var(--ok-bg); border-color: var(--ok-border); }
+    .svc-tile.degraded { background: var(--degraded-bg); border-color: var(--degraded-border); }
+    .svc-tile.down { background: var(--down-bg); border-color: var(--down-border); }
+    .svc-tile .name {
+      font-weight: 600; font-size: 13px; color: var(--fg);
+      word-break: break-word;
+    }
+    .svc-tile.ok .name { color: var(--ok-fg); }
+    .svc-tile.degraded .name { color: var(--degraded-fg); }
+    .svc-tile.down .name { color: var(--down-fg); }
+    .svc-tile .status {
+      font-size: 10px; letter-spacing: 0.12em;
+      color: var(--muted);
+      margin-top: 0.1rem;
+    }
+    .svc-tile .msg {
+      font-size: 11px; color: var(--muted);
+      margin-top: 0.3rem; line-height: 1.35;
+      word-break: break-word;
+    }
+    .svc-tile .ts { font-size: 10px; color: var(--dim); margin-top: 0.2rem; }
+
+    /* CONTAINERS — chunky bordered rows */
+    .cnt-row {
+      display: grid;
+      grid-template-columns: 1.1fr 1.6fr auto auto;
+      align-items: center;
+      gap: 0.65rem;
+      padding: 0.4rem 0.55rem;
+      border: 1px solid var(--border);
+      margin-bottom: 0.35rem;
+      background: var(--bg-deep);
+      cursor: pointer;
+    }
+    .cnt-row:last-child { margin-bottom: 0; }
+    .cnt-row:hover { border-color: var(--amber); }
+    .cnt-row .name { font-weight: 600; color: var(--fg); }
+    .cnt-row .image {
+      color: var(--muted); font-size: 12px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .cnt-row .state {
+      font-size: 10px; letter-spacing: 0.1em;
+      padding: 0.05rem 0.4rem; border: 1px solid;
+    }
+    .cnt-row .state.running { color: var(--ok-fg); border-color: var(--ok-border); background: var(--ok-bg); }
+    .cnt-row .state.exited,
+    .cnt-row .state.stopped { color: var(--down-fg); border-color: var(--down-border); background: var(--down-bg); }
+    .cnt-row .state.paused,
+    .cnt-row .state.created { color: var(--degraded-fg); border-color: var(--degraded-border); background: var(--degraded-bg); }
+    .cnt-row .ts { color: var(--muted); font-size: 11px; }
+    @media (max-width: 540px) {
+      .cnt-row { grid-template-columns: 1fr auto; row-gap: 0.15rem; }
+      .cnt-row .image, .cnt-row .ts { grid-column: 1 / -1; }
+    }
+
+    /* STACK ITEMS — reminders / news / vault */
+    .stack-item {
+      border: 1px solid var(--border);
+      padding: 0.4rem 0.55rem;
+      margin-bottom: 0.35rem;
+      background: var(--bg-deep);
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 0.55rem;
+    }
+    .stack-item:last-child { margin-bottom: 0; }
+    .stack-item .label {
+      font-size: 10px; letter-spacing: 0.12em;
+      padding: 0.05rem 0.4rem;
+      border: 1px solid;
+      white-space: nowrap;
+    }
+    .stack-item.rem .label { color: var(--amber); border-color: var(--amber); background: var(--degraded-bg); }
+    .stack-item.news .label { color: var(--phosphor); border-color: var(--ok-border); background: var(--ok-bg); }
+    .stack-item.vault .label { color: var(--cyan); border-color: #3a5a55; background: #102622; }
+    .stack-item .body {
+      font-size: 13px; color: var(--fg);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .stack-item .body a { color: inherit; }
+    .stack-item .body a:hover { color: var(--amber); }
+    .stack-item .tail {
+      font-size: 10px; color: var(--muted);
+      letter-spacing: 0.06em; white-space: nowrap;
+    }
+    @media (max-width: 540px) {
+      .stack-item { grid-template-columns: auto 1fr; row-gap: 0.15rem; }
+      .stack-item .tail { grid-column: 1 / -1; }
+    }
+
+    /* per-widget error/empty banner */
+    .banner {
+      color: var(--muted); font-size: 12px;
+      padding: 0.4rem 0;
+      text-align: center;
+    }
+    .banner.err { color: var(--red); }
+  </style>
+</head>
+<body>
+  <div class="page-head">
+    <div class="brand">[<span class="accent">nucleus</span>] / dashboard</div>
+    <div class="meta">
+      <span id="updated">▸ loading…</span>
+      <span class="age" id="age"></span>
+    </div>
+  </div>
+  <nav class="nav">
+    <a href="{{CHAT_URL}}" target="_blank" rel="noopener" style="display: {{CHAT_LINK_DISPLAY}}">› chat</a>
+    <a href="{{NEWS_URL}}" target="_blank" rel="noopener" style="display: {{NEWS_LINK_DISPLAY}}">› news feed</a>
+  </nav>
+
+  <div class="grid" id="grid"></div>
+  <div class="tray" id="tray"></div>
+
+<script>
+const REFRESH_MS = 5 * 60 * 1000; // 5 minutes
+const STATE_KEY = 'nucleus-dashboard-v1';
+
+// Each widget declares: id, title, span class, fetch URL, and a render(json) → html function.
+// The framework handles chrome, hide/show, collapse, scroll preservation across refreshes.
+const WIDGETS = [
+  { id: 'services',   title: 'services',          span: 'w-12', fetch: '/api/services',     render: renderServices },
+  { id: 'reminders',  title: 'reminders',         span: 'w-4',  fetch: '/api/reminders',    render: renderReminders, emptyMsg: 'no pending reminders' },
+  { id: 'news',       title: 'top news',          span: 'w-4',  fetch: '/api/news/top',     render: renderNews,      emptyMsg: 'no news in the last 48h' },
+  { id: 'vault',      title: 'recent vault ops',  span: 'w-4',  fetch: '/api/vault/recent', render: renderVault,     emptyMsg: 'no .md files found' },
+  { id: 'containers', title: 'docker containers', span: 'w-12', fetch: '/api/containers',   render: renderContainers, emptyMsg: 'no containers' },
+];
+
+const $ = (q, root) => (root || document).querySelector(q);
+const $$ = (q, root) => Array.from((root || document).querySelectorAll(q));
+const escapeHTML = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// --- persistent state for hide/collapse ---
+let state = {};
+try { state = JSON.parse(localStorage.getItem(STATE_KEY) || '{}'); } catch (_) {}
+function saveState() { localStorage.setItem(STATE_KEY, JSON.stringify(state)); }
+function widgetState(id) { return state[id] || {}; }
+function setWidgetState(id, patch) { state[id] = { ...(state[id] || {}), ...patch }; saveState(); }
+
+// --- per-widget data cache, keyed by widget id ---
+const cache = {};
+let lastRefreshAt = null;
+
+// --- relative-time helpers ---
+function relTime(epochSeconds) {
+  if (!epochSeconds) return '';
+  const now = Math.floor(Date.now() / 1000);
+  const delta = now - epochSeconds;
+  if (delta < 60) return delta + 's ago';
+  if (delta < 3600) return Math.floor(delta / 60) + 'm ago';
+  if (delta < 86400) return Math.floor(delta / 3600) + 'h ago';
+  return Math.floor(delta / 86400) + 'd ago';
+}
+function relDue(rfc3339) {
+  if (!rfc3339) return '';
+  const t = Date.parse(rfc3339);
+  if (Number.isNaN(t)) return '';
+  const delta = Math.floor((t - Date.now()) / 1000);
+  if (delta < 0) return 'overdue ' + relTime(Math.floor(t / 1000));
+  if (delta < 60) return 'in <1m';
+  if (delta < 3600) return 'in ' + Math.floor(delta / 60) + 'm';
+  if (delta < 86400) return 'in ' + Math.floor(delta / 3600) + 'h';
+  return 'in ' + Math.floor(delta / 86400) + 'd';
+}
+function clockTimeISO(rfc3339) {
+  if (!rfc3339) return '';
+  const d = new Date(rfc3339);
+  return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+}
+
+// --- renderers ---
+function renderServices(data) {
+  // /api/services returns Array<Snapshot> directly.
+  const items = Array.isArray(data) ? data : [];
+  if (!items.length) return null;
+  return `<div class="svc-grid">` + items.map(s => `
+    <div class="svc-tile ${escapeHTML(s.status)}">
+      <div class="name">${escapeHTML(s.id)}</div>
+      <div class="status">[${escapeHTML((s.status || '').toUpperCase())}]</div>
+      <div class="msg">${escapeHTML(s.message || '')}</div>
+      <div class="ts">${s.checked_at ? new Date(s.checked_at).toLocaleTimeString('en-GB') : ''}</div>
+    </div>
+  `).join('') + `</div>`;
+}
+
+function renderContainers(data) {
+  if (data && data.error) return bannerErr(data.error);
+  const items = (data && data.containers) || [];
+  if (!items.length) return null;
+  return items.map(c => `
+    <div class="cnt-row" data-href="/containers/${encodeURIComponent(c.id)}">
+      <span class="name">${escapeHTML(c.name)}</span>
+      <span class="image">${escapeHTML(c.image)}</span>
+      <span class="state ${escapeHTML(c.state)}">${escapeHTML((c.state || '').toUpperCase())}</span>
+      <span class="ts">${escapeHTML(c.status)}</span>
+    </div>
+  `).join('');
+}
+
+function renderReminders(data) {
+  if (data && data.ok === false && data.error) return bannerErr(data.error);
+  const items = (data && data.items) || [];
+  if (!items.length) return null;
+  return items.map(r => `
+    <div class="stack-item rem">
+      <span class="label" title="${escapeHTML(r.due_at)}">${escapeHTML(clockTimeISO(r.due_at) || '--')}</span>
+      <span class="body" title="${escapeHTML(r.body)}">${escapeHTML(r.body)}</span>
+      <span class="tail">${escapeHTML(relDue(r.due_at))} · ${escapeHTML(r.channel)}</span>
+    </div>
+  `).join('');
+}
+
+function renderNews(data) {
+  if (data && data.ok === false && data.error) return bannerErr(data.error);
+  const items = (data && data.items) || [];
+  if (!items.length) return null;
+  return items.map(n => {
+    const scoreTxt = (n.notable_score != null) ? n.notable_score.toFixed(2) : '–';
+    return `
+      <div class="stack-item news">
+        <span class="label">${escapeHTML(scoreTxt)}</span>
+        <span class="body" title="${escapeHTML(n.title)}">
+          <a href="${escapeHTML(n.url)}" target="_blank" rel="noopener">${escapeHTML(n.title)}</a>
+        </span>
+        <span class="tail">${escapeHTML(n.source_name || '')}</span>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderVault(data) {
+  if (data && data.ok === false && data.error) return bannerErr(data.error);
+  const items = (data && data.items) || [];
+  if (!items.length) return null;
+  return items.map(v => `
+    <div class="stack-item vault">
+      <span class="label">md</span>
+      <span class="body" title="${escapeHTML(v.path)}">${escapeHTML(v.path)}</span>
+      <span class="tail">${escapeHTML(relTime(v.mtime_unix))}</span>
+    </div>
+  `).join('');
+}
+
+function bannerErr(msg) { return `<div class="banner err">${escapeHTML(msg)}</div>`; }
+function bannerEmpty(msg) { return `<div class="banner">${escapeHTML(msg)}</div>`; }
+
+// --- widget framework ---
+function rule(n) { return '─'.repeat(Math.max(0, n)); }
+
+function buildWidgetEl(w) {
+  const ws = widgetState(w.id);
+  const collapsed = !!ws.collapsed;
+  const el = document.createElement('div');
+  el.className = `widget ${w.span}` + (collapsed ? ' collapsed' : '');
+  el.dataset.id = w.id;
+  el.innerHTML = `
+    <div class="widget-head">
+      <span class="corner">┌──</span>
+      <span class="name">${escapeHTML(w.title)}</span>
+      <span class="count" data-count></span>
+      <span class="fill">${rule(200)}</span>
+      <span class="ctrls">
+        <button data-act="collapse" title="${collapsed ? 'expand' : 'collapse'}">${collapsed ? '+' : '−'}</button>
+        <button data-act="hide" title="hide">✕</button>
+      </span>
+      <span class="corner">──┐</span>
+    </div>
+    <div class="widget-body" data-body><div class="banner">loading…</div></div>
+  `;
+  el.querySelector('[data-act="collapse"]').onclick = () => {
+    setWidgetState(w.id, { collapsed: !collapsed });
+    fullRender();
+  };
+  el.querySelector('[data-act="hide"]').onclick = () => {
+    setWidgetState(w.id, { hidden: true });
+    fullRender();
+  };
+  return el;
+}
+
+function fullRender() {
+  const grid = $('#grid');
+  const tray = $('#tray');
+  grid.innerHTML = '';
+  WIDGETS.filter(w => !widgetState(w.id).hidden).forEach(w => grid.appendChild(buildWidgetEl(w)));
+  // Container row click — delegate at grid level so re-renders don't lose it.
+  // Actually each row has its own data-href, so we wire a single delegate.
+
+  const hidden = WIDGETS.filter(w => widgetState(w.id).hidden);
+  if (!hidden.length) {
+    tray.innerHTML = '';
+    tray.style.display = 'none';
+  } else {
+    tray.style.display = 'block';
+    tray.innerHTML = '◂ hidden ▸ ' + hidden.map(w =>
+      `<span class="tray-chip" data-id="${w.id}">+ ${escapeHTML(w.title)}</span>`
+    ).join('');
+    $$('.tray-chip', tray).forEach(c => {
+      c.onclick = () => {
+        setWidgetState(c.dataset.id, { hidden: false });
+        fullRender();
+      };
+    });
+  }
+
+  // After rebuild, push cached data back into bodies (no network call).
+  WIDGETS.filter(w => !widgetState(w.id).hidden).forEach(w => {
+    if (cache[w.id] !== undefined) renderInto(w, cache[w.id]);
+    else fetchAndRender(w);
+  });
+}
+
+// Click delegation on the grid for cursor-pointer container rows.
+document.addEventListener('click', e => {
+  const row = e.target.closest('.cnt-row[data-href]');
+  if (row) location.href = row.dataset.href;
+});
+
+function renderInto(w, data) {
+  const el = $(`.widget[data-id="${w.id}"]`);
+  if (!el) return;
+  const body = $('[data-body]', el);
+  const count = $('[data-count]', el);
+  const html = w.render(data);
+  // preserve scrollTop across content swaps
+  const prevTop = body.scrollTop;
+  if (html === null || html === '') {
+    body.classList.add('empty');
+    body.innerHTML = bannerEmpty(w.emptyMsg || 'nothing yet');
+    if (count) count.textContent = '· 0';
+  } else {
+    body.classList.remove('empty');
+    body.innerHTML = html;
+    if (count) {
+      const n = countItems(w.id, data);
+      count.textContent = n != null ? `· ${n}` : '';
+    }
+  }
+  body.scrollTop = prevTop;
+}
+
+function countItems(id, data) {
+  if (id === 'services') return Array.isArray(data) ? data.length : null;
+  if (id === 'containers') return data && data.containers ? data.containers.length : null;
+  if (data && data.items) return data.items.length;
+  return null;
+}
+
+async function fetchAndRender(w) {
+  try {
+    const res = await fetch(w.fetch, { cache: 'no-store' });
+    const data = await res.json();
+    cache[w.id] = data;
+    renderInto(w, data);
+  } catch (e) {
+    cache[w.id] = { ok: false, error: e.message };
+    renderInto(w, cache[w.id]);
+  }
+}
+
+async function refreshAll() {
+  const visible = WIDGETS.filter(w => !widgetState(w.id).hidden);
+  await Promise.all(visible.map(fetchAndRender));
+  lastRefreshAt = new Date();
+  updateClock();
+}
+
+function updateClock() {
+  const now = new Date();
+  const tzAbbr = new Intl.DateTimeFormat('en-GB', { timeZoneName: 'short' })
+    .formatToParts(now).find(p => p.type === 'timeZoneName')?.value ?? '';
+  $('#updated').textContent = '▸ updated ' + now.toLocaleTimeString('en-GB') + ' ' + tzAbbr;
+  if (lastRefreshAt) {
+    const ageSec = Math.floor((Date.now() - lastRefreshAt.getTime()) / 1000);
+    $('#age').textContent = `(data ${relSimple(ageSec)} old · auto-refresh ${REFRESH_MS / 60000}m)`;
+  }
+}
+function relSimple(sec) {
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm';
+  return Math.floor(sec / 3600) + 'h';
+}
+
+// initial render + first fetch
+fullRender();
+refreshAll();
+setInterval(refreshAll, REFRESH_MS);
+setInterval(updateClock, 1000);
+
+// refresh immediately when the tab regains focus after a long absence
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && lastRefreshAt) {
+    const ageMs = Date.now() - lastRefreshAt.getTime();
+    if (ageMs > REFRESH_MS) refreshAll();
+  }
+});
+</script>
+</body>
+</html>

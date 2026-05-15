@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "messaging/discord",
+    "news/fetcher",
+    "news/api",
+    "dashboard",
+    "chat",
+    "chores/distiller",
+    "chores/preference-learner",
+    "chores/reminders",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+dotenvy = "0.15"
+figment = { version = "0.10", features = ["toml", "env"] }
+
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
+bollard = "0.18"
+tokio-cron-scheduler = "0.13"
+
+anyhow = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+futures = "0.3"
+
+nucleus-core = { path = "core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

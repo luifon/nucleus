@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LAUNCHD_PREFIX__.alfred</string>
+    <!-- Run via a login shell so nvm's PATH is set up; exec npm so launchctl
+         tracks the right pid. Update the node path if you switch nvm versions
+         or move to system node. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>cd __USER_HOME__/Development/nucleus/messaging/whatsapp && exec npm start</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__USER_HOME__/Development/nucleus/messaging/whatsapp</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TZ</key>
+        <string>__TZ__</string>
+        <key>NUCLEUS_LOG</key>
+        <string>info</string>
+        <key>NUCLEUS_CLAUDE_BIN</key>
+        <string>__USER_HOME__/.local/bin/claude</string>
+        <key>NUCLEUS_WORKSPACE_ROOT</key>
+        <string>__USER_HOME__/Development/nucleus</string>
+        <key>PATH</key>
+        <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/alfred.log</string>
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/alfred.log</string>
+</dict>
+</plist>
