@@ -1,0 +1,37 @@
+{
+  "name": "@nucleus/whatsapp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Nucleus WhatsApp bot — brain-dump style, allowlist-scoped to a single chat.",
+  "bin": {
+    "nucleus-whatsapp": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "discover": "tsx src/index.ts --discover",
+    "send": "tsx src/send.ts",
+    "list-groups": "tsx src/list-groups.ts",
+    "build": "tsc -p .",
+    "start:prod": "node dist/index.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc11",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/qrcode-terminal": "^0.12.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

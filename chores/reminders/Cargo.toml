@@ -1,0 +1,20 @@
+[package]
+name = "reminders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "reminders"
+path = "src/main.rs"
+
+[dependencies]
+nucleus-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+sqlx = { workspace = true }
+serde = { workspace = true }
