@@ -100,6 +100,11 @@ pub struct GmailConfig {
     pub classifier_model: String,
     pub killlist_auto_promote_threshold: u32,
     pub calendar_default_duration_min: u32,
+    /// The Gmail trash account JARVIS operates on. Sourced from
+    /// `NUCLEUS_GMAIL_ACCOUNT`. Empty when unset; persona/prompt
+    /// `${GMAIL_ACCOUNT}` substitutions become empty strings in that case.
+    #[serde(default)]
+    pub account: String,
     /// Personal email JARVIS adds as attendee on calendar events.
     /// Sourced from NUCLEUS_PERSONAL_EMAIL — empty when unset, in which
     /// case calendar deliveries fail fast at delivery time.
@@ -169,6 +174,7 @@ impl Settings {
         };
 
         let mut gmail = toml.gmail;
+        gmail.account = std::env::var("NUCLEUS_GMAIL_ACCOUNT").unwrap_or_default();
         gmail.personal_email = std::env::var("NUCLEUS_PERSONAL_EMAIL").unwrap_or_default();
 
         Ok(Settings {
@@ -206,4 +212,11 @@ fn split_csv(s: &str) -> Vec<String> {
 /// Substitute `${USER_NAME}` placeholders in a string with the configured name.
 pub fn substitute(s: &str, identity: &Identity) -> String {
     s.replace("${USER_NAME}", &identity.user_name)
+}
+
+/// Substitute `${GMAIL_ACCOUNT}` placeholders in a string with the configured
+/// Gmail trash account. Kept separate from [`substitute`] so callers who
+/// don't depend on Gmail don't carry the surface area.
+pub fn substitute_gmail(s: &str, gmail: &GmailConfig) -> String {
+    s.replace("${GMAIL_ACCOUNT}", &gmail.account)
 }

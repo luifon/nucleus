@@ -256,8 +256,8 @@ Supported `--channels` values:
   `WHATSAPP_BRAINDUMP_GROUP_NAMES`). Same queue mechanism
 - `calendar` — creates a Google Calendar event via JARVIS + Claude.ai
   Calendar MCP (ADR-007). The event is created on the trash account
-  (`the-trash-account`) with `NUCLEUS_PERSONAL_EMAIL` as attendee, so the
-  invite lands on the user's main calendar with native phone/watch
+  (`$NUCLEUS_GMAIL_ACCOUNT`) with `$NUCLEUS_PERSONAL_EMAIL` as attendee,
+  so the invite lands on the user's main calendar with native phone/watch
   alerts. Event duration defaults to `[gmail].calendar_default_duration_min`
   (30 min). Use this when the user wants an actual *calendar invite*,
   not just a one-shot ping — "put dentist Monday 17h on my calendar",

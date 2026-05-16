@@ -474,6 +474,7 @@ async fn main() -> Result<()> {
         append_system_prompt: Some(persona),
         permission_mode: PermissionMode::parse(&settings.claude.permission_mode),
         disallowed_tools: settings.claude.disallowed_tools.clone(),
+        allowed_tools: vec![],
         add_dirs: vec![],
         tmux_session: "nucleus-discord".into(),
         idle_timeout: std::time::Duration::from_secs(60 * 60 * 4),
