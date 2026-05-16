@@ -3,6 +3,7 @@ target/
 **/node_modules/
 **/dist/
 **/auth/
+**/auth.old-*/
 
 # runtime data — Tier 1 per-bot state
 memory/*
