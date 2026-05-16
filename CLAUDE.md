@@ -254,15 +254,29 @@ Supported `--channels` values:
   `memory/whatsapp.db`; Alfred drains every 5s
 - `braindump` — WhatsApp Brain Dump group (first entry of
   `WHATSAPP_BRAINDUMP_GROUP_NAMES`). Same queue mechanism
+- `calendar` — creates a Google Calendar event via JARVIS + Claude.ai
+  Calendar MCP (ADR-007). The event is created on the trash account
+  (`the-trash-account`) with `NUCLEUS_PERSONAL_EMAIL` as attendee, so the
+  invite lands on the user's main calendar with native phone/watch
+  alerts. Event duration defaults to `[gmail].calendar_default_duration_min`
+  (30 min). Use this when the user wants an actual *calendar invite*,
+  not just a one-shot ping — "put dentist Monday 17h on my calendar",
+  "schedule the Q3 review for tomorrow 9am". Cron-recurring reminders
+  on `--channels calendar` create one event per fire — fine for
+  occasional recurrence, wrong for "every weekday" (you'd flood the
+  calendar). Prefer `discord-home` or `alfred` for those.
 
 Pick the channels based on where the user asked. "Remind me on
 WhatsApp" or "remind me here" (when they're already in Alfred) →
 `alfred`. No default to WhatsApp — Discord is the safe default for
 unattended delivery, since the WhatsApp app is on the user's phone and
-could be muted/inactive. Multi-channel ("remind me on Discord AND
-WhatsApp") works: pass a comma list. Each channel retries
-independently up to 3 attempts before giving up for that fire; the
-others aren't redelivered while a laggard retries.
+could be muted/inactive. "Schedule X" / "put X on my calendar" /
+"invite me to X" → `calendar` (typically combined with `discord-home`
+for a same-day heads-up: `--channels calendar,discord-home`).
+Multi-channel ("remind me on Discord AND WhatsApp") works: pass a
+comma list. Each channel retries independently up to 3 attempts before
+giving up for that fire; the others aren't redelivered while a laggard
+retries.
 
 The 18:30 weekday timesheet reminder is seeded as a `created_by =
 'system'` row on binary startup — don't add it manually. If the user
