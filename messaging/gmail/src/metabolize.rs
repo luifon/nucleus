@@ -79,6 +79,18 @@ pub async fn run(settings: &Settings, workspace_root: &Path) -> Result<()> {
         append_system_prompt: Some(persona),
         permission_mode: Some(PermissionMode::Auto),
         disallowed_tools: settings.claude.disallowed_tools.clone(),
+        // Pre-approve the Gmail MCP tools JARVIS needs to do the sweep
+        // without per-call classifier prompting. List + read + label
+        // ops are all expected; without this, the run stalls on the
+        // first mutation.
+        allowed_tools: vec![
+            "mcp__claude_ai_Gmail__list_labels".into(),
+            "mcp__claude_ai_Gmail__create_label".into(),
+            "mcp__claude_ai_Gmail__search_threads".into(),
+            "mcp__claude_ai_Gmail__get_thread".into(),
+            "mcp__claude_ai_Gmail__label_thread".into(),
+            "mcp__claude_ai_Gmail__unlabel_thread".into(),
+        ],
         tmux_session: "nucleus-jarvis".into(),
         window_name: Some("metabolism".into()),
         ready_timeout: Duration::from_secs(20),
