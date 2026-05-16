@@ -16,7 +16,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import fs from "node:fs";
 
-import { loadConfig, type Config } from "./config.js";
+import { loadConfig, normalizeSenderId, type Config } from "./config.js";
 import { SessionPool } from "./claude_session.js";
 import { ChatSessionStore, OutboundQueueStore, type OutboundRow } from "./db.js";
 import { record as recordDiary } from "./diary.js";
@@ -322,6 +322,40 @@ function resolveOutboundTarget(target: string): string | null {
   return allowedJids.has(jid) ? jid : null;
 }
 
+/** Check `participant` against the configured sender allowlist. Modern
+ *  WhatsApp groups deliver participants as `@lid` for privacy, so we:
+ *    1. compare the LID's user part against the set (zero-cost match),
+ *    2. if that misses and the JID is a LID, ask Baileys to resolve
+ *       LID → PN via `signalRepository.lidMapping.getPNForLID()` and
+ *       compare the resolved PN's user part too.
+ *  Returns true when either form is on the list. PN resolution can return
+ *  null when the bot hasn't yet seen a mapping for this contact — in
+ *  that case the user should put the LID directly in the env (it's
+ *  surfaced in the "ignoring" log line). */
+async function isSenderAllowed(
+  sock: any,
+  participant: string,
+  allowed: Set<string>,
+): Promise<boolean> {
+  if (allowed.size === 0) return false;
+  const normalized = normalizeSenderId(participant);
+  if (normalized && allowed.has(normalized)) return true;
+  if (participant.endsWith("@lid")) {
+    try {
+      const pn: string | null | undefined =
+        await sock?.signalRepository?.lidMapping?.getPNForLID?.(participant);
+      if (pn) {
+        const pnUser = normalizeSenderId(pn);
+        if (pnUser && allowed.has(pnUser)) return true;
+      }
+    } catch {
+      // Resolution failure: fall through to deny. The participant LID
+      // is still logged in the caller so the operator can add it.
+    }
+  }
+  return false;
+}
+
 async function handleMessage(
   sock: any,
   msg: WAMessage,
@@ -349,16 +383,31 @@ async function handleMessage(
     return;
   }
 
-  // 3. Sender must be us. In a self-only group every message is fromMe by
-  //    definition; this is the last-line defense if anyone else ever ends up
-  //    in the group somehow.
-  if (!msg.key.fromMe) {
-    log.warn({ chatId, participant: msg.key.participant }, "whatsapp: non-self message in allowed group — ignoring");
+  // 3. Don't reply to ourselves — would loop. Silent skip, not a warn.
+  if (msg.key.fromMe) {
     return;
   }
 
-  // 4. Group must currently have only one participant (us). If anyone else
-  //    has been added since pairing, refuse and disable until manually re-enabled.
+  // 4. Per-sender allowlist. Pre-bot-number-split this gate didn't exist
+  //    because bot==user (every legit message was fromMe). Now the bot
+  //    runs as a separate identity, so we must explicitly enumerate who
+  //    is allowed to address it inside an allowlisted group. Without this,
+  //    anyone who creates a group with a colliding name (`Alfred`,
+  //    `Brain Dump`) and adds the bot could spam it.
+  const participant = msg.key.participant ?? "";
+  const senderOk = await isSenderAllowed(sock, participant, config.allowedSenders);
+  if (!senderOk) {
+    log.warn(
+      { chatId, participant },
+      "whatsapp: sender not in WHATSAPP_ALLOWED_SENDERS — ignoring (add the listed participant if this is you)",
+    );
+    return;
+  }
+
+  // 5. Membership-change tripwire. The sender allowlist defends against
+  //    *messages* from the wrong identity; this tripwire still flags
+  //    group-composition drift so we notice if someone gets added to an
+  //    Alfred/Brain Dump group, even if they never speak.
   let memberIds: string[] = [];
   try {
     const metadata = await sock.groupMetadata(chatId);
@@ -367,17 +416,6 @@ async function handleMessage(
     log.warn({ err: (e as Error).message }, "whatsapp: groupMetadata failed — refusing to respond");
     return;
   }
-
-  if (memberIds.length !== 1) {
-    log.warn(
-      { chatId, members: memberIds },
-      "whatsapp: allowed group has >1 participant — refusing (re-enable manually after verifying)",
-    );
-    return;
-  }
-
-  // 5. Membership-change tripwire: if the SET of members has changed since
-  //    last seen, mark the group disabled. observeMembers handles persistence.
   const { disabled, reason } = store.observeMembers(chatId, memberIds);
   if (disabled) {
     log.warn({ chatId, reason }, "whatsapp: group disabled — manual re-enable required");
