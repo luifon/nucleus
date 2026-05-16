@@ -485,7 +485,7 @@ async fn deliver(
 
 /// Schedule a calendar event by spawning a one-shot JARVIS session and
 /// asking it to call the Google Calendar MCP. Per ADR-007, the calendar
-/// lives on the trash account (the-trash-account) but the personal email is
+/// lives on the configured trash account but the personal email is
 /// added as attendee so the invite reaches the user's main calendar.
 async fn deliver_calendar(
     settings: &Settings,

@@ -7,7 +7,7 @@
 Two unlocks the existing Nucleus surfaces can't deliver:
 
 1. **Calendar invites from any bot.** "Alfred, dentist Monday 17h" should land on the user's personal calendar with native alerts — not just a once-per-minute Discord nudge from the local `reminders` table.
-2. **Inbox metabolism** for the trash account (`$NUCLEUS_GMAIL_ACCOUNT`) — currently 5,500+ emails of mostly machine-sent junk that the user never sees.
+2. **Inbox metabolism** for the operator's trash account (`$NUCLEUS_GMAIL_ACCOUNT`) — currently 5,500+ emails of mostly machine-sent junk that the user never sees.
 
 Two implementation paths considered:
 
@@ -64,7 +64,7 @@ Google           → invite email to $NUCLEUS_PERSONAL_EMAIL
 You              → see event on personal calendar, native phone/watch alerts
 ```
 
-This is shared infrastructure — calendar isn't JARVIS-exclusive. The MCP is authenticated against the-trash-account, so the calendar is on the-trash-account, but invites land on the personal email through standard Google flow.
+This is shared infrastructure — calendar isn't JARVIS-exclusive. The MCP is authenticated against the trash account, so the calendar is on the trash account, but invites land on `$NUCLEUS_PERSONAL_EMAIL` through standard Google flow.
 
 **Gated on the reminders v2 refactor currently in progress.** Don't start building the `--channel calendar` branch until the reminders binary's TZ-correct, pause/resume, `--cron` work lands. The new branch needs to ride on whatever model v2 settles on.
 

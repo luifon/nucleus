@@ -45,6 +45,29 @@ const DEFAULT_ASK: Required<AskOptions> = {
   quiescentMs: 3_000,
 };
 
+/** Prepend a fresh wall-clock context line to every payload. Long-lived
+ *  SessionPool sessions otherwise stay anchored to spawn-day "today" —
+ *  the model has no built-in clock, and a single `date` call at session
+ *  start gets carried as the anchor for every turn after. Recomputing
+ *  per ask() keeps "tomorrow"/"in N hours" reasoning honest. */
+function withDatePreamble(message: string): string {
+  const now = new Date();
+  const tz = process.env.TZ || process.env.NUCLEUS_TZ || "America/Sao_Paulo";
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    weekday: "short",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(now).map((p) => [p.type, p.value]));
+  const stamp = `${parts.year}-${parts.month}-${parts.day} (${parts.weekday}), local ${parts.hour}:${parts.minute} ${tz}`;
+  return `[context: today is ${stamp}]\n\n${message}`;
+}
+
 /** A live tmux-hosted claude session. */
 export class Session {
   constructor(
@@ -103,7 +126,7 @@ export class Session {
   async ask(message: string, opts: AskOptions = {}): Promise<string> {
     const ask = { ...DEFAULT_ASK, ...opts };
     const fromOffset = this.cursor;
-    await pasteAndSend(this.tmuxTarget, message);
+    await pasteAndSend(this.tmuxTarget, withDatePreamble(message));
     const reply = await waitForAssistant(
       this.transcriptPath,
       fromOffset,

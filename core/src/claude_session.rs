@@ -176,7 +176,8 @@ impl Session {
     /// for at most `opts.max_wait`.
     pub async fn ask(&mut self, message: &str, opts: AskOptions) -> Result<String> {
         let from = self.cursor;
-        paste_and_send(&self.tmux_target, message).await?;
+        let payload = with_date_preamble(message);
+        paste_and_send(&self.tmux_target, &payload).await?;
         let reply = wait_for_assistant(
             &self.transcript_path,
             from,
@@ -690,4 +691,17 @@ fn extract_last_assistant_text(buffer: &str) -> Option<String> {
 /// Single-quote shell escape: `it's` → `'it'\''s'`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Prepend a fresh wall-clock context line to every ask payload. Long-lived
+/// `SessionPool` sessions otherwise stay anchored to spawn-day "today" — the
+/// model has no internal clock and a single `date` lookup at session start
+/// gets carried as the anchor across every subsequent turn. Recomputing per
+/// ask() keeps "tomorrow" / "in N hours" reasoning honest. Falls back to a
+/// UTC stamp if local timezone resolution fails.
+fn with_date_preamble(message: &str) -> String {
+    use chrono::Local;
+    let now = Local::now();
+    let stamp = now.format("%Y-%m-%d (%a), local %H:%M %Z").to_string();
+    format!("[context: today is {stamp}]\n\n{message}")
 }

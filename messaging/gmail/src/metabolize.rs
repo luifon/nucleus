@@ -71,8 +71,13 @@ pub async fn run(settings: &Settings, workspace_root: &Path) -> Result<()> {
         .await
         .with_context(|| format!("reading {}", persona_path.display()))?;
     let persona = config::substitute(&persona, &settings.identity);
+    let persona = config::substitute_gmail(&persona, &settings.gmail);
 
-    let prompt = build_prompt(&lookback_from.to_rfc3339(), &killlist);
+    let prompt = build_prompt(
+        &lookback_from.to_rfc3339(),
+        &killlist,
+        &settings.gmail.account,
+    );
 
     let mut session = Session::spawn(SpawnOptions {
         workspace_root: workspace_root.to_path_buf(),
@@ -195,10 +200,10 @@ fn nucleus_tz() -> Tz {
     chrono_tz::America::Sao_Paulo
 }
 
-fn build_prompt(watermark_rfc3339: &str, killlist: &[String]) -> String {
+fn build_prompt(watermark_rfc3339: &str, killlist: &[String], account: &str) -> String {
     let killlist_json = serde_json::to_string(killlist).unwrap_or_else(|_| "[]".into());
     format!(
-        r#"Run today's inbox metabolism on $NUCLEUS_GMAIL_ACCOUNT.
+        r#"Run today's inbox metabolism on {account}.
 
 LOOKBACK
   Walk every UNREAD thread newer than {watermark}.
@@ -246,6 +251,7 @@ OUTPUT (REPLY WITH ONLY THIS JSON, NO PROSE, NO MARKDOWN FENCES)
 
 If zero unread threads matched, return all-zero counts. Do not invent counts.
 "#,
+        account = account,
         watermark = watermark_rfc3339,
         killlist_json = killlist_json,
     )
