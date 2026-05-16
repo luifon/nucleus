@@ -38,6 +38,9 @@ tools/cloudflared/*.yaml
 tools/launchd/*.plist
 !tools/launchd/*.plist.example
 
+# personal Claude Code overrides (hooks + permissions for this operator only)
+.claude/settings.local.json
+
 # personal project state — see docs/SECRETS.md
 docs/ROADMAP.md
 docs/TODO.md
