@@ -31,9 +31,15 @@ use std::str::FromStr;
 pub const CHANNEL_DISCORD_HOME: &str = "discord-home";
 pub const CHANNEL_ALFRED: &str = "alfred";
 pub const CHANNEL_BRAINDUMP: &str = "braindump";
+/// Calendar event delivery via JARVIS + Claude.ai Calendar MCP (ADR-007).
+pub const CHANNEL_CALENDAR: &str = "calendar";
 
-pub const KNOWN_CHANNELS: &[&str] =
-    &[CHANNEL_DISCORD_HOME, CHANNEL_ALFRED, CHANNEL_BRAINDUMP];
+pub const KNOWN_CHANNELS: &[&str] = &[
+    CHANNEL_DISCORD_HOME,
+    CHANNEL_ALFRED,
+    CHANNEL_BRAINDUMP,
+    CHANNEL_CALENDAR,
+];
 
 /// Per-channel retry budget before marking the channel `failed` for this fire.
 pub const MAX_ATTEMPTS: i64 = 3;
