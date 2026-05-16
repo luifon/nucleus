@@ -40,6 +40,17 @@ contemplation_cron = "0 4 * * 0"
 metabolism_model = "claude-haiku-4-5"
 contemplation_model = "claude-sonnet-4-6"
 
+[gmail]
+# Daily inbox metabolism (ADR-007). 5am local; cron evaluated in NUCLEUS_TZ.
+metabolism_cron = "0 5 * * *"
+# Cheap classifier — taxonomy is small and the rubric is fixed.
+classifier_model = "claude-haiku-4-5"
+# Auto-promote a sender to the kill-list after this many junk hits.
+killlist_auto_promote_threshold = 3
+# Default duration applied to calendar events scheduled via the
+# `--channel calendar` reminder path when no explicit end time is given.
+calendar_default_duration_min = 30
+
 [ports]
 news_api = 8080
 dashboard = 8090

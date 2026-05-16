@@ -22,6 +22,7 @@ pub struct Settings {
     pub diary: DiaryConfig,
     pub distiller: DistillerConfig,
     pub news: NewsConfig,
+    pub gmail: GmailConfig,
     pub ports: PortsConfig,
 }
 
@@ -94,6 +95,19 @@ pub struct NewsConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GmailConfig {
+    pub metabolism_cron: String,
+    pub classifier_model: String,
+    pub killlist_auto_promote_threshold: u32,
+    pub calendar_default_duration_min: u32,
+    /// Personal email JARVIS adds as attendee on calendar events.
+    /// Sourced from NUCLEUS_PERSONAL_EMAIL — empty when unset, in which
+    /// case calendar deliveries fail fast at delivery time.
+    #[serde(default)]
+    pub personal_email: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PortsConfig {
     pub news_api: u16,
     pub dashboard: u16,
@@ -109,6 +123,7 @@ struct TomlConfig {
     diary: DiaryConfig,
     distiller: DistillerConfig,
     news: NewsConfig,
+    gmail: GmailConfig,
     ports: PortsConfig,
 }
 
@@ -153,6 +168,9 @@ impl Settings {
             chat: env_optional("NUCLEUS_CHAT_PUBLIC_URL"),
         };
 
+        let mut gmail = toml.gmail;
+        gmail.personal_email = std::env::var("NUCLEUS_PERSONAL_EMAIL").unwrap_or_default();
+
         Ok(Settings {
             identity,
             public_urls,
@@ -163,6 +181,7 @@ impl Settings {
             diary: toml.diary,
             distiller: toml.distiller,
             news: toml.news,
+            gmail,
             ports: toml.ports,
         })
     }

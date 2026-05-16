@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "core",
     "messaging/discord",
+    "messaging/gmail",
     "news/fetcher",
     "news/api",
     "dashboard",

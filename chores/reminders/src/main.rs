@@ -15,8 +15,14 @@ mod store;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
-use nucleus_core::{config::Settings, diary, discord_sdk};
+use nucleus_core::{
+    claude::PermissionMode,
+    claude_session::{AskOptions, Session, SpawnOptions},
+    config::{self, Settings},
+    diary, discord_sdk,
+};
 use std::path::Path;
+use std::time::Duration;
 
 const AGENT_NAME: &str = "reminders";
 const DB_PATH: &str = "memory/reminders.db";
@@ -472,8 +478,92 @@ async fn deliver(
             let queue_id = store::enqueue_whatsapp(&pool, &target, &body, "reminders").await?;
             Ok(format!("whatsapp-queue#{}", queue_id))
         }
+        store::CHANNEL_CALENDAR => deliver_calendar(settings, workspace_root, r).await,
         other => bail!("unknown channel {:?}", other),
     }
+}
+
+/// Schedule a calendar event by spawning a one-shot JARVIS session and
+/// asking it to call the Google Calendar MCP. Per ADR-007, the calendar
+/// lives on the trash account (the-trash-account) but the personal email is
+/// added as attendee so the invite reaches the user's main calendar.
+async fn deliver_calendar(
+    settings: &Settings,
+    workspace_root: &Path,
+    r: &store::Reminder,
+) -> Result<String> {
+    if settings.gmail.personal_email.is_empty() {
+        bail!("NUCLEUS_PERSONAL_EMAIL not set — calendar channel needs an attendee");
+    }
+    let next_fire = r
+        .next_fire_at
+        .as_deref()
+        .ok_or_else(|| anyhow!("reminder #{} has no next_fire_at", r.id))?;
+    let start_utc = DateTime::parse_from_rfc3339(next_fire)
+        .with_context(|| format!("parsing next_fire_at {:?}", next_fire))?
+        .with_timezone(&Utc);
+    let duration = chrono::Duration::minutes(
+        settings.gmail.calendar_default_duration_min.max(1) as i64,
+    );
+    let end_utc = start_utc + duration;
+
+    let persona_path = workspace_root.join("messaging/gmail/persona.md");
+    let persona = tokio::fs::read_to_string(&persona_path)
+        .await
+        .with_context(|| format!("reading {}", persona_path.display()))?;
+    let persona = config::substitute(&persona, &settings.identity);
+
+    let prompt = format!(
+        r#"Schedule a calendar event using the `mcp__claude_ai_Google_Calendar__create_event` tool.
+
+summary:    {summary}
+start:      {start} (RFC3339 UTC)
+end:        {end} (RFC3339 UTC)
+attendees:  ["{attendee}"]
+send_updates: "all"
+
+After the tool succeeds, reply with ONLY the event id on its own line — no prose, no markdown."#,
+        summary = r.body.replace('\n', " "),
+        start = start_utc.to_rfc3339(),
+        end = end_utc.to_rfc3339(),
+        attendee = settings.gmail.personal_email,
+    );
+
+    // One-shot session — no SessionPool keying, the calendar channel doesn't
+    // need conversational continuity.
+    let mut session = Session::spawn(SpawnOptions {
+        workspace_root: workspace_root.to_path_buf(),
+        append_system_prompt: Some(persona),
+        permission_mode: Some(PermissionMode::Auto),
+        disallowed_tools: settings.claude.disallowed_tools.clone(),
+        tmux_session: "nucleus-jarvis".into(),
+        window_name: Some(format!("cal-{}", r.id)),
+        ready_timeout: Duration::from_secs(20),
+        ..SpawnOptions::default()
+    })
+    .await
+    .context("spawning JARVIS session for calendar event")?;
+
+    let raw = session
+        .ask(
+            &prompt,
+            AskOptions {
+                max_wait: Duration::from_secs(60),
+                quiescent_window: Duration::from_secs(3),
+            },
+        )
+        .await;
+    let _ = session.close().await;
+    let raw = raw.context("JARVIS calendar create_event")?;
+
+    let event_id = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .last()
+        .ok_or_else(|| anyhow!("JARVIS returned no event id; raw reply: {raw}"))?
+        .to_string();
+    Ok(format!("calendar:{}", event_id))
 }
 
 fn first_group_name(env_var: &str) -> Option<String> {
