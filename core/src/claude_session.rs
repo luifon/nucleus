@@ -48,6 +48,11 @@ pub struct SpawnOptions {
     pub permission_mode: Option<PermissionMode>,
     /// Tool patterns to refuse.
     pub disallowed_tools: Vec<String>,
+    /// Tool patterns pre-approved without prompting the auto-mode
+    /// classifier — passed through as `--allowed-tools`. Use for MCP
+    /// tools the persona is expected to call repeatedly (e.g.
+    /// `mcp__claude_ai_Google_Calendar__create_event` for JARVIS).
+    pub allowed_tools: Vec<String>,
     /// Extra dirs claude is allowed to touch (`--add-dir`).
     pub add_dirs: Vec<PathBuf>,
     /// tmux session name (e.g. "nucleus-discord"). Created if missing.
@@ -68,6 +73,7 @@ impl Default for SpawnOptions {
             append_system_prompt: None,
             permission_mode: None,
             disallowed_tools: vec![],
+            allowed_tools: vec![],
             add_dirs: vec![],
             tmux_session: "nucleus".into(),
             window_name: None,
@@ -208,6 +214,7 @@ pub struct PoolConfig {
     pub append_system_prompt: Option<String>,
     pub permission_mode: Option<PermissionMode>,
     pub disallowed_tools: Vec<String>,
+    pub allowed_tools: Vec<String>,
     pub add_dirs: Vec<PathBuf>,
     pub tmux_session: String,
     /// Sessions idle for longer than this get reaped on the next reap_idle()
@@ -222,6 +229,7 @@ impl Default for PoolConfig {
             append_system_prompt: None,
             permission_mode: None,
             disallowed_tools: vec![],
+            allowed_tools: vec![],
             add_dirs: vec![],
             tmux_session: "nucleus".into(),
             idle_timeout: Duration::from_secs(60 * 60 * 4), // 4h
@@ -290,6 +298,7 @@ impl SessionPool {
                     append_system_prompt: self.config.append_system_prompt.clone(),
                     permission_mode: self.config.permission_mode,
                     disallowed_tools: self.config.disallowed_tools.clone(),
+                    allowed_tools: self.config.allowed_tools.clone(),
                     add_dirs: self.config.add_dirs.clone(),
                     tmux_session: self.config.tmux_session.clone(),
                     window_name: Some(window_name),
@@ -403,6 +412,10 @@ fn build_claude_args(session_id: &str, resuming: bool, opts: &SpawnOptions) -> V
     if !opts.disallowed_tools.is_empty() {
         args.push("--disallowed-tools".into());
         args.push(opts.disallowed_tools.join(" "));
+    }
+    if !opts.allowed_tools.is_empty() {
+        args.push("--allowed-tools".into());
+        args.push(opts.allowed_tools.join(" "));
     }
     args
 }
