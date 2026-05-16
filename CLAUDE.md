@@ -189,45 +189,84 @@ write to T3. Both can happen for the same candidate.
 
 ## Rule 10 — Scheduling reminders via the `reminders` CLI
 
-When the user asks to be reminded at a future time ("remind me at 16:45
-about dentist", "in 30 min nudge me to check the deploy", "tomorrow 9am
-about Q3 sync"), call the `reminders` binary directly via Bash:
+A reminder is the universal primitive for time-triggered notifications
+(see ADR-006). Use the `reminders` binary directly via Bash whenever
+the user asks to be nudged at a future time or on a schedule.
+
+**One-shot** ("remind me at 16:45 about dentist", "in 30 min nudge me
+to check the deploy", "tomorrow 9am about Q3 sync") — use `--at`:
 
 ```bash
 ./target/release/reminders add \
   --at "2026-05-14T16:45:00<offset>" \
   --body "dentist appointment at 17h" \
-  --channel discord-home
+  --channels discord-home
 ```
 
-You're responsible for converting the natural-language time into an
-RFC3339 ISO timestamp **with the user's timezone offset** — read
-`$NUCLEUS_TZ` (or `/etc/localtime` if unset) to resolve the offset.
-Be careful with "tomorrow", "next Tuesday", "in N hours" — resolve
-relative to *now*, not session start.
+**Recurring** ("every weekday at 18:30 remind me to log hours", "every
+Monday morning at 9 send me the weekly review prompt") — use `--cron`
+with a standard 5-field cron expression (minute hour day month dow),
+evaluated in `NUCLEUS_TZ`:
 
-Other useful subcommands:
-- `reminders list` — show pending reminders
-- `reminders cancel <id>` — cancel by id (the `add` command prints the
-  id on success — keep it if the user might want to cancel)
+```bash
+./target/release/reminders add \
+  --cron "30 18 * * 1-5" \
+  --body "⏰ End of day — time to log your hours." \
+  --channels discord-home
+```
 
-Delivery is once-per-minute via launchd; a reminder due at 16:45:00
-fires somewhere in [16:45:00, 16:45:59]. Good enough for human time
-scales.
+`--at` and `--cron` are mutually exclusive. `--at` accepts RFC3339 with
+offset (e.g. `2026-05-14T16:45:00-03:00`) or a naive local timestamp
+that's interpreted in `NUCLEUS_TZ`. You're responsible for converting
+natural language to ISO — read `$NUCLEUS_TZ` (or `/etc/localtime` if
+unset) to resolve the offset, and resolve relative phrases ("tomorrow",
+"in N hours") against *now*, not session start.
 
-Supported `--channel` values:
+`--channels` is plural, comma-separated, and validates against the
+known set. Default is `discord-home`. Examples:
+
+- `--channels discord-home`
+- `--channels alfred`
+- `--channels discord-home,alfred` (delivers to both, per-channel retry)
+
+Other subcommands:
+- `reminders list` — active/pending reminders with next fire time and
+  channels. Add `--include-fired` / `--include-cancelled` to broaden.
+- `reminders show <id>` — full detail incl. channel state + recent fires
+- `reminders cancel <id>` — terminate (the `add` command prints the new
+  id on stdout — keep it in case the user wants to cancel)
+- `reminders pause <id> [--until <iso>]` — temporarily disable; with
+  `--until`, the ticker auto-resumes at that time
+- `reminders resume <id>` — re-activate a paused reminder
+- `reminders history [--days N] [--channel c] [--reminder id]` — audit
+  log of fire attempts (per channel, success/error)
+
+Delivery is once-per-minute via launchd (`reminders-tick.plist`,
+`StartInterval=60`). A reminder due at 16:45:00 fires somewhere in
+[16:45:00, 16:45:59]. **Fire-late policy:** if `next_fire_at` is in
+the past (laptop closed, missed minute, whatever) the next tick fires
+it anyway — one delivery, then advance to the next future match.
+
+Supported `--channels` values:
 - `discord-home` (default) — posts in the configured Discord home channel
-- `alfred` — sends to the WhatsApp conversational group (first entry of
+- `alfred` — WhatsApp conversational group (first entry of
   `WHATSAPP_ALLOWED_GROUP_NAMES`). Goes through the outbound_queue in
   `memory/whatsapp.db`; Alfred drains every 5s
-- `braindump` — sends to the WhatsApp Brain Dump group (first entry of
+- `braindump` — WhatsApp Brain Dump group (first entry of
   `WHATSAPP_BRAINDUMP_GROUP_NAMES`). Same queue mechanism
 
-Pick the channel based on where the user asked. "Remind me on WhatsApp"
-or "remind me here" (when they're already in Alfred) → `alfred`. No
-default to WhatsApp — Discord is the safe default for unattended
-delivery, since the WhatsApp app is on the user's phone and could be
-muted/inactive.
+Pick the channels based on where the user asked. "Remind me on
+WhatsApp" or "remind me here" (when they're already in Alfred) →
+`alfred`. No default to WhatsApp — Discord is the safe default for
+unattended delivery, since the WhatsApp app is on the user's phone and
+could be muted/inactive. Multi-channel ("remind me on Discord AND
+WhatsApp") works: pass a comma list. Each channel retries
+independently up to 3 attempts before giving up for that fire; the
+others aren't redelivered while a laggard retries.
+
+The 18:30 weekday timesheet reminder is seeded as a `created_by =
+'system'` row on binary startup — don't add it manually. If the user
+cancels it, the seeder won't re-create it (cancellation is sticky).
 
 ## When in doubt
 

@@ -1,14 +1,14 @@
-//! reminders — scheduled pings to Discord (and eventually WhatsApp).
+//! reminders — universal time-triggered notifications (ADR-006).
 //!
 //! Subcommands:
-//!   timesheet            daily end-of-day nudge to log hours (preset)
-//!   add                  schedule an ad-hoc reminder
-//!   list                 show pending reminders
-//!   cancel <id>          mark a pending reminder cancelled
-//!   due                  poll for due reminders and deliver them (cron)
-//!
-//! V1 delivers to Discord only. WhatsApp will land once we work out the
-//! Baileys single-client constraint (Alfred already owns the auth).
+//!   add      schedule a reminder (--at xor --cron, --channels c1,c2,…)
+//!   list     show reminders (active/pending by default)
+//!   show     full detail for one reminder including channels + history
+//!   cancel   terminate a reminder
+//!   pause    temporarily disable; optional --until for auto-resume
+//!   resume   reactivate a paused reminder
+//!   history  query the per-fire audit log
+//!   due      polling tick — run from launchd every minute
 
 mod store;
 
@@ -31,32 +31,60 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Daily end-of-day nudge to log hours.
-    Timesheet,
-    /// Schedule an ad-hoc reminder.
+    /// Schedule a reminder. Choose ONE of --at (one-shot) or --cron (recurring).
     Add {
-        /// When to fire, as an ISO-8601 timestamp WITH timezone offset
-        /// (e.g. "2026-05-14T16:45:00<offset>", where offset is "+HH:MM"
-        /// or "-HH:MM"). The caller is responsible for converting natural
-        /// language to ISO.
-        #[arg(long)]
-        at: String,
-        /// The reminder body. What you want the bot to say to you.
+        /// One-shot fire time. ISO-8601; offset optional (no offset = local TZ).
+        #[arg(long, conflicts_with = "cron")]
+        at: Option<String>,
+        /// Standard 5-field cron expression, evaluated in NUCLEUS_TZ.
+        #[arg(long, conflicts_with = "at")]
+        cron: Option<String>,
+        /// Reminder body.
         #[arg(long)]
         body: String,
-        /// Where to deliver. Default: discord-home.
-        #[arg(long, default_value = store::CHANNEL_DISCORD_HOME)]
-        channel: String,
+        /// Comma-separated channels. Default: discord-home.
+        #[arg(long, default_value = store::CHANNEL_DISCORD_HOME, value_delimiter = ',')]
+        channels: Vec<String>,
     },
-    /// List pending reminders.
-    List,
-    /// Cancel a pending reminder by id.
+    /// List reminders (active/pending by default).
+    List {
+        #[arg(long)]
+        include_fired: bool,
+        #[arg(long)]
+        include_cancelled: bool,
+    },
+    /// Full detail for one reminder, including channels + recent fires.
+    Show {
+        #[arg(value_name = "ID")]
+        id: i64,
+    },
+    /// Cancel a reminder.
     Cancel {
         #[arg(value_name = "ID")]
         id: i64,
     },
-    /// Polling tick — find any due reminders and fire them. Run from
-    /// launchd every minute.
+    /// Pause a reminder. With --until, auto-resumes at that time.
+    Pause {
+        #[arg(value_name = "ID")]
+        id: i64,
+        #[arg(long)]
+        until: Option<String>,
+    },
+    /// Resume a paused reminder.
+    Resume {
+        #[arg(value_name = "ID")]
+        id: i64,
+    },
+    /// Query the fire history.
+    History {
+        #[arg(long)]
+        days: Option<i64>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        reminder: Option<i64>,
+    },
+    /// Polling tick — find due reminders and deliver them.
     Due,
 }
 
@@ -68,92 +96,196 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Timesheet => timesheet(&settings, &workspace_root).await,
-        Cmd::Add { at, body, channel } => {
-            add(&workspace_root, &at, &body, &channel).await
+        Cmd::Add { at, cron, body, channels } => {
+            add(&workspace_root, at.as_deref(), cron.as_deref(), &body, &channels).await
         }
-        Cmd::List => list(&workspace_root).await,
+        Cmd::List { include_fired, include_cancelled } => {
+            list(&workspace_root, include_fired, include_cancelled).await
+        }
+        Cmd::Show { id } => show(&workspace_root, id).await,
         Cmd::Cancel { id } => cancel(&workspace_root, id).await,
+        Cmd::Pause { id, until } => pause(&workspace_root, id, until.as_deref()).await,
+        Cmd::Resume { id } => resume(&workspace_root, id).await,
+        Cmd::History { days, channel, reminder } => {
+            history(&workspace_root, days, channel.as_deref(), reminder).await
+        }
         Cmd::Due => due(&settings, &workspace_root).await,
     }
 }
 
-async fn timesheet(settings: &Settings, workspace_root: &Path) -> Result<()> {
-    if settings.discord.home_channel_id.is_empty() {
-        bail!("DISCORD_HOME_CHANNEL_ID is not set; nothing to send to");
-    }
-    let mention = settings
-        .discord
-        .allowed_user_ids
-        .first()
-        .map(|id| format!("<@{}> ", id))
-        .unwrap_or_default();
-    let content = format!("{}⏰ End of day — time to log your hours.", mention);
-
-    let msg_id = discord_sdk::send_announcement(
-        &settings.discord.home_channel_id,
-        &content,
-    )
-    .await?;
-    tracing::info!("timesheet reminder sent (msg {})", msg_id);
-
-    let _ = diary::record_observation(
-        workspace_root,
-        AGENT_NAME,
-        "timesheet",
-        &format!("posted reminder, message {}", msg_id),
-        diary::Tag::Observation,
-    );
-    Ok(())
+async fn open_pool(workspace_root: &Path) -> Result<sqlx::SqlitePool> {
+    let pool = store::open(&workspace_root.join(DB_PATH)).await?;
+    // Idempotent: skips when the row is already there (or has been
+    // cancelled — cancellation is sticky).
+    store::seed_default_reminders(&pool).await?;
+    Ok(pool)
 }
 
-async fn add(workspace_root: &Path, at: &str, body: &str, channel: &str) -> Result<()> {
-    let due_at = DateTime::parse_from_rfc3339(at)
-        .map_err(|e| anyhow!("--at must be RFC3339 with offset (e.g. 2026-05-14T16:45:00+00:00): {e}"))?
-        .with_timezone(&Utc);
-    if !is_known_channel(channel) {
-        bail!(
-            "unknown channel {:?}; supported: discord-home, alfred, braindump",
-            channel
-        );
-    }
+async fn add(
+    workspace_root: &Path,
+    at: Option<&str>,
+    cron: Option<&str>,
+    body: &str,
+    channels: &[String],
+) -> Result<()> {
     if body.trim().is_empty() {
         bail!("--body cannot be empty");
     }
+    if channels.is_empty() {
+        bail!("--channels must list at least one destination");
+    }
 
-    let pool = store::open(&workspace_root.join(DB_PATH)).await?;
-    let id = store::insert(&pool, due_at, body, channel).await?;
-    let local = due_at.with_timezone(&Local);
+    let pool = open_pool(workspace_root).await?;
+
+    let (cron_expr, next_fire_at, one_shot) = match (at, cron) {
+        (Some(_), Some(_)) => bail!("--at and --cron are mutually exclusive"),
+        (None, None) => bail!("must provide --at (one-shot) or --cron (recurring)"),
+        (Some(at_str), None) => {
+            let at_local = store::parse_at(at_str)?;
+            let (c, when_utc) = store::one_shot_cron(at_local);
+            (c, when_utc, true)
+        }
+        (None, Some(c)) => {
+            let tz = store::nucleus_tz();
+            let next = store::next_match_utc(c, Utc::now(), tz)
+                .map_err(|e| anyhow!("--cron rejected: {e}"))?;
+            (c.to_string(), next, false)
+        }
+    };
+
+    let id = store::insert_with_channels(
+        &pool,
+        body,
+        &cron_expr,
+        one_shot,
+        next_fire_at,
+        channels,
+        "user",
+    )
+    .await?;
+    let local = next_fire_at.with_timezone(&Local);
     tracing::info!(
         id = id,
-        due_local = %local.format("%Y-%m-%d %H:%M %Z"),
-        channel = channel,
+        next_fire_local = %local.format("%Y-%m-%d %H:%M %Z"),
+        cron = %cron_expr,
+        one_shot = one_shot,
+        channels = ?channels,
         body_len = body.len(),
         "reminder scheduled"
     );
-    // Print id on stdout so callers (Claude in a bot session) can capture it.
+    // Print id on stdout so callers can capture it.
     println!("{}", id);
     Ok(())
 }
 
-async fn list(workspace_root: &Path) -> Result<()> {
-    let pool = store::open(&workspace_root.join(DB_PATH)).await?;
-    let rows = store::list_pending(&pool).await?;
+async fn list(
+    workspace_root: &Path,
+    include_fired: bool,
+    include_cancelled: bool,
+) -> Result<()> {
+    let pool = open_pool(workspace_root).await?;
+    let rows = store::list_all(&pool, include_fired, include_cancelled).await?;
     if rows.is_empty() {
-        println!("(no pending reminders)");
+        println!("(no reminders)");
         return Ok(());
     }
     for r in rows {
-        let local = DateTime::parse_from_rfc3339(&r.due_at)
+        let next = r
+            .next_fire_at
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|_| r.due_at.clone());
-        println!("#{:<4} {}  [{}]  {}", r.id, local, r.channel, r.body);
+            .unwrap_or_else(|| "—".to_string());
+        let kind = if r.one_shot { "once" } else { "cron" };
+        let extra = match r.status.as_str() {
+            "paused" => match r.paused_until.as_deref() {
+                Some(u) => format!(" [paused until {}]", u),
+                None => " [paused]".to_string(),
+            },
+            "fired" => " [fired]".to_string(),
+            "cancelled" => " [cancelled]".to_string(),
+            _ => String::new(),
+        };
+        let channels = store::channels_for(&pool, r.id).await?;
+        let ch: Vec<&str> = channels.iter().map(|c| c.channel.as_str()).collect();
+        println!(
+            "#{:<4} {}  [{}] {:>5}  ({})  {}{}",
+            r.id,
+            next,
+            ch.join(","),
+            kind,
+            r.cron,
+            r.body,
+            extra
+        );
+    }
+    Ok(())
+}
+
+async fn show(workspace_root: &Path, id: i64) -> Result<()> {
+    let pool = open_pool(workspace_root).await?;
+    let r = store::get(&pool, id)
+        .await?
+        .ok_or_else(|| anyhow!("#{} not found", id))?;
+    let local_next = r
+        .next_fire_at
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M %Z").to_string())
+        .unwrap_or_else(|| "—".into());
+
+    println!("#{}  status={}  one_shot={}", r.id, r.status, r.one_shot);
+    println!("  body: {}", r.body);
+    println!("  cron: {}", r.cron);
+    println!("  next_fire: {}  (utc: {})",
+        local_next,
+        r.next_fire_at.as_deref().unwrap_or("—"));
+    if let Some(l) = r.last_fired_at.as_deref() {
+        println!("  last_fired: {}", l);
+    }
+    if let Some(p) = r.paused_until.as_deref() {
+        println!("  paused_until: {}", p);
+    }
+    println!("  created: {} by {}", r.created_at, r.created_by);
+    println!("  channels:");
+    let chs = store::channels_for(&pool, r.id).await?;
+    if chs.is_empty() {
+        println!("    (none)");
+    }
+    for c in chs {
+        println!(
+            "    - {:12}  status={:8}  attempts={}{}",
+            c.channel,
+            c.status,
+            c.attempts,
+            c.last_error
+                .as_deref()
+                .map(|e| format!("  err={e}"))
+                .unwrap_or_default()
+        );
+    }
+    println!("  recent fires:");
+    let fires = store::fire_history(&pool, Some(30), None, Some(r.id)).await?;
+    if fires.is_empty() {
+        println!("    (none)");
+    }
+    for f in fires.iter().take(10) {
+        let outcome = if f.success { "ok " } else { "ERR" };
+        let extra = if f.success {
+            f.msg_id.clone().unwrap_or_default()
+        } else {
+            f.error.clone().unwrap_or_default()
+        };
+        println!(
+            "    {}  {}  {:12}  {}  {}",
+            f.fired_at, outcome, f.channel, f.id, extra
+        );
     }
     Ok(())
 }
 
 async fn cancel(workspace_root: &Path, id: i64) -> Result<()> {
-    let pool = store::open(&workspace_root.join(DB_PATH)).await?;
+    let pool = open_pool(workspace_root).await?;
     let cancelled = store::cancel(&pool, id).await?;
     if cancelled {
         tracing::info!(id = id, "cancelled reminder");
@@ -164,15 +296,81 @@ async fn cancel(workspace_root: &Path, id: i64) -> Result<()> {
     Ok(())
 }
 
-async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
-    let pool = store::open(&workspace_root.join(DB_PATH)).await?;
-    let now = Utc::now();
-    let due_list = store::pending_due(&pool, now).await?;
-    if due_list.is_empty() {
-        // Quiet on the empty case — this runs every minute.
+async fn pause(workspace_root: &Path, id: i64, until: Option<&str>) -> Result<()> {
+    let pool = open_pool(workspace_root).await?;
+    let until_utc = match until {
+        Some(u) => Some(store::parse_at(u)?.with_timezone(&Utc)),
+        None => None,
+    };
+    let ok = store::pause(&pool, id, until_utc).await?;
+    if !ok {
+        bail!("#{} not found (or not active/pending)", id);
+    }
+    match until_utc {
+        Some(u) => println!(
+            "paused #{} (auto-resumes {})",
+            id,
+            u.with_timezone(&Local).format("%Y-%m-%d %H:%M %Z")
+        ),
+        None => println!("paused #{} (indefinitely)", id),
+    }
+    Ok(())
+}
+
+async fn resume(workspace_root: &Path, id: i64) -> Result<()> {
+    let pool = open_pool(workspace_root).await?;
+    let ok = store::resume(&pool, id).await?;
+    if !ok {
+        bail!("#{} not found or not paused", id);
+    }
+    println!("resumed #{}", id);
+    Ok(())
+}
+
+async fn history(
+    workspace_root: &Path,
+    days: Option<i64>,
+    channel: Option<&str>,
+    reminder: Option<i64>,
+) -> Result<()> {
+    let pool = open_pool(workspace_root).await?;
+    let rows = store::fire_history(&pool, days, channel, reminder).await?;
+    if rows.is_empty() {
+        println!("(no fires recorded)");
         return Ok(());
     }
-    tracing::info!(count = due_list.len(), "delivering due reminders");
+    for f in rows {
+        let local = DateTime::parse_from_rfc3339(&f.fired_at)
+            .map(|d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or(f.fired_at.clone());
+        let outcome = if f.success { "ok " } else { "ERR" };
+        let extra = if f.success {
+            f.msg_id.unwrap_or_default()
+        } else {
+            f.error.unwrap_or_default()
+        };
+        println!(
+            "{}  #{:<4} {}  {:12}  {}",
+            local, f.reminder_id, outcome, f.channel, extra
+        );
+    }
+    Ok(())
+}
+
+async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
+    let pool = open_pool(workspace_root).await?;
+    let now = Utc::now();
+
+    let resumed = store::auto_resume_paused(&pool, now).await?;
+    if resumed > 0 {
+        tracing::info!(count = resumed, "auto-resumed paused reminders");
+    }
+
+    let work = store::pending_due_with_channels(&pool, now).await?;
+    if work.is_empty() {
+        return Ok(());
+    }
+    tracing::info!(count = work.len(), "delivering due reminders");
 
     let mention = settings
         .discord
@@ -181,24 +379,62 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
         .map(|id| format!("<@{}> ", id))
         .unwrap_or_default();
 
-    for r in due_list {
-        match deliver(settings, workspace_root, &mention, &r).await {
-            Ok(msg_id) => {
-                store::mark_fired(&pool, r.id, &msg_id).await?;
-                tracing::info!(id = r.id, msg = %msg_id, "fired");
-                let _ = diary::record_observation(
-                    workspace_root,
-                    AGENT_NAME,
-                    "fired",
-                    &format!("reminder #{} ({}c) → {}", r.id, r.body.len(), r.channel),
-                    diary::Tag::Observation,
-                );
+    for (reminder, channels) in work {
+        let fired_at = Utc::now();
+        for ch in channels {
+            match deliver(settings, workspace_root, &mention, &reminder, &ch.channel).await {
+                Ok(msg_id) => {
+                    store::record_channel_fire(
+                        &pool,
+                        reminder.id,
+                        &ch.channel,
+                        fired_at,
+                        Ok(&msg_id),
+                    )
+                    .await?;
+                    tracing::info!(
+                        id = reminder.id,
+                        channel = %ch.channel,
+                        msg = %msg_id,
+                        "fired"
+                    );
+                    let _ = diary::record_observation(
+                        workspace_root,
+                        AGENT_NAME,
+                        "fired",
+                        &format!(
+                            "reminder #{} ({}c) → {}",
+                            reminder.id,
+                            reminder.body.len(),
+                            ch.channel
+                        ),
+                        diary::Tag::Observation,
+                    );
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    store::record_channel_fire(
+                        &pool,
+                        reminder.id,
+                        &ch.channel,
+                        fired_at,
+                        Err(&err),
+                    )
+                    .await?;
+                    tracing::warn!(
+                        id = reminder.id,
+                        channel = %ch.channel,
+                        err = %err,
+                        "deliver failed; per-channel retry will pick it up"
+                    );
+                }
             }
-            Err(e) => {
-                // Stay pending — next tick retries. Log but don't bail; we
-                // want the loop to continue for other reminders.
-                tracing::warn!(id = r.id, err = %e, "deliver failed; will retry next tick");
-            }
+        }
+        // Either advances the schedule (all channels terminal) or
+        // leaves next_fire_at alone for the next tick to retry the
+        // still-pending ones.
+        if let Err(e) = store::advance_after_fire(&pool, reminder.id).await {
+            tracing::warn!(id = reminder.id, err = %e, "advance_after_fire failed");
         }
     }
     Ok(())
@@ -209,8 +445,9 @@ async fn deliver(
     workspace_root: &Path,
     mention: &str,
     r: &store::Reminder,
+    channel: &str,
 ) -> Result<String> {
-    match r.channel.as_str() {
+    match channel {
         store::CHANNEL_DISCORD_HOME => {
             if settings.discord.home_channel_id.is_empty() {
                 bail!("DISCORD_HOME_CHANNEL_ID not set");
@@ -219,18 +456,16 @@ async fn deliver(
             discord_sdk::send_announcement(&settings.discord.home_channel_id, &body).await
         }
         store::CHANNEL_ALFRED | store::CHANNEL_BRAINDUMP => {
-            // Pick the first configured group name for the requested role
-            // and enqueue into whatsapp.db. Alfred's running process drains
-            // every 5s and sends via its socket. The body is sent raw — no
-            // mention prefix because WhatsApp doesn't render Discord-style
-            // mentions, and the user is the only participant anyway.
-            let env_var = match r.channel.as_str() {
+            let env_var = match channel {
                 store::CHANNEL_ALFRED => "WHATSAPP_ALLOWED_GROUP_NAMES",
                 store::CHANNEL_BRAINDUMP => "WHATSAPP_BRAINDUMP_GROUP_NAMES",
                 _ => unreachable!(),
             };
             let target = first_group_name(env_var).ok_or_else(|| {
-                anyhow!("channel {:?} requires {env_var} to be set with at least one group", r.channel)
+                anyhow!(
+                    "channel {:?} requires {env_var} to be set with at least one group",
+                    channel
+                )
             })?;
             let body = format!("🔔 *Reminder:* {}", r.body);
             let pool = store::open_whatsapp_db(&workspace_root.join(WHATSAPP_DB_PATH)).await?;
@@ -241,17 +476,11 @@ async fn deliver(
     }
 }
 
-/// Read a comma-separated env var (typically WHATSAPP_ALLOWED_GROUP_NAMES
-/// or WHATSAPP_BRAINDUMP_GROUP_NAMES) and return the first entry, trimmed.
 fn first_group_name(env_var: &str) -> Option<String> {
-    std::env::var(env_var).ok()?.split(',').next()
+    std::env::var(env_var)
+        .ok()?
+        .split(',')
+        .next()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-fn is_known_channel(c: &str) -> bool {
-    matches!(
-        c,
-        store::CHANNEL_DISCORD_HOME | store::CHANNEL_ALFRED | store::CHANNEL_BRAINDUMP
-    )
 }

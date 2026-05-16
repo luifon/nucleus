@@ -19,7 +19,7 @@ brain is your existing Claude subscription — no separate API billing.
 | **Obsidian chat** | Persistent multi-chat against your PARA vault. Standalone service behind its own tunnel at `chat.<your-domain>`. |
 | **Distiller** | Hourly + weekly passes that promote diary observations to long-term memory (PROMOTE / MERGE / ARCHIVE / DROP, Mem0-style ops). |
 | **Preference learner** | Weekly pass that reads news votes and rewrites a preferences file the next news fetch reads back. |
-| **Reminders** | Ask either bot "remind me at 16:45 about dentist" → Claude schedules via the `reminders` CLI. Once-per-minute polling delivers to Discord OR WhatsApp (via Alfred-drained outbound queue). Includes the daily 18:30 timesheet nudge as a preset. |
+| **Reminders** | Ask either bot "remind me at 16:45 about dentist" → Claude schedules via the `reminders` CLI. Once-per-minute polling delivers to one or more channels (Discord home, Alfred / Brain Dump WhatsApp groups via the Alfred-drained outbound queue). Supports `--at` (one-shot) and `--cron` (recurring) with pause/resume + per-channel retry; daily timesheet nudge is seeded as a recurring system reminder. |
 
 ## Architecture at a glance
 
@@ -45,7 +45,6 @@ brain is your existing Claude subscription — no separate API billing.
               │ │ distiller-weekly    │   sessions
               │ │ preference-learner  │   (one-shot)
               │ │ reminders-tick      │ ← every 60s
-              │ │ timesheet-reminder  │
               │ └─────────────────────┘
               │
    whatsapp ──┘  ┌──────────────────────────────────────────────┐
@@ -171,10 +170,10 @@ npm run discover    # prints a QR code as PNG (opens in Preview) + ASCII
 ./tools/launchd/install.sh
 # Substitutes __USER_HOME__ → $HOME and __TZ__ → $NUCLEUS_TZ (auto-
 # detected from /etc/localtime if unset) in each plist template, copies
-# to ~/Library/LaunchAgents/, loads via launchctl. 11 services total
+# to ~/Library/LaunchAgents/, loads via launchctl. 10 services total
 # (discord, alfred, news-api, news-fetcher, dashboard, chat,
-# distiller-hourly, distiller-weekly, preference-learner, reminders-tick,
-# timesheet-reminder).
+# distiller-hourly, distiller-weekly, preference-learner,
+# reminders-tick).
 ```
 
 Verify:

@@ -40,7 +40,7 @@ NUCLEUS_LAUNCHD_PREFIX=tech.mycompany ./tools/launchd/install.sh
 | `distiller-hourly.plist.example` | Diary metabolism | StartInterval 3600 |
 | `distiller-weekly.plist.example` | Sunday 04:00 contemplation | StartCalendarInterval |
 | `preference-learner.plist.example` | Weekly news preference learning | StartCalendarInterval |
-| `timesheet-reminder.plist.example` | 18:30 Discord nudge | StartCalendarInterval |
+| `reminders-tick.plist.example` | Reminders polling worker | StartInterval 60 |
 
 ## Gitignore
 
