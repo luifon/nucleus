@@ -23,6 +23,7 @@ pub struct Settings {
     pub distiller: DistillerConfig,
     pub news: NewsConfig,
     pub gmail: GmailConfig,
+    pub reminders: RemindersConfig,
     pub ports: PortsConfig,
 }
 
@@ -112,6 +113,30 @@ pub struct GmailConfig {
     pub personal_email: String,
 }
 
+/// Settings for the reminders subsystem (ADR-006 + ADR-008).
+///
+/// `default_channels` is the fallback for system-prompt reminders when
+/// neither the stored prompt nor the per-reminder `--channels` flag
+/// specifies where outer-error alerts should land. Body-based reminders
+/// always use their own per-reminder channels and ignore this default.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RemindersConfig {
+    #[serde(default = "default_reminder_channels")]
+    pub default_channels: Vec<String>,
+}
+
+impl Default for RemindersConfig {
+    fn default() -> Self {
+        Self {
+            default_channels: default_reminder_channels(),
+        }
+    }
+}
+
+fn default_reminder_channels() -> Vec<String> {
+    vec!["discord-home".to_string()]
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PortsConfig {
     pub news_api: u16,
@@ -129,6 +154,8 @@ struct TomlConfig {
     distiller: DistillerConfig,
     news: NewsConfig,
     gmail: GmailConfig,
+    #[serde(default)]
+    reminders: RemindersConfig,
     ports: PortsConfig,
 }
 
@@ -188,6 +215,7 @@ impl Settings {
             distiller: toml.distiller,
             news: toml.news,
             gmail,
+            reminders: toml.reminders,
             ports: toml.ports,
         })
     }

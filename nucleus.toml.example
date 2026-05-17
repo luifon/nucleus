@@ -51,6 +51,13 @@ killlist_auto_promote_threshold = 3
 # `--channel calendar` reminder path when no explicit end time is given.
 calendar_default_duration_min = 30
 
+[reminders]
+# Default output routing for system-prompt reminders (ADR-008) when
+# neither the stored prompt nor --channels specifies where results
+# should go. Body-based reminders aren't affected — they always use
+# their own per-reminder channels.
+default_channels = ["discord-home"]
+
 [ports]
 news_api = 8080
 dashboard = 8090

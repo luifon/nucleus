@@ -283,9 +283,79 @@ The 18:30 weekday timesheet reminder is seeded as a `created_by =
 'system'` row on binary startup — don't add it manually. If the user
 cancels it, the seeder won't re-create it (cancellation is sticky).
 
+### Skill-fire reminders (`--system-prompt`, ADR-008)
+
+For a reminder whose job is to *do something at fire time* (run a skill,
+read state and summarize, orchestrate a multi-step task) rather than
+just post a static body, use `--system-prompt` instead of `--body`:
+
+```bash
+./target/release/reminders add \
+  --cron "20 8 * * 1-5" \
+  --system-prompt "Run pre-meeting-prep skill, post results to discord-home." \
+  --channels discord-home
+```
+
+At fire time the worker spawns a one-shot interactive Claude session
+inside the `nucleus-reminders-fire` tmux session, sends the
+`system_prompt` as the first message (with a small routing-hint
+preamble), and forwards the session's reply to the listed channels.
+All skills (project `.claude/skills/` + operator `~/.claude/skills/`)
+auto-load, so the prompt can name a skill by `/<name>` or describe an
+ad-hoc task. The session's final reply IS the post — don't add
+preamble like "Here is the summary:".
+
+Rules:
+
+- `--body` and `--system-prompt` are **mutually exclusive**. Pick one.
+- `--channels` is **optional** for `--system-prompt` reminders. Falls
+  back to `[reminders].default_channels` in `nucleus.toml`, then to
+  `discord-home` if unset. For `--body` reminders `--channels` keeps
+  its original default of `discord-home`.
+- Outer-error alerts (spawn failure, empty reply, ask() timeout) go to
+  the listed channels with a `⚠️ Reminder #N fire failed: …` body.
+- Per-tick file lock at `memory/reminders-tick.lock` serializes ticks
+  so a long fire doesn't get duplicated by the next minute's launchd
+  tick. Stale (>10min) lockfiles are reclaimed automatically.
+
+Prefer `--body` for simple text pings. Reserve `--system-prompt` for
+fires that genuinely need a Claude session — they cost a tmux+session
+spawn each time. The 18:30 timesheet stays on `--body` forever.
+
+## Rule 11 — Skills (ADR-008): never author in one shot
+
+A skill (`SKILL.md`) is **procedural memory** — a memorized "when X
+comes up, do Y" the bot can invoke. See ADR-008. Two storage trees:
+
+- `.claude/skills/<name>/` — **developer/repo** workflows. Committed.
+- `~/.claude/skills/<name>/` — **operator-personal** routines. Not
+  committed; the operator owns this tree.
+
+Default to `~/.claude/skills/` for anything that names a real tool,
+contact, URL, or routine. Rule 1 still applies — identifiers don't go
+into committed files even via skill bodies.
+
+Authoring discipline:
+
+1. **Do not author a new skill in a single bot turn.** Too many wrong
+   turns get baked in. The right pattern is exploratory session →
+   capture what worked → formalize via skill-creator → test from a
+   fresh session.
+2. **Every skill must include a `# Failure modes` section.** An empty
+   one signals the skill hasn't been thought through. Reviewers
+   (the user, or future-you) should bounce skills that skip it.
+3. **Frontmatter additions on top of Claude Code's contract** (per
+   ADR-008): `flavor: recipe|learned`, `mcp_needed`, `last_used`,
+   `last_failure`, `failure_count_30d`, `notify_on_failure`. These
+   are bot/operator-edited; Claude Code ignores unknown frontmatter,
+   the bot reads them as part of its system context.
+4. **Fires from a reminder**: the spawned session's reply is what
+   posts. The persona at `chores/reminders/persona.md` enforces the
+   ready-to-send-reply contract — don't undo it.
+
 ## When in doubt
 
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
-- `docs/ADR-*.md` — architecture decisions and why (especially ADR-005 for the vault)
+- `docs/ADR-*.md` — architecture decisions and why (especially ADR-005 for the vault, ADR-008 for skills)
 - `README.md` — setup + operating cheatsheet
 - `$NUCLEUS_TIER2_DIR/MEMORY.md` (typically `~/.claude/projects/<cwd-encoded>/memory/MEMORY.md`) — Tier 2 shared facts (auto-loaded; check the index there for what's already known about the user)
