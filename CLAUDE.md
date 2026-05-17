@@ -104,20 +104,21 @@ account — accidentally posting in the wrong chat is socially expensive.
 
 ## Rule 7 — Code identity is the venue, not the persona
 
-When adding a new messaging surface (Signal, Telegram, etc.):
+The two existing messaging surfaces follow this split:
 
 - **Crate / binary / launchd service / DB / log / diary dir** → named after
-  the **venue** (`discord`, `whatsapp`, `signal`, …). This is what shows up
-  in `ps`, `launchctl list`, file paths.
-- **Persona** (the character voice — "Jerry Lewis", "Alfred", whoever)
-  lives in `messaging/<venue>/persona.md` and is decoupled. Substituted
-  into the system prompt via `--append-system-prompt` at spawn time.
+  the **venue** (`discord`, `whatsapp`). This is what shows up in `ps`,
+  `launchctl list`, file paths.
+- **Persona** (the character voice configured per bot) lives in
+  `messaging/<venue>/persona.md` and is decoupled. Substituted into the
+  system prompt via `--append-system-prompt` at spawn time.
 
 The bot can sign messages with the persona name in user-facing content
 (diary entries, /remember footer, etc.) — that's the character. But code
 identifiers stay venue-based for searchability.
 
-We renamed `jerry` → `discord` once for this reason. Don't recreate.
+We renamed `jerry` → `discord` once for this reason. Don't recreate. No
+further venues are planned; if that ever changes, keep the split.
 
 ## Rule 8 — WhatsApp gotchas worth remembering
 
