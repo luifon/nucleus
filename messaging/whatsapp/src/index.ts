@@ -18,10 +18,23 @@ import fs from "node:fs";
 
 import { loadConfig, normalizeSenderId, type Config } from "./config.js";
 import { SessionPool } from "./claude_session.js";
-import { ChatSessionStore, OutboundQueueStore, type OutboundRow } from "./db.js";
+import {
+  ChatSessionStore,
+  OutboundQueueStore,
+  PendingPlansStore,
+  shortPlanId,
+  type OutboundRow,
+} from "./db.js";
 import { record as recordDiary } from "./diary.js";
 import { transcribe } from "./transcribe.js";
-import { captureToPara, type AppliedOp } from "./braindump.js";
+import {
+  planCapture,
+  applyPlan,
+  interpretResponse,
+  formatRundown,
+  type AppliedOp,
+  type PlanForReview,
+} from "./braindump.js";
 
 // Synchronous destination — no worker-thread buffering. Logs appear in stdout
 // as soon as they're emitted, which matters when tailing to debug what stage
@@ -57,8 +70,15 @@ const allowedJids = new Map<string, ChatRole>();
  *  drainer to translate "Alfred" / "Brain Dump" targets into JIDs. */
 const groupNameToJid = new Map<string, string>();
 
-const OUTBOUND_DRAIN_INTERVAL_MS = 5_000;
+// Tightened from 5s to 1s so braindump-ack messages (queued by the
+// planning Claude session via src/ack.ts) land within ~1s — close to
+// instant for the operator.
+const OUTBOUND_DRAIN_INTERVAL_MS = 1_000;
 const OUTBOUND_MAX_ATTEMPTS = 5;
+
+// ADR-005a: braindump plan timeout + sweep cadence.
+const PLAN_TIMEOUT_MS = 30 * 60 * 1000;
+const PLAN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 async function main() {
   const discover = process.argv.includes("--discover");
@@ -95,6 +115,8 @@ async function main() {
   // doesn't use it — corrections happen via follow-up captures + move ops
   // (see CLAUDE.md Rule 9 + ADR-005).
   const outbound = new OutboundQueueStore(config.dbPath);
+  // ADR-005a: holds brain-dump plans pending operator review.
+  const plansStore = new PendingPlansStore(config.dbPath);
 
   // Tear down any leftover tmux sessions from a previous run before we own
   // fresh windows. Both the conversational SessionPool (nucleus-whatsapp)
@@ -129,7 +151,7 @@ async function main() {
     }
   }, 30 * 60 * 1000);
 
-  await connect(config, store, sessions, outbound);
+  await connect(config, store, sessions, outbound, plansStore);
 }
 
 async function connect(
@@ -137,6 +159,7 @@ async function connect(
   store: ChatSessionStore,
   sessions: SessionPool,
   outbound: OutboundQueueStore,
+  plansStore: PendingPlansStore,
 ): Promise<void> {
   const authDir = path.join(config.workspaceRoot, "messaging/whatsapp/auth");
   fs.mkdirSync(authDir, { recursive: true });
@@ -184,7 +207,10 @@ async function connect(
       // unexpected event fires. Then start the outbound drain — the
       // drainer needs the allowlist to authorize each target.
       resolveAllowlist(sock, config)
-        .then(() => startOutboundDrain(sock, outbound))
+        .then(() => {
+          startOutboundDrain(sock, outbound);
+          startPlanExpirySweep(sock, plansStore);
+        })
         .catch((e) =>
           log.error({ err: e?.message }, "whatsapp: allowlist resolve failed"),
         );
@@ -195,7 +221,7 @@ async function connect(
       log.warn({ reason, shouldReconnect }, "whatsapp: connection closed");
       if (shouldReconnect) {
         const delay = reason === 405 ? 5000 : 2000;
-        setTimeout(() => connect(config, store, sessions, outbound).catch((e) => log.error(e, "reconnect failed")), delay);
+        setTimeout(() => connect(config, store, sessions, outbound, plansStore).catch((e) => log.error(e, "reconnect failed")), delay);
       } else {
         log.error("whatsapp: logged out — delete auth/ and re-pair");
       }
@@ -205,7 +231,7 @@ async function connect(
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
     for (const msg of messages) {
-      await handleMessage(sock, msg, config, store, sessions).catch((e) => {
+      await handleMessage(sock, msg, config, store, sessions, plansStore).catch((e) => {
         log.error({ err: e?.message }, "whatsapp: handler failed");
       });
     }
@@ -362,6 +388,7 @@ async function handleMessage(
   config: Config,
   store: ChatSessionStore,
   sessions: SessionPool,
+  plansStore: PendingPlansStore,
 ): Promise<void> {
   const chatId = msg.key.remoteJid;
   if (!chatId) return;
@@ -423,7 +450,16 @@ async function handleMessage(
   }
   // ---- END FILTERS ----
 
-  // Resolve the message body — text OR transcribed voice memo.
+  // Brain-dump dispatches before extraction — the role handler decides
+  // whether this is a reply (skip transcription, treat text as response)
+  // or a new capture (run the planning pipeline). Ack timing also differs
+  // between the two paths, so each branch owns its own acks.
+  if (role === "braindump") {
+    await handleBrainDump(sock, msg, chatId, config, plansStore);
+    return;
+  }
+
+  // Conversational path: extraction is the same for text + voice.
   let text = "";
   let inputKind: "text" | "voice" = "text";
 
@@ -454,14 +490,10 @@ async function handleMessage(
 
   log.info({ chatId, role, kind: inputKind, len: text.length }, "whatsapp: processing message");
 
-  if (role === "braindump") {
-    await handleBrainDump(sock, chatId, text, inputKind, config);
-  } else {
-    await handleAlfredConversational(sock, chatId, text, inputKind, config, store, sessions);
-  }
+  await handleConversational(sock, chatId, text, inputKind, config, store, sessions);
 }
 
-async function handleAlfredConversational(
+async function handleConversational(
   sock: any,
   chatId: string,
   text: string,
@@ -507,57 +539,273 @@ async function handleAlfredConversational(
   }
 }
 
-/** Brain-dump capture pipeline (multi-op).
+/** Brain-dump pipeline entry (ADR-005a review-before-apply).
  *
- *  Captures may decompose into multiple files across multiple folders,
- *  append to existing notes, and include moves of prior misfiled notes.
- *  Sees the vault as --add-dir; returns a list of ops; each op is
- *  validated (path-escape, vault containment, sub-folder gating) and
- *  applied. See ADR-005 + CLAUDE.md Rule 9.
+ *  Voice memos are always new captures (auto-expire prior plan, transcribe,
+ *  plan). Text messages route based on pending-plan state:
+ *    - pending plan exists → handlePlanResponse (interpret reply)
+ *    - no pending plan      → handleNewCapture (run planning)
  *
- *  The bot doesn't escalate — if Claude is uncertain, it falls back to
- *  0-Inbox (or whatever safe path the plan chose). Corrections happen
- *  via FOLLOW-UP captures: the user sends "that should be in Projects/X"
- *  and the next plan emits a `move` op against the prior file.
+ *  Each branch owns its own ack cadence.
  */
 async function handleBrainDump(
+  sock: any,
+  msg: WAMessage,
+  chatId: string,
+  config: Config,
+  plansStore: PendingPlansStore,
+): Promise<void> {
+  // Voice memos can't realistically be a reply to a structured plan, so we
+  // treat them as new captures unconditionally. A prior pending plan (if
+  // any) is expired with a notice.
+  if (msg.message?.audioMessage) {
+    await sendBotAck(sock, chatId, "✓ recebido");
+    const dur = msg.message.audioMessage.seconds ?? 0;
+    await sendBotAck(sock, chatId, `🎧 transcrevendo memo de ${dur}s…`);
+
+    let text: string;
+    try {
+      const buffer = (await downloadMediaMessage(msg, "buffer", {}, {
+        logger: baileysLogger as any,
+        reuploadRequest: sock.updateMediaMessage,
+      })) as Buffer;
+      log.info({ chatId, bytes: buffer.length, seconds: dur }, "whatsapp: transcribing voice memo");
+      const result = await transcribe(buffer);
+      text = result.text;
+      log.info({ chatId, transcribedChars: text.length, ms: result.durationMs }, "whatsapp: transcribed");
+    } catch (e) {
+      const err = (e as Error).message;
+      log.error({ err }, "whatsapp: transcription failed");
+      await sock.sendMessage(chatId, { text: formatReply(`couldn't transcribe that — ${err}`) });
+      return;
+    }
+    if (!text.trim()) return;
+    await expireAnyPendingPlan(sock, chatId, plansStore);
+    await handleNewCapture(sock, chatId, text, "voice", config, plansStore);
+    return;
+  }
+
+  const text = extractText(msg);
+  if (!text.trim()) return;
+
+  const pending = plansStore.mostRecentPending(chatId);
+  if (pending) {
+    await handlePlanResponse(sock, chatId, text, pending, config, plansStore);
+  } else {
+    await sendBotAck(sock, chatId, "✓ recebido");
+    await handleNewCapture(sock, chatId, text, "text", config, plansStore);
+  }
+}
+
+/** New-capture path: spawn planning Claude session (which sends its own
+ *  🧠 ack via src/ack.ts), receive plan, send rundown. The plan row is
+ *  persisted inside planCapture; the operator's reply will be handled by
+ *  a subsequent inbound message → handlePlanResponse. */
+async function handleNewCapture(
   sock: any,
   chatId: string,
   text: string,
   inputKind: "text" | "voice",
   config: Config,
+  plansStore: PendingPlansStore,
 ): Promise<void> {
   await sock.sendPresenceUpdate("composing", chatId);
+  let plan: PlanForReview;
   try {
-    const outcome = await captureToPara(text, inputKind, config);
-    const reply = formatOutcomeReply(outcome.summary, outcome.confidence, outcome.ops);
-    await sock.sendMessage(chatId, { text: formatReply(reply) });
+    plan = await planCapture(text, inputKind, config, chatId, plansStore);
+  } catch (e) {
+    const err = (e as Error).message;
+    log.error({ err }, "whatsapp: braindump planning failed");
+    await sock.sendMessage(chatId, { text: formatReply(`couldn't plan that — ${err}`) });
+    await sock.sendPresenceUpdate("paused", chatId);
+    return;
+  }
+
+  // No-op plan: Claude decided nothing needs filing (e.g. capture was a
+  // meta-test, or the operator said "ignore this"). Skip the rundown +
+  // review cycle entirely — there's nothing to approve. Just confirm
+  // and resolve. Avoids the silly "plano #X / (no ops) / responda em
+  // texto livre" message that asks for a reply with nothing to reply about.
+  if (plan.ops.length === 0) {
+    plansStore.resolve(plan.planId, "applied", "no-op plan (claude returned 0 ops)");
+    await sock.sendMessage(chatId, { text: formatReply("✓ nada para arquivar") });
+    await sock.sendPresenceUpdate("paused", chatId);
     log.info(
-      {
-        chatId,
-        ops: outcome.ops.length,
-        ok: outcome.ops.filter((o) => o.status === "ok").length,
-        rejected: outcome.ops.filter((o) => o.status === "rejected").length,
-        confidence: outcome.confidence,
-        elapsedMs: outcome.elapsedMs,
-      },
-      "whatsapp: braindump applied",
+      { chatId, planId: plan.shortId, summary: plan.summary, elapsedMs: plan.elapsedMs },
+      "whatsapp: braindump no-op plan auto-resolved",
     );
     recordDiary(
       config.diaryRoot,
       "braindump",
-      `captured ${inputKind} (${text.length}c) → ${outcome.summary} (${(outcome.confidence * 100).toFixed(0)}% conf, ${(outcome.elapsedMs / 1000).toFixed(1)}s)`,
+      `plan #${plan.shortId} no-op from ${inputKind} (${text.length}c): ${plan.summary || "(no summary)"}`,
       "OBSERVATION",
     );
+    return;
+  }
+
+  await sock.sendMessage(chatId, { text: formatReply(formatRundown(plan)) });
+  await sock.sendPresenceUpdate("paused", chatId);
+
+  log.info(
+    {
+      chatId,
+      planId: plan.shortId,
+      ops: plan.ops.length,
+      confidence: plan.confidence,
+      elapsedMs: plan.elapsedMs,
+    },
+    "whatsapp: braindump plan ready, awaiting review",
+  );
+  recordDiary(
+    config.diaryRoot,
+    "braindump",
+    `plan #${plan.shortId} from ${inputKind} (${text.length}c) → ${plan.summary} (${(plan.confidence * 100).toFixed(0)}% conf, ${(plan.elapsedMs / 1000).toFixed(1)}s, ${plan.ops.length} ops; awaiting review)`,
+    "OBSERVATION",
+  );
+}
+
+/** Plan-response path: spawn response-interpreter, branch on action. */
+async function handlePlanResponse(
+  sock: any,
+  chatId: string,
+  replyText: string,
+  pending: ReturnType<PendingPlansStore["mostRecentPending"]> & {},
+  config: Config,
+  plansStore: PendingPlansStore,
+): Promise<void> {
+  await sendBotAck(sock, chatId, "⚙️ interpretando…");
+  await sock.sendPresenceUpdate("composing", chatId);
+
+  let result: import("./braindump.js").InterpretResult;
+  try {
+    result = await interpretResponse(pending, replyText, config);
   } catch (e) {
     const err = (e as Error).message;
-    log.error({ err }, "whatsapp: braindump filing failed");
-    await sock.sendMessage(chatId, {
-      text: formatReply(`couldn't file that — ${err}`),
-    });
-  } finally {
+    log.error({ err, planId: shortPlanId(pending.id) }, "whatsapp: interpret failed");
+    await sock.sendMessage(chatId, { text: formatReply(`erro interpretando: ${err}`) });
     await sock.sendPresenceUpdate("paused", chatId);
+    return;
   }
+
+  const shortId = shortPlanId(pending.id);
+  log.info({ chatId, planId: shortId, action: result.action, ids: result.ids }, "whatsapp: braindump interpret");
+
+  if (result.action === "ambiguous") {
+    const note = result.note ?? "não entendi, pode reformular?";
+    await sock.sendMessage(chatId, { text: formatReply(note) });
+    await sock.sendPresenceUpdate("paused", chatId);
+    return;
+  }
+
+  if (result.action === "reject") {
+    plansStore.resolve(pending.id, "rejected", result.note ?? "operator rejected");
+    await sock.sendMessage(chatId, { text: formatReply(`✓ plano #${shortId} cancelado`) });
+    await sock.sendPresenceUpdate("paused", chatId);
+    recordDiary(
+      config.diaryRoot,
+      "braindump",
+      `plan #${shortId} rejected by operator${result.note ? ` (${result.note})` : ""}`,
+      "OBSERVATION",
+    );
+    return;
+  }
+
+  if (result.action === "new_capture") {
+    // Operator sent fresh content instead of replying. Expire this plan
+    // and re-process the message as a new capture.
+    plansStore.resolve(pending.id, "expired", "superseded by new capture");
+    await sock.sendMessage(chatId, {
+      text: formatReply(`⏱ plano #${shortId} cancelado — processando novo capture`),
+    });
+    await sock.sendPresenceUpdate("paused", chatId);
+    await handleNewCapture(sock, chatId, replyText, "text", config, plansStore);
+    return;
+  }
+
+  // action === "apply"
+  await sendBotAck(sock, chatId, "📂 aplicando…");
+  let outcome: import("./braindump.js").CaptureOutcome;
+  try {
+    outcome = applyPlan(pending.id, result.ids ?? "all", plansStore, config);
+  } catch (e) {
+    const err = (e as Error).message;
+    log.error({ err, planId: shortId }, "whatsapp: applyPlan failed");
+    await sock.sendMessage(chatId, { text: formatReply(`erro aplicando: ${err}`) });
+    await sock.sendPresenceUpdate("paused", chatId);
+    return;
+  }
+  const reply = formatOutcomeReply(outcome.summary, outcome.confidence, outcome.ops);
+  await sock.sendMessage(chatId, { text: formatReply(reply) });
+  await sock.sendPresenceUpdate("paused", chatId);
+
+  log.info(
+    {
+      chatId,
+      planId: shortId,
+      ops: outcome.ops.length,
+      ok: outcome.ops.filter((o) => o.status === "ok").length,
+      rejected: outcome.ops.filter((o) => o.status === "rejected").length,
+      elapsedMs: outcome.elapsedMs,
+    },
+    "whatsapp: braindump plan applied",
+  );
+  recordDiary(
+    config.diaryRoot,
+    "braindump",
+    `plan #${shortId} applied (${outcome.ops.filter((o) => o.status === "ok").length}/${outcome.ops.length} ok)`,
+    "OBSERVATION",
+  );
+}
+
+/** Expire any pending plan for this chat, notifying the operator. Called
+ *  on voice-memo arrival (and as a defensive sweep before new captures)
+ *  so a stale plan doesn't compete with the new one. */
+async function expireAnyPendingPlan(
+  sock: any,
+  chatId: string,
+  plansStore: PendingPlansStore,
+): Promise<void> {
+  const expired = plansStore.expirePendingForChat(chatId, "superseded by new capture");
+  for (const id of expired) {
+    const sid = shortPlanId(id);
+    await sock.sendMessage(chatId, {
+      text: formatReply(`⏱ plano #${sid} cancelado — processando novo capture`),
+    }).catch((e: Error) =>
+      log.warn({ err: e.message, planId: sid }, "whatsapp: cancel notice failed"),
+    );
+  }
+}
+
+/** Send a short status ack with the venue's signature applied. */
+async function sendBotAck(sock: any, chatId: string, body: string): Promise<void> {
+  await sock.sendMessage(chatId, { text: formatReply(body) }).catch((e: Error) =>
+    log.warn({ err: e.message }, "whatsapp: ack send failed"),
+  );
+}
+
+/** Periodic sweep: expire `pending_plans` rows older than PLAN_TIMEOUT_MS
+ *  and notify each affected chat. Handles the "operator walked away"
+ *  case where no inbound traffic triggers the on-entry sweep. */
+function startPlanExpirySweep(sock: any, plansStore: PendingPlansStore): void {
+  setInterval(async () => {
+    let rows: ReturnType<PendingPlansStore["sweepExpired"]>;
+    try {
+      rows = plansStore.sweepExpired(PLAN_TIMEOUT_MS);
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "whatsapp: plan sweep failed");
+      return;
+    }
+    if (rows.length === 0) return;
+    log.info({ count: rows.length }, "whatsapp: swept expired braindump plans");
+    for (const row of rows) {
+      const sid = shortPlanId(row.id);
+      await sock.sendMessage(row.chatId, {
+        text: formatReply(`⏱ plano #${sid} expirou — reenvie se ainda quiser`),
+      }).catch((e: Error) =>
+        log.warn({ err: e.message, planId: sid }, "whatsapp: expiry notice failed"),
+      );
+    }
+  }, PLAN_SWEEP_INTERVAL_MS);
 }
 
 /** Format a multi-op outcome as a human-readable WhatsApp reply.
@@ -602,9 +850,10 @@ function formatOutcomeReply(
 }
 
 /** Persona signature on every outbound message. The name is the character
- *  the bot speaks as (see persona.md). Code identity stays venue-based;
- *  this literal is the only place the persona name appears in code. */
-const PERSONA_SIGNATURE = "— Alfred";
+ *  the bot speaks as (see persona.md). Code identity stays venue-based
+ *  (Rule 7); the persona name itself lives in .env so it can change
+ *  without touching code, and so the name doesn't get committed. */
+const PERSONA_SIGNATURE = `— ${process.env.WHATSAPP_PERSONA_NAME ?? "bot"}`;
 
 /** Format every outbound message so it's distinguishable from the user's
  *  own typed messages in the same self-group: bold body + persona signature. */
