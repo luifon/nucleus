@@ -18,6 +18,10 @@ export interface SpawnOptions {
   appendSystemPrompt?: string;
   permissionMode?: string;
   disallowedTools?: string[];
+  /** Tool patterns to pre-approve so the auto-mode classifier doesn't
+   *  prompt or block them. Same pattern syntax as disallowedTools,
+   *  e.g. `Bash(npm test:*)`. */
+  allowedTools?: string[];
   addDirs?: string[];
   tmuxSession: string;
   windowName?: string;
@@ -90,6 +94,9 @@ export class Session {
     for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
     if (opts.disallowedTools?.length) {
       args.push("--disallowed-tools", opts.disallowedTools.join(" "));
+    }
+    if (opts.allowedTools?.length) {
+      args.push("--allowed-tools", opts.allowedTools.join(" "));
     }
 
     const inner = `cd ${shellQuote(opts.workspaceRoot)} && claude ${args.map(shellQuote).join(" ")}`;

@@ -13,6 +13,7 @@
     "start": "tsx src/index.ts",
     "discover": "tsx src/index.ts --discover",
     "send": "tsx src/send.ts",
+    "ack": "tsx src/ack.ts",
     "list-groups": "tsx src/list-groups.ts",
     "build": "tsc -p .",
     "start:prod": "node dist/index.js"

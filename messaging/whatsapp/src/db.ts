@@ -65,6 +65,27 @@ export class ChatSessionStore {
 
       CREATE INDEX IF NOT EXISTS idx_outbound_status_enqueued
         ON outbound_queue(status, enqueued_at);
+
+      -- ADR-005a: brain-dump review-before-apply. Each capture produces
+      -- a plan that's held here until the operator approves (or rejects,
+      -- or times out). One pending plan per chat at a time; new captures
+      -- auto-expire prior ones.
+      CREATE TABLE IF NOT EXISTS pending_plans (
+        id            TEXT PRIMARY KEY,
+        chat_id       TEXT NOT NULL,
+        captured_at   TEXT NOT NULL,
+        capture_text  TEXT NOT NULL,
+        input_kind    TEXT NOT NULL,
+        ops_json      TEXT NOT NULL,
+        summary       TEXT NOT NULL,
+        confidence    REAL NOT NULL,
+        status        TEXT NOT NULL,
+        resolved_at   TEXT,
+        resolution    TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_pending_plans_chat_status_time
+        ON pending_plans(chat_id, status, captured_at DESC);
     `);
   }
 
@@ -279,6 +300,21 @@ export class OutboundQueueStore {
     this.db.exec(`PRAGMA journal_mode = WAL;`);
   }
 
+  /** Insert a new pending row. Returns the auto-assigned id. `target` is
+   *  either a group name (resolved via the bot's allowlist name→JID map)
+   *  or a raw JID; either way the drainer authorizes before sending. */
+  enqueue(input: { target: string; body: string; source: string }): number {
+    const now = new Date().toISOString();
+    const res = this.db
+      .prepare(
+        `INSERT INTO outbound_queue
+           (target, body, source, enqueued_at, status, attempts)
+         VALUES (?, ?, ?, ?, 'pending', 0)`,
+      )
+      .run(input.target, input.body, input.source, now);
+    return Number(res.lastInsertRowid);
+  }
+
   /** Up-to-`limit` pending rows, oldest first. */
   pending(limit: number = 20): OutboundRow[] {
     const rows = this.db
@@ -335,4 +371,188 @@ export class OutboundQueueStore {
       )
       .run(attempts, error, status, id);
   }
+}
+
+// ============================================================
+// PendingPlansStore — ADR-005a brain-dump review-before-apply
+// ============================================================
+
+export type PlanStatus =
+  | "pending"
+  | "applied"
+  | "partial"
+  | "rejected"
+  | "expired";
+
+export interface PendingPlanRow {
+  id: string;
+  chatId: string;
+  capturedAt: string;
+  captureText: string;
+  inputKind: "text" | "voice";
+  opsJson: string;
+  summary: string;
+  confidence: number;
+  status: PlanStatus;
+}
+
+/** Storage for brain-dump plans that are pending operator review. The
+ *  WhatsApp handler inserts on plan computation, looks up on operator
+ *  reply, and marks resolved (applied/partial/rejected/expired) when
+ *  the lifecycle ends. Schema is created by ChatSessionStore's CREATE
+ *  block — instantiate that first. */
+export class PendingPlansStore {
+  private db: DatabaseSync;
+
+  constructor(dbPath: string) {
+    this.db = new DatabaseSync(dbPath);
+    this.db.exec(`PRAGMA journal_mode = WAL;`);
+  }
+
+  insert(input: {
+    chatId: string;
+    captureText: string;
+    inputKind: "text" | "voice";
+    opsJson: string;
+    summary: string;
+    confidence: number;
+  }): string {
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO pending_plans
+         (id, chat_id, captured_at, capture_text, input_kind,
+          ops_json, summary, confidence, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      )
+      .run(
+        id,
+        input.chatId,
+        now,
+        input.captureText,
+        input.inputKind,
+        input.opsJson,
+        input.summary,
+        input.confidence,
+      );
+    return id;
+  }
+
+  get(id: string): PendingPlanRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, chat_id, captured_at, capture_text, input_kind,
+                ops_json, summary, confidence, status
+         FROM pending_plans
+         WHERE id = ?`,
+      )
+      .get(id) as
+      | {
+          id: string;
+          chat_id: string;
+          captured_at: string;
+          capture_text: string;
+          input_kind: string;
+          ops_json: string;
+          summary: string;
+          confidence: number;
+          status: string;
+        }
+      | undefined;
+    if (!row) return null;
+    return rowToPlan(row);
+  }
+
+  /** Most recent pending plan for this chat, if any. */
+  mostRecentPending(chatId: string): PendingPlanRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, chat_id, captured_at, capture_text, input_kind,
+                ops_json, summary, confidence, status
+         FROM pending_plans
+         WHERE chat_id = ? AND status = 'pending'
+         ORDER BY captured_at DESC LIMIT 1`,
+      )
+      .get(chatId) as any;
+    if (!row) return null;
+    return rowToPlan(row);
+  }
+
+  /** Set terminal status with resolution note. */
+  resolve(id: string, status: PlanStatus, resolution: string): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE pending_plans
+            SET status = ?, resolved_at = ?, resolution = ?
+          WHERE id = ?`,
+      )
+      .run(status, now, resolution, id);
+  }
+
+  /** Expire all `pending` rows for this chat. Used on new-capture arrival
+   *  so a stale plan from the prior thought doesn't linger. Returns
+   *  the ids that were expired so the caller can notify. */
+  expirePendingForChat(chatId: string, reason: string): string[] {
+    const now = new Date().toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM pending_plans
+         WHERE chat_id = ? AND status = 'pending'`,
+      )
+      .all(chatId) as Array<{ id: string }>;
+    if (rows.length === 0) return [];
+    this.db
+      .prepare(
+        `UPDATE pending_plans
+            SET status = 'expired', resolved_at = ?, resolution = ?
+          WHERE chat_id = ? AND status = 'pending'`,
+      )
+      .run(now, reason, chatId);
+    return rows.map((r) => r.id);
+  }
+
+  /** Sweep all `pending` rows older than `maxAgeMs` to `expired`. Returns
+   *  the rows that were expired (so caller can notify per-chat). */
+  sweepExpired(maxAgeMs: number): PendingPlanRow[] {
+    const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT id, chat_id, captured_at, capture_text, input_kind,
+                ops_json, summary, confidence, status
+         FROM pending_plans
+         WHERE status = 'pending' AND captured_at < ?`,
+      )
+      .all(cutoff) as any[];
+    if (rows.length === 0) return [];
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE pending_plans
+            SET status = 'expired', resolved_at = ?, resolution = 'idle timeout'
+          WHERE status = 'pending' AND captured_at < ?`,
+      )
+      .run(now, cutoff);
+    return rows.map(rowToPlan);
+  }
+}
+
+function rowToPlan(row: any): PendingPlanRow {
+  return {
+    id: row.id,
+    chatId: row.chat_id,
+    capturedAt: row.captured_at,
+    captureText: row.capture_text,
+    inputKind: row.input_kind === "voice" ? "voice" : "text",
+    opsJson: row.ops_json,
+    summary: row.summary,
+    confidence: row.confidence,
+    status: row.status as PlanStatus,
+  };
+}
+
+/** Short display id: first 4 hex chars of the UUID. */
+export function shortPlanId(id: string): string {
+  return id.replace(/-/g, "").slice(0, 4);
 }
