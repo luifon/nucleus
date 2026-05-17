@@ -95,14 +95,15 @@ async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
             last_fired_at   TEXT,
             paused_until    TEXT,
             created_at      TEXT    NOT NULL,
-            created_by      TEXT    NOT NULL DEFAULT 'user'
+            created_by      TEXT    NOT NULL DEFAULT 'user',
+            system_prompt   TEXT
         );
         "#,
     )
     .execute(pool)
     .await?;
 
-    // Additive ALTERs for DBs that pre-date ADR-006. SQLite has no
+    // Additive ALTERs for DBs that pre-date ADR-006/008. SQLite has no
     // `ADD COLUMN IF NOT EXISTS`, so we tolerate "duplicate column"
     // errors explicitly.
     let alters = [
@@ -112,6 +113,12 @@ async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE reminders ADD COLUMN last_fired_at TEXT",
         "ALTER TABLE reminders ADD COLUMN paused_until TEXT",
         "ALTER TABLE reminders ADD COLUMN created_by TEXT NOT NULL DEFAULT 'user'",
+        // ADR-008: when set, the reminder spawns a one-shot Claude
+        // session at fire time and uses this string as the ask()
+        // payload (NOT as a literal --append-system-prompt — the
+        // firing path adds a generic reminders persona for that).
+        // body XOR system_prompt is enforced in code, not SQL.
+        "ALTER TABLE reminders ADD COLUMN system_prompt TEXT",
     ];
     for stmt in alters {
         if let Err(e) = sqlx::query(stmt).execute(pool).await {
@@ -339,6 +346,12 @@ pub struct Reminder {
     pub paused_until: Option<String>,
     pub created_at: String,
     pub created_by: String,
+    /// ADR-008: when Some, this reminder fires by spawning a one-shot
+    /// Claude session and using the stored string as the first ask()
+    /// payload (the firing path adds its own generic persona via
+    /// --append-system-prompt). XOR with `body`: exactly one is
+    /// non-empty, enforced at CLI insert time.
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -355,7 +368,8 @@ pub struct ChannelRow {
 async fn load_reminder(pool: &SqlitePool, id: i64) -> Result<Option<Reminder>> {
     let row = sqlx::query(
         "SELECT id, body, cron, one_shot, status, next_fire_at,
-                last_fired_at, paused_until, created_at, created_by
+                last_fired_at, paused_until, created_at, created_by,
+                system_prompt
            FROM reminders WHERE id = ?1",
     )
     .bind(id)
@@ -376,6 +390,7 @@ fn row_to_reminder(r: sqlx::sqlite::SqliteRow) -> Reminder {
         paused_until: r.try_get::<Option<String>, _>("paused_until").ok().flatten(),
         created_at: r.get("created_at"),
         created_by: r.try_get::<Option<String>, _>("created_by").ok().flatten().unwrap_or_else(|| "user".into()),
+        system_prompt: r.try_get::<Option<String>, _>("system_prompt").ok().flatten(),
     }
 }
 
@@ -416,6 +431,7 @@ pub async fn insert_with_channels(
     next_fire_at: DateTime<Utc>,
     channels: &[String],
     created_by: &str,
+    system_prompt: Option<&str>,
 ) -> Result<i64> {
     if channels.is_empty() {
         bail!("at least one channel is required");
@@ -435,8 +451,8 @@ pub async fn insert_with_channels(
     let mut tx = pool.begin().await?;
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO reminders
-            (body, cron, one_shot, status, next_fire_at, created_at, created_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            (body, cron, one_shot, status, next_fire_at, created_at, created_by, system_prompt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          RETURNING id",
     )
     .bind(body)
@@ -446,6 +462,7 @@ pub async fn insert_with_channels(
     .bind(next_fire_at.to_rfc3339())
     .bind(&now)
     .bind(created_by)
+    .bind(system_prompt)
     .fetch_one(&mut *tx)
     .await
     .context("insert reminder")?;
@@ -474,7 +491,8 @@ pub async fn list_all(
 ) -> Result<Vec<Reminder>> {
     let mut q = String::from(
         "SELECT id, body, cron, one_shot, status, next_fire_at,
-                last_fired_at, paused_until, created_at, created_by
+                last_fired_at, paused_until, created_at, created_by,
+                system_prompt
            FROM reminders WHERE 1=1",
     );
     if !include_fired {
@@ -526,7 +544,8 @@ pub async fn pending_due_with_channels(
     let cutoff = now.to_rfc3339();
     let rems = sqlx::query(
         "SELECT id, body, cron, one_shot, status, next_fire_at,
-                last_fired_at, paused_until, created_at, created_by
+                last_fired_at, paused_until, created_at, created_by,
+                system_prompt
            FROM reminders
           WHERE status IN ('active', 'pending')
             AND next_fire_at IS NOT NULL
@@ -904,6 +923,7 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
             next,
             &channels,
             "system",
+            None,
         )
         .await?;
         tracing::info!(id, body = seed.body, "reminders: seeded system reminder");

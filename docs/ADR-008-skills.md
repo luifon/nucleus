@@ -230,6 +230,64 @@ Greenfield. No existing skills to migrate. Steps:
 - **ADR-012 (proposed)** — guided setup wizard, à la Hermes. Walks the operator through `.env`, `.claude/settings.local.json`, launchd install, plugin install, and seeds default skills/reminders. Includes a step that asks "personal skill or dev skill?" when scaffolding via skill-creator, automating the policy in [Authoring workflow](#authoring-workflow). Out of scope for ADR-008.
 - **Phase 2 — learned skills.** Distiller emits and promotes `procedure`-tagged diary entries. Schema and frontmatter are already forward-compatible.
 
+## Implementation notes (added 2026-05-17)
+
+Two design points resolved during implementation that differ from the
+text above. Recording them here so the next reader has the ground truth:
+
+1. **Firing payload is delivered via `ask()`, not literal
+   `--append-system-prompt`.** The stored `system_prompt` column is
+   sent as the first `ask()` payload to a one-shot Session that is
+   itself spawned with a thin generic reminders persona
+   (`chores/reminders/persona.md`) injected via
+   `--append-system-prompt`. This matches the established calendar /
+   news-fetcher patterns and lets each reminder be a *task*, not a
+   *persona*. The column name `system_prompt` stays for ADR fidelity;
+   the code in `chores/reminders/src/store.rs` carries an explanatory
+   comment.
+
+2. **The skill-creator plugin is not installed via committed
+   `.claude/settings.json`.** Claude Code's plugin model uses
+   `/plugin install` (marketplace) or `--plugin-dir`/`--plugin-url`
+   (local). There is no documented "list plugins in
+   `.claude/settings.json`" format. ADR-008's migration step 1 should
+   be read as "document the install command in README and operator
+   setup notes"; the future setup wizard (ADR-012) will automate it.
+
+3. **Skill output bridge: the worker forwards the session's reply.**
+   The spawned firing session has no built-in posting tool — Discord
+   posting lives in Rust (`nucleus_core::discord_sdk`), not a CLI a
+   session can `Bash` into. To unblock Phase 1 without adding a
+   `nucleus-post` CLI, the reminders worker captures the session's
+   final assistant message and posts it to the listed `--channels` via
+   the existing `deliver()` path. The persona enforces a
+   ready-to-send-reply contract. Reply is capped at 1800 chars to fit
+   under Discord's 2000-char ceiling. If a future skill needs to emit
+   multiple posts or post asynchronously, a small CLI bridge would be
+   the right addition then; punted for v1.
+
+4. **Per-tick file lock.** Skill-fire sessions can run for minutes;
+   the launchd plist ticks every 60s. The implementation adds a
+   `memory/reminders-tick.lock` file at the top of `due()` that
+   serializes ticks. Stale (>10min) locks are reclaimed
+   automatically. The body-based fast path is unaffected in practice
+   (sub-second delivery) but still benefits from the serialization.
+
+5. **What v1 does NOT track:** the frontmatter fields `last_used`,
+   `last_failure`, and `failure_count_30d` are documented above but
+   not auto-updated by any code. The bot has no visibility into
+   per-step skill execution from outside the spawned session, only
+   into whether the outer fire succeeded. Operators may edit these
+   manually; the distiller may write them in a later slice. Out of
+   scope for v1.
+
+6. **Maintenance routes (ARCHIVE / MERGE / STALE-WARN) deferred.**
+   ADR-008's "Weekly contemplation gains skill-maintenance routes"
+   requires distiller awareness of the `skills/` trees. The distiller
+   (`chores/distiller/`) doesn't currently know about skills; plumbing
+   that is a separate slice (Phase 1.5) and not blocking Phase 1's
+   value (recurring-flow execution).
+
 ## References
 
 - ADR-002 — tiered memory model and storage location conventions

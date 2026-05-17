@@ -262,6 +262,63 @@ MERGE / ARCHIVE / DROP operations against T2 / T3).
 
 Full design: `docs/ADR-002-memory.md` and `docs/ADR-004-diary-and-distillation.md`.
 
+## Skills (procedural memory)
+
+Where memory tiers store *facts*, **skills** store *procedures* —
+"when X comes up, do Y." Skills use Claude Code's native `SKILL.md`
+mechanism with Nucleus-specific frontmatter on top (see ADR-008).
+
+| Path | Audience | Committed? |
+|---|---|---|
+| `.claude/skills/<name>/SKILL.md` | Skills for *working on* Nucleus (debug helpers, dev workflows) | Yes |
+| `~/.claude/skills/<name>/SKILL.md` | Skills for the operator's own recurring flows (pre-meeting prep, weekly review, etc.) | No — operator-personal |
+
+Skills run two ways:
+
+1. **Manually**: invoke from any session with `/<skill-name>`.
+2. **From a reminder**: pass `--system-prompt` (instead of `--body`) to
+   `reminders add`. At fire time the worker spawns a one-shot
+   interactive Claude session, sends the prompt as the first message,
+   captures the reply, and forwards it to the configured channels.
+
+The session sees every skill's description in its tool listing, so the
+prompt can compose (`"Run skill-A, then skill-B, summarize both."`) or
+go free-form (`"Read today's diary, post a one-line blockers summary."`).
+
+### Authoring
+
+The bot **should not author a skill in one shot.** The recommended flow
+(per ADR-008):
+
+1. **Explore** interactively in a regular Claude Code session — walk
+   the surface together, hit failures, work around them.
+2. **Capture** what worked: trigger, steps, observed failure modes.
+3. **Formalize** with the [skill-creator plugin](https://code.claude.com/docs/en/plugins) —
+   `/plugin install skill-creator@anthropic` (verify the exact
+   marketplace path with `/plugin marketplace` first), then
+   `/skill-creator create`. It scaffolds `SKILL.md` with the required
+   sections. Hand-edit the Nucleus-specific frontmatter additions
+   (`flavor: recipe`, `mcp_needed`, `notify_on_failure`,
+   `last_used`/`last_failure`/`failure_count_30d`).
+4. **Test** from a fresh session — close the exploratory one, open a
+   new one, invoke the skill or fire a one-shot reminder against it.
+5. **Iterate** via `/skill-creator improve` after observing real fires.
+
+> The skill-creator plugin isn't shipped via committed `.claude/settings.json` —
+> Claude Code installs plugins through `/plugin install` from a marketplace,
+> not via a config-file list. Document the chosen install command in your
+> own setup notes; the future setup wizard (ADR-012) will automate it.
+
+### Sensitivity defaults
+
+Skill bodies that name real tools, contacts, URLs, or recurring routines
+**must** live in `~/.claude/skills/` (not the repo). Per `CLAUDE.md`
+Rule 1, anything identifying belongs in `.env`-substituted strings or
+operator-personal files. The `.claude/skills/` tree is for generic
+dev/debug workflows that any contributor could use.
+
+If you're unsure where a skill belongs, default to `~/.claude/skills/`.
+
 ## Folder layout
 
 ```
@@ -297,6 +354,7 @@ nucleus/
 - `docs/ADR-003-permissions.md` — Discord/WhatsApp bot security posture
 - `docs/ADR-004-diary-and-distillation.md` — journal pattern, promotion ops
 - `docs/ADR-005-second-brain.md` — T3 = PARA-organized Obsidian vault; multi-op brain-dump pipeline
+- `docs/ADR-008-skills.md` — procedural memory via Claude Code's native `SKILL.md` mechanism + the reminders `system_prompt` extension
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
 
@@ -337,7 +395,16 @@ tmux kill-window -t nucleus-discord:<window-prefix>
 ./target/release/reminders add \
   --at "2026-05-14T16:45:00<your-tz-offset>" \
   --body "dentist appointment" \
-  --channel discord-home          # or alfred | braindump
+  --channels discord-home         # or alfred | braindump | calendar
+
+# Skill-fire reminder (ADR-008): spawns a one-shot Claude session at fire
+# time, executes the prompt (possibly invoking a skill), forwards the
+# reply to the channels. Use --system-prompt instead of --body.
+./target/release/reminders add \
+  --cron "20 8 * * 1-5" \
+  --system-prompt "Run pre-meeting-prep skill, post results to discord-home." \
+  --channels discord-home
+
 ./target/release/reminders list   # see pending
 ./target/release/reminders cancel <id>
 
