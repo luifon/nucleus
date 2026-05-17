@@ -56,6 +56,17 @@ done < "$ENV_FILE"
 HAY="$(cat)"
 [ -z "$HAY" ] && exit 0
 
+# When the input is a `git diff --cached` (pre-commit / Claude Bash hook),
+# only the *added* lines matter. A diff that REMOVES a leaked value should
+# not trigger the same block as one that ADDS one — the removal is the fix.
+# Detect diff mode by the leading `diff --git` marker.
+case "$HAY" in
+  "diff --git"*)
+    HAY="$(printf '%s' "$HAY" | grep '^+' | grep -v '^+++' || true)"
+    [ -z "$HAY" ] && exit 0
+    ;;
+esac
+
 FOUND=()
 for pat in "${PATTERNS[@]}"; do
   if printf '%s' "$HAY" | grep -F -- "$pat" > /dev/null 2>&1; then
