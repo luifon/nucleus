@@ -18,7 +18,14 @@ use std::path::PathBuf;
 
 const AGENT_NAME: &str = "news-fetcher";
 const DB_PATH: &str = "memory/news.db";
-const TOP_N_NOTABLE_TO_POST: usize = 10;
+const TOP_N_NOTABLE_TO_POST: usize = 5;
+// Two-stage per-source bound: score at most PRE_SCORE_CAP new items (slice
+// taken in RSS-feed order, which is newest-first for the feeds we pull),
+// then keep at most POST_SCORE_CAP. Keeps the LLM scoring call bounded
+// even when a firehose (arXiv cs.AI) drops hundreds of new items in one
+// pull — without this, the per-source score_all() prompt grows unbounded.
+const PRE_SCORE_CAP: usize = 20;
+const POST_SCORE_CAP: usize = 10;
 
 #[derive(Debug)]
 struct SourceRow {
@@ -105,11 +112,14 @@ async fn main() -> Result<()> {
                 if new.is_empty() {
                     continue;
                 }
-                // Score every new item from this source, then keep only the
-                // top `max_per_fetch` by notable_score. The rest get
-                // deleted so the UI is never drowned by a single source.
-                let scored = score_all(&workspace_root, &new, &settings.identity.user_name).await?;
-                let kept = persist_top_n(&pool, &new, &scored, src.max_per_fetch as usize).await?;
+                // Two-stage cap: take the first PRE_SCORE_CAP items (RSS
+                // order = newest-first) to bound the LLM scoring call, then
+                // keep at most POST_SCORE_CAP by notable_score. Everything
+                // else (including the unscored 21..N) gets deleted by
+                // persist_top_n so the UI isn't drowned by a single source.
+                let to_score: &[ParsedItem] = &new[..new.len().min(PRE_SCORE_CAP)];
+                let scored = score_all(&workspace_root, to_score, &settings.identity.user_name).await?;
+                let kept = persist_top_n(&pool, &new, &scored, POST_SCORE_CAP).await?;
                 notable_count += scored.iter().filter(|s| s.score >= 0.6 && kept.iter().any(|k| k.id == s.id)).count();
                 all_kept.extend(kept);
             }
