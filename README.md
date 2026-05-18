@@ -83,6 +83,22 @@ reaper keeps the tmux server tidy.
 - **claude CLI** — installed and authenticated against your Claude account.
   This is the brain. Verify with `claude --version`; then `claude` in a fresh
   shell to confirm the TUI loads (Ctrl+C to exit).
+- **Claude.ai connectors enabled** — Nucleus relies on two account-level
+  MCP integrations that you enable at [claude.ai](https://claude.ai)
+  under Settings → Connectors (NOT via this repo's
+  `.claude/settings.json`, which only covers Claude Code marketplace
+  plugins):
+  - **Gmail** — required for the daily inbox metabolism + label-based
+    triage (ADR-007). Tools: `mcp__claude_ai_Gmail__*`.
+  - **Google Calendar** — required for the `--channels calendar`
+    reminder path (creates events on your trash account, invites your
+    primary email; ADR-007). Tools:
+    `mcp__claude_ai_Google_Calendar__create_event`.
+
+  These auth against your personal Google account through Claude.ai
+  and stay there — the tokens never enter this repo. Without them
+  enabled, `gmail-metabolism` and the calendar channel fail at fire
+  time with an MCP-unavailable error.
 - **A Discord application + bot** — token in hand. Required intents:
   `Guilds`, `Guild Messages`, `Direct Messages`, `Message Content`.
 - **A Cloudflare tunnel** (optional, but the news + dashboard + chat front-
