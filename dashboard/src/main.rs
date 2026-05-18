@@ -176,11 +176,31 @@ async fn list_reminders(State(s): State<AppState>) -> Json<serde_json::Value> {
     let Some(pool) = &s.reminders_pool else {
         return Json(serde_json::json!({ "ok": false, "items": [], "error": "reminders.db not available" }));
     };
+    // Post-ADR-006: `due_at` is now `next_fire_at`, channels live in a
+    // separate table, and one-shot vs recurring split into `pending`
+    // and `active` statuses. We alias back to the wire shape the HTML
+    // expects (`due_at`, `channel`) so the renderer doesn't change.
+    // Skill-fire reminders (ADR-008) store an empty body + a
+    // `system_prompt` — surface the prompt with a 🪄 marker so the
+    // widget isn't blank, matching the CLI's `reminders list` output.
     let rows: Result<Vec<ReminderDto>, _> = sqlx::query_as::<_, ReminderDto>(
-        "SELECT id, due_at, body, channel
-           FROM reminders
-          WHERE status = 'pending'
-          ORDER BY due_at ASC
+        "SELECT r.id,
+                r.next_fire_at AS due_at,
+                CASE
+                    WHEN r.system_prompt IS NOT NULL AND r.system_prompt <> ''
+                        THEN '🪄 ' || r.system_prompt
+                    ELSE r.body
+                END AS body,
+                COALESCE(
+                    (SELECT GROUP_CONCAT(rc.channel, ',')
+                       FROM reminder_channels rc
+                      WHERE rc.reminder_id = r.id),
+                    ''
+                ) AS channel
+           FROM reminders r
+          WHERE r.status IN ('pending', 'active')
+            AND r.next_fire_at IS NOT NULL
+          ORDER BY r.next_fire_at ASC
           LIMIT 20",
     )
     .fetch_all(pool)
