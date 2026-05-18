@@ -335,6 +335,14 @@ Default to `~/.claude/skills/` for anything that names a real tool,
 contact, URL, or routine. Rule 1 still applies — identifiers don't go
 into committed files even via skill bodies.
 
+When invoking `/skill-creator create`, **name the destination path in
+the prompt** rather than letting the model infer it. Example:
+`/skill-creator create daily-digest at ~/.claude/skills/daily-digest` (personal)
+vs `/skill-creator create rust-build-check at .claude/skills/rust-build-check`
+(generic, repo-committed). If a SKILL.md appears unexpectedly in
+`git status`, that's the signal — the model placed it in the committed
+tree when you meant personal. Move it before committing.
+
 Authoring discipline:
 
 1. **Do not author a new skill in a single bot turn.** Too many wrong
