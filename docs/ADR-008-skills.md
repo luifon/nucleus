@@ -111,7 +111,7 @@ The bot should **not** author a skill in one shot. Too many wrong turns get bake
 4. **Test from a fresh session.** Close the exploratory session. Open a new one. Trigger the skill (manually or via reminder). Verify it executes correctly.
 5. **Iterate.** `/skill-creator improve` after observing real fires.
 
-Authoring sensitive flows (operator routines, third-party tools): always end up in `~/.claude/skills/`. The skill-creator plugin doesn't know our policy — the operator is responsible for the choice. ADR-012 (future) may automate this.
+Authoring sensitive flows (operator routines, third-party tools): always end up in `~/.claude/skills/`. The skill-creator plugin doesn't know our policy — the operator is responsible for the choice. ADR-009 (future) may automate this.
 
 ## Reminders extension
 
@@ -227,7 +227,7 @@ Greenfield. No existing skills to migrate. Steps:
 
 ## Future work
 
-- **ADR-012 (proposed)** — guided setup wizard, à la Hermes. Walks the operator through `.env`, `.claude/settings.local.json`, launchd install, plugin install, and seeds default skills/reminders. Includes a step that asks "personal skill or dev skill?" when scaffolding via skill-creator, automating the policy in [Authoring workflow](#authoring-workflow). Out of scope for ADR-008.
+- **ADR-009 (proposed)** — guided setup wizard, à la Hermes. Walks the operator through `.env`, `.claude/settings.local.json`, launchd install, plugin install, and seeds default skills/reminders. Includes a step that asks "personal skill or dev skill?" when scaffolding via skill-creator, automating the policy in [Authoring workflow](#authoring-workflow). Out of scope for ADR-008.
 - **Phase 2 — learned skills.** Distiller emits and promotes `procedure`-tagged diary entries. Schema and frontmatter are already forward-compatible.
 
 ## Implementation notes (added 2026-05-17)

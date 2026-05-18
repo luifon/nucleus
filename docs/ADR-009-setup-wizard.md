@@ -1,9 +1,9 @@
-# ADR-012 — Setup wizard: guided one-shot Nucleus install
+# ADR-009 — Setup wizard: guided one-shot Nucleus install
 
 **Status:** Placeholder / deferred (2026-05-17)
 
 This ADR is a stub. The need surfaced during ADR-008 drafting (skill-creator
-plugin install + per-skill audience prompt) and ADR-009 drafting (Tailscale
+plugin install + per-skill audience prompt) and ADR-010 drafting (Tailscale
 bootstrap + Cloudflare route changes). Both raise install-time friction the
 fresh-clone operator currently has to navigate manually.
 
@@ -16,7 +16,7 @@ Setting up Nucleus on a fresh machine today is a multi-step manual process:
 - Run `tools/launchd/install.sh` to install plists
 - Configure cloudflared tunnels manually (per `tools/cloudflared/README.md`)
 - Install the skill-creator plugin (ADR-008) via `.claude/settings.json`
-- Bootstrap Tailscale and configure `tailscale serve` (ADR-009)
+- Bootstrap Tailscale and configure `tailscale serve` (ADR-010)
 - Seed default reminders / skills / vault structure
 
 Each step is documented in the README, but the operator must thread them
@@ -57,5 +57,5 @@ genuinely-missing pieces. No destructive overwrites.
 ## References
 
 - ADR-008 — skills; per-audience scaffolding step
-- ADR-009 — Tailscale bootstrap, cloudflared route management
+- ADR-010 — Tailscale bootstrap, cloudflared route management
 - ADR-001, README.md — current manual install paths the wizard would replace

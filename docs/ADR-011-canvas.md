@@ -1,4 +1,4 @@
-# ADR-010 — Canvas: agent-rendered interactive components in the dashboard chat
+# ADR-011 — Canvas: agent-rendered interactive components in the dashboard chat
 
 **Status:** Proposed (2026-05-16)
 
@@ -22,7 +22,7 @@ The dashboard chat gains:
 
 This ADR does not ship without two pieces of upstream work:
 
-- **ADR-009 (proposed) — perimeter / private deployment.** The dashboard and chat surfaces must be moved behind Tailscale before canvas ships. News stays publicly accessible (read-only RSS-shape); dashboard and chat are operator-only. Canvas adds attack surface to a chat surface that is currently public; the perimeter move is therefore a hard precondition, not a parallel concern. ADR-009 is drafted at implementation kickoff, not now.
+- **ADR-010 (proposed) — perimeter / private deployment.** The dashboard and chat surfaces must be moved behind Tailscale before canvas ships. News stays publicly accessible (read-only RSS-shape); dashboard and chat are operator-only. Canvas adds attack surface to a chat surface that is currently public; the perimeter move is therefore a hard precondition, not a parallel concern. ADR-010 is drafted at implementation kickoff, not now.
 - **A persona file for the chat venue** at `chat/persona.md`. Q's voice, scope, behavior. Substituted into spawned sessions via `--append-system-prompt`, same mechanism every other venue uses (Rule 7).
 
 ## Where canvas works
@@ -196,11 +196,11 @@ Enforcement model: a *policy*, not a runtime gate. The Q persona prompt carries 
 - No `<script>`, `<iframe>`, no arbitrary HTML inside canvas option / item / prompt text.
 - No JS evaluation of agent-provided strings.
 - No file upload in MVP (a future `form` field type may add it, with strict MIME + size constraints documented separately).
-- Tailscale-only access (ADR-009 prerequisite) means the surface is not exposed to the public internet.
+- Tailscale-only access (ADR-010 prerequisite) means the surface is not exposed to the public internet.
 
 ## Migration / rollout
 
-1. **Prerequisite — ADR-009:** Tailscale-gate dashboard + chat. News stays public. Verify no leaks.
+1. **Prerequisite — ADR-010:** Tailscale-gate dashboard + chat. News stays public. Verify no leaks.
 2. **Stand up the new binary at the URL in `$NUCLEUS_CHAT_V2_PUBLIC_URL`:**
    - Either a forked `chat-v2/` crate or a feature-flagged `chat/` build, served on a separate port + tunnel.
    - The existing chat URL (`$NUCLEUS_CHAT_PUBLIC_URL`) continues serving the unchanged old binary.
@@ -214,7 +214,7 @@ Enforcement model: a *policy*, not a runtime gate. The Q persona prompt carries 
 
 - **Inline mermaid / chart canvas types** — diagrams and charts as first-class canvas, not markdown extensions.
 - **File / vault preview canvas** — a block that previews a markdown file from the vault with an "open in Obsidian" action.
-- **ADR-009 (perimeter)** — drafted at implementation kickoff. Tailscale ACLs, cloudflared adjustments, verifying that news stays public while dashboard + chat are private.
+- **ADR-010 (perimeter)** — drafted at implementation kickoff. Tailscale ACLs, cloudflared adjustments, verifying that news stays public while dashboard + chat are private.
 - **Brain-dump rundown on WhatsApp** — addendum to ADR-005. Separate from canvas; documented here only to record the decision that it does *not* belong on canvas.
 
 ## References
@@ -224,7 +224,7 @@ Enforcement model: a *policy*, not a runtime gate. The Q persona prompt carries 
 - ADR-006 — reminders; not a canvas surface, listed for cross-reference
 - ADR-007 — JARVIS / Gmail venue; pattern for "venue-specific persona with venue-specific system prompt"
 - ADR-008 — skills; not a canvas surface
-- ADR-009 (proposed) — perimeter / private deployment; hard prerequisite
+- ADR-010 (proposed) — perimeter / private deployment; hard prerequisite
 - CLAUDE.md Rule 6 — outbound messaging authorization (applies to canvas-driven outbound)
 - CLAUDE.md Rule 7 — code identity is the venue, not the persona (chat = venue, Q = persona)
 - CLAUDE.md Rule 9 — vault-writing rules (apply when canvas-driven choices result in vault ops)
