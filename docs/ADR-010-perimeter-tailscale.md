@@ -1,4 +1,4 @@
-# ADR-009 — Perimeter: Tailscale-gating the operator surfaces
+# ADR-010 — Perimeter: Tailscale-gating the operator surfaces
 
 **Status:** Proposed (2026-05-17)
 
@@ -6,7 +6,7 @@
 
 Three Nucleus surfaces are exposed via Cloudflare tunnel today: dashboard, chat, and news. All three are reachable at public URLs; none of the operator-only surfaces (dashboard, chat) have auth in front of them. The only thing keeping the dashboard private is the obscurity of its hostname — discoverable by anyone who runs a subdomain scan against the operator's registered domain or stumbles onto it via a referrer leak.
 
-ADR-010 (canvas) raised the stakes: canvas adds an interactive, agent-rendered surface to chat. Even with the destructive-action policy (canvas presents choices, never executes destructive ops without a typed confirmation), running that surface on a publicly addressable URL is the wrong default. ADR-009 declared this perimeter work a hard prerequisite for shipping canvas.
+ADR-011 (canvas) raised the stakes: canvas adds an interactive, agent-rendered surface to chat. Even with the destructive-action policy (canvas presents choices, never executes destructive ops without a typed confirmation), running that surface on a publicly addressable URL is the wrong default. ADR-010 declared this perimeter work a hard prerequisite for shipping canvas.
 
 The work is also useful independent of canvas. Dashboard and chat are operator-only by nature; only the operator's devices ever need to reach them. They should not be on the public internet at all. News is intentionally public (read-only RSS-shape content; ADR-001).
 
@@ -22,7 +22,7 @@ URL shape uses Tailscale's default `<machine>.<tailnet>.ts.net` form for v1 — 
 |---|---|---|
 | `dashboard` | Cloudflare tunnel at `$NUCLEUS_DASHBOARD_PUBLIC_URL` | Tailscale Serve at `https://<machine>.<tailnet>.ts.net/` (or a dedicated port path). CF route removed. |
 | `chat` | Cloudflare tunnel at `$NUCLEUS_CHAT_PUBLIC_URL` | Tailscale Serve at `https://<machine>.<tailnet>.ts.net/chat/` (or similar). CF route removed. |
-| `chat-v2` (per ADR-010) | not yet deployed | Tailscale Serve from day one; never gets a public CF route. |
+| `chat-v2` (per ADR-011) | not yet deployed | Tailscale Serve from day one; never gets a public CF route. |
 | `news-api` | Cloudflare tunnel at `$NUCLEUS_NEWS_PUBLIC_URL` | Unchanged. Stays public. |
 | Other cloudflared routes | Whatever's in `~/.cloudflared/config.yml` | Audit during rollout; remove anything that's operator-only and now redundant. |
 
@@ -127,7 +127,7 @@ No "preserve the CF route as fallback" path. SSH tunneling covers the rollback c
 ## References
 
 - ADR-001 — architecture / which surfaces exist and what they're for
-- ADR-010 — canvas; declared this work as a hard prerequisite
+- ADR-011 — canvas; declared this work as a hard prerequisite
 - CLAUDE.md Rule 1 — secrets stay in `.env`; URLs are referenced via `NUCLEUS_*_PUBLIC_URL`
 - `cloudflared_setup` (T2 memory) — current tunnel config conventions
 - Tailscale Serve docs — https://tailscale.com/kb/1242/tailscale-serve
