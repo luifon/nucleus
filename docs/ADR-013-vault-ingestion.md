@@ -1,4 +1,4 @@
-# ADR-012 — Vault ingestion: PDFs/Word/HTML → markdown in the PARA tree
+# ADR-013 — Vault ingestion: PDFs/Word/HTML → markdown in the PARA tree
 
 **Status:** Placeholder / deferred (2026-05-17)
 

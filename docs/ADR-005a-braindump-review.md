@@ -23,7 +23,7 @@ This is fast and usually right, but the failure mode is silent:
   operator wanted; pruning afterwards is more work than reviewing
   upfront.
 
-ADR-011 (canvas) explicitly **disclaimed** brain-dump review as a
+ADR-012 (canvas) explicitly **disclaimed** brain-dump review as a
 canvas concern: review stays on the same platform the capture arrived
 on. WhatsApp is the venue, so the review interaction has to work
 inside WhatsApp's text-only constraints.
@@ -349,7 +349,7 @@ split functions with the review step between them.
 - **Op rewriting in the review loop.** Interpreter selects, doesn't
   modify. Want a different bucket? Reject + re-capture. Keeps the
   feature small.
-- **Canvas review on the dashboard.** ADR-011 already disclaimed this.
+- **Canvas review on the dashboard.** ADR-012 already disclaimed this.
   WhatsApp is the venue; review stays on the venue.
 - **Per-op preview of bodies.** The rundown intentionally hides the
   op body markdown. If the operator wants to see what Claude wrote,
@@ -412,7 +412,7 @@ Don't add the flag preemptively.
   conventions
 - ADR-006 — reminders / `outbound_queue` (the table reused by the
   ack helper)
-- ADR-011 — canvas; explicitly out-of-scope for brain-dump review
+- ADR-012 — canvas; explicitly out-of-scope for brain-dump review
 - CLAUDE.md Rule 6 — outbound authorization (the braindump group is
   a self-group, all acks are within-scope)
 - CLAUDE.md Rule 7 — venue/persona split (persona is venue-bound

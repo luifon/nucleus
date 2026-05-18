@@ -1,4 +1,4 @@
-# ADR-009 — Setup wizard: guided one-shot Nucleus install
+# ADR-010 — Setup wizard: guided one-shot Nucleus install
 
 **Status:** Proposed (2026-05-18)
 
@@ -12,7 +12,7 @@ the operator threads from README:
 - Run `tools/launchd/install.sh` to install plists
 - Configure cloudflared tunnels (per `tools/cloudflared/README.md`)
 - Install the skill-creator plugin (ADR-008) via `.claude/settings.json`
-- Bootstrap Tailscale and configure `tailscale serve` (ADR-010)
+- Bootstrap Tailscale and configure `tailscale serve` (ADR-011)
 - Seed default reminders / skills / vault structure
 - `cargo build --release` so binaries exist
 
@@ -193,9 +193,9 @@ Phase 7).
 - Punts to manual setup with README link if the operator wants a custom
   config.
 
-### Phase 7 — Tailscale (per ADR-010)
+### Phase 7 — Tailscale (per ADR-011)
 
-Runs if `dashboard` or `chat` is selected. Per ADR-010, those surfaces
+Runs if `dashboard` or `chat` is selected. Per ADR-011, those surfaces
 move behind Tailscale.
 
 - Detects `tailscale` binary — prints install hint if missing and pauses.
@@ -369,7 +369,7 @@ mysterious runtime failure.
 - ADR-001 — workspace layout; the wizard fits as another `chores/` crate
 - ADR-008 — skill-creator plugin install + per-skill audience prompt
   (Phase 8 sub-step)
-- ADR-010 — Tailscale bootstrap (Phase 7)
+- ADR-011 — Tailscale bootstrap (Phase 7)
 - README.md — manual install paths the wizard automates
 - CLAUDE.md Rule 1 — secrets stay in `.env`; the wizard walks the
   operator through populating it
