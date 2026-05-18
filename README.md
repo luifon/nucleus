@@ -293,21 +293,19 @@ The bot **should not author a skill in one shot.** The recommended flow
 1. **Explore** interactively in a regular Claude Code session — walk
    the surface together, hit failures, work around them.
 2. **Capture** what worked: trigger, steps, observed failure modes.
-3. **Formalize** with the [skill-creator plugin](https://code.claude.com/docs/en/plugins) —
-   `/plugin install skill-creator@anthropic` (verify the exact
-   marketplace path with `/plugin marketplace` first), then
-   `/skill-creator create`. It scaffolds `SKILL.md` with the required
-   sections. Hand-edit the Nucleus-specific frontmatter additions
-   (`flavor: recipe`, `mcp_needed`, `notify_on_failure`,
-   `last_used`/`last_failure`/`failure_count_30d`).
+3. **Formalize** with the [skill-creator plugin](https://claude.com/plugins/skill-creator).
+   It's declared in this repo's `.claude/settings.json` under
+   `enabledPlugins`, so Claude Code prompts you to install it the
+   first time you `cd` into the repo and trust the folder — accept.
+   If you ever land in a session without it, install manually with
+   `/plugin install skill-creator@claude-plugins-official` then
+   `/reload-plugins`. Invoke `/skill-creator create` and let it
+   scaffold `SKILL.md`. Hand-edit the Nucleus-specific frontmatter
+   additions (`flavor: recipe`, `mcp_needed`, `notify_on_failure`,
+   `last_used` / `last_failure` / `failure_count_30d`).
 4. **Test** from a fresh session — close the exploratory one, open a
    new one, invoke the skill or fire a one-shot reminder against it.
 5. **Iterate** via `/skill-creator improve` after observing real fires.
-
-> The skill-creator plugin isn't shipped via committed `.claude/settings.json` —
-> Claude Code installs plugins through `/plugin install` from a marketplace,
-> not via a config-file list. Document the chosen install command in your
-> own setup notes; the future setup wizard (ADR-012) will automate it.
 
 ### Sensitivity defaults
 

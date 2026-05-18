@@ -246,13 +246,17 @@ text above. Recording them here so the next reader has the ground truth:
    the code in `chores/reminders/src/store.rs` carries an explanatory
    comment.
 
-2. **The skill-creator plugin is not installed via committed
-   `.claude/settings.json`.** Claude Code's plugin model uses
-   `/plugin install` (marketplace) or `--plugin-dir`/`--plugin-url`
-   (local). There is no documented "list plugins in
-   `.claude/settings.json`" format. ADR-008's migration step 1 should
-   be read as "document the install command in README and operator
-   setup notes"; the future setup wizard (ADR-012) will automate it.
+2. **Skill-creator IS installed via committed `.claude/settings.json`.**
+   The plan-phase note that said otherwise was wrong. Claude Code
+   supports `enabledPlugins` in `.claude/settings.json` with the
+   format `"plugin-id@marketplace-id": true`. The committed
+   `.claude/settings.json` carries
+   `"skill-creator@claude-plugins-official": true`, so contributors
+   are prompted on first trust of the folder. The `claude-plugins-official`
+   marketplace is auto-registered by Claude Code — no `extraKnownMarketplaces`
+   entry needed. ADR-008's migration step 1 as originally written
+   stands; the manual `/plugin install` is only a fallback for
+   sessions that somehow miss the prompt.
 
 3. **Skill output bridge: the worker forwards the session's reply.**
    The spawned firing session has no built-in posting tool — Discord
