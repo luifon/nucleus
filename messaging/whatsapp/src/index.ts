@@ -66,9 +66,24 @@ type ChatRole = "alfred" | "braindump" | "dm";
 const allowedJids = new Map<string, ChatRole>();
 
 /** JID-shape discriminator (ADR-005b). Groups end `@g.us`; DMs end
- *  `@s.whatsapp.net`. Anything else (channels, broadcasts) is unsupported. */
+ *  `@s.whatsapp.net` or `@lid` (modern WhatsApp surfaces some DMs
+ *  under LIDs). Anything else (channels, broadcasts) is unsupported. */
 function chatType(jid: string): "group" | "dm" {
   return jid.endsWith("@g.us") ? "group" : "dm";
+}
+
+/** Resolve the role for an inbound chatId. Groups use literal-JID
+ *  lookup; DMs normalize the chatId user-part to digits and check
+ *  against the DM-sender set, matching either @s.whatsapp.net or
+ *  @lid presentations of the same operator. */
+function resolveRole(chatId: string, config: Config): ChatRole | undefined {
+  const direct = allowedJids.get(chatId);
+  if (direct) return direct;
+  if (chatType(chatId) === "dm") {
+    const digits = normalizeSenderId(chatId);
+    if (digits && config.allowedDmSenders.has(digits)) return "dm";
+  }
+  return undefined;
 }
 
 /** Reverse lookup populated by resolveAllowlist: group name (case-
@@ -268,10 +283,6 @@ async function resolveAllowlist(sock: any, config: Config): Promise<void> {
   // capture chat to also get conversational replies — pick one role).
   for (const jid of config.allowedChatIds) allowedJids.set(jid, "alfred");
   for (const jid of config.brainDumpChatIds) allowedJids.set(jid, "braindump");
-  // ADR-005b: DM allowlist. JIDs always end `@s.whatsapp.net`; we can't
-  // collide with group JIDs (`@g.us`), so order doesn't matter here.
-  for (const jid of config.allowedDmJids) allowedJids.set(jid, "dm");
-
   const wantAlfred = new Set(config.allowedGroupNames.map((n) => n.toLowerCase()));
   const wantBrainDump = new Set(config.brainDumpGroupNames.map((n) => n.toLowerCase()));
   if (!wantAlfred.size && !wantBrainDump.size) {
@@ -425,13 +436,13 @@ async function handleMessage(
   }
 
   // ---- IRON-TIGHT FILTERS ----
-  // 1. Allowlist must be in the resolved map (env-derived JIDs ∪ name-matched groups
-  //    ∪ ADR-005b DM JIDs).
-  const role = allowedJids.get(chatId);
+  // 1. Resolve role: groups match by literal JID in `allowedJids`; DMs
+  //    match by normalized digit-only chatId user-part against the DM
+  //    sender set (handles both @s.whatsapp.net and @lid forms).
+  const role = resolveRole(chatId, config);
   if (!role) return;
 
-  // 2. Chat-type sanity. Groups end @g.us; DMs end @s.whatsapp.net.
-  //    Anything else (channels, broadcasts) is unsupported.
+  // 2. Chat-type sanity. Groups end @g.us; DMs end @s.whatsapp.net or @lid.
   const kind = chatType(chatId);
   if (kind === "group" && !chatId.endsWith("@g.us")) return;
 

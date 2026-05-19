@@ -141,9 +141,13 @@ export interface Config {
   brainDumpChatIds: string[];
   /** Brain-dump capture allowlist by group name. */
   brainDumpGroupNames: string[];
-  /** DM allowlist (ADR-005b): JIDs in `<digits>@s.whatsapp.net` form the
-   *  bot accepts DMs from. Empty = DM listening disabled. */
-  allowedDmJids: string[];
+  /** DM allowlist (ADR-005b): normalized digit-only user parts of JIDs
+   *  the bot accepts DMs from. Empty = DM listening disabled. Accepts any
+   *  shape in the env var (full `@s.whatsapp.net` JID, full `@lid` JID,
+   *  bare phone number, bare LID) — same posture as `allowedSenders` for
+   *  the group path. Match happens after normalizing the inbound DM's
+   *  chatId user-part to digits. */
+  allowedDmSenders: Set<string>;
   /** Per-sender authorization: only messages whose participant matches
    *  one of these IDs are processed, even inside an allowlisted group.
    *  Holds normalized digit-only user parts; comparison is against the
@@ -209,8 +213,10 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
     allowedGroupNames: splitCsv(process.env.WHATSAPP_ALLOWED_GROUP_NAMES),
     brainDumpChatIds: splitCsv(process.env.WHATSAPP_BRAINDUMP_CHAT_IDS),
     brainDumpGroupNames: splitCsv(process.env.WHATSAPP_BRAINDUMP_GROUP_NAMES),
-    allowedDmJids: splitCsv(process.env.WHATSAPP_ALLOWED_DM_JIDS).filter((jid) =>
-      jid.endsWith("@s.whatsapp.net"),
+    allowedDmSenders: new Set(
+      splitCsv(process.env.WHATSAPP_ALLOWED_DM_JIDS)
+        .map(normalizeSenderId)
+        .filter((s) => s.length > 0),
     ),
     allowedSenders: new Set(
       splitCsv(process.env.WHATSAPP_ALLOWED_SENDERS)
