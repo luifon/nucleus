@@ -66,12 +66,11 @@ pub async fn run(settings: &Settings, workspace_root: &Path) -> Result<()> {
         "metabolism: starting JARVIS run"
     );
 
-    let persona_path = workspace_root.join("messaging/gmail/persona.md");
-    let persona = tokio::fs::read_to_string(&persona_path)
-        .await
-        .with_context(|| format!("reading {}", persona_path.display()))?;
-    let persona = config::substitute(&persona, &settings.identity);
-    let persona = config::substitute_gmail(&persona, &settings.gmail);
+    let persona = config::resolve_persona(&settings.identity, "gmail", None)
+        .context("resolving Gmail persona (ADR-009)")?;
+    // ${GMAIL_ACCOUNT} substitution stays here — resolve_persona handles only
+    // ${USER_NAME}; per-venue placeholders remain venue-local.
+    let persona = config::substitute_gmail(&persona.body, &settings.gmail);
 
     let prompt = build_prompt(
         &lookback_from.to_rfc3339(),

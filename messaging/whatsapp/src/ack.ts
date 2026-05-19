@@ -38,12 +38,12 @@ function main(): void {
   const workspaceRoot =
     process.env.NUCLEUS_WORKSPACE_ROOT ??
     path.resolve(import.meta.dirname, "..", "..", "..");
-  // loadConfig loads .env into process.env as a side effect — must happen
-  // before reading WHATSAPP_PERSONA_NAME, otherwise the fallback fires
-  // whenever this script is invoked from a context (tmux, npx) where
-  // .env hasn't already been sourced into the parent shell.
+  // loadConfig loads .env into process.env as a side effect AND resolves
+  // the persona (ADR-009) — must happen before reading the display name,
+  // otherwise the fallback fires whenever this script is invoked from a
+  // context (tmux, npx) where .env hasn't already been sourced.
   const config = loadConfig(workspaceRoot, false);
-  const personaName = process.env.WHATSAPP_PERSONA_NAME ?? "bot";
+  const personaName = config.personaDisplayName;
 
   const target = config.brainDumpGroupNames[0];
   if (!target) {

@@ -86,6 +86,7 @@ async function main() {
     process.env.NUCLEUS_WORKSPACE_ROOT ??
     path.resolve(import.meta.dirname, "..", "..", "..");
   const config = loadConfig(workspaceRoot, discover);
+  configurePersona(config.personaDisplayName);
 
   log.info(
     {
@@ -849,11 +850,17 @@ function formatOutcomeReply(
   return lines.join("\n");
 }
 
-/** Persona signature on every outbound message. The name is the character
- *  the bot speaks as (see persona.md). Code identity stays venue-based
- *  (Rule 7); the persona name itself lives in .env so it can change
- *  without touching code, and so the name doesn't get committed. */
-const PERSONA_SIGNATURE = `— ${process.env.WHATSAPP_PERSONA_NAME ?? "bot"}`;
+/** Persona display name on every outbound message. Code identity stays
+ *  venue-based (Rule 7); the persona's user-facing name comes from the
+ *  resolved persona's `display_name` frontmatter (ADR-009), which lives
+ *  in the persona file's frontmatter rather than env. Initialized at boot
+ *  by `configurePersona`; defaults to `"bot"` if a handler somehow runs
+ *  before config is loaded. */
+let personaDisplayName = "bot";
+
+export function configurePersona(displayName: string): void {
+  personaDisplayName = displayName;
+}
 
 /** Format every outbound message so it's distinguishable from the user's
  *  own typed messages in the same self-group: bold body + persona signature. */
@@ -864,7 +871,7 @@ function formatReply(body: string): string {
     .split("\n")
     .map((line) => (line.trim() ? `*${line}*` : line))
     .join("\n");
-  return `${bolded}\n\n*${PERSONA_SIGNATURE}*`;
+  return `${bolded}\n\n*— ${personaDisplayName}*`;
 }
 
 function extractText(msg: WAMessage): string {
