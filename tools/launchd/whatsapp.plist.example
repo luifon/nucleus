@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>__LAUNCHD_PREFIX__.alfred</string>
+    <string>__LAUNCHD_PREFIX__.whatsapp</string>
     <!-- Run via a login shell so nvm's PATH is set up; exec npm so launchctl
          tracks the right pid. Update the node path if you switch nvm versions
          or move to system node. -->
@@ -35,8 +35,8 @@
     <key>ThrottleInterval</key>
     <integer>15</integer>
     <key>StandardOutPath</key>
-    <string>__USER_HOME__/Development/nucleus/memory/alfred.log</string>
+    <string>__USER_HOME__/Development/nucleus/memory/whatsapp.log</string>
     <key>StandardErrorPath</key>
-    <string>__USER_HOME__/Development/nucleus/memory/alfred.log</string>
+    <string>__USER_HOME__/Development/nucleus/memory/whatsapp.log</string>
 </dict>
 </plist>

@@ -33,7 +33,7 @@ NUCLEUS_LAUNCHD_PREFIX=tech.mycompany ./tools/launchd/install.sh
 | Template | Purpose | Trigger |
 |----------|---------|---------|
 | `discord.plist.example` | Discord bot | KeepAlive (always running) |
-| `alfred.plist.example` | WhatsApp bot | KeepAlive (always running) |
+| `whatsapp.plist.example` | WhatsApp bot | KeepAlive (always running) |
 | `news-api.plist.example` | News HTTP server | KeepAlive |
 | `dashboard.plist.example` | Dashboard HTTP server | KeepAlive |
 | `news-fetcher.plist.example` | Twice-daily news pull | StartCalendarInterval (e.g. 09:00 + 18:00) |

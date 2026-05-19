@@ -3,7 +3,7 @@
 //
 // Usage: npm run list-groups
 //
-// IMPORTANT: stop the running Alfred service first (launchctl stop dev.nucleus.alfred
+// IMPORTANT: stop the running WhatsApp service first (launchctl stop dev.nucleus.whatsapp
 // or similar). Two concurrent Baileys connections from the same auth dir
 // will race each other.
 
