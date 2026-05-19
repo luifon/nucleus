@@ -62,11 +62,16 @@ async fn main() -> Result<()> {
         .output()
         .await;
 
+    // ADR-009: chat venue resolves its persona via NUCLEUS_PERSONA_CHAT.
+    let persona = nucleus_core::config::resolve_persona(&settings.identity, "chat", None)
+        .context("resolving chat persona (ADR-009)")?;
+
     let sessions = claude_session::SessionPool::new(claude_session::PoolConfig {
         workspace_root: workspace_root.clone(),
-        append_system_prompt: None,
+        append_system_prompt: Some(persona.body),
         permission_mode,
         disallowed_tools: settings.claude.disallowed_tools.clone(),
+        allowed_tools: vec![],
         add_dirs: vec![vault_path.clone()],
         tmux_session: "nucleus-chat".into(),
         idle_timeout: std::time::Duration::from_secs(60 * 60 * 2),
