@@ -94,6 +94,8 @@ Both bots can technically send anywhere their accounts are authed for. Before
 sending to a destination that isn't:
 
 - A DM from the user / a message in the user's self-group
+- A WhatsApp DM from the operator's JID (per `WHATSAPP_ALLOWED_DM_JIDS`,
+  ADR-005b) — replying in the same DM thread is pre-authorized
 - The configured home channel (`DISCORD_HOME_CHANNEL_ID`)
 - A pre-authorized scheduled output (daily news, timesheet reminder, weekly
   distillation digest)
@@ -255,6 +257,11 @@ Supported `--channels` values:
   `memory/whatsapp.db`; Alfred drains every 5s
 - `braindump` — WhatsApp Brain Dump group (first entry of
   `WHATSAPP_BRAINDUMP_GROUP_NAMES`). Same queue mechanism
+- `whatsapp-dm` — WhatsApp DM to the operator's JID (first entry of
+  `WHATSAPP_ALLOWED_DM_JIDS`, ADR-005b). Same queue mechanism as the
+  group channels; if the allowlist is empty the channel errors at
+  delivery time. Useful when you want a reminder to land in the
+  operator's own DM thread instead of a self-group
 - `calendar` — creates a Google Calendar event via JARVIS + Claude.ai
   Calendar MCP (ADR-007). The event is created on the trash account
   (`$NUCLEUS_GMAIL_ACCOUNT`) with `$NUCLEUS_PERSONAL_EMAIL` as attendee,
