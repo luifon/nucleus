@@ -523,34 +523,14 @@ async function handleMessage(
 
   if (!text.trim()) return;
 
-  // ADR-005b: if a DM looks like an explicit brain-dump capture, nudge the
-  // operator to the brain-dump group instead of silently routing the
-  // capture-shaped input through the conversational handler. The check is
-  // intentionally narrow — there are no current trigger keywords in this
-  // codebase, so the predicate only fires on prefixed signals. Voice memos
-  // in DM are treated as conversation (see ADR-005b §"Brain-dump in DM").
-  if (role === "dm" && looksLikeBrainDumpCapture(text, inputKind)) {
-    await sock.sendMessage(chatId, {
-      text: formatReply("brain-dump goes to the brain-dump group."),
-    });
-    return;
-  }
-
   log.info({ chatId, role, kind: inputKind, len: text.length }, "whatsapp: processing message");
 
+  // Brain-dump capture is structurally group-only: a JID only carries the
+  // braindump role if it was seeded from a braindump group/CHAT_ID env var,
+  // and DM JIDs (@s.whatsapp.net) never appear in those lists. So there's
+  // nothing to reject here — the role split itself enforces it.
   const pool = role === "dm" ? sessionsDm : sessions;
   await handleConversational(sock, chatId, text, inputKind, config, store, pool);
-}
-
-/** Brain-dump-shaped detection for DM gating (ADR-005b). Today's brain-dump
- *  pipeline has no content-based triggers — capture happens because the
- *  message arrived in a brain-dump-role group. So this predicate only
- *  flags explicit slash-prefixed signals (e.g., `/sync`, `/braindump`)
- *  the operator might type in DM by mistake. Voice memos in DM are NOT
- *  flagged — per ADR-005b they're transcribed and treated as conversation. */
-function looksLikeBrainDumpCapture(text: string, _inputKind: "text" | "voice"): boolean {
-  const t = text.trim().toLowerCase();
-  return t.startsWith("/sync") || t.startsWith("/braindump") || t.startsWith("/brain-dump");
 }
 
 async function handleConversational(
