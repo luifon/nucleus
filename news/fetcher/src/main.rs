@@ -32,7 +32,6 @@ struct SourceRow {
     id: i64,
     name: String,
     url: String,
-    max_per_fetch: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -214,13 +213,19 @@ async fn rescore_today(pool: &SqlitePool, workspace_root: &PathBuf, user_name: &
             }
         }
 
-        // Step B — score every unscored item, then cap to max_per_fetch.
+        // Step B — score the first PRE_SCORE_CAP unscored items only.
+        // Same bound as the main fetch path: arXiv-shape days can leave
+        // hundreds of unscored rows, and `score_all` is one Claude call
+        // for the whole batch — must stay bounded.
         let to_score_rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
             "SELECT id, title, summary FROM items
-             WHERE source_id = ?1 AND fetch_date = ?2 AND notable_score IS NULL",
+             WHERE source_id = ?1 AND fetch_date = ?2 AND notable_score IS NULL
+             ORDER BY published_at DESC
+             LIMIT ?3",
         )
         .bind(src.id)
         .bind(&today)
+        .bind(PRE_SCORE_CAP as i64)
         .fetch_all(pool)
         .await?;
         let to_score: Vec<ParsedItem> = to_score_rows
@@ -244,9 +249,9 @@ async fn rescore_today(pool: &SqlitePool, workspace_root: &PathBuf, user_name: &
             }
         }
 
-        // Step C — prune to top max_per_fetch by score. NULL scores sort
+        // Step C — prune to top POST_SCORE_CAP by score. NULL scores sort
         // last (treated as 0 in the ORDER BY).
-        let cap = src.max_per_fetch;
+        let cap = POST_SCORE_CAP as i64;
         let to_drop: Vec<(String,)> = sqlx::query_as(
             "SELECT id FROM items
               WHERE source_id = ?1 AND fetch_date = ?2
@@ -320,10 +325,9 @@ async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
           last_error TEXT
         );
     "#).execute(pool).await?;
-    // Per-source quality cap (top-N by notable_score kept each fetch).
-    // 10 is the default; arXiv-style firehoses get lowered explicitly.
-    let _ = sqlx::query("ALTER TABLE sources ADD COLUMN max_per_fetch INTEGER NOT NULL DEFAULT 10")
-        .execute(pool).await;
+    // Note: a `max_per_fetch` column may still exist on legacy DBs from
+    // before the PRE_SCORE_CAP / POST_SCORE_CAP refactor. It is no longer
+    // read; left in place to avoid an irreversible schema change.
 
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS items (
@@ -389,28 +393,28 @@ async fn seed_default_sources(pool: &SqlitePool) -> Result<()> {
     // so we can add new defaults later and they pick up automatically
     // without disturbing the existing DB. Manual sources added via the
     // dashboard / SQL stay put.
-    let defaults: &[(&str, &str, i64)] = &[
-        // (name, url, max_per_fetch)
-        ("Hacker News",            "https://hnrss.org/frontpage",                       10),
-        ("lobste.rs",              "https://lobste.rs/rss",                             10),
-        ("Simon Willison",         "https://simonwillison.net/atom/everything/",        10),
-        ("The Pragmatic Engineer", "https://newsletter.pragmaticengineer.com/feed",     10),
-        ("Latent Space",           "https://www.latent.space/feed",                     10),
-        ("Anthropic Engineering",  "https://www.anthropic.com/engineering/rss.xml",     10),
-        ("Hugging Face papers",    "https://jamesg.blog/hf-papers.xml",                 10),
-        ("Rust Blog",              "https://blog.rust-lang.org/feed.xml",               10),
-        ("Julia Evans",            "https://jvns.ca/atom.xml",                          10),
-        // arXiv cs.AI publishes ~400/day; capped low so the daily firehose
-        // contributes the top 5 most-relevant papers, not 400 rows of noise.
-        ("arXiv cs.AI",            "https://export.arxiv.org/rss/cs.AI",                 5),
+    let defaults: &[(&str, &str)] = &[
+        // (name, url) — all sources cap at PRE_SCORE_CAP / POST_SCORE_CAP
+        // (currently 20 / 10) regardless of source. arXiv cs.AI publishes
+        // ~400/day but the pre-score slice keeps the LLM call bounded.
+        ("Hacker News",            "https://hnrss.org/frontpage"),
+        ("lobste.rs",              "https://lobste.rs/rss"),
+        ("Simon Willison",         "https://simonwillison.net/atom/everything/"),
+        ("The Pragmatic Engineer", "https://newsletter.pragmaticengineer.com/feed"),
+        ("Latent Space",           "https://www.latent.space/feed"),
+        ("Anthropic Engineering",  "https://www.anthropic.com/engineering/rss.xml"),
+        ("Hugging Face papers",    "https://jamesg.blog/hf-papers.xml"),
+        ("Rust Blog",              "https://blog.rust-lang.org/feed.xml"),
+        ("Julia Evans",            "https://jvns.ca/atom.xml"),
+        ("arXiv cs.AI",            "https://export.arxiv.org/rss/cs.AI"),
     ];
     let mut added = 0usize;
-    for (name, url, max_per_fetch) in defaults {
+    for (name, url) in defaults {
         let res = sqlx::query(
-            "INSERT OR IGNORE INTO sources (name, url, kind, enabled, max_per_fetch)
-             VALUES (?1, ?2, 'feed', 1, ?3)",
+            "INSERT OR IGNORE INTO sources (name, url, kind, enabled)
+             VALUES (?1, ?2, 'feed', 1)",
         )
-        .bind(name).bind(url).bind(max_per_fetch)
+        .bind(name).bind(url)
         .execute(pool).await?;
         if res.rows_affected() > 0 {
             added += 1;
@@ -429,10 +433,10 @@ async fn seed_default_sources(pool: &SqlitePool) -> Result<()> {
 }
 
 async fn list_enabled_sources(pool: &SqlitePool) -> Result<Vec<SourceRow>> {
-    let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
-        "SELECT id, name, url, max_per_fetch FROM sources WHERE enabled = 1"
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT id, name, url FROM sources WHERE enabled = 1"
     ).fetch_all(pool).await?;
-    Ok(rows.into_iter().map(|(id, name, url, max_per_fetch)| SourceRow { id, name, url, max_per_fetch }).collect())
+    Ok(rows.into_iter().map(|(id, name, url)| SourceRow { id, name, url }).collect())
 }
 
 async fn fetch_source(http: &reqwest::Client, src: &SourceRow) -> Result<Vec<ParsedItem>> {
@@ -573,7 +577,7 @@ async fn upsert_items(pool: &SqlitePool, items: &[ParsedItem]) -> Result<Vec<Par
 }
 
 /// Delete a batch of items by id. Used by the score-then-cap pipeline to
-/// drop everything outside the top max_per_fetch of a source.
+/// drop everything outside the top POST_SCORE_CAP of a source.
 async fn delete_items(pool: &SqlitePool, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
