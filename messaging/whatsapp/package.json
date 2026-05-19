@@ -16,6 +16,7 @@
     "ack": "tsx src/ack.ts",
     "list-groups": "tsx src/list-groups.ts",
     "build": "tsc -p .",
+    "test": "tsx --test src/**/*.test.ts",
     "start:prod": "node dist/index.js"
   },
   "dependencies": {
