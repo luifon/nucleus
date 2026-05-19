@@ -1,5 +1,5 @@
-//! Nucleus Discord bot — persona is "Jerry Lewis" by default, configured
-//! via messaging/discord/persona.md (substituted at load).
+//! Nucleus Discord bot. Persona is resolved at spawn via
+//! `NUCLEUS_PERSONA_DISCORD=<slug>` → `personas/<slug>.md` (see ADR-009).
 //!
 //! Maintains a per-channel `SessionPool` against long-lived interactive
 //! `claude` processes inside tmux. Persona injected via --append-system-prompt
@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 const AGENT_NAME: &str = "discord";
 const MAX_DISCORD_CHARS: usize = 2000;
-const PERSONA_FILE: &str = "messaging/discord/persona.md";
 const DB_PATH: &str = "memory/discord.db";
 
 /// Per-message context handed to the worker that calls claude.
@@ -453,10 +452,8 @@ async fn main() -> Result<()> {
     let token = std::env::var("DISCORD_BOT_TOKEN").context("DISCORD_BOT_TOKEN not set")?;
 
     let workspace_root = std::env::current_dir()?;
-    let persona_path = workspace_root.join(PERSONA_FILE);
-    let persona_raw = std::fs::read_to_string(&persona_path)
-        .with_context(|| format!("reading persona at {:?}", persona_path))?;
-    let persona = nucleus_core::config::substitute(&persona_raw, &settings.identity);
+    let persona = nucleus_core::config::resolve_persona(&settings.identity, "discord", None)
+        .context("resolving Discord persona (ADR-009)")?;
 
     let db_path = workspace_root.join(DB_PATH);
     let pool = db::open(&db_path).await.context("opening discord.db")?;
@@ -471,7 +468,7 @@ async fn main() -> Result<()> {
 
     let sessions = Arc::new(SessionPool::new(PoolConfig {
         workspace_root: workspace_root.clone(),
-        append_system_prompt: Some(persona),
+        append_system_prompt: Some(persona.body),
         permission_mode: PermissionMode::parse(&settings.claude.permission_mode),
         disallowed_tools: settings.claude.disallowed_tools.clone(),
         allowed_tools: vec![],

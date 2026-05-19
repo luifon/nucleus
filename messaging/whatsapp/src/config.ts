@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { resolvePersona } from "./persona.js";
 
 /** Minimal TOML reader — supports flat tables, scalars, single-line AND
  * multi-line string arrays. Doesn't handle nested tables, inline tables,
@@ -126,17 +127,13 @@ export function normalizeSenderId(raw: string): string {
   return userPart.replace(/\D+/g, "");
 }
 
-function substitute(s: string): string {
-  return s.replace(/\$\{USER_NAME\}/g, process.env.NUCLEUS_USER_NAME ?? "user");
-}
-
 export interface Config {
   workspaceRoot: string;
   userName: string;
   claudeBin: string;
   permissionMode: string;
   disallowedTools: string[];
-  /** Conversational allowlist (Alfred persona): JID → role "alfred". */
+  /** Conversational allowlist: JID → role "alfred" (the conversational role). */
   allowedChatIds: string[];
   /** Conversational allowlist by group name. */
   allowedGroupNames: string[];
@@ -151,7 +148,13 @@ export interface Config {
    *  the underlying phone number user part. */
   allowedSenders: Set<string>;
   discoverMode: boolean;
+  /** Persona markdown body fed to `--append-system-prompt`. Resolved via
+   *  `NUCLEUS_PERSONA_WHATSAPP` per ADR-009. */
   appendSystemPrompt: string;
+  /** Persona display name used in the reply-signature footer. Comes from
+   *  the persona file's frontmatter `display_name`, falling back to the
+   *  slug (ADR-009). Replaces the legacy `WHATSAPP_PERSONA_NAME` env var. */
+  personaDisplayName: string;
   vaultPath: string;
   diaryRoot: string;
   dbPath: string;
@@ -171,10 +174,8 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
   const diary = parsed.diary ?? { root: "memory/diaries" };
   const obsidian = parsed.obsidian ?? {};
 
-  const personaPath = path.join(workspaceRoot, "messaging/whatsapp/persona.md");
-  const persona = fs.existsSync(personaPath)
-    ? substitute(fs.readFileSync(personaPath, "utf-8"))
-    : "";
+  const userName = envRequired("NUCLEUS_USER_NAME");
+  const persona = resolvePersona(workspaceRoot, userName, "whatsapp");
 
   const rawVault = (obsidian.vault_path ?? "~/Documents/Obsidian") as string;
   const vaultPath = rawVault.startsWith("~/")
@@ -183,7 +184,7 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
 
   return {
     workspaceRoot,
-    userName: envRequired("NUCLEUS_USER_NAME"),
+    userName,
     claudeBin: process.env.NUCLEUS_CLAUDE_BIN ?? claude.binary ?? "claude",
     permissionMode: claude.permission_mode ?? "auto",
     disallowedTools: claude.disallowed_tools ?? [],
@@ -197,7 +198,8 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
         .filter((s) => s.length > 0),
     ),
     discoverMode: discover,
-    appendSystemPrompt: persona,
+    appendSystemPrompt: persona.body,
+    personaDisplayName: persona.displayName,
     vaultPath,
     diaryRoot: path.resolve(workspaceRoot, diary.root ?? "memory/diaries"),
     dbPath: path.join(workspaceRoot, "memory/whatsapp.db"),
