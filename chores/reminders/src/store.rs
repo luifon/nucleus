@@ -16,9 +16,11 @@
 //!
 //! Channel codes (used in `reminder_channels.channel`):
 //!   - "discord-home"  → DISCORD_HOME_CHANNEL_ID
-//!   - "alfred"        → WhatsApp Alfred group (via outbound_queue in
-//!                       memory/whatsapp.db; Alfred drains every 5s)
-//!   - "braindump"     → WhatsApp Brain Dump group (same path)
+//!   - "whatsapp-group" → WhatsApp conversational group (per
+//!                        WHATSAPP_ALLOWED_GROUP_NAMES; via
+//!                        outbound_queue in memory/whatsapp.db)
+//!   - "braindump"     → WhatsApp brain-dump group (per
+//!                        WHATSAPP_BRAINDUMP_GROUP_NAMES; same path)
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, TimeZone, Utc};
@@ -29,7 +31,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 pub const CHANNEL_DISCORD_HOME: &str = "discord-home";
-pub const CHANNEL_ALFRED: &str = "alfred";
+pub const CHANNEL_WHATSAPP_GROUP: &str = "whatsapp-group";
 pub const CHANNEL_BRAINDUMP: &str = "braindump";
 /// Calendar event delivery via JARVIS + Claude.ai Calendar MCP (ADR-007).
 pub const CHANNEL_CALENDAR: &str = "calendar";
@@ -40,7 +42,7 @@ pub const CHANNEL_WHATSAPP_DM: &str = "whatsapp-dm";
 
 pub const KNOWN_CHANNELS: &[&str] = &[
     CHANNEL_DISCORD_HOME,
-    CHANNEL_ALFRED,
+    CHANNEL_WHATSAPP_GROUP,
     CHANNEL_BRAINDUMP,
     CHANNEL_CALENDAR,
     CHANNEL_WHATSAPP_DM,
@@ -215,6 +217,14 @@ async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
             }
         }
     }
+
+    // Rule 7 cleanup: the conversational WhatsApp channel value was once
+    // "alfred" (the persona name) — renamed to "whatsapp-group" to match
+    // venue-based naming (parallel to "whatsapp-dm"). Idempotent: no-op
+    // once the rename has run.
+    sqlx::query("UPDATE reminder_channels SET channel = 'whatsapp-group' WHERE channel = 'alfred'")
+        .execute(pool)
+        .await?;
 
     Ok(())
 }

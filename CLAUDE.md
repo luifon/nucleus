@@ -229,8 +229,8 @@ unset) to resolve the offset, and resolve relative phrases ("tomorrow",
 known set. Default is `discord-home`. Examples:
 
 - `--channels discord-home`
-- `--channels alfred`
-- `--channels discord-home,alfred` (delivers to both, per-channel retry)
+- `--channels whatsapp-group`
+- `--channels discord-home,whatsapp-group` (delivers to both, per-channel retry)
 
 Other subcommands:
 - `reminders list` — active/pending reminders with next fire time and
@@ -252,9 +252,9 @@ it anyway — one delivery, then advance to the next future match.
 
 Supported `--channels` values:
 - `discord-home` (default) — posts in the configured Discord home channel
-- `alfred` — WhatsApp conversational group (first entry of
+- `whatsapp-group` — WhatsApp conversational group (first entry of
   `WHATSAPP_ALLOWED_GROUP_NAMES`). Goes through the outbound_queue in
-  `memory/whatsapp.db`; Alfred drains every 5s
+  `memory/whatsapp.db`; the WhatsApp bot drains every 1s
 - `braindump` — WhatsApp Brain Dump group (first entry of
   `WHATSAPP_BRAINDUMP_GROUP_NAMES`). Same queue mechanism
 - `whatsapp-dm` — WhatsApp DM to the operator's JID (first entry of
@@ -272,11 +272,12 @@ Supported `--channels` values:
   "schedule the Q3 review for tomorrow 9am". Cron-recurring reminders
   on `--channels calendar` create one event per fire — fine for
   occasional recurrence, wrong for "every weekday" (you'd flood the
-  calendar). Prefer `discord-home` or `alfred` for those.
+  calendar). Prefer `discord-home` or `whatsapp-group` for those.
 
 Pick the channels based on where the user asked. "Remind me on
-WhatsApp" or "remind me here" (when they're already in Alfred) →
-`alfred`. No default to WhatsApp — Discord is the safe default for
+WhatsApp" or "remind me here" (when they're already in the WhatsApp
+conversational group) → `whatsapp-group`. No default to WhatsApp —
+Discord is the safe default for
 unattended delivery, since the WhatsApp app is on the user's phone and
 could be muted/inactive. "Schedule X" / "put X on my calendar" /
 "invite me to X" → `calendar` (typically combined with `discord-home`
