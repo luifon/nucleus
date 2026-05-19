@@ -799,9 +799,9 @@ async fn deliver(
             let body = format!("{}🔔 **Reminder:** {}", mention, r.body);
             discord_sdk::send_announcement(&settings.discord.home_channel_id, &body).await
         }
-        store::CHANNEL_ALFRED | store::CHANNEL_BRAINDUMP | store::CHANNEL_WHATSAPP_DM => {
+        store::CHANNEL_WHATSAPP_GROUP | store::CHANNEL_BRAINDUMP | store::CHANNEL_WHATSAPP_DM => {
             let env_var = match channel {
-                store::CHANNEL_ALFRED => "WHATSAPP_ALLOWED_GROUP_NAMES",
+                store::CHANNEL_WHATSAPP_GROUP => "WHATSAPP_ALLOWED_GROUP_NAMES",
                 store::CHANNEL_BRAINDUMP => "WHATSAPP_BRAINDUMP_GROUP_NAMES",
                 store::CHANNEL_WHATSAPP_DM => "WHATSAPP_ALLOWED_DM_JIDS",
                 _ => unreachable!(),
@@ -946,7 +946,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
 
 /// First non-empty entry from a comma-separated env var. Used to pick
 /// the default delivery target for WhatsApp channels — the first listed
-/// group name (alfred/braindump) or the first listed DM JID.
+/// group name (whatsapp-group/braindump) or the first listed DM JID.
 fn first_csv_entry(env_var: &str) -> Option<String> {
     std::env::var(env_var)
         .ok()?

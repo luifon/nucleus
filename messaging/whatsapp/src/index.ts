@@ -49,20 +49,21 @@ const baileysLogger = pino({ level: "silent" });
 /**
  * Resolved allowlist — JID → role. The role decides which pipeline runs:
  *
- *   "alfred"    — conversational. Send a message, get a reply via SessionPool.
- *                 Voice memos are transcribed → asked → reply.
- *   "braindump" — capture-only. Inbound messages get classified and filed
- *                 into the PARA-organized vault (T3). Voice memos are
- *                 transcribed → filed as PARA notes. The bot may reply
- *                 with confirmation ("filed to 2-Areas/Nucleus/...") or
- *                 escalate when classification is uncertain (Phase 4).
+ *   "whatsapp-group" — conversational. Send a message, get a reply via
+ *                      SessionPool. Voice memos are transcribed → asked
+ *                      → reply.
+ *   "braindump"      — capture-only. Inbound messages get classified and
+ *                      filed into the PARA-organized vault (T3). Voice
+ *                      memos are transcribed → filed as PARA notes. The
+ *                      bot may reply with confirmation or escalate when
+ *                      classification is uncertain (Phase 4).
  *
  * Built at connection.open from the four allowlist sources in Config
- * (alfred chatIds + groupNames, braindump chatIds + groupNames). Empty
+ * (group chatIds + groupNames, braindump chatIds + groupNames). Empty
  * until populated. Held in module scope so the message handler can read it
  * without plumbing through args.
  */
-type ChatRole = "alfred" | "braindump" | "dm";
+type ChatRole = "whatsapp-group" | "braindump" | "dm";
 const allowedJids = new Map<string, ChatRole>();
 
 /** JID-shape discriminator (ADR-005b). Groups end `@g.us`; DMs end
@@ -281,11 +282,11 @@ async function resolveAllowlist(sock: any, config: Config): Promise<void> {
   // Seed with literal JIDs from env. Brain-dump assignments take precedence
   // if a JID somehow appears in both lists (we never want a brain-dump
   // capture chat to also get conversational replies — pick one role).
-  for (const jid of config.allowedChatIds) allowedJids.set(jid, "alfred");
+  for (const jid of config.allowedChatIds) allowedJids.set(jid, "whatsapp-group");
   for (const jid of config.brainDumpChatIds) allowedJids.set(jid, "braindump");
-  const wantAlfred = new Set(config.allowedGroupNames.map((n) => n.toLowerCase()));
+  const wantGroup = new Set(config.allowedGroupNames.map((n) => n.toLowerCase()));
   const wantBrainDump = new Set(config.brainDumpGroupNames.map((n) => n.toLowerCase()));
-  if (!wantAlfred.size && !wantBrainDump.size) {
+  if (!wantGroup.size && !wantBrainDump.size) {
     log.info({ allowedJids: [...allowedJids] }, "whatsapp: allowlist resolved (no group lookups needed)");
     return;
   }
@@ -301,22 +302,22 @@ async function resolveAllowlist(sock: any, config: Config): Promise<void> {
         allowedJids.set(jid, "braindump");
         groupNameToJid.set(name, jid);
         matches.push({ jid, name, role: "braindump" });
-      } else if (wantAlfred.has(lower)) {
-        allowedJids.set(jid, "alfred");
+      } else if (wantGroup.has(lower)) {
+        allowedJids.set(jid, "whatsapp-group");
         groupNameToJid.set(name, jid);
-        matches.push({ jid, name, role: "alfred" });
+        matches.push({ jid, name, role: "whatsapp-group" });
       }
     }
     log.info(
       {
-        requestedAlfred: config.allowedGroupNames,
+        requestedGroup: config.allowedGroupNames,
         requestedBrainDump: config.brainDumpGroupNames,
         matched: matches,
         allowedJids: Object.fromEntries(allowedJids),
       },
       "whatsapp: allowlist resolved",
     );
-    const totalRequested = wantAlfred.size + wantBrainDump.size;
+    const totalRequested = wantGroup.size + wantBrainDump.size;
     if (matches.length < totalRequested) {
       log.warn(
         "whatsapp: one or more group names did not match any participating group — bot will be deaf to them",

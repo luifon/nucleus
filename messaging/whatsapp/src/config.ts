@@ -133,7 +133,7 @@ export interface Config {
   claudeBin: string;
   permissionMode: string;
   disallowedTools: string[];
-  /** Conversational allowlist: JID → role "alfred" (the conversational role). */
+  /** Conversational allowlist: JID → role "whatsapp-group" (the conversational role). */
   allowedChatIds: string[];
   /** Conversational allowlist by group name. */
   allowedGroupNames: string[];
