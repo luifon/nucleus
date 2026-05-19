@@ -151,12 +151,20 @@ export interface Config {
    *  the underlying phone number user part. */
   allowedSenders: Set<string>;
   discoverMode: boolean;
-  /** Persona markdown body fed to `--append-system-prompt`. Resolved via
-   *  `NUCLEUS_PERSONA_WHATSAPP` per ADR-009. */
-  appendSystemPrompt: string;
-  /** Persona display name used in the reply-signature footer. Comes from
-   *  the persona file's frontmatter `display_name`, falling back to the
-   *  slug (ADR-009). Replaces the legacy `WHATSAPP_PERSONA_NAME` env var. */
+  /** Persona markdown body for conversational groups (ADR-005b: `group`
+   *  context). Resolved via NUCLEUS_PERSONA_WHATSAPP_GROUP, falling back
+   *  to NUCLEUS_PERSONA_WHATSAPP. Fed to `--append-system-prompt`. */
+  appendSystemPromptGroup: string;
+  /** Persona markdown body for DMs (ADR-005b: `dm` context). Resolved via
+   *  NUCLEUS_PERSONA_WHATSAPP_DM, falling back to NUCLEUS_PERSONA_WHATSAPP. */
+  appendSystemPromptDm: string;
+  /** Persona markdown body for brain-dump spawns (ADR-005b: `braindump`
+   *  context). Resolved via NUCLEUS_PERSONA_WHATSAPP_BRAINDUMP, falling
+   *  back to NUCLEUS_PERSONA_WHATSAPP. */
+  appendSystemPromptBraindump: string;
+  /** Persona display name for the reply-signature footer. ADR-005b
+   *  resolves persona *bodies* per context but keeps a single venue-level
+   *  display name — the footer label is uniform across contexts. */
   personaDisplayName: string;
   vaultPath: string;
   diaryRoot: string;
@@ -178,7 +186,13 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
   const obsidian = parsed.obsidian ?? {};
 
   const userName = envRequired("NUCLEUS_USER_NAME");
-  const persona = resolvePersona(workspaceRoot, userName, "whatsapp");
+  // ADR-005b: three context-scoped resolutions; each falls back to the
+  // venue default if its override env var isn't set. Single display name
+  // (from the venue default, no context) keeps the footer uniform.
+  const personaDefault = resolvePersona(workspaceRoot, userName, "whatsapp");
+  const personaGroup = resolvePersona(workspaceRoot, userName, "whatsapp", "group");
+  const personaDm = resolvePersona(workspaceRoot, userName, "whatsapp", "dm");
+  const personaBraindump = resolvePersona(workspaceRoot, userName, "whatsapp", "braindump");
 
   const rawVault = (obsidian.vault_path ?? "~/Documents/Obsidian") as string;
   const vaultPath = rawVault.startsWith("~/")
@@ -204,8 +218,10 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
         .filter((s) => s.length > 0),
     ),
     discoverMode: discover,
-    appendSystemPrompt: persona.body,
-    personaDisplayName: persona.displayName,
+    appendSystemPromptGroup: personaGroup.body,
+    appendSystemPromptDm: personaDm.body,
+    appendSystemPromptBraindump: personaBraindump.body,
+    personaDisplayName: personaDefault.displayName,
     vaultPath,
     diaryRoot: path.resolve(workspaceRoot, diary.root ?? "memory/diaries"),
     dbPath: path.join(workspaceRoot, "memory/whatsapp.db"),

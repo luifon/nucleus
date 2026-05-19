@@ -62,8 +62,14 @@ const baileysLogger = pino({ level: "silent" });
  * until populated. Held in module scope so the message handler can read it
  * without plumbing through args.
  */
-type ChatRole = "alfred" | "braindump";
+type ChatRole = "alfred" | "braindump" | "dm";
 const allowedJids = new Map<string, ChatRole>();
+
+/** JID-shape discriminator (ADR-005b). Groups end `@g.us`; DMs end
+ *  `@s.whatsapp.net`. Anything else (channels, broadcasts) is unsupported. */
+function chatType(jid: string): "group" | "dm" {
+  return jid.endsWith("@g.us") ? "group" : "dm";
+}
 
 /** Reverse lookup populated by resolveAllowlist: group name (case-
  *  sensitive, as configured in .env) → JID. Used by the outbound queue
@@ -135,30 +141,44 @@ async function main() {
 
   const sessions = new SessionPool({
     workspaceRoot: config.workspaceRoot,
-    appendSystemPrompt: config.appendSystemPrompt,
+    appendSystemPrompt: config.appendSystemPromptGroup,
     permissionMode: config.permissionMode,
     disallowedTools: config.disallowedTools,
     tmuxSession: "nucleus-whatsapp",
     idleTimeoutMs: 4 * 60 * 60 * 1000, // 4h
   });
 
-  // Background idle reaper.
+  // ADR-005b: a second pool with the DM-context persona. Group JIDs end
+  // `@g.us` and DM JIDs end `@s.whatsapp.net`, so the keys never collide
+  // — we use chatId as the key in both pools, and the dispatch chooses
+  // which pool to talk to based on chatType.
+  const sessionsDm = new SessionPool({
+    workspaceRoot: config.workspaceRoot,
+    appendSystemPrompt: config.appendSystemPromptDm,
+    permissionMode: config.permissionMode,
+    disallowedTools: config.disallowedTools,
+    tmuxSession: "nucleus-whatsapp-dm",
+    idleTimeoutMs: 4 * 60 * 60 * 1000, // 4h
+  });
+
+  // Background idle reaper covers both pools.
   setInterval(async () => {
     try {
-      const n = await sessions.reapIdle();
+      const n = (await sessions.reapIdle()) + (await sessionsDm.reapIdle());
       if (n > 0) log.info({ reaped: n }, "whatsapp: reaped idle sessions");
     } catch (e) {
       log.warn({ err: (e as Error).message }, "whatsapp: reap failed");
     }
   }, 30 * 60 * 1000);
 
-  await connect(config, store, sessions, outbound, plansStore);
+  await connect(config, store, sessions, sessionsDm, outbound, plansStore);
 }
 
 async function connect(
   config: Config,
   store: ChatSessionStore,
   sessions: SessionPool,
+  sessionsDm: SessionPool,
   outbound: OutboundQueueStore,
   plansStore: PendingPlansStore,
 ): Promise<void> {
@@ -222,7 +242,7 @@ async function connect(
       log.warn({ reason, shouldReconnect }, "whatsapp: connection closed");
       if (shouldReconnect) {
         const delay = reason === 405 ? 5000 : 2000;
-        setTimeout(() => connect(config, store, sessions, outbound, plansStore).catch((e) => log.error(e, "reconnect failed")), delay);
+        setTimeout(() => connect(config, store, sessions, sessionsDm, outbound, plansStore).catch((e) => log.error(e, "reconnect failed")), delay);
       } else {
         log.error("whatsapp: logged out — delete auth/ and re-pair");
       }
@@ -232,7 +252,7 @@ async function connect(
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
     for (const msg of messages) {
-      await handleMessage(sock, msg, config, store, sessions, plansStore).catch((e) => {
+      await handleMessage(sock, msg, config, store, sessions, sessionsDm, plansStore).catch((e) => {
         log.error({ err: e?.message }, "whatsapp: handler failed");
       });
     }
@@ -248,6 +268,9 @@ async function resolveAllowlist(sock: any, config: Config): Promise<void> {
   // capture chat to also get conversational replies — pick one role).
   for (const jid of config.allowedChatIds) allowedJids.set(jid, "alfred");
   for (const jid of config.brainDumpChatIds) allowedJids.set(jid, "braindump");
+  // ADR-005b: DM allowlist. JIDs always end `@s.whatsapp.net`; we can't
+  // collide with group JIDs (`@g.us`), so order doesn't matter here.
+  for (const jid of config.allowedDmJids) allowedJids.set(jid, "dm");
 
   const wantAlfred = new Set(config.allowedGroupNames.map((n) => n.toLowerCase()));
   const wantBrainDump = new Set(config.brainDumpGroupNames.map((n) => n.toLowerCase()));
@@ -389,6 +412,7 @@ async function handleMessage(
   config: Config,
   store: ChatSessionStore,
   sessions: SessionPool,
+  sessionsDm: SessionPool,
   plansStore: PendingPlansStore,
 ): Promise<void> {
   const chatId = msg.key.remoteJid;
@@ -401,53 +425,63 @@ async function handleMessage(
   }
 
   // ---- IRON-TIGHT FILTERS ----
-  // 1. Allowlist must be in the resolved map (env-derived JIDs ∪ name-matched groups).
+  // 1. Allowlist must be in the resolved map (env-derived JIDs ∪ name-matched groups
+  //    ∪ ADR-005b DM JIDs).
   const role = allowedJids.get(chatId);
   if (!role) return;
 
-  // 2. Groups only — no DMs, no broadcasts, no channels.
-  if (!chatId.endsWith("@g.us")) {
-    log.warn({ chatId }, "whatsapp: chatId in allowlist but not a group — ignoring");
-    return;
-  }
+  // 2. Chat-type sanity. Groups end @g.us; DMs end @s.whatsapp.net.
+  //    Anything else (channels, broadcasts) is unsupported.
+  const kind = chatType(chatId);
+  if (kind === "group" && !chatId.endsWith("@g.us")) return;
 
   // 3. Don't reply to ourselves — would loop. Silent skip, not a warn.
-  if (msg.key.fromMe) {
-    return;
-  }
+  if (msg.key.fromMe) return;
 
-  // 4. Per-sender allowlist. Pre-bot-number-split this gate didn't exist
-  //    because bot==user (every legit message was fromMe). Now the bot
-  //    runs as a separate identity, so we must explicitly enumerate who
-  //    is allowed to address it inside an allowlisted group. Without this,
-  //    anyone who creates a group with a colliding name (`Alfred`,
-  //    `Brain Dump`) and adds the bot could spam it.
-  const participant = msg.key.participant ?? "";
-  const senderOk = await isSenderAllowed(sock, participant, config.allowedSenders);
-  if (!senderOk) {
-    log.warn(
-      { chatId, participant },
-      "whatsapp: sender not in WHATSAPP_ALLOWED_SENDERS — ignoring (add the listed participant if this is you)",
-    );
-    return;
-  }
+  if (kind === "group") {
+    // 4G. Per-sender allowlist. Pre-bot-number-split this gate didn't exist
+    //     because bot==user (every legit message was fromMe). Now the bot
+    //     runs as a separate identity, so we must explicitly enumerate who
+    //     is allowed to address it inside an allowlisted group. Without this,
+    //     anyone who creates a group with the same name as one of yours and
+    //     adds the bot could spam it.
+    const participant = msg.key.participant ?? "";
+    const senderOk = await isSenderAllowed(sock, participant, config.allowedSenders);
+    if (!senderOk) {
+      log.warn(
+        { chatId, participant },
+        "whatsapp: sender not in WHATSAPP_ALLOWED_SENDERS — ignoring (add the listed participant if this is you)",
+      );
+      return;
+    }
 
-  // 5. Membership-change tripwire. The sender allowlist defends against
-  //    *messages* from the wrong identity; this tripwire still flags
-  //    group-composition drift so we notice if someone gets added to an
-  //    Alfred/Brain Dump group, even if they never speak.
-  let memberIds: string[] = [];
-  try {
-    const metadata = await sock.groupMetadata(chatId);
-    memberIds = metadata.participants.map((p: any) => p.id);
-  } catch (e) {
-    log.warn({ err: (e as Error).message }, "whatsapp: groupMetadata failed — refusing to respond");
-    return;
-  }
-  const { disabled, reason } = store.observeMembers(chatId, memberIds);
-  if (disabled) {
-    log.warn({ chatId, reason }, "whatsapp: group disabled — manual re-enable required");
-    return;
+    // 5G. Membership-change tripwire. The sender allowlist defends against
+    //     *messages* from the wrong identity; this tripwire still flags
+    //     group-composition drift so we notice if someone gets added to an
+    //     allowlisted group, even if they never speak.
+    let memberIds: string[] = [];
+    try {
+      const metadata = await sock.groupMetadata(chatId);
+      memberIds = metadata.participants.map((p: any) => p.id);
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "whatsapp: groupMetadata failed — refusing to respond");
+      return;
+    }
+    const { disabled, reason } = store.observeMembers(chatId, memberIds);
+    if (disabled) {
+      log.warn({ chatId, reason }, "whatsapp: group disabled — manual re-enable required");
+      return;
+    }
+  } else {
+    // 4D. DM path (ADR-005b). The sender == chatId by definition; the JID
+    //     is on `allowedDmJids` because role resolution succeeded. No
+    //     participant allowlist + no membership tripwire (single-party
+    //     chat). The role can't be `braindump` here — we never seed
+    //     @s.whatsapp.net JIDs as braindump — but assert defensively.
+    if (role !== "dm") {
+      log.warn({ chatId, role }, "whatsapp: DM with non-dm role — refusing");
+      return;
+    }
   }
   // ---- END FILTERS ----
 
@@ -489,9 +523,34 @@ async function handleMessage(
 
   if (!text.trim()) return;
 
+  // ADR-005b: if a DM looks like an explicit brain-dump capture, nudge the
+  // operator to the brain-dump group instead of silently routing the
+  // capture-shaped input through the conversational handler. The check is
+  // intentionally narrow — there are no current trigger keywords in this
+  // codebase, so the predicate only fires on prefixed signals. Voice memos
+  // in DM are treated as conversation (see ADR-005b §"Brain-dump in DM").
+  if (role === "dm" && looksLikeBrainDumpCapture(text, inputKind)) {
+    await sock.sendMessage(chatId, {
+      text: formatReply("brain-dump goes to the brain-dump group."),
+    });
+    return;
+  }
+
   log.info({ chatId, role, kind: inputKind, len: text.length }, "whatsapp: processing message");
 
-  await handleConversational(sock, chatId, text, inputKind, config, store, sessions);
+  const pool = role === "dm" ? sessionsDm : sessions;
+  await handleConversational(sock, chatId, text, inputKind, config, store, pool);
+}
+
+/** Brain-dump-shaped detection for DM gating (ADR-005b). Today's brain-dump
+ *  pipeline has no content-based triggers — capture happens because the
+ *  message arrived in a brain-dump-role group. So this predicate only
+ *  flags explicit slash-prefixed signals (e.g., `/sync`, `/braindump`)
+ *  the operator might type in DM by mistake. Voice memos in DM are NOT
+ *  flagged — per ADR-005b they're transcribed and treated as conversation. */
+function looksLikeBrainDumpCapture(text: string, _inputKind: "text" | "voice"): boolean {
+  const t = text.trim().toLowerCase();
+  return t.startsWith("/sync") || t.startsWith("/braindump") || t.startsWith("/brain-dump");
 }
 
 async function handleConversational(

@@ -163,7 +163,7 @@ export async function planCapture(
 
   const spawnOpts: SpawnOptions = {
     workspaceRoot: config.workspaceRoot,
-    appendSystemPrompt: config.appendSystemPrompt,
+    appendSystemPrompt: config.appendSystemPromptBraindump,
     permissionMode: config.permissionMode,
     disallowedTools: config.disallowedTools,
     // Pre-approve the ack helper so the auto-mode classifier doesn't
@@ -232,7 +232,7 @@ export async function interpretResponse(
 
   const spawnOpts: SpawnOptions = {
     workspaceRoot: config.workspaceRoot,
-    appendSystemPrompt: config.appendSystemPrompt,
+    appendSystemPrompt: config.appendSystemPromptBraindump,
     permissionMode: config.permissionMode,
     disallowedTools: config.disallowedTools,
     tmuxSession: TMUX_SESSION,
