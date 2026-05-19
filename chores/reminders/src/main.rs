@@ -799,15 +799,16 @@ async fn deliver(
             let body = format!("{}🔔 **Reminder:** {}", mention, r.body);
             discord_sdk::send_announcement(&settings.discord.home_channel_id, &body).await
         }
-        store::CHANNEL_ALFRED | store::CHANNEL_BRAINDUMP => {
+        store::CHANNEL_ALFRED | store::CHANNEL_BRAINDUMP | store::CHANNEL_WHATSAPP_DM => {
             let env_var = match channel {
                 store::CHANNEL_ALFRED => "WHATSAPP_ALLOWED_GROUP_NAMES",
                 store::CHANNEL_BRAINDUMP => "WHATSAPP_BRAINDUMP_GROUP_NAMES",
+                store::CHANNEL_WHATSAPP_DM => "WHATSAPP_ALLOWED_DM_JIDS",
                 _ => unreachable!(),
             };
-            let target = first_group_name(env_var).ok_or_else(|| {
+            let target = first_csv_entry(env_var).ok_or_else(|| {
                 anyhow!(
-                    "channel {:?} requires {env_var} to be set with at least one group",
+                    "channel {:?} requires {env_var} to be set with at least one entry",
                     channel
                 )
             })?;
@@ -845,11 +846,12 @@ async fn deliver_calendar(
     );
     let end_utc = start_utc + duration;
 
-    let persona_path = workspace_root.join("messaging/gmail/persona.md");
-    let persona = tokio::fs::read_to_string(&persona_path)
-        .await
-        .with_context(|| format!("reading {}", persona_path.display()))?;
-    let persona = config::substitute(&persona, &settings.identity);
+    // ADR-009: persona resolved from `personas/<slug>.md` via env var, not
+    // from the deleted `messaging/gmail/persona.md` file. `${GMAIL_ACCOUNT}`
+    // substitution happens after resolution, same as in metabolize.rs.
+    let persona = config::resolve_persona(&settings.identity, "gmail", None)
+        .context("resolving Gmail persona for calendar reminder (ADR-009)")?;
+    let persona = config::substitute_gmail(&persona.body, &settings.gmail);
 
     let prompt = format!(
         r#"Schedule a calendar event using the `mcp__claude_ai_Google_Calendar__create_event` tool.
@@ -942,7 +944,10 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
-fn first_group_name(env_var: &str) -> Option<String> {
+/// First non-empty entry from a comma-separated env var. Used to pick
+/// the default delivery target for WhatsApp channels — the first listed
+/// group name (alfred/braindump) or the first listed DM JID.
+fn first_csv_entry(env_var: &str) -> Option<String> {
     std::env::var(env_var)
         .ok()?
         .split(',')

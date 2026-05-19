@@ -33,12 +33,17 @@ pub const CHANNEL_ALFRED: &str = "alfred";
 pub const CHANNEL_BRAINDUMP: &str = "braindump";
 /// Calendar event delivery via JARVIS + Claude.ai Calendar MCP (ADR-007).
 pub const CHANNEL_CALENDAR: &str = "calendar";
+/// WhatsApp DM to the operator's JID (ADR-005b). Posts to the first
+/// entry of WHATSAPP_ALLOWED_DM_JIDS; the channel is unavailable if
+/// that list is empty.
+pub const CHANNEL_WHATSAPP_DM: &str = "whatsapp-dm";
 
 pub const KNOWN_CHANNELS: &[&str] = &[
     CHANNEL_DISCORD_HOME,
     CHANNEL_ALFRED,
     CHANNEL_BRAINDUMP,
     CHANNEL_CALENDAR,
+    CHANNEL_WHATSAPP_DM,
 ];
 
 /// Per-channel retry budget before marking the channel `failed` for this fire.
