@@ -187,10 +187,20 @@ npm run discover    # prints a QR code as PNG (opens in Preview) + ASCII
 # Substitutes __USER_HOME__ → $HOME and __TZ__ → $NUCLEUS_TZ (auto-
 # detected from /etc/localtime if unset) in each plist template, copies
 # to ~/Library/LaunchAgents/, loads via launchctl. 10 services total
-# (discord, alfred, news-api, news-fetcher, dashboard, chat,
+# (discord, whatsapp, news-api, news-fetcher, dashboard, chat,
 # distiller-hourly, distiller-weekly, preference-learner,
 # reminders-tick).
 ```
+
+> **Upgrading from a pre-ADR-009 install?** The WhatsApp service was
+> renamed `alfred → whatsapp` (Rule 7 — venue names in code, persona
+> names only in config). Before re-running `install.sh`, unload the old
+> service so launchctl doesn't keep firing it:
+>
+> ```bash
+> launchctl bootout gui/$UID/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.alfred
+> # then re-run install.sh — it will load dev.nucleus.whatsapp fresh
+> ```
 
 Verify:
 ```bash
@@ -377,7 +387,7 @@ nucleus/
 ```bash
 # Tail any service's log
 tail -f memory/discord.log
-tail -f memory/alfred.log
+tail -f memory/whatsapp.log
 tail -f memory/news-fetcher.log
 tail -f memory/dashboard.log
 
@@ -427,7 +437,7 @@ cd messaging/whatsapp && npm run send -- <phone-or-jid> "<message>"
 
 # Re-pair WhatsApp (e.g. moving to a new number)
 rm -rf messaging/whatsapp/auth
-launchctl unload ~/Library/LaunchAgents/"${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}".alfred.plist
+launchctl unload ~/Library/LaunchAgents/"${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}".whatsapp.plist
 cd messaging/whatsapp && npm run discover
 # scan QR, update .env if the group changed, then re-install via install.sh
 ```
