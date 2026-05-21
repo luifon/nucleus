@@ -532,8 +532,11 @@ fn sanitize_summary(s: &str) -> String {
         }
     }
     let trimmed: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    if trimmed.len() > 600 {
-        format!("{}...", &trimmed[..600])
+    // Truncate by char count, not byte index — multi-byte UTF-8 (smart
+    // quotes, emoji) lands mid-character at a byte boundary and panics.
+    if trimmed.chars().count() > 600 {
+        let head: String = trimmed.chars().take(600).collect();
+        format!("{}...", head)
     } else {
         trimmed
     }
