@@ -799,16 +799,10 @@ async fn deliver(
             let body = format!("{}🔔 **Reminder:** {}", mention, r.body);
             discord_sdk::send_announcement(&settings.discord.home_channel_id, &body).await
         }
-        store::CHANNEL_WHATSAPP_GROUP | store::CHANNEL_BRAINDUMP | store::CHANNEL_WHATSAPP_DM => {
-            let env_var = match channel {
-                store::CHANNEL_WHATSAPP_GROUP => "WHATSAPP_ALLOWED_GROUP_NAMES",
-                store::CHANNEL_BRAINDUMP => "WHATSAPP_BRAINDUMP_GROUP_NAMES",
-                store::CHANNEL_WHATSAPP_DM => "WHATSAPP_ALLOWED_DM_JIDS",
-                _ => unreachable!(),
-            };
-            let target = first_csv_entry(env_var).ok_or_else(|| {
+        store::CHANNEL_WHATSAPP_DM => {
+            let target = first_csv_entry("WHATSAPP_ALLOWED_DM_JIDS").ok_or_else(|| {
                 anyhow!(
-                    "channel {:?} requires {env_var} to be set with at least one entry",
+                    "channel {:?} requires WHATSAPP_ALLOWED_DM_JIDS to be set with at least one entry",
                     channel
                 )
             })?;

@@ -229,8 +229,8 @@ unset) to resolve the offset, and resolve relative phrases ("tomorrow",
 known set. Default is `discord-home`. Examples:
 
 - `--channels discord-home`
-- `--channels whatsapp-group`
-- `--channels discord-home,whatsapp-group` (delivers to both, per-channel retry)
+- `--channels whatsapp-dm`
+- `--channels discord-home,whatsapp-dm` (delivers to both, per-channel retry)
 
 Other subcommands:
 - `reminders list` — active/pending reminders with next fire time and
@@ -252,16 +252,14 @@ it anyway — one delivery, then advance to the next future match.
 
 Supported `--channels` values:
 - `discord-home` (default) — posts in the configured Discord home channel
-- `whatsapp-group` — WhatsApp conversational group (first entry of
-  `WHATSAPP_ALLOWED_GROUP_NAMES`). Goes through the outbound_queue in
-  `memory/whatsapp.db`; the WhatsApp bot drains every 1s
-- `braindump` — WhatsApp Brain Dump group (first entry of
-  `WHATSAPP_BRAINDUMP_GROUP_NAMES`). Same queue mechanism
 - `whatsapp-dm` — WhatsApp DM to the operator's JID (first entry of
-  `WHATSAPP_ALLOWED_DM_JIDS`, ADR-005b). Same queue mechanism as the
-  group channels; if the allowlist is empty the channel errors at
-  delivery time. Useful when you want a reminder to land in the
-  operator's own DM thread instead of a self-group
+  `WHATSAPP_ALLOWED_DM_JIDS`, ADR-005b). Goes through the outbound_queue
+  in `memory/whatsapp.db`; the WhatsApp bot drains every 1s. The
+  delivery target may be supplied as a bare digit string or a full
+  `<digits>@s.whatsapp.net` JID — the bot normalizes either form.
+- (The brain-dump group is NOT a reminder destination. The brain-dump
+  pipeline owns that surface for capture only; personal reminders go
+  to DM.)
 - `calendar` — creates a Google Calendar event via JARVIS + Claude.ai
   Calendar MCP (ADR-007). The event is created on the trash account
   (`$NUCLEUS_GMAIL_ACCOUNT`) with `$NUCLEUS_PERSONAL_EMAIL` as attendee,
@@ -272,12 +270,11 @@ Supported `--channels` values:
   "schedule the Q3 review for tomorrow 9am". Cron-recurring reminders
   on `--channels calendar` create one event per fire — fine for
   occasional recurrence, wrong for "every weekday" (you'd flood the
-  calendar). Prefer `discord-home` or `whatsapp-group` for those.
+  calendar). Prefer `discord-home` or `whatsapp-dm` for those.
 
 Pick the channels based on where the user asked. "Remind me on
-WhatsApp" or "remind me here" (when they're already in the WhatsApp
-conversational group) → `whatsapp-group`. No default to WhatsApp —
-Discord is the safe default for
+WhatsApp" → `whatsapp-dm`. No default to WhatsApp — Discord is the
+safe default for
 unattended delivery, since the WhatsApp app is on the user's phone and
 could be muted/inactive. "Schedule X" / "put X on my calendar" /
 "invite me to X" → `calendar` (typically combined with `discord-home`

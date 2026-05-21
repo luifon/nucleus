@@ -419,7 +419,7 @@ tmux kill-window -t nucleus-discord:<window-prefix>
 ./target/release/reminders add \
   --at "2026-05-14T16:45:00<your-tz-offset>" \
   --body "dentist appointment" \
-  --channels discord-home         # or whatsapp-group | braindump | whatsapp-dm | calendar
+  --channels discord-home         # or whatsapp-dm | calendar
 
 # Skill-fire reminder (ADR-008): spawns a one-shot Claude session at fire
 # time, executes the prompt (possibly invoking a skill), forwards the

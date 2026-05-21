@@ -16,11 +16,15 @@
 //!
 //! Channel codes (used in `reminder_channels.channel`):
 //!   - "discord-home"  → DISCORD_HOME_CHANNEL_ID
-//!   - "whatsapp-group" → WhatsApp conversational group (per
-//!                        WHATSAPP_ALLOWED_GROUP_NAMES; via
-//!                        outbound_queue in memory/whatsapp.db)
-//!   - "braindump"     → WhatsApp brain-dump group (per
-//!                        WHATSAPP_BRAINDUMP_GROUP_NAMES; same path)
+//!   - "whatsapp-dm"   → WhatsApp DM to the operator (per
+//!                       WHATSAPP_ALLOWED_DM_JIDS; via outbound_queue
+//!                       in memory/whatsapp.db)
+//!   - "calendar"      → Google Calendar event via JARVIS + Claude.ai
+//!                       Calendar MCP (ADR-007)
+//!
+//! Brain-dump group routing is NOT exposed as a reminder channel: the
+//! brain-dump pipeline owns that surface (capture-only). Reminders go
+//! to the operator's DM.
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, TimeZone, Utc};
@@ -31,21 +35,17 @@ use std::path::Path;
 use std::str::FromStr;
 
 pub const CHANNEL_DISCORD_HOME: &str = "discord-home";
-pub const CHANNEL_WHATSAPP_GROUP: &str = "whatsapp-group";
-pub const CHANNEL_BRAINDUMP: &str = "braindump";
-/// Calendar event delivery via JARVIS + Claude.ai Calendar MCP (ADR-007).
-pub const CHANNEL_CALENDAR: &str = "calendar";
 /// WhatsApp DM to the operator's JID (ADR-005b). Posts to the first
 /// entry of WHATSAPP_ALLOWED_DM_JIDS; the channel is unavailable if
 /// that list is empty.
 pub const CHANNEL_WHATSAPP_DM: &str = "whatsapp-dm";
+/// Calendar event delivery via JARVIS + Claude.ai Calendar MCP (ADR-007).
+pub const CHANNEL_CALENDAR: &str = "calendar";
 
 pub const KNOWN_CHANNELS: &[&str] = &[
     CHANNEL_DISCORD_HOME,
-    CHANNEL_WHATSAPP_GROUP,
-    CHANNEL_BRAINDUMP,
-    CHANNEL_CALENDAR,
     CHANNEL_WHATSAPP_DM,
+    CHANNEL_CALENDAR,
 ];
 
 /// Per-channel retry budget before marking the channel `failed` for this fire.
@@ -218,13 +218,17 @@ async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
         }
     }
 
-    // Rule 7 cleanup: the conversational WhatsApp channel value was once
-    // "alfred" (the persona name) — renamed to "whatsapp-group" to match
-    // venue-based naming (parallel to "whatsapp-dm"). Idempotent: no-op
-    // once the rename has run.
-    sqlx::query("UPDATE reminder_channels SET channel = 'whatsapp-group' WHERE channel = 'alfred'")
-        .execute(pool)
-        .await?;
+    // WhatsApp reminders go to DM only. The historical "alfred" (persona
+    // name) and "whatsapp-group" (venue rename of alfred) and "braindump"
+    // (capture surface mis-used as a reminder channel) all route reminder
+    // delivery to a group — the wrong default for personal reminders.
+    // Sweep them all to "whatsapp-dm" idempotently on every startup.
+    sqlx::query(
+        "UPDATE reminder_channels SET channel = 'whatsapp-dm'
+         WHERE channel IN ('alfred', 'whatsapp-group', 'braindump')",
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
