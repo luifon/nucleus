@@ -133,7 +133,21 @@ further venues are planned; if that ever changes, keep the split.
 
 ## Rule 9 — Writing into the Obsidian vault (T3 / second brain)
 
-The vault at `~/Documents/Obsidian/` is PARA-organized (see ADR-005).
+The vault at `~/Documents/Obsidian/` is PARA-organized with three
+extension buckets (see ADR-005). 8 top-level folders, renumbered
+2026-05-21 to a rainbow scheme:
+
+| # | Folder | Belongs here |
+|---|---|---|
+| 0 | `0-Inbox` | Unclassified captures; "I'll figure out where this goes later" |
+| 1 | `1-Main-Notes` | Hubs / MOCs / recurring-question answers (curated by user) |
+| 2 | `2-Daily-Notes` | Time-anchored journal entries (`YYYY-MM-DD.md`) |
+| 3 | `3-Projects` | Short-term efforts with deadline + outcome |
+| 4 | `4-Areas` | Ongoing responsibilities, no end date |
+| 5 | `5-Resources` | Reference material on topics of interest |
+| 6 | `6-Slipbox` | Atomic evergreen ideas (Zettelkasten, flat, no sub-folders) |
+| 7 | `7-Archives` | Inactive items from any of the above |
+
 The brain-dump pipeline writes via a multi-op plan — each capture can
 emit multiple `create` / `append` / `move` ops. When you (or a bot)
 write into the vault, follow these rules:
@@ -141,24 +155,39 @@ write into the vault, follow these rules:
 1. **Decompose by major theme.** A long capture should produce multiple
    files (one per major theme), not one big markdown. Sub-headings
    inside each file separate sub-themes. Don't atomize into
-   one-idea-per-file (Zettelkasten-style is NOT what we want).
+   one-idea-per-file unless you're writing to `6-Slipbox` (where one
+   idea per note IS the convention).
 
 2. **Pick the right bucket** using the per-bucket README files as ground
-   truth (`0-Inbox/README.md`, `1-Projects/README.md`, etc). If unsure
-   between two, prefer `0-Inbox/` — better to under-classify than mis-file.
+   truth (`0-Inbox/README.md`, `1-Main-Notes/README.md`,
+   `2-Daily-Notes/README.md`, `3-Projects/README.md`,
+   `4-Areas/README.md`, `5-Resources/README.md`,
+   `6-Slipbox/README.md`, `7-Archives/README.md`). Quick routing rules:
+     - Time-anchored ("log this for today", "today I learned...") → `2-Daily-Notes/YYYY-MM-DD.md`
+     - Atomic evergreen idea, not tied to a Project/Area → `6-Slipbox/`
+     - Concrete project work → `3-Projects/<X>/` (X must already exist)
+     - Ongoing responsibility → `4-Areas/<X>/` (X must exist)
+     - Reference material → `5-Resources/<X>/` (X must exist)
+     - Hub / index / "main notes" (ONLY when explicitly directed) → `1-Main-Notes/`
+     - Explicit archive → `7-Archives/`
+     - Can't classify → `0-Inbox/` (better under-classify than mis-file)
 
 3. **Sub-folder creation is allowed but gated.** New sub-folders under
-   `1-Projects/`, `2-Areas/`, or `3-Resources/` may be created ONLY when
+   `3-Projects/`, `4-Areas/`, or `5-Resources/` may be created ONLY when
    the capture itself explicitly directs it ("create a folder for X",
    "this is a project for Y", "Y is one of my projects, put it there").
    Speculative creation by the bot is forbidden — when in doubt,
-   `0-Inbox/`. The op carries a `createsSubfolder: true` flag that the
-   validator gates on; lying about the flag means your op gets rejected.
+   `0-Inbox/` (or `6-Slipbox/` for atomic ideas). The op carries a
+   `createsSubfolder: true` flag that the validator gates on; lying
+   about the flag means your op gets rejected. `6-Slipbox` is flat —
+   never create sub-folders there.
 
 4. **Prefer APPEND over CREATE** when an existing file already covers a
    theme. Look at existing notes' titles + frontmatter; if a captured
    fragment overlaps, append to that file (the bot adds a dated
-   separator) instead of creating a new duplicate.
+   separator) instead of creating a new duplicate. For `2-Daily-Notes`,
+   if today's note already exists, ALWAYS append with a `## HH:MM`
+   sub-heading rather than creating a new file.
 
 5. **META-CORRECTIONS use `move` ops.** When a capture is correcting a
    prior misfile ("that note from earlier should be in Projects/X"),
@@ -167,7 +196,9 @@ write into the vault, follow these rules:
 
 6. **Link siblings.** Read the immediate sibling notes in the destination
    folder and add `[[wiki-links]]` to anything thematically related.
-   Don't fabricate links to notes that don't exist.
+   Don't fabricate links to notes that don't exist. `6-Slipbox` notes
+   especially: link liberally to other slipbox notes or to the relevant
+   Area/Resource so they don't orphan.
 
 7. **Frontmatter every NEW file.** YAML block at top:
    ```yaml

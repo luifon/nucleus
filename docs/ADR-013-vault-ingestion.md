@@ -28,14 +28,14 @@ Rough sketch:
 - **Trigger:** launchd `StartInterval=300`. Cheap polling.
 - **Extractors:** `pdftotext` (poppler), `pandoc` (.docx, .html), `tesseract`
   (OCR fallback when pdftotext returns empty), passthrough for .txt/.md.
-- **Output:** `3-Resources/imported/<date>-<slug>/<filename>.md`, frontmatter
+- **Output:** `5-Resources/imported/<date>-<slug>/<filename>.md`, frontmatter
   carries `original_filename`, `original_path`, `file_hash` (sha256, dedup
   key), `extraction_tool`, `ingested_at`.
 - **Source disposition:** success → `~/Nucleus-Inbox/_processed/`; failure →
   `~/Nucleus-Inbox/_failed/` with sibling `.error.txt`.
 - **Notification:** optional, configurable via `[ingest] notify_channels`
   in `nucleus.toml`. Defaults to silent.
-- **No auto-classification** in MVP — everything lands in `3-Resources/
+- **No auto-classification** in MVP — everything lands in `5-Resources/
   imported/`. Operator moves to the right bucket manually, or invokes the
   brain-dump classification pipeline (ADR-005) post-ingest.
 

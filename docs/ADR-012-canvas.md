@@ -65,8 +65,8 @@ XML-like inline blocks in the agent's message text:
 ```xml
 <canvas type="decision" id="bucket-pick-2026-05-16-abc123">
   <prompt>Which PARA bucket should this go in?</prompt>
-  <option value="1-Projects/X">1-Projects/X — active engagement</option>
-  <option value="2-Areas/Y">2-Areas/Y — ongoing</option>
+  <option value="3-Projects/X">3-Projects/X — active engagement</option>
+  <option value="4-Areas/Y">4-Areas/Y — ongoing</option>
   <option value="0-Inbox">0-Inbox — unsure</option>
 </canvas>
 ```
@@ -84,9 +84,9 @@ XML-like inline blocks in the agent's message text:
 ```xml
 <canvas type="review" id="multi-op-2026-05-16-ghi789">
   <prompt>The brain-dump plan would do these ops. Uncheck any you don't want.</prompt>
-  <item id="op-1" default="checked">create 1-Projects/X/idea.md</item>
-  <item id="op-2" default="checked">append to 3-Resources/Y.md</item>
-  <item id="op-3" default="unchecked">move 0-Inbox/old.md → 4-Archives/</item>
+  <item id="op-1" default="checked">create 3-Projects/X/idea.md</item>
+  <item id="op-2" default="checked">append to 5-Resources/Y.md</item>
+  <item id="op-3" default="unchecked">move 0-Inbox/old.md → 7-Archives/</item>
 </canvas>
 ```
 
@@ -102,7 +102,7 @@ When the user submits, the frontend posts a new user message back to the chat AP
 
 ```xml
 <canvas-response id="bucket-pick-2026-05-16-abc123">
-  <value>1-Projects/X</value>
+  <value>3-Projects/X</value>
 </canvas-response>
 ```
 

@@ -28,10 +28,13 @@ TIER 3   — Second brain               PARA-organized Obsidian vault, written b
                                       bots and the user; Claude reads via --add-dir
             ~/Documents/Obsidian/
               0-Inbox/        capture-now-organize-later landing pad
-              1-Projects/     short-term efforts with a deadline
-              2-Areas/        ongoing responsibilities
-              3-Resources/    reference material
-              4-Archives/     inactive items from the other three
+              1-Main-Notes/   hubs / MOCs / recurring-question answers
+              2-Daily-Notes/  time-anchored journal (YYYY-MM-DD.md)
+              3-Projects/     short-term efforts with a deadline
+              4-Areas/        ongoing responsibilities
+              5-Resources/    reference material
+              6-Slipbox/      atomic evergreen ideas (Zettelkasten)
+              7-Archives/     inactive items from the other buckets
 
 TIER 4   — Vector recall              ❌ deferred indefinitely
             mem0 needs an embedding + LLM provider; neither is covered by

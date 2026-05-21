@@ -43,7 +43,7 @@ import type { Config } from "./config.js";
 export type CaptureOp =
   | {
       op: "create";
-      bucket: string;             // e.g. "1-Projects/Example-Project"
+      bucket: string;             // e.g. "3-Projects/Example-Project"
       filename: string;           // leaf name
       body: string;               // markdown w/ frontmatter
       createsSubfolder: boolean;  // true if bucket sub-folder doesn't exist yet
@@ -116,15 +116,18 @@ interface ClaudePlan {
 const FALLBACK_BUCKET = "0-Inbox";
 const ALLOWED_TOPS = [
   "0-Inbox",
-  "1-Projects",
-  "2-Areas",
-  "3-Resources",
-  "4-Archives",
+  "1-Main-Notes",
+  "2-Daily-Notes",
+  "3-Projects",
+  "4-Areas",
+  "5-Resources",
+  "6-Slipbox",
+  "7-Archives",
 ];
 const NEEDS_DIRECTIVE_FOR_SUBFOLDER = new Set([
-  "1-Projects",
-  "2-Areas",
-  "3-Resources",
+  "3-Projects",
+  "4-Areas",
+  "5-Resources",
 ]);
 
 const TMUX_SESSION = "nucleus-whatsapp-braindump";
@@ -763,7 +766,7 @@ OUTPUT SHAPE:
   "ops": [
     {
       "op": "create",
-      "bucket": "1-Projects/Example-Project",
+      "bucket": "3-Projects/Example-Project",
       "filename": "${today}-contract.md",
       "body": "<full markdown body INCLUDING YAML frontmatter>",
       "createsSubfolder": false,
@@ -771,14 +774,14 @@ OUTPUT SHAPE:
     },
     {
       "op": "append",
-      "targetPath": "1-Projects/Example-Project/contract.md",
+      "targetPath": "3-Projects/Example-Project/contract.md",
       "body": "<fragment to append; bot adds a dated separator>",
       "reason": "<one sentence>"
     },
     {
       "op": "move",
       "fromPath": "0-Inbox/some-file.md",
-      "toBucket": "1-Projects/Example-Project",
+      "toBucket": "3-Projects/Example-Project",
       "toFilename": "",
       "createsSubfolder": false,
       "reason": "<one sentence>"
@@ -811,6 +814,24 @@ DECOMPOSITION (the most important rule):
    identify what's being corrected. The correction does the work — do
    NOT file a new note describing what should happen.
 
+3a. ROUTING by bucket type (don't default to 0-Inbox blindly):
+    - 0-Inbox        — capture you genuinely can't classify yet
+    - 1-Main-Notes   — ONLY when capture explicitly says "main notes" /
+                       "index" / "hub note" (curated by user, not bot)
+    - 2-Daily-Notes  — when capture is time-anchored ("log this for
+                       today", "today I learned X"). Name YYYY-MM-DD.md
+                       for current date; APPEND if file exists
+    - 3-Projects/X   — concrete project work; X must already exist or
+                       capture must explicitly direct creation
+    - 4-Areas/X      — ongoing responsibility content; X must exist or
+                       capture must direct creation
+    - 5-Resources/X  — reference material; X must exist or capture
+                       must direct creation
+    - 6-Slipbox      — atomic evergreen IDEAS (single-concept, not
+                       project/area-tied). Self-contained, links to
+                       siblings. Flat — no sub-folders.
+    - 7-Archives     — only for explicit archive ops; not a default
+
 PLACEMENT (CLAUDE.md Rule 9):
 
 4. Use existing folders when one fits. If nothing fits AND the capture
@@ -823,7 +844,7 @@ PLACEMENT (CLAUDE.md Rule 9):
    Speculative creation is forbidden — when in doubt, 0-Inbox.
 
 6. Top-level dirs always exist; you don't need createsSubfolder for
-   them. The flag matters for sub-folders inside Projects/Areas/Resources.
+   them. The flag matters for sub-folders inside 3-Projects/4-Areas/5-Resources.
    The bot validates and rejects ops that try to create a sub-folder
    without the flag set.
 
