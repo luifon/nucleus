@@ -26,6 +26,7 @@ import {
   type OutboundRow,
 } from "./db.js";
 import { record as recordDiary } from "./diary.js";
+import { alertDiscordHome } from "./discord_alert.js";
 import { transcribe } from "./transcribe.js";
 import {
   planCapture,
@@ -97,6 +98,17 @@ const groupNameToJid = new Map<string, string>();
 // instant for the operator.
 const OUTBOUND_DRAIN_INTERVAL_MS = 1_000;
 const OUTBOUND_MAX_ATTEMPTS = 5;
+
+// Connection-rot watchdog. Baileys can land in a state where the socket
+// is "connected" to its event handlers but every sendMessage throws
+// "Connection Closed" — inbound traffic still flows, but outbound is
+// silently broken. We've seen the bot sit in this state for hours,
+// accumulating failed outbound_queue rows with no alert. Solution: count
+// consecutive "Connection Closed"-shaped failures across the whole drain
+// loop, alert + exit(1) (launchd respawns with fresh Baileys state) once
+// the threshold is hit, reset on the first successful send.
+const CONNECTION_ROT_THRESHOLD = 5;
+let consecutiveConnectionFailures = 0;
 
 // ADR-005a: braindump plan timeout + sweep cadence.
 const PLAN_TIMEOUT_MS = 30 * 60 * 1000;
@@ -357,13 +369,30 @@ function startOutboundDrain(sock: any, outbound: OutboundQueueStore, config: Con
         continue;
       }
       try {
+        if (process.env.NUCLEUS_WHATSAPP_FORCE_SEND_FAIL === "1") {
+          throw new Error("Connection Closed (synthetic — NUCLEUS_WHATSAPP_FORCE_SEND_FAIL)");
+        }
         const sent = await sock.sendMessage(jid, { text: r.body });
         outbound.markSent(r.id, sent?.key?.id ?? "");
+        consecutiveConnectionFailures = 0;
         log.info({ id: r.id, target: r.target, jid }, "whatsapp: outbound sent");
       } catch (e) {
         const err = (e as Error).message;
         outbound.markFailure(r.id, err, OUTBOUND_MAX_ATTEMPTS);
         log.warn({ id: r.id, err, attempts: r.attempts + 1 }, "whatsapp: outbound send failed");
+        if (/connection closed/i.test(err)) {
+          consecutiveConnectionFailures += 1;
+          log.warn(
+            { consecutive: consecutiveConnectionFailures, threshold: CONNECTION_ROT_THRESHOLD },
+            "whatsapp: connection-rot counter incremented",
+          );
+          if (consecutiveConnectionFailures >= CONNECTION_ROT_THRESHOLD) {
+            const alert = `⚠️ WhatsApp bot exiting: ${consecutiveConnectionFailures} consecutive "Connection Closed" sendMessage failures — launchd will respawn.`;
+            log.error(alert);
+            await alertDiscordHome(alert);
+            process.exit(1);
+          }
+        }
       }
     }
   }, OUTBOUND_DRAIN_INTERVAL_MS);
