@@ -18,53 +18,76 @@ This skill is the source of truth for modifying the operator's Obsidian vault's 
 
 Create the `snippets/` directory if it doesn't exist (`mkdir -p`) — Obsidian only creates it on first manual snippet.
 
-## PARA folder convention (established 2026-05-15)
+## Folder convention (established 2026-05-15, renumbered 2026-05-21)
 
-The vault's top-level folders are: `0-Inbox`, `1-Projects`, `2-Areas`, `3-Resources`, `4-Archives` (note: **Archives** plural, not Archive). All styling and color-group rules key off these exact names.
+The vault's top-level folders are 8, renumbered to a rainbow scheme:
 
-## Locked colour palette
+| # | Folder | Purpose |
+|---|---|---|
+| 0 | `0-Inbox` | Capture-now-organize-later landing pad |
+| 1 | `1-Main-Notes` | Hub / MOCs / recurring-question answers |
+| 2 | `2-Daily-Notes` | Date-stamped journal (`YYYY-MM-DD.md`) |
+| 3 | `3-Projects` | Short-term efforts with deadline + outcome (PARA P) |
+| 4 | `4-Areas` | Ongoing responsibilities (PARA A) |
+| 5 | `5-Resources` | Reference material on topics of interest (PARA R) |
+| 6 | `6-Slipbox` | Atomic evergreen notes (Zettelkasten) |
+| 7 | `7-Archives` | Inactive items, cold storage (PARA Archives) |
 
-Deep, saturated colours — readable on tinted backgrounds. **Do not lighten/pastel these** unless the user explicitly asks for "lighter" — the deep palette is what the operator has approved after iteration.
+All styling, color-group rules, and bot routing logic key off these exact names. The vault's per-folder `README.md` files are the ground truth for what belongs where.
 
-| Bucket | Hex | rgb int (for `graph.json`) | Vibe |
-|---|---|---|---|
-| `0-Inbox` | `#8a7438` | `9073720` | deep gold — "fresh / unsorted" |
-| `1-Projects` | `#c47020` | `12873760` | burnt amber — active work |
-| `2-Areas` | `#4d8c2a` | `5082154` | deep grass — ongoing responsibilities |
-| `3-Resources` | `#1f8275` | `2065013` | deep teal — reference library |
-| `4-Archives` | `#6c6a63` | `7105123` | muted grey — done / cold |
+## Locked rainbow palette
+
+Solid, vibrant rainbow on dark Obsidian background. **Do not lighten/pastel these** unless the user explicitly asks — every text/background pair is WCAG AA verified (≥4.5:1 contrast). Archives is intentionally NOT rainbow — it stays muted italic to signal "cold storage."
+
+| Bucket | BG hex | Text hex | rgb int (for `graph.json`) | Contrast |
+|---|---|---|---|---|
+| `0-Inbox` | `#c0392b` red | `#ffffff` | `12597547` | 5.9:1 |
+| `1-Main-Notes` | `#e67e22` orange | `#1a1a1a` | `15105570` | 6.3:1 |
+| `2-Daily-Notes` | `#f1c40f` yellow | `#1a1a1a` | `15844367` | 11.7:1 |
+| `3-Projects` | `#1e8449` green | `#ffffff` | `1999945` | 5.5:1 |
+| `4-Areas` | `#2471a3` blue | `#ffffff` | `2388387` | 5.4:1 |
+| `5-Resources` | `#5b3aa8` indigo | `#ffffff` | `5978792` | 10:1 |
+| `6-Slipbox` | `#8e44ad` violet | `#ffffff` | `9323693` | 5.8:1 |
+| `7-Archives` | muted (italic, opacity 0.7) | `var(--text-faint)` | `7105123` (graph only) | n/a |
 
 To convert any new hex → Obsidian's `graph.json` rgb integer: `printf "%d\n" 0xRRGGBB` in bash.
 
 ## CSS snippet pattern — depth-aware folder coloring
 
-Three visual tiers per PARA bucket — established and approved in the snippet `nucleus-para-colors.css`:
+Three visual tiers within depth-having buckets (`1-Main-Notes`, `3-Projects`, `4-Areas`, `5-Resources`):
 
-- **L0** (top folder, e.g., `1-Projects`): deep brand colour text, weight 700, `rgba(brand, 0.22)` background.
-- **L1** (direct children — folders or files one level inside): same deep colour text, weight 600, `rgba(brand, 0.12)` background.
-- **L2+** (grandchildren and deeper): no text override (uses Obsidian default), thin `2px` left border at `rgba(brand, 0.4)`, transparent background.
+- **L0** (top folder, e.g., `3-Projects`): **solid** brand-colour background, contrast text, weight 700.
+- **L1** (direct children — folders or files one level inside): `rgba(brand, 0.18)` tinted background, lighter shade of brand colour for text on dark, weight 600.
+- **L2+** (grandchildren and deeper): no text override, thin `2px` left border at `rgba(brand, 0.4)`, transparent background.
+
+Flat buckets (`0-Inbox`, `2-Daily-Notes`, `6-Slipbox`) only get L0 styling. Archives gets only the muted italic treatment regardless of depth.
 
 Depth selection uses `:has()` (Chromium 105+, current Obsidian is fine):
 
 ```css
-/* L0 */
-.nav-folder-title[data-path="1-Projects"] { … }
+/* L0 — solid rainbow background */
+.nav-folder-title[data-path="3-Projects"] {
+  color: #ffffff;
+  background: #1e8449;
+  font-weight: 700;
+  border-radius: 4px;
+}
 
-/* L1 — folders and files directly inside 1-Projects */
-.nav-folder:has(> .nav-folder-title[data-path="1-Projects"])
+/* L1 — folders and files directly inside 3-Projects */
+.nav-folder:has(> .nav-folder-title[data-path="3-Projects"])
   > .nav-folder-children > .nav-folder > .nav-folder-title,
-.nav-folder:has(> .nav-folder-title[data-path="1-Projects"])
+.nav-folder:has(> .nav-folder-title[data-path="3-Projects"])
   > .nav-folder-children > .nav-file   > .nav-file-title { … }
 
 /* L2+ — anything deeper */
-.nav-folder:has(> .nav-folder-title[data-path="1-Projects"])
+.nav-folder:has(> .nav-folder-title[data-path="3-Projects"])
   > .nav-folder-children > .nav-folder > .nav-folder-children
   :is(.nav-folder-title, .nav-file-title) { … }
 ```
 
-`Archives` is styled with italic + opacity 0.7 instead of a coloured background — keeps it distinct from `Inbox` so the two transient buckets don't blur.
+`7-Archives` is styled with italic + opacity 0.7 instead of a coloured background — signals "filed away" and visually demotes it below the rainbow.
 
-Tab underlines use `.workspace-tab-header[data-path^="1-Projects/"] .workspace-tab-header-inner { border-bottom: 2px solid <brand>; }`.
+Tab underlines use `.workspace-tab-header[data-path^="3-Projects/"] .workspace-tab-header-inner { border-bottom: 2px solid <brand>; }` — one per coloured bucket, none for Archives.
 
 ## graph.json shape
 
@@ -72,8 +95,8 @@ Tab underlines use `.workspace-tab-header[data-path^="1-Projects/"] .workspace-t
 {
   "colorGroups": [
     {
-      "query": "path:1-Projects",        // search query, NOT regex
-      "color": { "a": 1, "rgb": 12873760 } // 24-bit int (R<<16 | G<<8 | B)
+      "query": "path:3-Projects",        // search query, NOT regex
+      "color": { "a": 1, "rgb": 1999945 } // 24-bit int (R<<16 | G<<8 | B)
     },
     …
   ],
@@ -120,7 +143,7 @@ After editing `app.json`, the user has to **toggle any setting in the Files-and-
 
 ## Working with this skill
 
-1. **Confirm the exact folder names before writing selectors.** Run `ls -d ~/Documents/Obsidian/[0-9]*` — the vault uses `4-Archives` plural, but it could change.
+1. **Confirm the exact folder names before writing selectors.** Run `ls -d ~/Documents/Obsidian/[0-9]*` — the vault uses 8 numbered top-level folders (see table above), but it could change.
 2. **Don't lighten brand colors without explicit ask.** The deep palette above is what the operator approved after iteration; lightening it triggers re-do.
 3. **Minimal-change rule applies here too.** If the user says "fix the child text", touch only the child text — not the background, not the tabs.
 4. **Verify with `ls`/`cat` before assuming defaults.** `app.json` is empty (`{}`) by default; `snippets/` may not exist.

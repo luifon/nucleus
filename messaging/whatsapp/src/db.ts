@@ -153,7 +153,7 @@ export class ChatSessionStore {
 }
 
 export interface ClassificationOption {
-  /** Display label shown to user, e.g. "2-Areas/Nucleus". Also serves as
+  /** Display label shown to user, e.g. "4-Areas/Nucleus". Also serves as
    *  the bucket path. */
   label: string;
   bucket: string;

@@ -12,17 +12,25 @@ The role T4 was supposed to play (long-tail recall over months of accumulated fa
 
 ## Decision
 
-T3 is a PARA-organized Obsidian vault at `~/Documents/Obsidian/`:
+T3 is a PARA-organized Obsidian vault at `~/Documents/Obsidian/` with three extension buckets (renumbered 2026-05-21):
 
 ```
-0-Inbox/        capture-now-organize-later landing pad
-1-Projects/     short-term efforts with a deadline + defined outcome
-2-Areas/        ongoing responsibilities with a standard to maintain
-3-Resources/    reference material on topics of interest
-4-Archives/     inactive items from the other three
+0-Inbox/         capture-now-organize-later landing pad
+1-Main-Notes/    hubs / MOCs / recurring-question answers (curated by user)
+2-Daily-Notes/   time-anchored journal entries (YYYY-MM-DD.md)
+3-Projects/      short-term efforts with a deadline + defined outcome
+4-Areas/         ongoing responsibilities with a standard to maintain
+5-Resources/     reference material on topics of interest
+6-Slipbox/       atomic evergreen ideas (Zettelkasten, flat, no sub-folders)
+7-Archives/      inactive items from any of the other buckets
 ```
 
-PARA is Tiago Forte's *Building a Second Brain* organizational scheme. Buckets are ordered by **actionability**, not topic. A note moves between buckets as its actionability changes — e.g., a note about deploy strategy starts in Projects (active rollout) → Areas (ongoing devops practice) → Archives (next platform).
+The PARA core (Projects/Areas/Resources/Archives) is Tiago Forte's *Building a Second Brain* scheme — buckets ordered by **actionability**, not topic. A note moves between buckets as its actionability changes — e.g., a note about deploy strategy starts in Projects (active rollout) → Areas (ongoing devops practice) → Archives (next platform).
+
+The three additions are research-validated extensions to plain PARA:
+- `1-Main-Notes` ≈ LYT's "Atlas" / Forte's MOC pattern — index/hub notes that link clusters of related material
+- `2-Daily-Notes` ≈ LYT's "Calendar" — time-anchored reflection
+- `6-Slipbox` ≈ Zettelkasten — atomic evergreen ideas that PARA's actionability axis doesn't cover (resolves the LYT-author's PARA critique: "Archive eats knowledge")
 
 ## How Claude reads + writes the vault
 
@@ -60,9 +68,9 @@ A capture isn't necessarily one file. The brain-dump pipeline asks Claude (with 
 ```json
 {
   "ops": [
-    { "op": "create", "bucket": "1-Projects/Example-Project", "filename": "contract.md", "body": "...", "createsSubfolder": false, "reason": "..." },
-    { "op": "append", "targetPath": "1-Projects/Example-Project/team.md", "body": "...", "reason": "..." },
-    { "op": "move",   "fromPath": "0-Inbox/old-note.md", "toBucket": "1-Projects/Example-Project", "toFilename": "", "createsSubfolder": false, "reason": "..." }
+    { "op": "create", "bucket": "3-Projects/Example-Project", "filename": "contract.md", "body": "...", "createsSubfolder": false, "reason": "..." },
+    { "op": "append", "targetPath": "3-Projects/Example-Project/team.md", "body": "...", "reason": "..." },
+    { "op": "move",   "fromPath": "0-Inbox/old-note.md", "toBucket": "3-Projects/Example-Project", "toFilename": "", "createsSubfolder": false, "reason": "..." }
   ],
   "summary": "created 2 docs in Projects/Example-Project, moved 1 from inbox",
   "confidence": 0.85
@@ -77,7 +85,7 @@ A 6-minute audio about a work contract should NOT become one 4KB markdown. It sh
 
 ### Sub-folder creation
 
-New sub-folders under `1-Projects/`, `2-Areas/`, or `3-Resources/` may be created **only when the capture explicitly directs it** ("create a folder for X", "Y is one of my projects, put it there"). The op carries a `createsSubfolder: true` flag that the validator gates on — lying about the flag means your op gets rejected. Speculative creation by the bot is forbidden.
+New sub-folders under `3-Projects/`, `4-Areas/`, or `5-Resources/` may be created **only when the capture explicitly directs it** ("create a folder for X", "Y is one of my projects, put it there"). The op carries a `createsSubfolder: true` flag that the validator gates on — lying about the flag means your op gets rejected. Speculative creation by the bot is forbidden. `6-Slipbox` is flat — never create sub-folders there.
 
 If nothing fits and no directive: file in `0-Inbox/`. The user can correct via a follow-up capture.
 
@@ -99,19 +107,21 @@ The `pending_classifications` SQLite table is kept for forward-compatibility but
 
 Unchanged. T1.5 (`nucleus/memory/diaries/<agent>/YYYY-MM-DD.md`, 7-day rolling) is the bot's operational scratch pad — completely internal. The distiller still reads T1.5 and produces T3 digests; the digests just land in PARA buckets now, not in flat per-agent silos.
 
-## Why PARA over Zettelkasten
+## Why PARA core + Zettelkasten side-car
 
 Considered:
-- **PARA (chosen)** — folders by lifecycle, refuses to organize by topic. Optimized for getting things done.
+- **PARA** — folders by lifecycle, refuses to organize by topic. Optimized for getting things done.
 - **Zettelkasten** — atomic notes densely interlinked, organized by emergent graph. Optimized for generating new ideas.
 - **Flat + tags** — single dir, organize via tags + search. Cheap; doesn't help with "what's actionable now."
 
-PARA wins for our use case (working second brain that bots can reason about) because:
+PARA is the spine because:
 - The folder name *is* the classification — Claude can pick from a small set of known buckets without ambiguity
-- Lifecycle progression is explicit (Project → Area → Archive); Zettelkasten has no notion of "this note is now stale"
+- Lifecycle progression is explicit (Project → Area → Archive); pure Zettelkasten has no notion of "this note is now stale"
 - Forte explicitly designs PARA to be tool-agnostic; works the same in plain folders
 
-We can add `[[wiki-links]]` between notes anyway (Rule 9.2) — that gives us emergent graph topology *on top of* the action-oriented folder structure. Best of both with no embedding dependency.
+But pure PARA leaks knowledge — atomic ideas that aren't tied to a Project/Area/Resource end up in 0-Inbox forever, or worse, get archived with a completed project (the LYT-author's critique of PARA). The 2026-05-21 renumber added `6-Slipbox` as a Zettelkasten side-car for that case: atomic evergreen notes live there, flat, linked to PARA siblings via `[[wiki-links]]`. We also added `1-Main-Notes` (MOCs/hubs) and `2-Daily-Notes` (Calendar/journal) to round out LYT's three-space model.
+
+Net: PARA for actionable lifecycle, Slipbox for evergreen ideas, Main-Notes for hubs, Daily-Notes for time-anchored reflection. `[[wiki-links]]` between everything gives us emergent graph topology *on top of* the structural folders — best of both with no embedding dependency.
 
 ## Why no Graphify (or similar plugins)
 
@@ -126,23 +136,35 @@ For notes, we get the same effect via Rule 9.2: when Claude writes a note, it re
 ├── 0-Inbox/
 │   ├── README.md
 │   └── 2026-05-14-thought-about-routing.md      ← brain-dump unsorted
-├── 1-Projects/
+├── 1-Main-Notes/
+│   ├── README.md
+│   ├── Nucleus-index.md                         ← MOC linking all Nucleus material
+│   └── How-to-deploy-northmark.md               ← recurring question
+├── 2-Daily-Notes/
+│   ├── README.md
+│   ├── 2026-05-21.md                            ← today's journal
+│   └── 2026-W20.md                              ← weekly review
+├── 3-Projects/
 │   ├── README.md
 │   └── SomeProject-Q3-redesign/
 │       ├── decisions.md
 │       └── 2026-W19-status.md
-├── 2-Areas/
+├── 4-Areas/
 │   ├── README.md
 │   ├── Nucleus/
 │   │   ├── 2026-W19-discord.md                  ← distiller digest
 │   │   └── 2026-W19-alfred.md
 │   └── Health/
 │       └── 2026-04-physiotherapy-notes.md
-├── 3-Resources/
+├── 5-Resources/
 │   ├── README.md
 │   └── Rust-async-patterns/
 │       └── pinning.md
-└── 4-Archives/
+├── 6-Slipbox/
+│   ├── README.md
+│   ├── why-cleanup-over-parallel-migrations.md  ← atomic idea
+│   └── has-css-depth-aware-selectors.md
+└── 7-Archives/
     ├── README.md
     └── Projects/
         └── Old-thing/

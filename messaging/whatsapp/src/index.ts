@@ -879,11 +879,11 @@ function startPlanExpirySweep(sock: any, plansStore: PendingPlansStore): void {
  *  Format:
  *    <summary> (<conf>% confidence)
  *
- *    + 1-Projects/Example-Project/contract.md
- *    + 1-Projects/Example-Project/team.md
- *    ↑ 2-Areas/Career/relationships.md (appended)
- *    → 1-Projects/Example-Project/overview.md (moved from 0-Inbox/old.md)
- *    ✗ 1-Projects/X (rejected: sub-folder X doesn't exist)
+ *    + 3-Projects/Example-Project/contract.md
+ *    + 3-Projects/Example-Project/team.md
+ *    ↑ 4-Areas/Career/relationships.md (appended)
+ *    → 3-Projects/Example-Project/overview.md (moved from 0-Inbox/old.md)
+ *    ✗ 3-Projects/X (rejected: sub-folder X doesn't exist)
  *
  *  Glyphs are a small dialect: + = create, ↑ = append, → = move,
  *  ✗ = rejected. Reads well in WhatsApp's monospace renderer.

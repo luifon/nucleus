@@ -156,9 +156,9 @@ Per-op numbered lines, no bodies, no reasons:
 ✓ plano #a3f1 (75%)
 "contrato + equipe + funil"
 
-1. + 1-Projects/Acme/contract.md
-2. + 1-Projects/Acme/team.md
-3. ↑ 2-Areas/Career/relationships.md
+1. + 3-Projects/Acme/contract.md
+2. + 3-Projects/Acme/team.md
+3. ↑ 4-Areas/Career/relationships.md
 ```
 
 - **Header**: short plan id (4 hex from the row UUID) + confidence %

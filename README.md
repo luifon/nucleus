@@ -107,16 +107,19 @@ reaper keeps the tmux server tidy.
 - **An Obsidian vault, PARA-organized** — required for brain-dump capture
   and the Obsidian chat service. The default vault path is
   `~/Documents/Obsidian/` (override in `nucleus.toml` under
-  `[obsidian].vault_path`). The vault MUST have these five top-level
+  `[obsidian].vault_path`). The vault MUST have these eight top-level
   folders, each containing a `README.md` describing what belongs there
   (the bots read these READMEs to classify captures):
   ```
   ~/Documents/Obsidian/
-  ├── 0-Inbox/README.md       capture-now-organize-later landing pad
-  ├── 1-Projects/README.md    short-term efforts with a deadline + outcome
-  ├── 2-Areas/README.md       ongoing responsibilities to maintain
-  ├── 3-Resources/README.md   reference material on topics of interest
-  └── 4-Archives/README.md    inactive items from the other three
+  ├── 0-Inbox/README.md         capture-now-organize-later landing pad
+  ├── 1-Main-Notes/README.md    hubs / MOCs / recurring-question answers
+  ├── 2-Daily-Notes/README.md   time-anchored journal (YYYY-MM-DD.md)
+  ├── 3-Projects/README.md      short-term efforts with deadline + outcome
+  ├── 4-Areas/README.md         ongoing responsibilities to maintain
+  ├── 5-Resources/README.md     reference material on topics of interest
+  ├── 6-Slipbox/README.md       atomic evergreen notes (Zettelkasten)
+  └── 7-Archives/README.md      inactive items from the other buckets
   ```
   See `docs/ADR-005-second-brain.md` for the PARA model and writing rules.
 - **Optional, for WhatsApp voice memos:**
@@ -279,7 +282,7 @@ Four tiers, each with a clear lifetime:
 | **T1** Session DBs | `memory/*.db` | Per-chat continuity | The owning bot only |
 | **T1.5** Diaries | `memory/diaries/<agent>/YYYY-MM-DD.md` | 7-day rolling | Distiller |
 | **T2** Shared facts | `$NUCLEUS_TIER2_DIR/*.md` | Auto-loaded into every `claude` session | All Claude spawns |
-| **T3** Second brain | `~/Documents/Obsidian/{0-Inbox, 1-Projects, 2-Areas, 3-Resources, 4-Archives}/` | Forever | User browses; bots read via `--add-dir` and write via the multi-op brain-dump pipeline (see ADR-005) |
+| **T3** Second brain | `~/Documents/Obsidian/{0-Inbox, 1-Main-Notes, 2-Daily-Notes, 3-Projects, 4-Areas, 5-Resources, 6-Slipbox, 7-Archives}/` | Forever | User browses; bots read via `--add-dir` and write via the multi-op brain-dump pipeline (see ADR-005) |
 | **T4** mem0 vector | `tools/mem0/docker-compose.yaml` (kept idle) | Deferred indefinitely | mem0 needs embedding + LLM provider, neither covered by Claude Max — T3 covers the role |
 
 Distillation pipeline (`chores/distiller`) runs hourly (cheap extraction

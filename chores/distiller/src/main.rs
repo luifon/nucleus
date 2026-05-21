@@ -192,11 +192,12 @@ struct Decision {
     description: Option<String>, // for PROMOTE
     kind: Option<String>,        // user|feedback|project|reference for PROMOTE
     body: Option<String>,        // markdown body for PROMOTE/MERGE/ARCHIVE
-    /// PARA destination for ARCHIVE: e.g. "2-Areas/Nucleus", "0-Inbox",
-    /// "3-Resources/Rust-async". Validated against the vault's allowed
-    /// top-level buckets in [`apply_decision`]; new sub-folders under
-    /// 1-Projects / 2-Areas / 3-Resources are NOT auto-created (those
-    /// represent durable user commitments, see CLAUDE.md Rule 9).
+    /// PARA destination for ARCHIVE: e.g. "4-Areas/Nucleus", "0-Inbox",
+    /// "5-Resources/Rust-async", "6-Slipbox". Validated against the
+    /// vault's allowed top-level buckets in [`apply_decision`]; new
+    /// sub-folders under 3-Projects / 4-Areas / 5-Resources are NOT
+    /// auto-created (those represent durable user commitments, see
+    /// CLAUDE.md Rule 9).
     bucket: Option<String>,
     /// ARCHIVE filename within `bucket`. If None we generate
     /// `YYYY-Www-<agent>.md`. Should be a leaf filename (no path
@@ -253,12 +254,19 @@ T2 vs T3 split: the test is "does the bot need this in every spawn?" If yes,
 PROMOTE/MERGE. If "user might want to browse this later," ARCHIVE.
 
 ARCHIVE rules (CLAUDE.md Rule 9 — read it if you haven't):
-  1. `bucket` MUST be one of: "0-Inbox", "1-Projects/<existing>",
-     "2-Areas/<existing>", "3-Resources/<existing>", "4-Archives/<...>".
-     DO NOT invent new sub-folders under 1-Projects, 2-Areas, or
-     3-Resources — those are the user's durable commitments and need
+  1. `bucket` MUST be one of:
+       "0-Inbox"
+       "1-Main-Notes"          (only if capture is explicitly hub/MOC)
+       "2-Daily-Notes"         (only for time-anchored entries; name YYYY-MM-DD.md)
+       "3-Projects/<existing>"
+       "4-Areas/<existing>"
+       "5-Resources/<existing>"
+       "6-Slipbox"             (atomic evergreen ideas; flat, no sub-folders)
+       "7-Archives/<...>"
+     DO NOT invent new sub-folders under 3-Projects, 4-Areas, or
+     5-Resources — those are the user's durable commitments and need
      human authorship. If you can't find a matching existing sub-folder,
-     use "0-Inbox" instead.
+     prefer "6-Slipbox" for atomic ideas or "0-Inbox" for unclassified.
   2. Read the per-bucket README.md to understand what belongs where.
   3. Read the immediate sibling notes in your chosen bucket and add
      [[wiki-links]] to thematically related ones in the body. Don't
@@ -282,7 +290,7 @@ Output a JSON array (no fences, no prose). Each element:
   "name": "kebab-case-slug",                      // PROMOTE/MERGE
   "kind": "user|feedback|project|reference",      // PROMOTE
   "description": "one-line summary",              // PROMOTE
-  "bucket": "2-Areas/Nucleus",                    // ARCHIVE
+  "bucket": "4-Areas/Nucleus",                    // ARCHIVE
   "filename": "2026-W19-something.md",            // ARCHIVE (optional)
   "body": "markdown body with frontmatter",       // PROMOTE/MERGE/ARCHIVE
   "reason": "why this op"                         // always
@@ -435,11 +443,12 @@ fn archive_to_para(
 /// 0-Inbox.
 ///
 /// Validation:
-/// - Must start with one of the five canonical top-level dirs
+/// - Must start with one of the canonical top-level dirs (8 of them)
 /// - Must not contain `..` or absolute path components
-/// - For 1-Projects / 2-Areas / 3-Resources, the named sub-folder MUST
+/// - For 3-Projects / 4-Areas / 5-Resources, the named sub-folder MUST
 ///   already exist (we don't auto-create durable user commitments).
-///   `0-Inbox` and `4-Archives/...` are allowed to create freely.
+///   0-Inbox, 1-Main-Notes, 2-Daily-Notes, 6-Slipbox, and 7-Archives/...
+///   are allowed to create freely.
 fn resolve_bucket(vault_path: &Path, bucket: Option<&str>) -> std::result::Result<PathBuf, String> {
     let raw = bucket.ok_or("no bucket supplied")?.trim().trim_matches('/');
     if raw.is_empty() {
@@ -449,12 +458,21 @@ fn resolve_bucket(vault_path: &Path, bucket: Option<&str>) -> std::result::Resul
         return Err(format!("path-escape attempt: {raw}"));
     }
     let top = raw.split('/').next().unwrap_or("");
-    let allowed_tops = ["0-Inbox", "1-Projects", "2-Areas", "3-Resources", "4-Archives"];
+    let allowed_tops = [
+        "0-Inbox",
+        "1-Main-Notes",
+        "2-Daily-Notes",
+        "3-Projects",
+        "4-Areas",
+        "5-Resources",
+        "6-Slipbox",
+        "7-Archives",
+    ];
     if !allowed_tops.contains(&top) {
         return Err(format!("unknown top-level bucket: {top}"));
     }
     let target = vault_path.join(raw);
-    let needs_existing_subdir = matches!(top, "1-Projects" | "2-Areas" | "3-Resources")
+    let needs_existing_subdir = matches!(top, "3-Projects" | "4-Areas" | "5-Resources")
         && raw.contains('/');
     if needs_existing_subdir && !target.exists() {
         return Err(format!("sub-folder {raw} doesn't exist (won't auto-create)"));

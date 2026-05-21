@@ -231,8 +231,9 @@ than leaving it as "go read ADR-008 someday."
 - Default reminders (timesheet etc.) via `reminders add` if the
   reminders table is empty
 - PARA vault buckets at `~/Documents/Obsidian/` if the vault is empty
-  (creates `0-Inbox/`, `1-Projects/`, `2-Areas/`, `3-Resources/`,
-  `4-Archives/` with their `README.md` files)
+  (creates `0-Inbox/`, `1-Main-Notes/`, `2-Daily-Notes/`, `3-Projects/`,
+  `4-Areas/`, `5-Resources/`, `6-Slipbox/`, `7-Archives/` with their
+  `README.md` files)
 
 **d. `cargo build --release`** — the wizard's final step. Runs the build
 with stdout streaming. On failure, the wizard reports the failure and
