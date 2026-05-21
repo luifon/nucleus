@@ -175,7 +175,15 @@ impl Session {
     /// Send a user message and wait for claude's next assistant reply. Blocks
     /// for at most `opts.max_wait`.
     pub async fn ask(&mut self, message: &str, opts: AskOptions) -> Result<String> {
-        let from = self.cursor;
+        // Wait for the transcript to be quiet for `quiescent_window` before
+        // snapshotting the cursor. Claude can keep writing after the
+        // previous `wait_for_assistant` returned (late tool outputs,
+        // continuation tokens), and without this settle the next ask reads
+        // from a stale offset and returns trailing content from the prior
+        // turn — the classic "one message late" symptom.
+        let from = wait_for_transcript_quiet(&self.transcript_path, opts.quiescent_window)
+            .await
+            .unwrap_or(self.cursor);
         let payload = with_date_preamble(message);
         paste_and_send(&self.tmux_target, &payload).await?;
         let reply = wait_for_assistant(
@@ -583,6 +591,32 @@ async fn wait_for_tui_ready(target: &str, timeout: Duration) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     anyhow::bail!("TUI did not become ready within {:?}", timeout);
+}
+
+/// Poll the transcript file's size until it's been unchanged for
+/// `settle_window`. Returns the byte length at that quiet moment, which
+/// the caller uses as the `from_offset` for the next `wait_for_assistant`.
+/// Returns `None` if the file is unreadable, so the caller can fall back
+/// to its cached cursor. Bounded by an internal max-wait so a pathological
+/// long-running emission can't block the call forever.
+async fn wait_for_transcript_quiet(path: &Path, settle_window: Duration) -> Option<u64> {
+    let mut last_size = tokio::fs::metadata(path).await.ok().map(|m| m.len())?;
+    let mut last_change = Instant::now();
+    let start = Instant::now();
+    const MAX_WAIT: Duration = Duration::from_secs(60);
+    loop {
+        let size = tokio::fs::metadata(path).await.ok().map(|m| m.len())?;
+        if size != last_size {
+            last_size = size;
+            last_change = Instant::now();
+        } else if last_change.elapsed() >= settle_window {
+            return Some(size);
+        }
+        if start.elapsed() >= MAX_WAIT {
+            return Some(last_size);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Poll the transcript file from `from_offset` onward until we've seen at
