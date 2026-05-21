@@ -245,7 +245,7 @@ async function connect(
       // drainer needs the allowlist to authorize each target.
       resolveAllowlist(sock, config)
         .then(() => {
-          startOutboundDrain(sock, outbound);
+          startOutboundDrain(sock, outbound, config);
           startPlanExpirySweep(sock, plansStore);
         })
         .catch((e) =>
@@ -338,7 +338,7 @@ async function resolveAllowlist(sock: any, config: Config): Promise<void> {
  *
  *  Bounded batch size per tick to avoid hogging the event loop if a
  *  large backlog accumulates (it won't in normal use, but defense in depth). */
-function startOutboundDrain(sock: any, outbound: OutboundQueueStore): void {
+function startOutboundDrain(sock: any, outbound: OutboundQueueStore, config: Config): void {
   setInterval(async () => {
     let rows: OutboundRow[];
     try {
@@ -350,7 +350,7 @@ function startOutboundDrain(sock: any, outbound: OutboundQueueStore): void {
     if (rows.length === 0) return;
     log.info({ count: rows.length }, "whatsapp: draining outbound queue");
     for (const r of rows) {
-      const jid = resolveOutboundTarget(r.target);
+      const jid = resolveOutboundTarget(r.target, config);
       if (!jid) {
         outbound.markFailure(r.id, `unknown target: ${r.target}`, OUTBOUND_MAX_ATTEMPTS);
         log.warn({ id: r.id, target: r.target }, "whatsapp: outbound target not in allowlist — failed");
@@ -369,14 +369,28 @@ function startOutboundDrain(sock: any, outbound: OutboundQueueStore): void {
   }, OUTBOUND_DRAIN_INTERVAL_MS);
 }
 
-/** Translate a queue row's `target` string to a JID. Accepts either a
- *  group name (resolved via the allowlist's name→JID map) or a literal
- *  JID (used directly if and only if it's on the allowlist). Returns
- *  null if the target isn't authorized — no sending to arbitrary chats. */
-function resolveOutboundTarget(target: string): string | null {
-  // Literal JID path: must already be on the allowlist.
-  if (target.includes("@g.us") || target.includes("@s.whatsapp.net")) {
+/** Translate a queue row's `target` string to a JID. Three accepted forms:
+ *    - Group JID (`@g.us`) — must be in `allowedJids` (resolved at startup).
+ *    - DM target — either a full `<digits>@s.whatsapp.net` JID or bare
+ *      digits (8-15 chars). Both normalize to the digit form and check
+ *      against `config.allowedDmSenders`. Returns the canonical
+ *      `<digits>@s.whatsapp.net` shape.
+ *    - Group name — resolved via the allowlist's name→JID map.
+ *  Returns null if the target isn't authorized — no sending to arbitrary chats. */
+function resolveOutboundTarget(target: string, config: Config): string | null {
+  // Group JID path.
+  if (target.includes("@g.us")) {
     return allowedJids.has(target) ? target : null;
+  }
+  // DM path: full @s.whatsapp.net JID, or bare digits. The DM allowlist
+  // lives in `config.allowedDmSenders` as digit-only strings, not in
+  // `allowedJids` (which only holds group JIDs).
+  if (target.includes("@s.whatsapp.net") || /^\d{8,15}$/.test(target)) {
+    const digits = normalizeSenderId(target);
+    if (digits && config.allowedDmSenders.has(digits)) {
+      return `${digits}@s.whatsapp.net`;
+    }
+    return null;
   }
   // Group name path: must be a name we resolved at startup.
   const jid = groupNameToJid.get(target);
