@@ -5,7 +5,7 @@
 //! + Claude's session transcript) so we can render history independently of
 //! Claude's internal session files.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -202,14 +202,13 @@ async fn send_message(
         return Err(ApiError::BadRequest("message empty".into()));
     }
 
-    let now = Utc::now().to_rfc3339();
-    sqlx::query("INSERT INTO obsidian_messages (chat_id, role, content, ts) VALUES (?1, 'user', ?2, ?3)")
-        .bind(&id)
-        .bind(&req.message)
-        .bind(&now)
-        .execute(&s.pool)
-        .await?;
-    let user_msg_id = last_insert_id(&s.pool).await?;
+    // Capture the user-msg timestamp now (the moment the request arrived)
+    // but defer the INSERT until after sessions.ask() succeeds. If ask()
+    // errors (claude session crashed, transcript timeout, etc.), nothing
+    // hits the DB — no orphan user row left over from a failed turn. The
+    // assistant row, user row, and chat metadata commit atomically as one
+    // transaction once we have a reply.
+    let user_now = Utc::now().to_rfc3339();
 
     let prompt = format!(
         "You are answering a question against the Obsidian vault at {:?}. The vault \
@@ -225,20 +224,36 @@ async fn send_message(
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let assistant_now = Utc::now().to_rfc3339();
+    let mut tx = s.pool.begin().await?;
+
+    sqlx::query("INSERT INTO obsidian_messages (chat_id, role, content, ts) VALUES (?1, 'user', ?2, ?3)")
+        .bind(&id)
+        .bind(&req.message)
+        .bind(&user_now)
+        .execute(&mut *tx)
+        .await?;
+    let (user_msg_id,): (i64,) = sqlx::query_as("SELECT last_insert_rowid()")
+        .fetch_one(&mut *tx)
+        .await?;
+
     sqlx::query("INSERT INTO obsidian_messages (chat_id, role, content, ts) VALUES (?1, 'assistant', ?2, ?3)")
         .bind(&id)
         .bind(&ask_result.reply)
         .bind(&assistant_now)
-        .execute(&s.pool)
+        .execute(&mut *tx)
         .await?;
-    let asst_msg_id = last_insert_id(&s.pool).await?;
+    let (asst_msg_id,): (i64,) = sqlx::query_as("SELECT last_insert_rowid()")
+        .fetch_one(&mut *tx)
+        .await?;
 
     sqlx::query("UPDATE obsidian_chats SET claude_session_id = ?1, last_active = ?2 WHERE id = ?3")
         .bind(&ask_result.session_id)
         .bind(&assistant_now)
         .bind(&id)
-        .execute(&s.pool)
+        .execute(&mut *tx)
         .await?;
+
+    tx.commit().await?;
 
     // Auto-title after first round-trip. Uses its own one-shot session so it
     // doesn't pollute the main chat's context.
@@ -274,7 +289,7 @@ async fn send_message(
             chat_id: id.clone(),
             role: "user".into(),
             content: req.message,
-            ts: now,
+            ts: user_now,
         },
         assistant_message: MessageRow {
             id: asst_msg_id,
@@ -309,14 +324,6 @@ async fn generate_title(cwd: &PathBuf, user: &str, assistant: &str) -> Result<St
     let _ = session.close().await;
     let title = raw.trim().trim_matches('"').trim_matches('\'').to_string();
     Ok(title.chars().take(80).collect())
-}
-
-async fn last_insert_id(pool: &SqlitePool) -> Result<i64> {
-    let (id,): (i64,) = sqlx::query_as("SELECT last_insert_rowid()")
-        .fetch_one(pool)
-        .await
-        .context("last_insert_rowid")?;
-    Ok(id)
 }
 
 async fn index(State(s): State<Arc<ChatState>>) -> Html<String> {
