@@ -493,16 +493,28 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                             &ch.channel,
                         )
                         .await;
-                        let recorded_msg_id = match forward {
-                            Ok(fw_msg) => format!("{}|fwd:{}", msg_id, fw_msg),
+                        // The skill-fire session succeeded; the forward to
+                        // this channel may or may not have. We preserve the
+                        // skill-fire:xxx prefix in msg_id either way so the
+                        // session-log → reminder_fires join still works, but
+                        // success must reflect the FORWARD outcome — a
+                        // failed channel delivery is not a successful fire
+                        // for that channel, even if the underlying session
+                        // produced a reply.
+                        let (recorded_msg_id, forward_err) = match forward {
+                            Ok(fw_msg) => (format!("{}|fwd:{}", msg_id, fw_msg), None),
                             Err(e) => {
+                                let err_str = e.to_string();
                                 tracing::warn!(
                                     id = reminder.id,
                                     channel = %ch.channel,
-                                    err = %e,
+                                    err = %err_str,
                                     "skill-fire reply forward failed"
                                 );
-                                format!("{}|fwd-err:{}", msg_id, truncate(&e.to_string(), 80))
+                                (
+                                    format!("{}|fwd-err:{}", msg_id, truncate(&err_str, 80)),
+                                    Some(err_str),
+                                )
                             }
                         };
                         store::record_channel_fire(
@@ -510,7 +522,11 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                             reminder.id,
                             &ch.channel,
                             fired_at,
-                            Ok(&recorded_msg_id),
+                            store::FireOutcome {
+                                success: forward_err.is_none(),
+                                msg_id: Some(&recorded_msg_id),
+                                error: forward_err.as_deref(),
+                            },
                         )
                         .await?;
                     }
@@ -564,7 +580,11 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                             reminder.id,
                             &ch.channel,
                             fired_at,
-                            Err(&err),
+                            store::FireOutcome {
+                                success: false,
+                                msg_id: None,
+                                error: Some(&err),
+                            },
                         )
                         .await?;
                     }
@@ -580,7 +600,11 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                             reminder.id,
                             &ch.channel,
                             fired_at,
-                            Ok(&msg_id),
+                            store::FireOutcome {
+                                success: true,
+                                msg_id: Some(&msg_id),
+                                error: None,
+                            },
                         )
                         .await?;
                         tracing::info!(
@@ -609,7 +633,11 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                             reminder.id,
                             &ch.channel,
                             fired_at,
-                            Err(&err),
+                            store::FireOutcome {
+                                success: false,
+                                msg_id: None,
+                                error: Some(&err),
+                            },
                         )
                         .await?;
                         tracing::warn!(
