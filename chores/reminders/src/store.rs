@@ -621,6 +621,17 @@ pub async fn auto_resume_paused(pool: &SqlitePool, now: DateTime<Utc>) -> Result
     Ok(res.rows_affected())
 }
 
+/// Outcome of one channel delivery attempt. `success=false` with a
+/// non-None `msg_id` is meaningful: skill-fires preserve the
+/// `skill-fire:xxx|fwd-err:yyy` identifier in `msg_id` even when the
+/// per-channel forward failed, so history queries can still join the
+/// fire to its session log while truthfully showing success=0.
+pub struct FireOutcome<'a> {
+    pub success: bool,
+    pub msg_id: Option<&'a str>,
+    pub error: Option<&'a str>,
+}
+
 /// Record the outcome of one channel attempt for one reminder. Updates
 /// the `reminder_channels` row (success → `sent`; failure → bump
 /// attempts and possibly flip to `failed`) and appends a
@@ -630,70 +641,57 @@ pub async fn record_channel_fire(
     reminder_id: i64,
     channel: &str,
     fired_at: DateTime<Utc>,
-    result: std::result::Result<&str, &str>,
+    outcome: FireOutcome<'_>,
 ) -> Result<()> {
     let now = fired_at.to_rfc3339();
     let mut tx = pool.begin().await?;
 
-    match result {
-        Ok(msg_id) => {
-            sqlx::query(
-                "UPDATE reminder_channels
-                    SET status = 'sent', last_attempt_at = ?1, last_error = NULL
-                  WHERE reminder_id = ?2 AND channel = ?3",
-            )
-            .bind(&now)
-            .bind(reminder_id)
-            .bind(channel)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "INSERT INTO reminder_fires
-                    (reminder_id, fired_at, channel, success, msg_id, error)
-                 VALUES (?1, ?2, ?3, 1, ?4, NULL)",
-            )
-            .bind(reminder_id)
-            .bind(&now)
-            .bind(channel)
-            .bind(msg_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        Err(err) => {
-            // Bump attempts; flip to `failed` when budget exhausted.
-            sqlx::query(
-                "UPDATE reminder_channels
-                    SET attempts = attempts + 1,
-                        last_error = ?1,
-                        last_attempt_at = ?2,
-                        status = CASE
-                                   WHEN attempts + 1 >= ?3 THEN 'failed'
-                                   ELSE 'pending'
-                                 END
-                  WHERE reminder_id = ?4 AND channel = ?5",
-            )
-            .bind(err)
-            .bind(&now)
-            .bind(MAX_ATTEMPTS)
-            .bind(reminder_id)
-            .bind(channel)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "INSERT INTO reminder_fires
-                    (reminder_id, fired_at, channel, success, msg_id, error)
-                 VALUES (?1, ?2, ?3, 0, NULL, ?4)",
-            )
-            .bind(reminder_id)
-            .bind(&now)
-            .bind(channel)
-            .bind(err)
-            .execute(&mut *tx)
-            .await?;
-        }
+    if outcome.success {
+        sqlx::query(
+            "UPDATE reminder_channels
+                SET status = 'sent', last_attempt_at = ?1, last_error = NULL
+              WHERE reminder_id = ?2 AND channel = ?3",
+        )
+        .bind(&now)
+        .bind(reminder_id)
+        .bind(channel)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        // Bump attempts; flip to `failed` when budget exhausted.
+        sqlx::query(
+            "UPDATE reminder_channels
+                SET attempts = attempts + 1,
+                    last_error = ?1,
+                    last_attempt_at = ?2,
+                    status = CASE
+                               WHEN attempts + 1 >= ?3 THEN 'failed'
+                               ELSE 'pending'
+                             END
+              WHERE reminder_id = ?4 AND channel = ?5",
+        )
+        .bind(outcome.error.unwrap_or(""))
+        .bind(&now)
+        .bind(MAX_ATTEMPTS)
+        .bind(reminder_id)
+        .bind(channel)
+        .execute(&mut *tx)
+        .await?;
     }
+
+    sqlx::query(
+        "INSERT INTO reminder_fires
+            (reminder_id, fired_at, channel, success, msg_id, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(reminder_id)
+    .bind(&now)
+    .bind(channel)
+    .bind(if outcome.success { 1 } else { 0 })
+    .bind(outcome.msg_id)
+    .bind(outcome.error)
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
     Ok(())
