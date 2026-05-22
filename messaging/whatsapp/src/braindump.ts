@@ -185,7 +185,9 @@ export async function planCapture(
   const session = await Session.spawn(spawnOpts);
   let raw: string;
   try {
-    raw = await session.ask(prompt);
+    // 10 min ceiling: long captures (~5min audio, ~3000+ chars) take 2-3min
+    // to plan against the vault, and the default 3min cuts them off.
+    raw = await session.ask(prompt, { maxWaitMs: 10 * 60_000 });
   } finally {
     await session.close().catch(() => {});
   }
