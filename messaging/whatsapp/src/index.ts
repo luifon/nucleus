@@ -110,6 +110,15 @@ const OUTBOUND_MAX_ATTEMPTS = 5;
 const CONNECTION_ROT_THRESHOLD = 5;
 let consecutiveConnectionFailures = 0;
 
+// Reconnects fire the connection.update("open") branch every time, which
+// re-invokes startOutboundDrain / startPlanExpirySweep. Without storing
+// the handles and clearing on re-entry, every reconnect leaked another
+// parallel setInterval — N reconnects → N concurrent drains racing on
+// the same row, multiplying a single transient send failure by N and
+// tripping the rot watchdog in milliseconds. Incident 2026-05-22.
+let outboundDrainTimer: NodeJS.Timeout | null = null;
+let planExpirySweepTimer: NodeJS.Timeout | null = null;
+
 // ADR-005a: braindump plan timeout + sweep cadence.
 const PLAN_TIMEOUT_MS = 30 * 60 * 1000;
 const PLAN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
@@ -351,7 +360,8 @@ async function resolveAllowlist(sock: any, config: Config): Promise<void> {
  *  Bounded batch size per tick to avoid hogging the event loop if a
  *  large backlog accumulates (it won't in normal use, but defense in depth). */
 function startOutboundDrain(sock: any, outbound: OutboundQueueStore, config: Config): void {
-  setInterval(async () => {
+  if (outboundDrainTimer) clearInterval(outboundDrainTimer);
+  outboundDrainTimer = setInterval(async () => {
     let rows: OutboundRow[];
     try {
       rows = outbound.pending(20);
@@ -882,7 +892,8 @@ async function sendBotAck(sock: any, chatId: string, body: string): Promise<void
  *  and notify each affected chat. Handles the "operator walked away"
  *  case where no inbound traffic triggers the on-entry sweep. */
 function startPlanExpirySweep(sock: any, plansStore: PendingPlansStore): void {
-  setInterval(async () => {
+  if (planExpirySweepTimer) clearInterval(planExpirySweepTimer);
+  planExpirySweepTimer = setInterval(async () => {
     let rows: ReturnType<PendingPlansStore["sweepExpired"]>;
     try {
       rows = plansStore.sweepExpired(PLAN_TIMEOUT_MS);
