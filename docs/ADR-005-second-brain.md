@@ -125,7 +125,7 @@ Net: PARA for actionable lifecycle, Slipbox for evergreen ideas, Main-Notes for 
 
 ## Why no Graphify (or similar plugins)
 
-Researched [Graphify](https://github.com/safishamsi/graphify) — turned out to be a code-AST tool, not a notes-linking tool. It can graph our codebases for cheaper bot context (possible future S-slice add-on, see [[ADR-001]]) but it doesn't help with notes.
+Researched [Graphify](https://github.com/safishamsi/graphify) — turned out to be a code-AST tool, not a notes-linking tool. It can graph codebases for cheaper bot context but it doesn't help with notes. **Speculative, not a planned slice.**
 
 For notes, we get the same effect via Rule 9.2: when Claude writes a note, it reads siblings and links them. Free, no embedding dep, fits our stack.
 

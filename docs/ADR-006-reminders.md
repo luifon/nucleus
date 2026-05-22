@@ -32,7 +32,7 @@ This ADR redesigns the reminders subsystem to subsume all of those — one model
 
 - **what** — a body string, the message that gets delivered
 - **when** — a cron expression, evaluated in the operator's local timezone (`NUCLEUS_TZ`); for one-shot use a cron pattern that matches a single calendar date plus a `one_shot` flag that prevents re-firing
-- **who** — one or more channels (Discord home, Alfred WhatsApp, Brain Dump WhatsApp, future Signal/Telegram)
+- **who** — one or more channels (Discord home, the WhatsApp conversational group, the WhatsApp brain-dump group, WhatsApp DM, Calendar)
 
 The `reminders due` polling worker is the single execution engine. The standalone `timesheet` subcommand + `dev.nucleus.timesheet-reminder` plist are removed. Default reminders (timesheet, anything else "this is just how Nucleus operates") get inserted by a seeder on binary startup, idempotently — the same pattern news-fetcher uses for default sources.
 

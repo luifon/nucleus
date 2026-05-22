@@ -8,7 +8,7 @@ Nucleus replaces Hermes Agent as the brain behind the user's personal Discord/Wh
 
 The brain runs as long-lived interactive `claude` sessions hosted in tmux windows (one per chat for the messaging surfaces, one per scheduled job). Headless `-p` mode is moving to API-only billing, so the entire stack went through a one-time migration to tmux-hosted sessions — see `core::claude_session::Session` / `SessionPool`. Live tmux sessions are attachable for debugging (`tmux attach -t nucleus-discord`).
 
-Hermes stays installed-but-dormant as a reference implementation; we lift patterns (Discord, voice transcription, future Signal) as we need them.
+Hermes stays installed-but-dormant as a reference implementation; we lift patterns (Discord, voice transcription) as we need them.
 
 ## Workspace
 
@@ -67,4 +67,4 @@ templates checked in).
 
 ## Hermes status
 
-Dormant-but-installed at `~/.hermes/`. Gateway service was stopped when S1 shipped. Don't uninstall — we keep it as a pattern library (Discord gateway flow, mem0 docker compose, voice transcription wiring) for whatever surface lands next (Signal, etc.).
+Dormant-but-installed at `~/.hermes/`. Gateway service was stopped when S1 shipped. Don't uninstall — we keep it as a pattern library (Discord gateway flow, mem0 docker compose, voice transcription wiring) for any future surface that lands.
