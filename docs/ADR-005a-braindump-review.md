@@ -1,6 +1,6 @@
 # ADR-005a — Brain-dump review-before-apply (WhatsApp, in-band)
 
-**Status:** Proposed (2026-05-17)
+**Status:** Accepted (2026-05-17) — Implemented (2026-05-17)
 **Addendum to:** [[ADR-005]] — second brain / PARA vault
 
 ## Context

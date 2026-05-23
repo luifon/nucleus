@@ -1,6 +1,6 @@
 # ADR-005b — WhatsApp DM mode (operator-only, conversational)
 
-**Status:** Proposed (2026-05-19)
+**Status:** Accepted (2026-05-19) — Implemented (2026-05-19)
 **Addendum to:** [[ADR-005]] — second brain / PARA vault
 **Sibling of:** [[ADR-005a]] — brain-dump review-before-apply
 

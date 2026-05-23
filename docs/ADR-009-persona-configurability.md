@@ -1,6 +1,6 @@
 # ADR-009 — Persona configurability
 
-**Status:** Proposed (2026-05-18)
+**Status:** Accepted (2026-05-18) — Implemented (2026-05-19)
 
 ## Context
 
