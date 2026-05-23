@@ -1,6 +1,6 @@
 ---
 name: obsidian-tweaks
-description: Modify the operator's Obsidian vault appearance and filtering. Triggered when the user asks to style/color/hide things in Obsidian — file-explorer folder colors, graph view color groups, "Excluded files" patterns, tab accents, callout/tag styling. Covers CSS snippets, `graph.json` color groups, and `app.json` `userIgnoreFilters`. Encodes the Nucleus deep-PARA palette and depth-tier conventions so iterations stay consistent across sessions.
+description: Modify the operator's Obsidian vault appearance, filtering, and plugin config. Triggered when the user asks to style/color/hide/configure things in Obsidian — file-explorer folder colors + icons, graph view color groups, "Excluded files" patterns, tab accents, callout/tag styling, plugin data, the Home dashboard. Covers CSS snippets (Style Settings-annotated), `graph.json`, `app.json`/`appearance.json`, the committed plugin set, and the Home.md dashboard. Encodes the Nucleus deep-PARA palette + depth-tier conventions + the read-mostly use model from ADR-014 so iterations stay consistent across sessions.
 ---
 
 # Obsidian vault tweaks
@@ -148,3 +148,162 @@ After editing `app.json`, the user has to **toggle any setting in the Files-and-
 3. **Minimal-change rule applies here too.** If the user says "fix the child text", touch only the child text — not the background, not the tabs.
 4. **Verify with `ls`/`cat` before assuming defaults.** `app.json` is empty (`{}`) by default; `snippets/` may not exist.
 5. **One CSS snippet per concern** is fine. The existing `nucleus-para-colors.css` is the canonical PARA snippet; new concerns (callout styling, tag colors, etc.) can live in their own snippet files so toggles stay independent.
+
+## Vault is read-mostly (ADR-014)
+
+The operator's interaction pattern with the vault is **read-mostly**:
+writes arrive via the WhatsApp brain-dump pipeline (ADR-005 + ADR-005a),
+reads are navigation and glancing. This shapes which customizations
+are in scope and which aren't.
+
+### What's installed (and why)
+
+| Plugin | ID | Purpose |
+|---|---|---|
+| Style Settings | `obsidian-style-settings` | Exposes CSS-snippet variables as UI knobs |
+| Dataview | `dataview` | Home dashboard ad-hoc queries; inline queries in any note |
+| Calendar | `calendar` (liamcain, pin to stable not beta) | Sidebar month view → daily notes |
+| Iconize | `obsidian-icon-folder` (FlorianWoelki) | Per-folder icons in file explorer |
+
+### What's deliberately NOT installed
+
+- **Templater / QuickAdd / Tasks** — capture-oriented. The brain-dump
+  pipeline owns this surface. Do not propose installing these unless
+  the operator's write pattern changes (i.e., they start typing
+  directly into the vault as the primary write path).
+- **Marketplace themes** (Minimal, AnuPpuccin, Things, etc.) — conflicts
+  with the locked Nucleus aesthetic per [[feedback_design_aesthetics]].
+  Stock theme + targeted snippets only.
+- **Periodic Notes** — YAGNI; no current weekly/monthly note flow.
+- **Excalidraw** — Canvas (core) is already enabled.
+
+### Plugin install convention
+
+Plugins are installed via GitHub releases, not via the Obsidian
+Community Plugin UI:
+
+```bash
+mkdir -p ~/Documents/Obsidian/.obsidian/plugins/<plugin-id>/
+cd ~/Documents/Obsidian/.obsidian/plugins/<plugin-id>/
+# Download main.js + manifest.json + styles.css (if present) from the
+# tagged GitHub release. For Calendar specifically, pin to the latest
+# 1.5.x — the 2.0.0-beta line uses plugin id `calendar-beta` and is
+# experimental.
+```
+
+The plugin ID in `manifest.json` MUST match the directory name or
+Obsidian silently refuses to load it. Then add the ID to
+`.obsidian/community-plugins.json` (a JSON array of enabled IDs).
+
+**Obsidian must be quit** while editing `appearance.json`, `app.json`,
+`workspace.json`, `community-plugins.json`, or per-plugin `data.json`
+— Obsidian rewrites these on quit and will clobber unsaved edits.
+CSS-snippet files and vault content (`.md`, `.base`) can be edited
+hot; Obsidian re-reads them.
+
+## Iconize folder-icon convention
+
+Iconize's `data.json` has a **two-level shape** — plugin settings nest
+under a `settings` key, folder-path → icon mappings are top-level keys.
+Putting settings at the top level (without a `settings` wrapper) makes
+the plugin's `loadIconFolderData()` throw a TypeError on first read
+(`data.settings[k]` where `data.settings` is undefined) — the plugin
+silently fails to initialize and no icons render. Verified against
+v2.14.7 bundle.
+
+Minimum working data.json:
+
+```json
+{
+  "settings": {
+    "migrated": 6,
+    "lucideIconPackType": "native"
+  },
+  "0-Inbox": "LiInbox",
+  "...": "..."
+}
+```
+
+`migrated` should be the current max migration version Iconize knows
+about (6 as of v2.14.7) so it skips legacy-format migrations — safe
+for fresh installs. On first load Iconize will flesh out all other
+DEFAULT_SETTINGS keys and rewrite the file; you don't need to pre-fill
+them. `lucideIconPackType: "native"` is the default but worth pinning.
+
+Lucide icons use the `Li` PascalCase prefix (`inbox` → `LiInbox`,
+`calendar-days` → `LiCalendarDays`). Normalization rule: split on
+spaces/dashes/underscores, PascalCase each part, join. The seed
+mapping from ADR-014:
+
+| Folder | Icon |
+|---|---|
+| `0-Inbox` | `LiInbox` |
+| `1-Main-Notes` | `LiCompass` |
+| `2-Daily-Notes` | `LiCalendarDays` |
+| `3-Projects` | `LiRocket` |
+| `4-Areas` | `LiTarget` |
+| `5-Resources` | `LiBookOpen` |
+| `6-Slipbox` | `LiSparkles` |
+| `7-Archives` | `LiArchive` |
+
+Reversible from the plugin UI (right-click folder → Change icon). If
+the operator changes one, update this table; the table is the
+intended state.
+
+## Style Settings annotation pattern
+
+New CSS snippets should be annotated with a `@settings` block at the
+top so their variables are tunable from the UI without re-editing the
+snippet:
+
+```css
+/* @settings
+name: Snippet display name
+id: snippet-id (must match enabledCssSnippets entry)
+settings:
+    -
+        id: variable-name
+        title: UI label
+        description: What this does
+        type: variable-color | variable-number-slider | variable-text
+        format: hex | rgb | hex-rgb
+        default: '#hex' or numeric
+*/
+
+.theme-dark, .theme-light {
+  --variable-name: <default>;
+}
+```
+
+Then reference `var(--variable-name)` in the CSS body. Style Settings
+exposes a UI under Settings → Style Settings; changes write to a
+separate config and override the snippet defaults at runtime.
+
+## Home dashboard
+
+`Home.md` at vault root is the operator-facing dashboard. It's the
+**default pinned tab** (workspace.json + bookmarks.json). Sections
+are Dataview queries today — Bases will take over the Projects/Areas
+sections once those buckets carry a `status` frontmatter field.
+
+The dashboard is **read-only by convention**. Bots write into the
+source folders (`0-Inbox`, `2-Daily-Notes`, `3-Projects`, `4-Areas`);
+Home.md just reflects. When adding a new section, prefer a query
+over a static link list.
+
+If the PARA folder structure ever changes (renumber, rename, split),
+**Home.md and the .base files must be updated in lockstep** — their
+queries name folders literally.
+
+## Reload checklist (updated)
+
+| What you changed | Obsidian must be closed? | How to reload |
+|---|---|---|
+| CSS snippet file | No | Settings → Appearance → CSS snippets → toggle OFF then ON |
+| `graph.json` | No | Close + reopen the graph view tab |
+| `app.json` (userIgnoreFilters) | Yes (rewritten on quit) | Restart Obsidian |
+| `appearance.json` (fonts, snippet enablement) | Yes | Restart Obsidian |
+| Plugin `data.json` | Yes (rewritten on quit) | Restart Obsidian, or disable+re-enable plugin |
+| `community-plugins.json` (enable/disable) | Yes | Restart Obsidian |
+| `workspace.json` | Yes (rewritten constantly) | Restart Obsidian |
+| Vault content (`.md`, `.base`) | No | Obsidian re-reads on focus |
