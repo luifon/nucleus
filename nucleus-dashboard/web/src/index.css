@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+/* =====================================================================
+   Nucleus dashboard — design tokens (ADR-015).
+   Aesthetic: terminal × tiles, JBM mono, near-black + amber.
+   Mirrors `nucleus-polish.css` for the Obsidian vault (ADR-014) so the
+   editor and the dashboard read as the same product.
+   ===================================================================== */
+
+@theme {
+  /* Color palette — locked. See ADR-015 §"Aesthetic guardrails" #3. */
+  --color-nucleus-bg: #0a0a0a;
+  --color-nucleus-surface: #141414;
+  --color-nucleus-border: #2a2a2a;
+  --color-nucleus-text: #e5e5e5;
+  --color-nucleus-faint: #707070;
+  --color-nucleus-accent: #e6b450;
+
+  /* PARA-rainbow status colors (ADR-014 obsidian-tweaks skill table). */
+  --color-status-ok: #1e8449;
+  --color-status-warn: #e6b450;
+  --color-status-down: #c0392b;
+  --color-status-idle: #707070;
+
+  /* Type. Single font across the entire app per guardrail #2. */
+  --font-mono: "JetBrains Mono", "Menlo", "Monaco", monospace;
+  --font-sans: var(--font-mono);
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  background: var(--color-nucleus-bg);
+  color: var(--color-nucleus-text);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Tabular numerals everywhere — for the bracketed status pills and
+   the chronological feed timestamps. */
+* {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Selection — amber-tinted, matches the Obsidian polish snippet. */
+::selection {
+  background: color-mix(in srgb, var(--color-nucleus-accent) 28%, transparent);
+}
+
+/* Scrollbar — minimal, near-black, faint thumb. */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--color-nucleus-border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--color-nucleus-faint); }
