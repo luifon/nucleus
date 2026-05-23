@@ -1,6 +1,6 @@
 # ADR-006 — Reminders as the universal time-triggered notification primitive
 
-**Status:** Proposed (2026-05-15)
+**Status:** Accepted (2026-05-15) — Implemented (2026-05-15)
 
 ## Context
 

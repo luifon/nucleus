@@ -1,6 +1,6 @@
 # ADR-008 — Skills: procedural memory via Claude Code's native skill mechanism
 
-**Status:** Proposed (2026-05-16)
+**Status:** Accepted (2026-05-16) — Implemented (2026-05-18)
 
 ## Context
 
