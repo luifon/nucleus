@@ -7,9 +7,12 @@
 import { spawn, exec } from "node:child_process";
 import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
+import { readFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
+
+import { appendEntry as diaryAppendEntry, record as diaryRecord } from "./diary.js";
 
 const execAsync = promisify(exec);
 
@@ -105,8 +108,16 @@ export class Session {
     const target = `${opts.tmuxSession}:${windowName}`;
     await tmux(["new-window", "-t", opts.tmuxSession, "-n", windowName, inner]);
 
-    await dismissTrustPrompt(target, 5_000);
-    await waitForTuiReady(target, opts.readyTimeoutMs ?? 20_000);
+    try {
+      await dismissTrustPrompt(target, 5_000);
+      await waitForTuiReady(target, opts.readyTimeoutMs ?? 20_000);
+    } catch (e) {
+      // The window we just created is now stuck on whatever prompt
+      // we couldn't dismiss. Killing it here keeps the next retry
+      // from leaking another orphan into the tmux session.
+      await tmux(["kill-window", "-t", target]).catch(() => {});
+      throw e;
+    }
     await sleep(500);
 
     const transcriptPath = transcriptPathFor(opts.workspaceRoot, sessionId);
@@ -218,6 +229,118 @@ export class SessionPool {
       }
     }
     return stale.length;
+  }
+
+  // Roll every active per-chat session forward by one day. TS mirror of
+  // `nucleus_core::claude_session::SessionPool::daily_rotate`. Skips
+  // chats inactive >24h or with <10 text turns; for the rest, asks the
+  // old session to summarize itself, appends the summary to the agent's
+  // daily diary, spawns a fresh session primed with summary + last 10
+  // turns, and calls `dbUpdate(chatKey, newSessionId)` so the caller
+  // can persist the new mapping. Failures are recorded to the diary as
+  // OBSERVATION; the old session is left alone in that case.
+  async dailyRotate(
+    diaryRoot: string,
+    dbUpdate: (chatKey: string, newSessionId: string) => Promise<void>,
+  ): Promise<RotationStats> {
+    const stats: RotationStats = { considered: 0, rotated: 0, skipped: 0, failed: 0 };
+    const keys = Array.from(this.entries.keys());
+    for (const chatKey of keys) {
+      stats.considered++;
+      const outcome = await this.rotateOne(chatKey, diaryRoot, dbUpdate).catch((e) => {
+        diaryRecord(
+          diaryRoot,
+          `daily_rotate ${chatKey}`,
+          `rotation failed: ${e instanceof Error ? e.message : String(e)}`,
+          "OBSERVATION",
+        );
+        return "failed" as const;
+      });
+      if (outcome === "rotated") stats.rotated++;
+      else if (outcome === "skipped") stats.skipped++;
+      else stats.failed++;
+    }
+    return stats;
+  }
+
+  private async rotateOne(
+    chatKey: string,
+    diaryRoot: string,
+    dbUpdate: (chatKey: string, newSessionId: string) => Promise<void>,
+  ): Promise<"rotated" | "skipped"> {
+    const entry = this.entries.get(chatKey);
+    if (!entry) return "skipped";
+
+    // Acquire the per-entry lock the same way ask() does: chain a new
+    // promise behind the previous one so a concurrent user ask waits
+    // for the rotation to finish.
+    const prev = entry.lock;
+    let release!: () => void;
+    entry.lock = new Promise<void>((r) => (release = r));
+    await prev;
+    try {
+      // Skip cold chats — idle reaper handles them.
+      if (entry.lastActive < Date.now() - 24 * 60 * 60 * 1000) return "skipped";
+
+      const turns = lastNTurns(entry.session.transcriptPath, 100);
+      if (turns.length < 10) return "skipped";
+      const replay = turns.slice(-10);
+
+      // Step 1: ask for the summary. Generous timeout — no user is
+      // waiting and the model may have to consume a large transcript.
+      const summary = await entry.session.ask(SUMMARY_PROMPT, {
+        maxWaitMs: 300_000,
+        quiescentMs: 5_000,
+      });
+
+      // Step 2: append to today's diary.
+      diaryAppendEntry(
+        diaryRoot,
+        `daily_rotate ${chatKey}`,
+        `Session rotated. Yesterday's summary:\n\n${summary.trim()}`,
+      );
+
+      // Step 3: spawn a fresh session (no resume, new UUID, new window).
+      const newSession = await Session.spawn({
+        workspaceRoot: this.config.workspaceRoot,
+        appendSystemPrompt: this.config.appendSystemPrompt,
+        permissionMode: this.config.permissionMode,
+        disallowedTools: this.config.disallowedTools,
+        addDirs: this.config.addDirs,
+        tmuxSession: this.config.tmuxSession,
+        // windowName left undefined → derives from the new session UUID,
+        // so it doesn't collide with the still-alive old window.
+        readyTimeoutMs: 60_000,
+      });
+
+      // Step 4: prime the new session. If priming fails, tear it down so
+      // we don't orphan it.
+      const priming = buildPrimingPreamble(summary, replay);
+      try {
+        await newSession.ask(priming, { maxWaitMs: 300_000, quiescentMs: 5_000 });
+      } catch (e) {
+        await newSession.close().catch(() => {});
+        throw e;
+      }
+
+      // Step 5: hand the new session-id to the caller for DB persistence.
+      try {
+        await dbUpdate(chatKey, newSession.sessionId);
+      } catch (e) {
+        await newSession.close().catch(() => {});
+        throw e;
+      }
+
+      // Step 6: swap in the new session, then close the old one.
+      const oldSession = entry.session;
+      entry.session = newSession;
+      entry.lastActive = Date.now();
+      await oldSession.close().catch(() => {});
+
+      return "rotated";
+    } finally {
+      release();
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -338,8 +461,19 @@ async function dismissTrustPrompt(target: string, timeoutMs: number): Promise<vo
   }
 }
 
-async function waitForTuiReady(target: string, timeoutMs: number): Promise<void> {
+// Some pre-input screens look "ready" in the naive sense (they have the
+// ❯ glyph) but actually want a numbered-option keypress before yielding
+// the real input prompt. The big one in the wild: long-lived chat
+// sessions launch into a "Resume from summary?" picker on `--resume`,
+// where ❯ sits next to option 1 but neither "auto mode" nor "Try " is
+// on screen — so the naive readiness check times out, the pool
+// respawns, and the next window hits the same picker. Detect the
+// picker, auto-dismiss with option 1 (the default, "Resume from
+// summary"), and let the next poll see the real input row.
+export async function waitForTuiReady(target: string, timeoutMs: number): Promise<void> {
   const start = Date.now();
+  let resumeDismissAttempts = 0;
+  const MAX_RESUME_DISMISSALS = 2;
   while (Date.now() - start < timeoutMs) {
     const { stdout } = await tmux(["capture-pane", "-t", target, "-p"]).catch(() => ({
       stdout: "",
@@ -347,6 +481,18 @@ async function waitForTuiReady(target: string, timeoutMs: number): Promise<void>
     }));
     if (stdout.includes("❯") && (stdout.includes("auto mode") || stdout.includes("Try "))) {
       return;
+    }
+    if (stdout.includes("Resume from summary")) {
+      if (resumeDismissAttempts >= MAX_RESUME_DISMISSALS) {
+        throw new Error(
+          `TUI blocked at interactive prompt: ResumeFromSummary (auto-dismiss failed after ${MAX_RESUME_DISMISSALS} attempts)`,
+        );
+      }
+      resumeDismissAttempts += 1;
+      await tmux(["send-keys", "-t", target, "1"]).catch(() => {});
+      await tmux(["send-keys", "-t", target, "Enter"]).catch(() => {});
+      await sleep(300);
+      continue;
     }
     await sleep(200);
   }
@@ -449,4 +595,203 @@ function shellQuote(s: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ---- daily rotation helpers (TS mirror of nucleus_core::claude_session) ----
+
+export type TurnRole = "user" | "assistant";
+
+export interface Turn {
+  role: TurnRole;
+  text: string;
+}
+
+export interface RotationStats {
+  considered: number;
+  rotated: number;
+  skipped: number;
+  failed: number;
+}
+
+const SUMMARY_PROMPT =
+  "Summarize this conversation in 5-10 bullets for tomorrow's session. " +
+  "Focus on ongoing tasks, decisions made, key facts about the user, " +
+  "and anything a fresh assistant would need to know. " +
+  "Reply with only the bullets.";
+
+const SYSTEM_INJECTED_PREFIXES = [
+  "<ide_opened_file>",
+  "<ide_diagnostics>",
+  "<system-reminder>",
+  "<command-message>",
+  "<command-name>",
+  "<command-args>",
+  "<local-command-",
+];
+
+function isSystemInjectedUserTurn(text: string): boolean {
+  const t = text.trimStart();
+  return SYSTEM_INJECTED_PREFIXES.some((p) => t.startsWith(p));
+}
+
+function stripDatePreamble(s: string): string {
+  const TAG = "[context: today is ";
+  if (s.startsWith(TAG)) {
+    const idx = s.indexOf("]\n\n");
+    if (idx >= 0) return s.slice(idx + 3);
+  }
+  return s;
+}
+
+/** Read the last `n` user/assistant text turns from a Claude transcript
+ *  JSONL. TS mirror of `nucleus_core::claude_session::last_n_turns`.
+ *  Same filters: drop tool_use/tool_result/thinking blocks, drop
+ *  Claude-Code-injected `<…>` user turns, strip the date preamble. */
+export function lastNTurns(transcriptPath: string, n: number): Turn[] {
+  let raw: string;
+  try {
+    raw = readFileSync(transcriptPath, "utf8");
+  } catch {
+    return [];
+  }
+  const turns: Turn[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let obj: any;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const kind = obj.type;
+    let role: TurnRole;
+    if (kind === "user") role = "user";
+    else if (kind === "assistant") role = "assistant";
+    else continue;
+    const content = obj.message?.content;
+    if (content === undefined || content === null) continue;
+    const parts: string[] = [];
+    if (typeof content === "string") {
+      parts.push(content);
+    } else if (Array.isArray(content)) {
+      for (const item of content) {
+        if (item && item.type === "text" && typeof item.text === "string") {
+          parts.push(item.text);
+        }
+      }
+    }
+    if (parts.length === 0) continue;
+    let text = parts.join("\n");
+    if (role === "user" && isSystemInjectedUserTurn(text)) continue;
+    text = stripDatePreamble(text).trim();
+    if (!text) continue;
+    turns.push({ role, text });
+  }
+  return turns.length > n ? turns.slice(turns.length - n) : turns;
+}
+
+/** Construct the first message a freshly-rotated session sees. TS mirror
+ *  of `build_priming_preamble`. */
+export function buildPrimingPreamble(summary: string, replay: Turn[]): string {
+  const lines: string[] = [];
+  lines.push("[Yesterday's session summary, for context]");
+  lines.push(summary.trim());
+  lines.push("");
+  lines.push("[Recent conversation, replayed for continuity]");
+  for (const turn of replay) {
+    const label = turn.role === "user" ? "USER" : "ASSISTANT";
+    lines.push(`${label}: ${turn.text.trim()}`);
+    lines.push("");
+  }
+  lines.push(
+    "[End of priming. The user has not sent a new message yet — " +
+      "acknowledge briefly that you have the context and stand by.]",
+  );
+  return lines.join("\n");
+}
+
+/** Sleep until the next 04:00 in NUCLEUS_TZ (falling back to TZ, then
+ *  UTC). Used by index.ts to gate the daily rotation tick.
+ *
+ *  Testing override: setting NUCLEUS_ROTATION_TEST_DELAY_SECONDS to a
+ *  positive integer short-circuits the 4am math and sleeps that many
+ *  seconds instead — lets us validate rotation end-to-end without
+ *  waiting until 4am. Leave unset in production. */
+export async function sleepUntilNext4am(): Promise<void> {
+  const override = process.env.NUCLEUS_ROTATION_TEST_DELAY_SECONDS;
+  if (override) {
+    const secs = Number.parseInt(override, 10);
+    if (Number.isFinite(secs) && secs > 0) {
+      await sleep(secs * 1000);
+      return;
+    }
+  }
+  const delayMs = msUntilNext4am(new Date(), resolveTz());
+  await sleep(delayMs);
+}
+
+function resolveTz(): string {
+  const cands = [process.env.NUCLEUS_TZ, process.env.TZ];
+  for (const c of cands) {
+    if (!c) continue;
+    // Validate by attempting a formatter — invalid IANA name throws.
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: c });
+      return c;
+    } catch {
+      // try next
+    }
+  }
+  return "UTC";
+}
+
+/** Milliseconds from `now` until the next 04:00 local time in `tz`.
+ *  Mirror of `duration_until_next_4am`. */
+export function msUntilNext4am(now: Date, tz: string): number {
+  // Build "now" expressed in tz as the components we'd see on a wall
+  // clock there. Intl.DateTimeFormat gives us those parts; we then build
+  // a Date that points at "today 04:00 in tz" by formatting backwards
+  // (Date.UTC computed via a probe).
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(now).map((p) => [p.type, p.value]));
+  const localYear = Number(parts.year);
+  const localMonth = Number(parts.month);
+  const localDay = Number(parts.day);
+  const localHour = Number(parts.hour);
+  const localMinute = Number(parts.minute);
+  const localSecond = Number(parts.second);
+
+  // What instant corresponds to (localYear-localMonth-localDay 04:00:00)
+  // in `tz`? We compute the tz offset at "now", apply it to get a target
+  // UTC instant, then refine once to handle the DST edge case where the
+  // 04:00 boundary is on a different offset than `now`.
+  const nowUtcMs = now.getTime();
+  const nowAsLocalMs = Date.UTC(
+    localYear,
+    localMonth - 1,
+    localDay,
+    localHour,
+    localMinute,
+    localSecond,
+  );
+  const offsetMs = nowAsLocalMs - nowUtcMs;
+
+  const target0400Ms =
+    Date.UTC(localYear, localMonth - 1, localDay, 4, 0, 0) - offsetMs;
+
+  let delta = target0400Ms - nowUtcMs;
+  // If 04:00 today already passed (or is *now* — be strict about
+  // "next"), advance one full day.
+  if (delta <= 0) delta += 24 * 60 * 60 * 1000;
+  return delta;
 }

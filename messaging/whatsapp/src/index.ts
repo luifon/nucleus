@@ -17,7 +17,7 @@ import path from "node:path";
 import fs from "node:fs";
 
 import { loadConfig, normalizeSenderId, type Config } from "./config.js";
-import { SessionPool } from "./claude_session.js";
+import { SessionPool, sleepUntilNext4am } from "./claude_session.js";
 import {
   ChatSessionStore,
   OutboundQueueStore,
@@ -207,6 +207,32 @@ async function main() {
       log.warn({ err: (e as Error).message }, "whatsapp: reap failed");
     }
   }, 30 * 60 * 1000);
+
+  // Background daily 04:00 rotation. Summarizes each active chat into the
+  // whatsapp daily diary, spawns a fresh primed session, and persists the
+  // new session-id to chat_sessions so any restart picks up the rotated id.
+  // Runs the same routine on both pools (group + DM).
+  (async () => {
+    while (true) {
+      await sleepUntilNext4am();
+      const dbUpdate = async (chatId: string, newSessionId: string) => {
+        store.save(chatId, newSessionId, true);
+      };
+      try {
+        const groupStats = await sessions.dailyRotate(config.diaryRoot, dbUpdate);
+        const dmStats = await sessionsDm.dailyRotate(config.diaryRoot, dbUpdate);
+        log.info(
+          { group: groupStats, dm: dmStats },
+          "whatsapp: daily rotation done",
+        );
+      } catch (e) {
+        log.error(
+          { err: (e as Error).message },
+          "whatsapp: daily rotation crashed",
+        );
+      }
+    }
+  })();
 
   await connect(config, store, sessions, sessionsDm, outbound, plansStore);
 }

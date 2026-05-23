@@ -42,3 +42,26 @@ export function record(
     fs.closeSync(fh);
   }
 }
+
+/** Append a context + summary without a tagged-bullet line. Used by the
+ *  daily rotation, where the summary IS the body — duplicating it as a
+ *  tag bullet would just be noise. */
+export function appendEntry(
+  diaryRoot: string,
+  context: string,
+  summary: string,
+): void {
+  const filePath = todayPath(diaryRoot);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const newFile = !fs.existsSync(filePath);
+  const fh = fs.openSync(filePath, "a");
+  try {
+    if (newFile) {
+      const date = new Date().toISOString().slice(0, 10);
+      fs.writeSync(fh, `---\nagent: ${AGENT}\ndate: ${date}\n---\n\n`);
+    }
+    fs.writeSync(fh, `## ${nowHHMM()} — ${context}\n${summary.trim()}\n\n`);
+  } finally {
+    fs.closeSync(fh);
+  }
+}

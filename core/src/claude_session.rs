@@ -385,6 +385,174 @@ impl SessionPool {
         Ok(to_close.len())
     }
 
+    /// Roll every active per-chat session forward by one day: ask each one
+    /// to summarize itself, append the summary to the agent's daily diary,
+    /// spawn a fresh session primed with the summary + last 10 turns, and
+    /// hand the new session-id back to the caller so it can persist the
+    /// new chat-key → session-id mapping.
+    ///
+    /// Motivation: long-lived sessions eventually hit the "Resume from
+    /// summary?" picker on resume, whose in-line compaction blows past our
+    /// 20s TUI-ready timeout. Doing the compaction offline at 4am keeps
+    /// every user-facing ask() out of that path.
+    ///
+    /// Chats are processed sequentially (one at a time per pool) — three
+    /// minutes of summarization + spawn cost across a handful of chats is
+    /// fine at 4am, and serialization avoids hammering the tmux server.
+    ///
+    /// Skips:
+    /// - Chats whose `last_active` is more than 24h old (the idle reaper
+    ///   will close them; no continuity worth preserving).
+    /// - Chats with fewer than 10 text turns on the transcript (too small
+    ///   to be worth rotating).
+    ///
+    /// Failure handling: a per-chat failure is recorded in the agent's
+    /// diary with an Observation tag and the rotation moves on. The old
+    /// session stays in place; the auto-dismiss picker safety net handles
+    /// the picker if it appears before tomorrow's rotation retries.
+    ///
+    /// `db_update_session_id` receives `(chat_key, new_session_id)` once
+    /// the new session is fully primed and ready. Order it so a partial
+    /// rotation leaves either the old or new session id valid in your DB,
+    /// never a dangling one (we close the old window only after the
+    /// callback succeeds).
+    pub async fn daily_rotate<F, Fut>(
+        &self,
+        agent_name: &str,
+        mut db_update_session_id: F,
+    ) -> RotationStats
+    where
+        F: FnMut(String, String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let mut stats = RotationStats::default();
+        let keys: Vec<(String, Arc<Mutex<Entry>>)> = {
+            let entries = self.entries.read().await;
+            entries
+                .iter()
+                .map(|(k, e)| (k.clone(), e.clone()))
+                .collect()
+        };
+        for (chat_key, entry_arc) in keys {
+            stats.considered += 1;
+            match self
+                .rotate_one(&chat_key, &entry_arc, agent_name, &mut db_update_session_id)
+                .await
+            {
+                Ok(RotateOutcome::Rotated) => stats.rotated += 1,
+                Ok(RotateOutcome::Skipped) => stats.skipped += 1,
+                Err(e) => {
+                    stats.failed += 1;
+                    let _ = crate::diary::record_observation(
+                        &self.config.workspace_root,
+                        agent_name,
+                        &format!("daily_rotate {}", chat_key),
+                        &format!("rotation failed: {e:#}"),
+                        crate::diary::Tag::Observation,
+                    );
+                }
+            }
+        }
+        stats
+    }
+
+    async fn rotate_one<F, Fut>(
+        &self,
+        chat_key: &str,
+        entry_arc: &Arc<Mutex<Entry>>,
+        agent_name: &str,
+        db_update_session_id: &mut F,
+    ) -> Result<RotateOutcome>
+    where
+        F: FnMut(String, String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let mut guard = entry_arc.lock().await;
+
+        // Skip cold chats — the idle reaper will close them and there's no
+        // user continuity worth preserving.
+        if guard.last_active.elapsed() > Duration::from_secs(24 * 60 * 60) {
+            return Ok(RotateOutcome::Skipped);
+        }
+
+        let transcript_path = guard.session.transcript_path.clone();
+        let turns = last_n_turns(&transcript_path, 100);
+        if turns.len() < 10 {
+            return Ok(RotateOutcome::Skipped);
+        }
+        let replay: Vec<Turn> = turns.iter().rev().take(10).rev().cloned().collect();
+
+        // Step 1: ask the old session to summarize itself. Generous timeout
+        // — no user is waiting and the model needs to read the whole
+        // transcript. If this triggers the picker, the existing auto-dismiss
+        // path handles it.
+        let summary = guard
+            .session
+            .ask(SUMMARY_PROMPT, AskOptions {
+                max_wait: Duration::from_secs(300),
+                quiescent_window: Duration::from_secs(5),
+            })
+            .await
+            .context("daily_rotate: summary ask failed")?;
+
+        // Step 2: append the summary to today's diary.
+        let entry = crate::diary::Entry::now(
+            format!("daily_rotate {}", chat_key),
+            format!("Session rotated. Yesterday's summary:\n\n{}", summary.trim()),
+        );
+        let _ = crate::diary::append(&self.config.workspace_root, agent_name, &entry);
+
+        // Step 3: spawn a brand-new session (no --resume, fresh UUID).
+        // Window name derived from the new UUID so it doesn't collide with
+        // the still-alive old window — we'll kill the old one after the DB
+        // update succeeds.
+        let new_session = Session::spawn(SpawnOptions {
+            workspace_root: self.config.workspace_root.clone(),
+            append_system_prompt: self.config.append_system_prompt.clone(),
+            permission_mode: self.config.permission_mode,
+            disallowed_tools: self.config.disallowed_tools.clone(),
+            allowed_tools: self.config.allowed_tools.clone(),
+            add_dirs: self.config.add_dirs.clone(),
+            tmux_session: self.config.tmux_session.clone(),
+            window_name: None,
+            ready_timeout: Duration::from_secs(60),
+            resume_session_id: None,
+        })
+        .await
+        .context("daily_rotate: spawn new session")?;
+        let new_session_id = new_session.session_id.clone();
+
+        // Step 4: prime the new session with the summary + last 10 turns.
+        // If priming fails we tear down the new session so we don't orphan it.
+        let priming = build_priming_preamble(&summary, &replay);
+        let mut new_session = new_session;
+        if let Err(e) = new_session
+            .ask(&priming, AskOptions {
+                max_wait: Duration::from_secs(300),
+                quiescent_window: Duration::from_secs(5),
+            })
+            .await
+        {
+            let _ = new_session.close().await;
+            return Err(e).context("daily_rotate: prime new session");
+        }
+
+        // Step 5: hand the new session-id to the caller so the DB row is
+        // updated BEFORE we close the old session. If this fails we tear
+        // down the new session — old one stays the source of truth.
+        if let Err(e) = db_update_session_id(chat_key.to_string(), new_session_id.clone()).await {
+            let _ = new_session.close().await;
+            return Err(e).context("daily_rotate: db update");
+        }
+
+        // Step 6: swap in the new session, then close the old one.
+        let old_session = std::mem::replace(&mut guard.session, new_session);
+        let _ = old_session.close().await;
+        guard.last_active = Instant::now();
+
+        Ok(RotateOutcome::Rotated)
+    }
+
     /// Close every session and tear down the tmux session.
     pub async fn shutdown(&self) -> Result<()> {
         let mut entries = self.entries.write().await;
@@ -402,6 +570,126 @@ impl SessionPool {
             .output()
             .await;
         Ok(())
+    }
+}
+
+/// Outcome of rotating a single chat. Aggregated into [`RotationStats`].
+enum RotateOutcome {
+    Rotated,
+    Skipped,
+}
+
+/// Roll-up from one [`SessionPool::daily_rotate`] pass. Callers log this
+/// for observability — the counts answer "did the 4am tick do anything?"
+#[derive(Debug, Default)]
+pub struct RotationStats {
+    pub considered: usize,
+    pub rotated: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+/// The deterministic prompt the old session is given before being closed.
+/// Phrased so the reply is the bullets directly, with no surrounding
+/// preamble we'd then have to strip before writing to the diary.
+const SUMMARY_PROMPT: &str =
+    "Summarize this conversation in 5-10 bullets for tomorrow's session. \
+     Focus on ongoing tasks, decisions made, key facts about the user, \
+     and anything a fresh assistant would need to know. \
+     Reply with only the bullets.";
+
+/// Build the first message a freshly-rotated session sees: yesterday's
+/// summary on top, then the last N turns replayed in plain "USER:"/
+/// "ASSISTANT:" form for textual continuity. Audio attachments are not
+/// included specially — they've already been transcribed by the time
+/// the turn lands in the transcript JSONL.
+fn build_priming_preamble(summary: &str, replay: &[Turn]) -> String {
+    let mut out = String::new();
+    out.push_str("[Yesterday's session summary, for context]\n");
+    out.push_str(summary.trim());
+    out.push_str("\n\n[Recent conversation, replayed for continuity]\n");
+    for turn in replay {
+        let label = match turn.role {
+            TurnRole::User => "USER",
+            TurnRole::Assistant => "ASSISTANT",
+        };
+        out.push_str(label);
+        out.push_str(": ");
+        out.push_str(turn.text.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str(
+        "[End of priming. The user has not sent a new message yet — \
+         acknowledge briefly that you have the context and stand by.]",
+    );
+    out
+}
+
+/// Resolve the operator's timezone for scheduling. Reads `NUCLEUS_TZ`,
+/// then `TZ`, falling back to UTC if neither parses. In real deployments
+/// `NUCLEUS_TZ` is always set (the launchd plist + dotenv populate it),
+/// so the fallback only ever fires in tests.
+pub fn nucleus_tz() -> chrono_tz::Tz {
+    let candidates = [std::env::var("NUCLEUS_TZ").ok(), std::env::var("TZ").ok()];
+    for c in candidates.iter().flatten() {
+        if c.is_empty() {
+            continue;
+        }
+        if let Ok(tz) = c.parse::<chrono_tz::Tz>() {
+            return tz;
+        }
+    }
+    chrono_tz::UTC
+}
+
+/// Sleep until the next 04:00 local time in [`nucleus_tz`]. Used by each
+/// bot's main loop to gate the daily rotation tick. Returns immediately
+/// after the wakeup; callers run the rotation, then call this again to
+/// schedule the following day.
+///
+/// Testing override: setting `NUCLEUS_ROTATION_TEST_DELAY_SECONDS` to a
+/// positive integer short-circuits the 4am math and sleeps that many
+/// seconds instead. Lets us validate the rotation end-to-end on a live
+/// bot without waiting until 4am. Leave unset in production.
+pub async fn sleep_until_next_4am() {
+    if let Ok(s) = std::env::var("NUCLEUS_ROTATION_TEST_DELAY_SECONDS") {
+        if let Ok(secs) = s.parse::<u64>() {
+            if secs > 0 {
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                return;
+            }
+        }
+    }
+    let delay = duration_until_next_4am(chrono::Utc::now(), nucleus_tz());
+    tokio::time::sleep(delay).await;
+}
+
+/// Compute how long from `now_utc` until the next 04:00 in `tz`. Pulled
+/// out so we can unit-test the wraparound (e.g. it's 03:30 → 30min; it's
+/// 04:30 → 23h30m).
+fn duration_until_next_4am(now_utc: chrono::DateTime<chrono::Utc>, tz: chrono_tz::Tz) -> Duration {
+    use chrono::{Datelike, TimeZone};
+    let now_local = now_utc.with_timezone(&tz);
+    let today_4am = tz
+        .with_ymd_and_hms(now_local.year(), now_local.month(), now_local.day(), 4, 0, 0)
+        .single();
+    let target_local = match today_4am {
+        Some(t) if now_local < t => t,
+        _ => {
+            let tomorrow = now_local.date_naive() + chrono::Duration::days(1);
+            tz.with_ymd_and_hms(tomorrow.year(), tomorrow.month(), tomorrow.day(), 4, 0, 0)
+                .single()
+                .unwrap_or_else(|| now_local + chrono::Duration::hours(24))
+        }
+    };
+    let target_utc = target_local.with_timezone(&chrono::Utc);
+    let delta = target_utc - now_utc;
+    // Clamp to a sane lower bound — a negative delta would mean we
+    // somehow computed a target in the past; fall back to a full day.
+    if delta.num_seconds() <= 0 {
+        Duration::from_secs(24 * 60 * 60)
+    } else {
+        Duration::from_secs(delta.num_seconds() as u64)
     }
 }
 
@@ -779,6 +1067,119 @@ fn extract_last_assistant_text(buffer: &str) -> Option<String> {
     last
 }
 
+/// Role of a transcript turn. Used by [`last_n_turns`] to label what came
+/// from the user vs. the assistant for downstream prompt construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRole {
+    User,
+    Assistant,
+}
+
+/// A single user/assistant text turn extracted from a session transcript.
+#[derive(Debug, Clone)]
+pub struct Turn {
+    pub role: TurnRole,
+    pub text: String,
+}
+
+/// Read the last `n` user/assistant text turns from a session transcript
+/// JSONL. Filters out non-conversational entries (tool_use, tool_result,
+/// thinking blocks, file-history snapshots, etc.) and Claude Code's
+/// system-injected user turns (`<ide_opened_file>`, `<system-reminder>`,
+/// etc.) that aren't the operator's own words. Strips the
+/// `[context: today is …]` date preamble we inject in [`with_date_preamble`]
+/// so the replay reads as the user's original message.
+///
+/// Returns turns in chronological order — oldest first, newest last.
+/// Returns an empty Vec if the transcript file is missing or unreadable;
+/// callers should treat that as "nothing to replay" rather than an error.
+pub fn last_n_turns(transcript_path: &Path, n: usize) -> Vec<Turn> {
+    use std::io::BufRead;
+    let file = match std::fs::File::open(transcript_path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut turns: Vec<Turn> = Vec::new();
+    for line in reader.lines().map_while(|r| r.ok()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
+        let role = match kind {
+            "user" => TurnRole::User,
+            "assistant" => TurnRole::Assistant,
+            _ => continue,
+        };
+        let Some(content) = v.get("message").and_then(|m| m.get("content")) else {
+            continue;
+        };
+        let mut text_parts: Vec<&str> = Vec::new();
+        if let Some(s) = content.as_str() {
+            text_parts.push(s);
+        } else if let Some(arr) = content.as_array() {
+            for item in arr {
+                if item.get("type").and_then(|s| s.as_str()) != Some("text") {
+                    continue;
+                }
+                if let Some(t) = item.get("text").and_then(|s| s.as_str()) {
+                    text_parts.push(t);
+                }
+            }
+        }
+        if text_parts.is_empty() {
+            continue;
+        }
+        let mut text = text_parts.join("\n");
+        if matches!(role, TurnRole::User) && is_system_injected_user_turn(&text) {
+            continue;
+        }
+        text = strip_date_preamble(&text).trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        turns.push(Turn { role, text });
+    }
+    if turns.len() > n {
+        let drop = turns.len() - n;
+        turns.drain(..drop);
+    }
+    turns
+}
+
+/// Claude Code injects synthetic `<…>`-wrapped user turns (IDE state,
+/// system reminders, slash-command echoes) into the transcript. They show
+/// up as `role: user` but the operator never typed them; replaying them
+/// would confuse a fresh session.
+fn is_system_injected_user_turn(text: &str) -> bool {
+    let t = text.trim_start();
+    const PREFIXES: &[&str] = &[
+        "<ide_opened_file>",
+        "<ide_diagnostics>",
+        "<system-reminder>",
+        "<command-message>",
+        "<command-name>",
+        "<command-args>",
+        "<local-command-",
+    ];
+    PREFIXES.iter().any(|p| t.starts_with(p))
+}
+
+fn strip_date_preamble(s: &str) -> &str {
+    const TAG: &str = "[context: today is ";
+    if let Some(rest) = s.strip_prefix(TAG) {
+        if let Some(idx) = rest.find("]\n\n") {
+            return &rest[idx + 3..];
+        }
+    }
+    s
+}
+
 /// Single-quote shell escape: `it's` → `'it'\''s'`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -925,5 +1326,171 @@ mod tests {
             msg.contains("did not become ready"),
             "unexpected error message: {msg}"
         );
+    }
+
+    /// Build a transcript JSONL with a realistic mix of entries — user
+    /// text, assistant text, tool_use, tool_result, system-injected user
+    /// turns, and a date-preamble-wrapped user message — then assert
+    /// last_n_turns returns only the operator-meaningful text turns,
+    /// chronologically, capped at N.
+    #[test]
+    fn last_n_turns_filters_and_orders_correctly() {
+        let tmp = std::env::temp_dir().join(format!(
+            "nucleus-last-n-turns-{}.jsonl",
+            std::process::id()
+        ));
+        let mut lines: Vec<String> = Vec::new();
+        // Non-conversational entries that should be ignored entirely.
+        lines.push(r#"{"type":"permission-mode","permissionMode":"auto"}"#.to_string());
+        lines.push(r#"{"type":"file-history-snapshot","messageId":"abc"}"#.to_string());
+        // System-injected user turn — must be skipped.
+        lines.push(r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<ide_opened_file>some log</ide_opened_file>"}]}}"#.to_string());
+        // Date-preamble wrapped real user message — preamble stripped.
+        lines.push(r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[context: today is 2026-05-23 (Sat), local 09:00 BRT]\n\nhello there"}]}}"#.to_string());
+        // Assistant thinking + tool_use — ignored (no text block).
+        lines.push(r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"…"},{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#.to_string());
+        // Tool result entries are tagged role:user — must be skipped.
+        lines.push(r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#.to_string());
+        // Assistant text reply.
+        lines.push(r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi! how can I help?"}]}}"#.to_string());
+        // Another user message (string-form content rather than array form).
+        lines.push(r#"{"type":"user","message":{"role":"user","content":"second user message"}}"#.to_string());
+        // Assistant reply combining thinking + text — text block kept.
+        lines.push(r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"…"},{"type":"text","text":"second assistant reply"}]}}"#.to_string());
+        std::fs::write(&tmp, lines.join("\n")).expect("write tmp jsonl");
+
+        let turns = last_n_turns(&tmp, 10);
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(turns.len(), 4, "expected 4 turns, got {:?}", turns);
+        assert!(matches!(turns[0].role, TurnRole::User));
+        assert_eq!(turns[0].text, "hello there");
+        assert!(matches!(turns[1].role, TurnRole::Assistant));
+        assert_eq!(turns[1].text, "hi! how can I help?");
+        assert!(matches!(turns[2].role, TurnRole::User));
+        assert_eq!(turns[2].text, "second user message");
+        assert!(matches!(turns[3].role, TurnRole::Assistant));
+        assert_eq!(turns[3].text, "second assistant reply");
+    }
+
+    /// When the transcript has more than N text turns, we keep only the
+    /// last N and drop the older ones.
+    #[test]
+    fn last_n_turns_caps_at_n() {
+        let tmp = std::env::temp_dir().join(format!(
+            "nucleus-last-n-turns-cap-{}.jsonl",
+            std::process::id()
+        ));
+        let mut lines = Vec::new();
+        for i in 0..15 {
+            lines.push(format!(
+                r#"{{"type":"user","message":{{"role":"user","content":"u{i}"}}}}"#
+            ));
+            lines.push(format!(
+                r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"a{i}"}}]}}}}"#
+            ));
+        }
+        std::fs::write(&tmp, lines.join("\n")).expect("write tmp jsonl");
+
+        let turns = last_n_turns(&tmp, 10);
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(turns.len(), 10);
+        // Last 10 of 30 turns = u10..a14 (alternating).
+        assert_eq!(turns[0].text, "u10");
+        assert_eq!(turns[9].text, "a14");
+    }
+
+    /// Missing transcript file returns an empty Vec — callers treat this
+    /// as "nothing to replay" without crashing the rotation.
+    #[test]
+    fn last_n_turns_missing_file_returns_empty() {
+        let tmp = std::env::temp_dir().join("nucleus-last-n-turns-nope.jsonl");
+        let _ = std::fs::remove_file(&tmp);
+        let turns = last_n_turns(&tmp, 10);
+        assert!(turns.is_empty());
+    }
+
+    /// Priming preamble structural sanity: summary up top, alternating
+    /// USER:/ASSISTANT: lines, closing instruction at the bottom.
+    #[test]
+    fn build_priming_preamble_orders_summary_then_replay() {
+        let replay = vec![
+            Turn {
+                role: TurnRole::User,
+                text: "hello".into(),
+            },
+            Turn {
+                role: TurnRole::Assistant,
+                text: "hi there".into(),
+            },
+        ];
+        let out = build_priming_preamble("- did X\n- decided Y", &replay);
+        let summary_idx = out.find("- did X").expect("summary present");
+        let user_idx = out.find("USER: hello").expect("user line present");
+        let asst_idx = out.find("ASSISTANT: hi there").expect("assistant line present");
+        let closing_idx = out.find("End of priming").expect("closing line present");
+        assert!(summary_idx < user_idx);
+        assert!(user_idx < asst_idx);
+        assert!(asst_idx < closing_idx);
+    }
+
+    /// Wraparound: at 03:30 local we sleep ~30 minutes; at 04:30 local we
+    /// sleep ~23h30m. Use UTC as the timezone so the test doesn't depend
+    /// on chrono-tz database availability for a specific region.
+    #[test]
+    fn duration_until_next_4am_wraps_correctly() {
+        use chrono::{TimeZone, Utc};
+        let tz = chrono_tz::UTC;
+
+        // 03:30 UTC → next 04:00 UTC is 30 minutes away.
+        let at_0330 = Utc.with_ymd_and_hms(2026, 5, 23, 3, 30, 0).unwrap();
+        let d = duration_until_next_4am(at_0330, tz);
+        assert_eq!(d.as_secs(), 30 * 60);
+
+        // 04:30 UTC → next 04:00 is tomorrow, 23h30m away.
+        let at_0430 = Utc.with_ymd_and_hms(2026, 5, 23, 4, 30, 0).unwrap();
+        let d = duration_until_next_4am(at_0430, tz);
+        assert_eq!(d.as_secs(), 23 * 3600 + 30 * 60);
+
+        // Exactly 04:00 → next 04:00 is tomorrow (24h), not "right now".
+        let at_0400 = Utc.with_ymd_and_hms(2026, 5, 23, 4, 0, 0).unwrap();
+        let d = duration_until_next_4am(at_0400, tz);
+        assert_eq!(d.as_secs(), 24 * 3600);
+    }
+
+    /// nucleus_tz honors NUCLEUS_TZ when set, falls back to UTC otherwise.
+    /// Saves/restores the env var so test order doesn't matter.
+    #[test]
+    fn nucleus_tz_reads_env() {
+        let saved_tz = std::env::var("NUCLEUS_TZ").ok();
+        let saved_posix = std::env::var("TZ").ok();
+        // SAFETY: tests run single-threaded by default for env mutation;
+        // we restore at the end. The known-good IANA name here is just
+        // for the env round-trip — chrono_tz parses any valid IANA id.
+        unsafe {
+            std::env::set_var("NUCLEUS_TZ", "Europe/Berlin");
+            std::env::remove_var("TZ");
+        }
+        let tz = nucleus_tz();
+        assert_eq!(tz, chrono_tz::Europe::Berlin);
+
+        unsafe {
+            std::env::remove_var("NUCLEUS_TZ");
+        }
+        let tz = nucleus_tz();
+        assert_eq!(tz, chrono_tz::UTC);
+
+        // Restore.
+        unsafe {
+            match saved_tz {
+                Some(v) => std::env::set_var("NUCLEUS_TZ", v),
+                None => std::env::remove_var("NUCLEUS_TZ"),
+            }
+            match saved_posix {
+                Some(v) => std::env::set_var("TZ", v),
+                None => std::env::remove_var("TZ"),
+            }
+        }
     }
 }
