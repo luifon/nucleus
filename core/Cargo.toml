@@ -16,6 +16,7 @@ sqlx = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = "0.10"
 async-trait = { workspace = true }
 figment = { workspace = true }
 dotenvy = { workspace = true }

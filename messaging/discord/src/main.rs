@@ -494,6 +494,37 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Background task: daily 04:00 local rotation. Summarize each active
+    // chat session, write the summary to today's diary, spawn a fresh
+    // session primed with the summary + last 10 turns, persist the new
+    // session-id back to channel_sessions. Keeps user-facing ask() calls
+    // from ever hitting the in-line "Resume from summary?" compaction.
+    {
+        let sessions = sessions.clone();
+        let db_pool = pool.clone();
+        tokio::spawn(async move {
+            loop {
+                nucleus_core::claude_session::sleep_until_next_4am().await;
+                let pool_for_cb = db_pool.clone();
+                let stats = sessions
+                    .daily_rotate("discord", move |chat_key, new_session_id| {
+                        let pool_for_cb = pool_for_cb.clone();
+                        async move {
+                            let channel_id: u64 = chat_key
+                                .parse()
+                                .context("rotation callback: parse channel_id")?;
+                            save_session(&pool_for_cb, channel_id, &new_session_id, true).await
+                        }
+                    })
+                    .await;
+                tracing::info!(
+                    "discord: daily rotation done — considered={} rotated={} skipped={} failed={}",
+                    stats.considered, stats.rotated, stats.skipped, stats.failed
+                );
+            }
+        });
+    }
+
     let handler = Handler {
         pool,
         sessions,

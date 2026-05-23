@@ -87,6 +87,44 @@ async fn main() -> Result<()> {
         index_html: Arc::new(index_html),
     });
 
+    // Background task: daily 04:00 local rotation across all live obsidian
+    // chats. Keeps user-facing /api/chats/{id}/ask out of the in-line
+    // "Resume from summary?" compaction path.
+    {
+        let chat_state = chat_state.clone();
+        tokio::spawn(async move {
+            loop {
+                nucleus_core::claude_session::sleep_until_next_4am().await;
+                let pool_for_cb = chat_state.pool.clone();
+                let stats = chat_state
+                    .sessions
+                    .daily_rotate("chat", move |chat_key, new_session_id| {
+                        let pool_for_cb = pool_for_cb.clone();
+                        async move {
+                            let now = chrono::Utc::now().to_rfc3339();
+                            sqlx::query(
+                                "UPDATE obsidian_chats \
+                                 SET claude_session_id = ?1, last_active = ?2 \
+                                 WHERE id = ?3",
+                            )
+                            .bind(&new_session_id)
+                            .bind(&now)
+                            .bind(&chat_key)
+                            .execute(&pool_for_cb)
+                            .await
+                            .map(|_| ())
+                            .context("rotation callback: update obsidian_chats")
+                        }
+                    })
+                    .await;
+                tracing::info!(
+                    "chat: daily rotation done — considered={} rotated={} skipped={} failed={}",
+                    stats.considered, stats.rotated, stats.skipped, stats.failed
+                );
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/favicon.svg", get(favicon))
         .route("/favicon-light.svg", get(favicon_light))
