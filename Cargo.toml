@@ -11,6 +11,9 @@ members = [
     "chores/distiller",
     "chores/preference-learner",
     "chores/reminders",
+    # ADR-015 — unified operator app. The three crates above (news/api,
+    # dashboard, chat) sunset once this one reaches parity.
+    "nucleus-dashboard/api",
 ]
 
 [workspace.package]

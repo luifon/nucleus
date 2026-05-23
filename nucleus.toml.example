@@ -62,3 +62,7 @@ default_channels = ["discord-home"]
 news_api = 8080
 dashboard = 8090
 chat = 8091
+# ADR-015 — unified operator app subsuming dashboard + chat + news public.
+# Optional during the parallel rollout window; becomes the only one
+# of the four after the sunset PR.
+nucleus_dashboard = 8092
