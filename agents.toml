@@ -31,7 +31,7 @@ tmux_session  = "nucleus-discord"
 log_path      = "memory/discord.log"
 diary_key     = "discord"
 persona_venue = "discord"
-capabilities  = ["rotates"]
+capabilities  = ["rotates", "skill_review"]
 
 [[agent]]
 name          = "whatsapp"
@@ -45,7 +45,7 @@ tmux_session  = "nucleus-whatsapp"
 log_path      = "memory/whatsapp.log"
 diary_key     = "whatsapp"
 persona_venue = "whatsapp"
-capabilities  = ["rotates"]
+capabilities  = ["rotates", "skill_review"]
 
 [[agent]]
 name          = "chat"
@@ -56,7 +56,7 @@ runtime       = "rust"
 tmux_session  = "nucleus-chat"
 diary_key     = "chat"
 persona_venue = "chat"
-capabilities  = ["rotates"]
+capabilities  = ["rotates", "skill_review"]
 
 # ── scheduled (launchd-cron domain jobs that drive Claude) ──
 
@@ -106,14 +106,14 @@ class         = "maintenance"
 launch        = "launchd-cron"
 runtime       = "rust"
 launchd_label = "dev.nucleus.skill-gap-learner"
+tmux_session  = "nucleus-skill-gap-learner"
+# ADR-017: all-facets successor to the sunset preference-learner. The periodic
+# `learn` pass (this entry) proposes missing skills across diaries + curates
+# the library; the on-the-fly arm is the `skill_review` capability on the
+# conversational agents below. Writes to ~/.claude/skills (operator-personal).
+schedule      = "30 4 * * *"
+log_path      = "memory/skill-gap-learner.log"
 diary_key     = "skill-gap-learner"
-# FUTURE (ADR-016 future work): generic, all-facets successor to the
-# sunset preference-learner. Reads diaries + transcripts and proposes
-# skills we're missing (periodic), plus an on-the-fly per-session arm
-# (the skill_review capability) on conversational agents. Inherits the
-# deferred persona-evolution (SOUL slot) as reviewable suggestions.
-# Not built yet — ships disabled so it doesn't appear live in /agents.
-enabled       = false
 
 # ── infra (host process / scheduler; no operator persona) ──
 
