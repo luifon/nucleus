@@ -13,3 +13,4 @@ export * from "./skills";
 export * from "./diary";
 export * from "./reminders";
 export * from "./sessions";
+export * from "./vault";
