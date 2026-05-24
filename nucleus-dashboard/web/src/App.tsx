@@ -7,14 +7,12 @@ import {
   Bell,
   BookOpen,
   Database,
-  Timer,
   Newspaper,
   Activity,
   type LucideIcon,
 } from "lucide-react";
 import HomePage from "./pages/HomePage";
 import NewsPage from "./pages/NewsPage";
-import CronPage from "./pages/CronPage";
 import SkillsPage from "./pages/SkillsPage";
 import DiaryPage from "./pages/DiaryPage";
 import RemindersPage from "./pages/RemindersPage";
@@ -42,7 +40,6 @@ const ROUTES: RouteEntry[] = [
   { path: "/reminders", label: "reminders", icon: Bell,            group: "observability", impl: "scaffolded" },
   { path: "/diary",     label: "diary",     icon: BookOpen,        group: "observability", impl: "scaffolded" },
   { path: "/vault",     label: "vault",     icon: Database,        group: "observability", impl: "scaffolded" },
-  { path: "/cron",      label: "cron",      icon: Timer,           group: "observability", impl: "scaffolded" },
 ];
 
 function PendingPage({ label, Icon }: { label: string; Icon: LucideIcon }) {
@@ -71,7 +68,6 @@ export default function App() {
           <Routes>
             <Route path="/" element={<HomePage />} />
             <Route path="/news" element={<NewsPage />} />
-            <Route path="/cron" element={<CronPage />} />
             <Route path="/skills" element={<SkillsPage />} />
             <Route path="/diary" element={<DiaryPage />} />
             <Route path="/reminders" element={<RemindersPage />} />

@@ -84,14 +84,9 @@ async fn main() -> Result<()> {
         app = app.nest("/news/api", handlers::news::router(news_state));
     }
 
-    // Cron router always mounts so the launchd-list endpoint works
-    // even when reminders.db doesn't exist yet.
-    let cron_state = Arc::new(handlers::cron::CronState {
-        reminders_pool: reminders_pool.clone(),
-    });
-    app = app.nest("/cron/api", handlers::cron::router(cron_state));
-
     // Reminders admin — requires the DB. Mount only when openable.
+    // (The retired /cron surface's upcoming + fire-history views were folded
+    // in here; its launchd list is superseded by /agents. ADR-016.)
     if let Some(pool) = reminders_pool.clone() {
         let state = Arc::new(handlers::reminders::RemindersState { pool });
         app = app.nest("/reminders/api", handlers::reminders::router(state));
@@ -198,9 +193,23 @@ async fn main() -> Result<()> {
 
     let app = app
         .nest_service("/assets", ServeDir::new(web_dist.join("assets")))
-        .fallback(move || {
+        .fallback(move |uri: axum::http::Uri| {
             let path = index_html_path.clone();
             async move {
+                // An unmatched API path must NOT get the SPA shell — returning
+                // HTML 200 for `/x/api/...` makes the frontend's jsonGet throw a
+                // cryptic "Unexpected token '<'" instead of a clean error. Give
+                // a real JSON 404 so a missing/typo'd/not-yet-deployed route is
+                // legible (this is what turned the /cron→/reminders deploy lag
+                // into a scary "syntax error").
+                let p = uri.path();
+                if p.contains("/api/") || p.ends_with("/api") {
+                    return (
+                        axum::http::StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "error": format!("no such API route: {p}") })),
+                    )
+                        .into_response();
+                }
                 match tokio::fs::read_to_string(path.as_ref()).await {
                     Ok(html) => Html(html).into_response(),
                     Err(e) => {

@@ -60,3 +60,23 @@ export const setReminderTitle = (id: number, title: string | null) =>
     id,
     title,
   });
+
+// Fire-attempt audit log — folded in from the retired /cron surface (its one
+// view /reminders lacked). "Upcoming" is just the active/pending rows of
+// listReminders sorted by next_fire, so it needs no separate fetcher.
+export type RecentFire = {
+  id: number;
+  reminder_id: number;
+  fired_at: string;
+  channel: string;
+  /** SQLite-style boolean. 1 = success, 0 = failure (error populated). */
+  success: number;
+  msg_id: string | null;
+  error: string | null;
+  reminder_title: string | null;
+  reminder_body: string | null;
+  /** 1 if the source reminder has a system_prompt (skill-fire). */
+  is_skill_fire: number;
+};
+
+export const listReminderHistory = () => jsonGet<RecentFire[]>("/reminders/api/history");
