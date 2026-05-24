@@ -18,6 +18,7 @@ import CronPage from "./pages/CronPage";
 import SkillsPage from "./pages/SkillsPage";
 import DiaryPage from "./pages/DiaryPage";
 import RemindersPage from "./pages/RemindersPage";
+import SessionsPage from "./pages/SessionsPage";
 
 type RouteEntry = {
   path: string;
@@ -34,7 +35,7 @@ const ROUTES: RouteEntry[] = [
   { path: "/",          label: "dashboard", icon: LayoutDashboard, group: "primary",       impl: "scaffolded" },
   { path: "/chat",      label: "chat",      icon: MessageSquare,   group: "primary",       impl: "pending"    },
   { path: "/news",      label: "news",      icon: Newspaper,       group: "primary",       impl: "scaffolded" },
-  { path: "/sessions",  label: "sessions",  icon: Terminal,        group: "observability", impl: "pending"    },
+  { path: "/sessions",  label: "sessions",  icon: Terminal,        group: "observability", impl: "scaffolded" },
   { path: "/skills",    label: "skills",    icon: Sparkles,        group: "observability", impl: "scaffolded" },
   { path: "/reminders", label: "reminders", icon: Bell,            group: "observability", impl: "scaffolded" },
   { path: "/diary",     label: "diary",     icon: BookOpen,        group: "observability", impl: "scaffolded" },
@@ -72,6 +73,7 @@ export default function App() {
             <Route path="/skills" element={<SkillsPage />} />
             <Route path="/diary" element={<DiaryPage />} />
             <Route path="/reminders" element={<RemindersPage />} />
+            <Route path="/sessions" element={<SessionsPage />} />
             {ROUTES.filter((r) => r.impl === "pending").map((r) => (
               <Route key={r.path} path={r.path} element={<PendingPage label={r.label} Icon={r.icon} />} />
             ))}
