@@ -743,6 +743,7 @@ async fn deliver_skill_fire(
         tmux_session: "nucleus-reminders-fire".into(),
         window_name: Some(format!("fire-{}", r.id)),
         ready_timeout: Duration::from_secs(20),
+        agent_label: Some("reminders-fire".into()),
         ..SpawnOptions::default()
     })
     .await
@@ -944,9 +945,12 @@ After the tool succeeds, reply with ONLY the event id on its own line — no pro
         allowed_tools: vec![
             "mcp__claude_ai_Google_Calendar__create_event".into(),
         ],
-        tmux_session: "nucleus-jarvis".into(),
+        // Venue-based identifier (Rule 7 / ADR-016) — shared with
+        // gmail-metabolism; JARVIS is the persona, not the code identity.
+        tmux_session: "nucleus-gmail".into(),
         window_name: Some(format!("cal-{}", r.id)),
         ready_timeout: Duration::from_secs(20),
+        agent_label: Some("calendar-fire".into()),
         ..SpawnOptions::default()
     })
     .await

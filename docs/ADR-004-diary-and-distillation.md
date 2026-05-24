@@ -1,6 +1,15 @@
 # ADR-004 — Diary tier and distillation pipeline
 
-**Status:** Accepted (2026-05-12)
+**Status:** Accepted (2026-05-12) — partially superseded by [[ADR-016]] (2026-05-24)
+
+> **ADR-016 amendment.** The two-stage distiller below (hourly metabolism +
+> weekly contemplation) is consolidated into **one daily pass**; the diary
+> tier, tags, and PROMOTE/MERGE/ARCHIVE/DROP vocabulary are unchanged. The
+> "Persona evolution (SOUL slot)" section is **deferred** out of the distiller
+> to ADR-016's future skill-gap learner (reviewable suggestions, not silent
+> writes to the now-gitignored `personas/<slug>.md`). Raw transcripts are now
+> indexed per run (ADR-016 run-log) — the "no full-transcript logging" footgun
+> below still holds: we index pointers, we don't copy transcripts.
 
 ## Context
 

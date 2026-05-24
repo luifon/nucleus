@@ -2,6 +2,16 @@
 
 **Status:** Accepted (2026-05-12)
 
+> **Roster has evolved — see `agents.toml`.** The crate/service table below
+> is the original 2026-05-12 roster, kept as a historical record. The live
+> agent roster is now the **`agents.toml` registry (ADR-016)**, surfaced at
+> the dashboard's `/agents`. Since then: ADR-015 collapsed `dashboard/`,
+> `chat/`, and `news/api/` into the single `nucleus-dashboard` binary;
+> ADR-016 consolidated the distiller to one daily pass and **sunset
+> `preference-learner`**; ADR-009 moved persona names out of code into
+> config (so "Jerry Lewis"/"Alfred" below are now operator-configurable
+> personas, not hardcoded). Read the table with those substitutions.
+
 ## Context
 
 Nucleus replaces Hermes Agent as the brain behind the user's personal Discord/WhatsApp bots, news aggregator, and local-services dashboard. Hermes did the discovery work — Discord gateway, mem0 stack, persona file pattern, daily-news cron — but routed every message through DeepSeek via OpenRouter (separate billing, mediocre output). Nucleus puts `claude` in the brain seat instead, leveraging the existing Claude Max subscription.

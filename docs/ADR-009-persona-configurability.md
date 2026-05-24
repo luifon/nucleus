@@ -282,6 +282,14 @@ parameter. Forward-compatible; no schema break.
 
 ## Related cleanups NOT in this ADR
 
+> **Done in [[ADR-016]] (2026-05-24).** Both items below were completed as
+> part of the agent-consolidation sweep: the `alfred` reminder-channel rows
+> are migrated to `whatsapp-dm` idempotently on startup
+> (`chores/reminders/src/store.rs`), and the remaining persona-name code
+> references were swept — `nucleus-jarvis` → `nucleus-gmail`, and the
+> `/remember` footer now signs with the resolved `display_name` instead of a
+> hardcoded "Jerry".
+
 These are Rule 7 drifts of the same shape (persona name leaking into
 code identifier) but with separate migration concerns:
 

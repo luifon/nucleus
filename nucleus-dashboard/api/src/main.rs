@@ -97,9 +97,23 @@ async fn main() -> Result<()> {
         app = app.nest("/reminders/api", handlers::reminders::router(state));
     }
 
-    // Sessions — tmux inspector. Stateless; shells out to tmux per
-    // request. Tolerates no-server-running by returning [].
-    app = app.nest("/sessions/api", handlers::sessions::router());
+    // Agents — the ADR-016 front door (supersedes the old /sessions tmux
+    // inspector, which is deleted). Reads agents.toml and probes
+    // liveness per agent. Tolerated-missing: if the registry can't load
+    // the surface is simply absent rather than crashing the binary.
+    match nucleus_core::agents::Registry::load_from(workspace_root.join("agents.toml")) {
+        Ok(registry) => {
+            let agents_state = Arc::new(handlers::agents::AgentsState {
+                workspace_root: workspace_root.clone(),
+                registry,
+                identity: _settings.identity.clone(),
+            });
+            app = app.nest("/agents/api", handlers::agents::router(agents_state));
+        }
+        Err(e) => {
+            tracing::warn!("nucleus-dashboard: agents.toml not loadable: {} — /agents disabled", e);
+        }
+    }
 
     // Vault — filesystem mtime feed over the Obsidian vault.
     // Tilde-expand the configured vault_path since the config loader
@@ -221,18 +235,11 @@ async fn init_chat(
     vault_path: &std::path::Path,
 ) -> Result<handlers::chat::ChatState> {
     const CHAT_DB_PATH: &str = "memory/chat.db";
-    const LEGACY_DASHBOARD_DB: &str = "memory/dashboard.db";
 
+    // The one-time dashboard.db → chat.db migration is retired (ADR-016):
+    // chat.db has long existed, so the `if !chat_db.exists()` guard never
+    // fired, and dashboard.db's sole chat is already present in chat.db.
     let chat_db = workspace_root.join(CHAT_DB_PATH);
-    let legacy_db = workspace_root.join(LEGACY_DASHBOARD_DB);
-    if !chat_db.exists() && legacy_db.exists() {
-        if let Err(e) = std::fs::copy(&legacy_db, &chat_db) {
-            tracing::warn!("chat: dashboard.db → chat.db migration failed: {}", e);
-        } else {
-            tracing::info!("chat: migrated dashboard.db → chat.db");
-        }
-    }
-
     let pool = db::open(&chat_db).await?;
     handlers::chat::ensure_schema(&pool).await?;
 
@@ -260,6 +267,7 @@ async fn init_chat(
         add_dirs: vec![vault_path.to_path_buf()],
         tmux_session: "nucleus-chat".into(),
         idle_timeout: std::time::Duration::from_secs(60 * 60 * 2),
+        agent_label: Some("chat".into()),
     });
 
     Ok(handlers::chat::ChatState {

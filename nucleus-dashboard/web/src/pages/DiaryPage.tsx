@@ -10,8 +10,8 @@ import { listDiaryAgents, listRecentDiary } from "@/lib/api";
 const ALL = "__all__";
 
 export default function DiaryPage() {
-  // Honor ?agent=X in the URL so cross-surface links (e.g. from
-  // /sessions when a pane is idle) land pre-filtered.
+  // Honor ?agent=X in the URL so cross-surface links (e.g. the diary
+  // button on an /agents tile) land pre-filtered.
   const [params] = useSearchParams();
   const initialAgent = params.get("agent") ?? ALL;
   const [agent, setAgent] = useState<string>(initialAgent);

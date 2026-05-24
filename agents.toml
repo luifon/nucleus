@@ -1,0 +1,159 @@
+# Agent registry — the single source of truth for every Nucleus agent.
+# See ADR-016. Loaded by `nucleus_core::agents::Registry::load()`.
+#
+# This file is COMMITTED (unlike nucleus.toml, which is gitignored). It's
+# canonical system topology — identical for everyone who clones the repo —
+# and contains no identifiers: venue-based names, relative paths, and
+# `dev.nucleus.*` labels only (Rule 1 / Rule 7).
+#
+# Hand-edited: adding/removing an agent means editing this file. Individual
+# executions (per-chat-key sessions, per-contract skill-fires, calendar
+# fires) are NOT entries here — they're discovered at runtime from the
+# session DBs + the run-log index (memory/logs/<name>/runs.jsonl).
+#
+# Fields (only name/class/launch are required):
+#   class   conversational | scheduled | maintenance | infra | ephemeral
+#   launch  launchd-daemon | launchd-cron | in-process | on-demand
+#   schedule is informational — the real schedule is in the plist.
+#   tmux_session present  => drives Claude => raw output via runs.jsonl index.
+#   log_path present      => launchd stdout/err file.
+#   capabilities          => rotates | skill_review  (Layer-A, in-agent).
+
+# ── conversational (fixed daemons hosting operator-facing Claude pools) ──
+
+[[agent]]
+name          = "discord"
+class         = "conversational"
+launch        = "launchd-daemon"
+runtime       = "rust"
+launchd_label = "dev.nucleus.discord"
+tmux_session  = "nucleus-discord"
+log_path      = "memory/discord.log"
+diary_key     = "discord"
+persona_venue = "discord"
+capabilities  = ["rotates"]
+
+[[agent]]
+name          = "whatsapp"
+class         = "conversational"
+launch        = "launchd-daemon"
+runtime       = "node"
+launchd_label = "dev.nucleus.whatsapp"
+# Primary pool session. The DM (nucleus-whatsapp-dm) and brain-dump
+# (nucleus-whatsapp-braindump) sessions are prefix-matched by /agents.
+tmux_session  = "nucleus-whatsapp"
+log_path      = "memory/whatsapp.log"
+diary_key     = "whatsapp"
+persona_venue = "whatsapp"
+capabilities  = ["rotates"]
+
+[[agent]]
+name          = "chat"
+class         = "conversational"
+# Hosted in-process by the nucleus-dashboard daemon; liveness tracks the host.
+launch        = "in-process"
+runtime       = "rust"
+tmux_session  = "nucleus-chat"
+diary_key     = "chat"
+persona_venue = "chat"
+capabilities  = ["rotates"]
+
+# ── scheduled (launchd-cron domain jobs that drive Claude) ──
+
+[[agent]]
+name          = "news-fetcher"
+class         = "scheduled"
+launch        = "launchd-cron"
+runtime       = "rust"
+launchd_label = "dev.nucleus.news-fetcher"
+tmux_session  = "nucleus-news-fetcher"
+schedule      = "0 9 * * *"
+log_path      = "memory/news-fetcher.log"
+diary_key     = "news-fetcher"
+
+[[agent]]
+name          = "gmail-metabolism"
+class         = "scheduled"
+launch        = "launchd-cron"
+runtime       = "rust"
+launchd_label = "dev.nucleus.gmail-metabolism"
+# Renamed from nucleus-jarvis (Rule 7 — venue, not persona). Shared with the
+# calendar-fire ephemeral agent (both are the Google-workspace venue).
+tmux_session  = "nucleus-gmail"
+schedule      = "0 * * * *"
+log_path      = "memory/gmail-metabolism.log"
+diary_key     = "gmail-metabolism"
+persona_venue = "gmail"
+
+# ── maintenance (read other agents' diaries → durable artifacts) ──
+
+[[agent]]
+name          = "distiller"
+class         = "maintenance"
+launch        = "launchd-cron"
+runtime       = "rust"
+launchd_label = "dev.nucleus.distiller"
+tmux_session  = "nucleus-distiller"
+# Consolidated single daily pass (was distiller-hourly + distiller-weekly):
+# extract → promote-to-T2 → archive-to-vault → prune.
+schedule      = "0 4 * * *"
+log_path      = "memory/distiller.log"
+diary_key     = "distiller"
+
+[[agent]]
+name          = "skill-gap-learner"
+class         = "maintenance"
+launch        = "launchd-cron"
+runtime       = "rust"
+launchd_label = "dev.nucleus.skill-gap-learner"
+diary_key     = "skill-gap-learner"
+# FUTURE (ADR-016 future work): generic, all-facets successor to the
+# sunset preference-learner. Reads diaries + transcripts and proposes
+# skills we're missing (periodic), plus an on-the-fly per-session arm
+# (the skill_review capability) on conversational agents. Inherits the
+# deferred persona-evolution (SOUL slot) as reviewable suggestions.
+# Not built yet — ships disabled so it doesn't appear live in /agents.
+enabled       = false
+
+# ── infra (host process / scheduler; no operator persona) ──
+
+[[agent]]
+name          = "nucleus-dashboard"
+class         = "infra"
+launch        = "launchd-daemon"
+runtime       = "rust"
+launchd_label = "dev.nucleus.nucleus-dashboard"
+log_path      = "memory/nucleus-dashboard.log"
+
+[[agent]]
+name          = "reminders-tick"
+class         = "infra"
+launch        = "launchd-cron"
+runtime       = "rust"
+launchd_label = "dev.nucleus.reminders-tick"
+# Native scheduler; fires every minute (StartInterval 60 in the plist).
+schedule      = "* * * * *"
+log_path      = "memory/reminders.log"
+diary_key     = "reminders"
+
+# ── ephemeral (on-demand, spawned by reminders-tick) ──
+
+[[agent]]
+name          = "reminders-fire"
+class         = "ephemeral"
+launch        = "on-demand"
+runtime       = "rust"
+# Skill-fire sessions (ADR-008). Raw output via the runs.jsonl index;
+# individual fires are tracked in reminders.db.
+tmux_session  = "nucleus-reminders-fire"
+diary_key     = "reminders"
+
+[[agent]]
+name          = "calendar-fire"
+class         = "ephemeral"
+launch        = "on-demand"
+runtime       = "rust"
+# Calendar event creation (ADR-007) via the gmail/JARVIS venue.
+tmux_session  = "nucleus-gmail"
+diary_key     = "reminders"
+persona_venue = "gmail"

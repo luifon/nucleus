@@ -12,7 +12,7 @@ export * from "./cron";
 export * from "./skills";
 export * from "./diary";
 export * from "./reminders";
-export * from "./sessions";
+export * from "./agents";
 export * from "./vault";
 export * from "./chat";
 export * from "./dashboard";

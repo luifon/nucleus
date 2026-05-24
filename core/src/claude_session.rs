@@ -36,6 +36,13 @@ pub struct Session {
     pub transcript_path: PathBuf,
     /// Byte offset into the transcript; we only read past this on each `ask`.
     cursor: u64,
+    /// Run-log bookkeeping (ADR-016). Set when spawned with an `agent_label`;
+    /// drives the `runs.jsonl` start/end rows. `None` = no run-log.
+    agent_label: Option<String>,
+    /// Unique id for this spawn's run-log row (distinct from `session_id`).
+    run_id: String,
+    /// Workspace root, needed to resolve the `memory/logs/<agent>/` path.
+    workspace_root: PathBuf,
 }
 
 /// Options for spawning a new claude session in tmux.
@@ -64,6 +71,11 @@ pub struct SpawnOptions {
     /// If `Some(uuid)`, resume that existing claude session. If `None`, a
     /// fresh UUID is generated and a new session is started.
     pub resume_session_id: Option<String>,
+    /// Registry agent name (ADR-016). When `Some`, each spawn appends a row
+    /// to `memory/logs/<agent>/runs.jsonl` pointing at the transcript, so the
+    /// raw output survives the window being killed. `None` = no run-log
+    /// (examples, tests, ad-hoc sessions).
+    pub agent_label: Option<String>,
 }
 
 impl Default for SpawnOptions {
@@ -79,6 +91,7 @@ impl Default for SpawnOptions {
             window_name: None,
             ready_timeout: Duration::from_secs(20),
             resume_session_id: None,
+            agent_label: None,
         }
     }
 }
@@ -181,11 +194,34 @@ impl Session {
             0
         };
 
+        // Run-log: append an in-flight row pointing at the transcript so the
+        // raw output is recoverable after the window is killed (ADR-016).
+        // Best-effort — never fail a spawn because the index couldn't write.
+        let run_id = uuid::Uuid::new_v4().to_string();
+        if let Some(agent) = &opts.agent_label {
+            let row = crate::runlog::RunRow {
+                run_id: run_id.clone(),
+                agent: agent.clone(),
+                session_id: session_id.clone(),
+                transcript_path: transcript_path.to_string_lossy().into_owned(),
+                tmux_target: target.clone(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                ended_at: None,
+                ok: None,
+            };
+            if let Err(e) = crate::runlog::record_start(&opts.workspace_root, &row) {
+                tracing::warn!("run-log record_start failed for {agent}: {e:#}");
+            }
+        }
+
         Ok(Self {
             session_id,
             tmux_target: target,
             transcript_path,
             cursor,
+            agent_label: opts.agent_label.clone(),
+            run_id,
+            workspace_root: opts.workspace_root.clone(),
         })
     }
 
@@ -218,7 +254,21 @@ impl Session {
     }
 
     /// Kill the tmux window (and the claude inside it).
+    ///
+    /// Finalizes the run-log row (sets `ended_at`, `ok = true`) — `ok` means
+    /// "closed cleanly", which is true on every explicit close. A run that
+    /// dies without `close()` (crash, SIGKILL) leaves `ended_at` null, which
+    /// reads as "ran, outcome unknown". Error-tracking proper is out of scope
+    /// (ADR-016): for scheduled agents the launchd exit code carries it; for
+    /// fires the diary + ⚠️ alert do.
     pub async fn close(self) -> Result<()> {
+        if let Some(agent) = &self.agent_label {
+            if let Err(e) =
+                crate::runlog::record_end(&self.workspace_root, agent, &self.run_id, true)
+            {
+                tracing::warn!("run-log record_end failed for {agent}: {e:#}");
+            }
+        }
         let _ = Command::new("tmux")
             .args(["kill-window", "-t", &self.tmux_target])
             .output()
@@ -246,6 +296,9 @@ pub struct PoolConfig {
     /// Sessions idle for longer than this get reaped on the next reap_idle()
     /// call. Set generously — re-spawning costs ~5s.
     pub idle_timeout: Duration,
+    /// Registry agent name for the run-log (ADR-016); threaded into every
+    /// session this pool spawns. `None` = no run-log.
+    pub agent_label: Option<String>,
 }
 
 impl Default for PoolConfig {
@@ -259,6 +312,7 @@ impl Default for PoolConfig {
             add_dirs: vec![],
             tmux_session: "nucleus".into(),
             idle_timeout: Duration::from_secs(60 * 60 * 4), // 4h
+            agent_label: None,
         }
     }
 }
@@ -330,6 +384,7 @@ impl SessionPool {
                     window_name: Some(window_name),
                     ready_timeout: Duration::from_secs(20),
                     resume_session_id,
+                    agent_label: self.config.agent_label.clone(),
                 })
                 .await?;
                 let entry = Arc::new(Mutex::new(Entry {
@@ -517,6 +572,7 @@ impl SessionPool {
             window_name: None,
             ready_timeout: Duration::from_secs(60),
             resume_session_id: None,
+            agent_label: self.config.agent_label.clone(),
         })
         .await
         .context("daily_rotate: spawn new session")?;
