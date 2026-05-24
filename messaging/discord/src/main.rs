@@ -135,6 +135,17 @@ impl Handler {
         };
         send_chunked(&http, job.channel_id, &reply).await?;
 
+        // On-the-fly skill review (ADR-017) — detached, fire-and-forget, never
+        // blocks or fails the reply we just sent.
+        if result.review_due {
+            nucleus_core::skills::fire_skill_review(
+                &self.workspace_root,
+                "discord",
+                &chat_key,
+                &result.transcript_path,
+            );
+        }
+
         // Diary auto-append.
         let summary = format!(
             "{} — replied in {:.1}s ({} session {})",
@@ -481,6 +492,11 @@ async fn main() -> Result<()> {
         tmux_session: "nucleus-discord".into(),
         idle_timeout: std::time::Duration::from_secs(60 * 60 * 4),
         agent_label: Some("discord".into()),
+        review_nudge_interval: if settings.skill_learner.enabled {
+            settings.skill_learner.nudge_interval
+        } else {
+            0
+        },
     }));
 
     // Background task: reap idle sessions every 30 minutes.

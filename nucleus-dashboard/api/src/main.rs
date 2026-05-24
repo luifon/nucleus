@@ -268,6 +268,11 @@ async fn init_chat(
         tmux_session: "nucleus-chat".into(),
         idle_timeout: std::time::Duration::from_secs(60 * 60 * 2),
         agent_label: Some("chat".into()),
+        review_nudge_interval: if settings.skill_learner.enabled {
+            settings.skill_learner.nudge_interval
+        } else {
+            0
+        },
     });
 
     Ok(handlers::chat::ChatState {
