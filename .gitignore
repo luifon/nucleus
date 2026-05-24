@@ -51,3 +51,5 @@ design-mocks/
 
 # playwright-mcp screenshot + snapshot artifacts
 .playwright-mcp/
+*-news-*.png
+*-news-*.yml
