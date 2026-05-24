@@ -22,3 +22,13 @@ export type TmuxSession = {
 };
 
 export const listSessions = () => jsonGet<TmuxSession[]>("/sessions/api/list");
+
+/** `tmux capture-pane -p` for the session's active pane (last N
+ *  scrollback lines, default 20). Plain text. */
+export const captureSessionPane = (session: string, lines = 20) =>
+  fetch(`/sessions/api/capture?session=${encodeURIComponent(session)}&lines=${lines}`).then(
+    async (r) => {
+      if (!r.ok) throw new Error(`/sessions/api/capture → ${r.status}`);
+      return r.text();
+    },
+  );
