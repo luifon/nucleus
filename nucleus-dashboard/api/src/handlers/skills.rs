@@ -184,9 +184,9 @@ async fn walk(root: &Path, tier: &'static str) -> Result<Vec<Skill>, SkillsError
 /// clean we get the full ADR-008 field set. On failure we fall back
 /// to a forgiving line-by-line `key: value` extractor that recovers
 /// at minimum `name` + `description`. This keeps the surface useful
-/// when a skill author writes a description like
-/// `natural-language colons` (the `: ` inside the value trips strict
-/// YAML), without forcing every author to remember YAML quoting rules.
+/// when a skill author writes a description containing `: ` inside
+/// the value (e.g. natural-language colons trip strict YAML) without
+/// forcing every author to remember YAML quoting rules.
 ///
 /// Parse failures are logged at WARN with the file path so the
 /// operator notices and can tighten the source.
