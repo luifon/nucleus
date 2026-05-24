@@ -1,12 +1,17 @@
-//! distiller — diary metabolism + contemplation passes (see ADR-004).
+//! distiller — diary distillation, one consolidated daily pass (ADR-016).
 //!
-//! Subcommands:
-//!   metabolism       hourly extraction over recent diary entries → _pending.md
-//!   contemplation    weekly judge: PROMOTE | MERGE | ARCHIVE | DROP
+//! Was two launchd jobs (hourly `metabolism` + weekly `contemplation`); now a
+//! single daily run with no subcommand. Each invocation:
+//!   1. metabolism    — extract candidates from the last day's diaries → _pending.md
+//!   2. contemplation — judge them (PROMOTE | MERGE | ARCHIVE | DROP) + prune
+//!
+//! Persona auto-evolution (ADR-004's "SOUL slot") is intentionally NOT here —
+//! that's deferred to the future skill-gap learner (ADR-016), which proposes
+//! persona edits as reviewable suggestions rather than silent writes to the
+//! operator-personal `personas/<slug>.md` files.
 
 use anyhow::{Context, Result};
 use chrono::{Duration, Local, NaiveDate};
-use clap::{Parser, Subcommand};
 use nucleus_core::{
     claude::PermissionMode,
     claude_session::{AskOptions, Session, SpawnOptions},
@@ -18,26 +23,10 @@ use std::path::{Path, PathBuf};
 
 const AGENT_NAME: &str = "distiller";
 
-#[derive(Parser)]
-#[command(name = "distiller", about = "Nucleus diary distillation pipeline")]
-struct Cli {
-    #[command(subcommand)]
-    command: Cmd,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// Cheap extraction over the last hour's entries → _pending.md per agent.
-    Metabolism,
-    /// Heavy promote/merge/archive/drop pass over the past 7 days.
-    Contemplation,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     nucleus_core::init_tracing();
     let settings = Settings::load().context("loading settings")?;
-    let cli = Cli::parse();
     let workspace_root = std::env::current_dir()?;
     let diary_root = workspace_root.join(&settings.diary.root);
 
@@ -46,10 +35,9 @@ async fn main() -> Result<()> {
         .output()
         .await;
 
-    match cli.command {
-        Cmd::Metabolism => metabolism(&workspace_root, &diary_root).await?,
-        Cmd::Contemplation => contemplation(&workspace_root, &diary_root, &settings).await?,
-    }
+    // One daily pass: extract fresh candidates, then judge + archive + prune.
+    metabolism(&workspace_root, &diary_root).await?;
+    contemplation(&workspace_root, &diary_root, &settings).await?;
     Ok(())
 }
 
@@ -108,11 +96,13 @@ async fn metabolism(workspace_root: &Path, diary_root: &Path) -> Result<()> {
         permission_mode: Some(PermissionMode::Auto),
         tmux_session: "nucleus-distiller".into(),
         window_name: Some("metabolism".into()),
+        agent_label: Some("distiller".into()),
         ..SpawnOptions::default()
     })
     .await
     .context("spawning claude session for metabolism")?;
-    let since = Local::now() - Duration::hours(1);
+    // Daily pass — scan the last day's entries (was hourly).
+    let since = Local::now() - Duration::days(1);
     let mut total_staged = 0usize;
     let mut agents_processed = 0usize;
 
@@ -219,6 +209,7 @@ async fn contemplation(workspace_root: &Path, diary_root: &Path, settings: &Sett
         add_dirs: vec![vault_path.clone()],
         tmux_session: "nucleus-distiller".into(),
         window_name: Some("contemplation".into()),
+        agent_label: Some("distiller".into()),
         ..SpawnOptions::default()
     })
     .await

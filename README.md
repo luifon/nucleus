@@ -37,11 +37,11 @@ brain is your existing Claude subscription — no separate API billing.
    WhatsApp ←─┐                      │
               │  ┌───────────────────▼──────┐
               │  │ news-fetcher (launchd 1x)│ ← claude session
-              │  │ distiller-{hourly,weekly}│
-              │  │ preference-learner       │
-              │  │ reminders-tick (60s)     │
+              │  │ distiller (daily)        │
               │  │ gmail-metabolism         │
+              │  │ reminders-tick (60s)     │
    discord    │  └──────────────────────────┘
+              │   (all agents declared in agents.toml — ADR-016)
    (Rust,     │
    serenity)  │  ┌──────────────────────────────────────────────┐
               │  │  nucleus-core (Rust lib)                     │
@@ -176,10 +176,9 @@ npm run discover    # prints a QR code as PNG (opens in Preview) + ASCII
 ./tools/launchd/install.sh
 # Substitutes __USER_HOME__ → $HOME and __TZ__ → $NUCLEUS_TZ (auto-
 # detected from /etc/localtime if unset) in each plist template, copies
-# to ~/Library/LaunchAgents/, loads via launchctl. 8 services total
-# (discord, whatsapp, nucleus-dashboard, news-fetcher,
-# distiller-hourly, distiller-weekly, preference-learner,
-# reminders-tick).
+# to ~/Library/LaunchAgents/, loads via launchctl. 7 services total
+# (discord, whatsapp, nucleus-dashboard, news-fetcher, gmail-metabolism,
+# distiller, reminders-tick).
 ```
 
 > **Upgrading from a pre-ADR-009 install?** The WhatsApp service was
@@ -192,10 +191,21 @@ npm run discover    # prints a QR code as PNG (opens in Preview) + ASCII
 > # then re-run install.sh — it will load dev.nucleus.whatsapp fresh
 > ```
 
+> **Upgrading from a pre-ADR-016 install?** The distiller's two jobs were
+> consolidated into one daily job, and preference-learner was sunset. Unload
+> the retired services before re-running `install.sh`:
+>
+> ```bash
+> P=gui/$UID/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}
+> launchctl bootout $P.distiller-hourly $P.distiller-weekly $P.preference-learner 2>/dev/null
+> tmux kill-session -t nucleus-jarvis 2>/dev/null   # renamed → nucleus-gmail
+> # then re-run install.sh — it loads dev.nucleus.distiller fresh
+> ```
+
 Verify:
 ```bash
 launchctl list | grep "${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}"
-curl http://127.0.0.1:8090/api/services | jq
+curl http://127.0.0.1:8092/agents/api/list | jq   # every agent + live state (ADR-016)
 
 # Optional: prove the Session machinery actually round-trips against your
 # claude install. Burns one ~15s claude turn.
@@ -252,8 +262,7 @@ vault_path = "~/Documents/Obsidian"
 fetch_cron = "0 9,18 * * *"
 
 [distiller]
-metabolism_cron = "0 * * * *"
-contemplation_cron = "0 4 * * 0"
+cron = "0 4 * * *"          # one consolidated daily pass (ADR-016)
 
 [ports]
 nucleus_dashboard = 8092
@@ -339,18 +348,18 @@ nucleus/
 ├── Cargo.toml              workspace manifest
 ├── nucleus.toml            non-identifying tunables (gitignored copy)
 ├── .env                    identifiers + secrets (gitignored)
-├── core/                   shared Rust lib — claude wrapper, config, memory, diary, …
+├── agents.toml             agent registry — single source of truth (ADR-016)
+├── core/                   shared Rust lib — claude wrapper, config, memory, diary, agents, runlog, …
 ├── messaging/
 │   ├── discord/            Discord bot — bin `discord` (Rust, serenity)
-│   └── whatsapp/           Alfred (TS, Baileys, whisper.cpp)
+│   ├── whatsapp/           WhatsApp bot (TS, Baileys, whisper.cpp)
+│   └── gmail/              gmail-metabolism — inbox triage via JARVIS persona (ADR-007)
 ├── news/
-│   ├── fetcher/            launchd-driven RSS pull + scorer
-│   └── api/                axum, day-bucketed feed + votes
-├── dashboard/              axum, health collectors + container drill-down
-├── chat/                   axum, Obsidian chat against the PARA vault
+│   └── fetcher/            launchd-driven RSS pull + scorer
+├── nucleus-dashboard/      unified operator app (ADR-015) — axum API + React SPA;
+│                           subsumes the old dashboard/, chat/, news/api/ crates
 ├── chores/
-│   ├── distiller/          metabolism + contemplation passes
-│   ├── preference-learner/ weekly votes → preferences file
+│   ├── distiller/          one daily distillation pass (ADR-016; was hourly+weekly)
 │   └── reminders/          ad-hoc reminders CLI + once-per-minute polling tick
 ├── tools/
 │   ├── launchd/            plist templates + install.sh
@@ -368,17 +377,24 @@ nucleus/
 - `docs/ADR-004-diary-and-distillation.md` — journal pattern, promotion ops
 - `docs/ADR-005-second-brain.md` — T3 = PARA-organized Obsidian vault; multi-op brain-dump pipeline
 - `docs/ADR-008-skills.md` — procedural memory via Claude Code's native `SKILL.md` mechanism + the reminders `system_prompt` extension
+- `docs/ADR-009-persona-configurability.md` — venue→persona mapping via `NUCLEUS_PERSONA_<VENUE>`; venue names in code, persona names in config
+- `docs/ADR-015-nucleus-dashboard-unified-operator-app.md` — the single operator app + aesthetic guardrails
+- `docs/ADR-016-agent-registry-and-log-capture.md` — `agents.toml` registry, run-log capture, `/agents` front door, distiller consolidation
+- `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
 
 ## Operating cheatsheet
 
 ```bash
+# See every agent + its live state at a glance (the front door, ADR-016):
+#   open http://127.0.0.1:8092/agents   — or:  curl …/agents/api/list | jq
+
 # Tail any service's log
 tail -f memory/discord.log
 tail -f memory/whatsapp.log
 tail -f memory/news-fetcher.log
-tail -f memory/dashboard.log
+tail -f memory/nucleus-dashboard.log
 
 # Watch a bot think live (the tmux window claude is running in)
 tmux attach -t nucleus-discord            # detach: Ctrl-b d
@@ -386,8 +402,8 @@ tmux attach -t nucleus-whatsapp
 tmux attach -t nucleus-chat               # Obsidian chat service
 # One-shot scheduled jobs only have a tmux session while they're running:
 tmux attach -t nucleus-news-fetcher       # if a run is in flight
-tmux attach -t nucleus-distiller          # hourly + weekly passes
-tmux attach -t nucleus-preference-learner
+tmux attach -t nucleus-distiller          # daily distillation pass
+tmux attach -t nucleus-gmail              # gmail metabolism + calendar fires (was nucleus-jarvis)
 
 # Reload a specific service after a code change
 cargo build --release && ./tools/launchd/install.sh discord
@@ -397,8 +413,8 @@ cargo build --release && ./tools/launchd/install.sh discord
 
 # Manually trigger a scheduled job (re-uses the launchd-configured environment)
 launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.news-fetcher
-launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.distiller-hourly
-launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.preference-learner
+launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.distiller       # daily pass (prunes diaries + writes memory/vault)
+launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.gmail-metabolism
 
 # Force a stuck per-chat session to respawn fresh (next message cold-spawns,
 # but with --resume so prior turns are still there)

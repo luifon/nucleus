@@ -316,6 +316,7 @@ async fn generate_title(cwd: &PathBuf, user: &str, assistant: &str) -> Result<St
         permission_mode: Some(PermissionMode::Auto),
         tmux_session: "nucleus-chat-title".into(),
         window_name: Some("title".into()),
+        agent_label: Some("chat".into()),
         ..SpawnOptions::default()
     })
     .await?;
