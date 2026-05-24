@@ -2,12 +2,19 @@
 
 **Status:** Accepted (2026-05-23) — Implemented (2026-05-24)
 
-> **Updated by [[ADR-016]] (2026-05-24).** The `/sessions` surface described
-> below was built then **deleted** — it's superseded by `/agents` (the
-> registry-backed front door). The `/sessions` references in the surface and
-> route tables are historical; the tmux copy-attach affordance now lives on
-> each `/agents` tile, and the `/` landing's deferred agents-health tile
-> shipped with ADR-016.
+> **Updated by [[ADR-016]] (2026-05-24).** Two surfaces below were built then
+> **deleted**, so read the surface + route tables with these substitutions:
+> - **`/sessions`** → superseded by **`/agents`** (the registry-backed front
+>   door); the tmux copy-attach affordance now lives on each `/agents` tile,
+>   and the `/` landing's deferred agents-health tile shipped with ADR-016.
+> - **`/cron`** → retired and folded into **`/agents`** (its launchd-liveness
+>   view) + **`/reminders`** (which gained `manage` + `history` tabs — the
+>   upcoming + fire-history views). Post-registry there's no distinct "cron"
+>   concept left to own. Unknown `/*/api/*` routes now return a JSON 404
+>   rather than the SPA shell.
+>
+> The current operator surfaces: `/` `/chat` `/news` `/agents` `/skills`
+> `/reminders` `/diary` `/vault`.
 
 **Supersedes (in part):**
 - [[ADR-001]] — the "one crate per operator surface" topology.
