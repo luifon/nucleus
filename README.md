@@ -39,9 +39,11 @@ brain is your existing Claude subscription — no separate API billing.
               │  │ news-fetcher (launchd 1x)│ ← claude session
               │  │ distiller (daily)        │
               │  │ gmail-metabolism         │
+              │  │ skill-gap-learner (daily)│
               │  │ reminders-tick (60s)     │
    discord    │  └──────────────────────────┘
-              │   (all agents declared in agents.toml — ADR-016)
+              │   (all agents declared in agents.toml — ADR-016;
+              │    skill-gap-learner also reviews on-the-fly — ADR-017)
    (Rust,     │
    serenity)  │  ┌──────────────────────────────────────────────┐
               │  │  nucleus-core (Rust lib)                     │
@@ -176,9 +178,9 @@ npm run discover    # prints a QR code as PNG (opens in Preview) + ASCII
 ./tools/launchd/install.sh
 # Substitutes __USER_HOME__ → $HOME and __TZ__ → $NUCLEUS_TZ (auto-
 # detected from /etc/localtime if unset) in each plist template, copies
-# to ~/Library/LaunchAgents/, loads via launchctl. 7 services total
+# to ~/Library/LaunchAgents/, loads via launchctl. 8 services total
 # (discord, whatsapp, nucleus-dashboard, news-fetcher, gmail-metabolism,
-# distiller, reminders-tick).
+# distiller, reminders-tick, skill-gap-learner).
 ```
 
 > **Upgrading from a pre-ADR-009 install?** The WhatsApp service was
@@ -263,6 +265,13 @@ fetch_cron = "0 9,18 * * *"
 
 [distiller]
 cron = "0 4 * * *"          # one consolidated daily pass (ADR-016)
+
+[skill_learner]
+# ADR-017: on-the-fly review after N turns/chat + a periodic learn/curate pass.
+nudge_interval = 12
+stale_after_days = 30
+archive_after_days = 90
+enabled = true
 
 [ports]
 nucleus_dashboard = 8092
@@ -360,7 +369,8 @@ nucleus/
 │                           subsumes the old dashboard/, chat/, news/api/ crates
 ├── chores/
 │   ├── distiller/          one daily distillation pass (ADR-016; was hourly+weekly)
-│   └── reminders/          ad-hoc reminders CLI + once-per-minute polling tick
+│   ├── reminders/          ad-hoc reminders CLI + once-per-minute polling tick
+│   └── skill-gap-learner/  autonomous skill learner — on-the-fly + periodic (ADR-017)
 ├── tools/
 │   ├── launchd/            plist templates + install.sh
 │   └── cloudflared/        tunnel config templates
@@ -380,6 +390,7 @@ nucleus/
 - `docs/ADR-009-persona-configurability.md` — venue→persona mapping via `NUCLEUS_PERSONA_<VENUE>`; venue names in code, persona names in config
 - `docs/ADR-015-nucleus-dashboard-unified-operator-app.md` — the single operator app + aesthetic guardrails
 - `docs/ADR-016-agent-registry-and-log-capture.md` — `agents.toml` registry, run-log capture, `/agents` front door, distiller consolidation
+- `docs/ADR-017-skill-gap-learner.md` — autonomous skill learner (on-the-fly review + periodic gap-detection/curator), the validation gate
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
@@ -403,6 +414,7 @@ tmux attach -t nucleus-chat               # Obsidian chat service
 # One-shot scheduled jobs only have a tmux session while they're running:
 tmux attach -t nucleus-news-fetcher       # if a run is in flight
 tmux attach -t nucleus-distiller          # daily distillation pass
+tmux attach -t nucleus-skill-gap-learner  # skill review (on-the-fly) + daily learn/curate (ADR-017)
 tmux attach -t nucleus-gmail              # gmail metabolism + calendar fires (was nucleus-jarvis)
 
 # Reload a specific service after a code change
