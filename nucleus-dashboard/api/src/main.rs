@@ -101,6 +101,24 @@ async fn main() -> Result<()> {
     // request. Tolerates no-server-running by returning [].
     app = app.nest("/sessions/api", handlers::sessions::router());
 
+    // Vault — filesystem mtime feed over the Obsidian vault.
+    // Tilde-expand the configured vault_path since the config loader
+    // doesn't do it for us today.
+    let vault_path_raw = &_settings.obsidian.vault_path;
+    let vault_root = if let Some(rest) = vault_path_raw.strip_prefix("~/") {
+        std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(rest))
+            .unwrap_or_else(|_| PathBuf::from(vault_path_raw))
+    } else if vault_path_raw == "~" {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(vault_path_raw))
+    } else {
+        PathBuf::from(vault_path_raw)
+    };
+    let vault_state = Arc::new(handlers::vault::VaultState { root: vault_root });
+    app = app.nest("/vault/api", handlers::vault::router(vault_state));
+
     // Skills router — walks both skill trees. Operator tier resolves
     // to $HOME/.claude/skills/; repo tier is relative to the workspace
     // root. Both tolerated-missing.

@@ -19,6 +19,7 @@ import SkillsPage from "./pages/SkillsPage";
 import DiaryPage from "./pages/DiaryPage";
 import RemindersPage from "./pages/RemindersPage";
 import SessionsPage from "./pages/SessionsPage";
+import VaultPage from "./pages/VaultPage";
 
 type RouteEntry = {
   path: string;
@@ -39,7 +40,7 @@ const ROUTES: RouteEntry[] = [
   { path: "/skills",    label: "skills",    icon: Sparkles,        group: "observability", impl: "scaffolded" },
   { path: "/reminders", label: "reminders", icon: Bell,            group: "observability", impl: "scaffolded" },
   { path: "/diary",     label: "diary",     icon: BookOpen,        group: "observability", impl: "scaffolded" },
-  { path: "/vault",     label: "vault",     icon: Database,        group: "observability", impl: "pending"    },
+  { path: "/vault",     label: "vault",     icon: Database,        group: "observability", impl: "scaffolded" },
   { path: "/cron",      label: "cron",      icon: Timer,           group: "observability", impl: "scaffolded" },
 ];
 
@@ -74,6 +75,7 @@ export default function App() {
             <Route path="/diary" element={<DiaryPage />} />
             <Route path="/reminders" element={<RemindersPage />} />
             <Route path="/sessions" element={<SessionsPage />} />
+            <Route path="/vault" element={<VaultPage />} />
             {ROUTES.filter((r) => r.impl === "pending").map((r) => (
               <Route key={r.path} path={r.path} element={<PendingPage label={r.label} Icon={r.icon} />} />
             ))}
