@@ -1,17 +1,3 @@
-//! Chat surface — multi-chat against the Obsidian vault, lifted
-//! from the standalone `chat/` crate (ADR-015 Phase 1). Each chat
-//! is a Claude session resumed across messages. Messages are
-//! double-stored (in our SQLite + Claude's session transcript) so
-//! we can render history independently of Claude's internal session
-//! files.
-//!
-//! Routes:
-//!   - GET    /chat/api/chats        list all chats (most-recent first)
-//!   - POST   /chat/api/chats        create a new empty chat
-//!   - GET    /chat/api/chats/:id    chat metadata + full message history
-//!   - DELETE /chat/api/chats/:id    remove chat + its messages
-//!   - POST   /chat/api/chats/:id/messages   ask the session
-
 use anyhow::Result;
 use axum::{
     extract::{Path, State},
@@ -38,9 +24,6 @@ pub struct ChatState {
     pub vault_path: PathBuf,
     pub workspace_root: PathBuf,
     pub sessions: SessionPool,
-    /// Display name resolved from the chat persona's `display_name`
-    /// frontmatter (ADR-009). Used as the assistant-role label in
-    /// the UI so we don't hardcode "Q" or "Assistant".
     pub persona_display_name: String,
 }
 
@@ -222,10 +205,8 @@ async fn send_message(
         return Err(ChatError::BadRequest("message empty".into()));
     }
 
-    // Capture the user-msg timestamp now (the moment the request arrived)
-    // but defer the INSERT until after sessions.ask() succeeds. If ask()
-    // errors (claude session crashed, transcript timeout, etc.), nothing
-    // hits the DB — no orphan user row left over from a failed turn.
+    // Defer the user-msg INSERT until after ask() returns so a failed
+    // ask leaves no orphan user row.
     let user_now = Utc::now().to_rfc3339();
 
     let prompt = format!(
@@ -273,8 +254,8 @@ async fn send_message(
 
     tx.commit().await?;
 
-    // Auto-title after first round-trip via a separate one-shot session so
-    // it doesn't pollute the main chat's context.
+    // Title in a separate one-shot session — keeps it out of the
+    // main chat's context.
     let mut new_title = chat.title.clone();
     if chat.title.is_none() {
         if let Ok(title) = generate_title(&s.workspace_root, &req.message, &ask_result.reply).await {
@@ -322,8 +303,8 @@ async fn send_message(
 }
 
 async fn generate_title(cwd: &PathBuf, user: &str, assistant: &str) -> Result<String> {
-    // chars().take() — slicing by byte offset can panic on multi-byte UTF-8
-    // boundaries (common in PT/ES/JP/CJK content).
+    // Slice by chars, not bytes — byte slicing panics on multi-byte
+    // UTF-8 boundaries (PT/ES/JP/CJK).
     let user_clip: String = user.chars().take(400).collect();
     let asst_clip: String = assistant.chars().take(400).collect();
     let prompt = format!(
