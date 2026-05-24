@@ -1,9 +1,6 @@
 import { MessageSquare, Trash2 } from "lucide-react";
 import { type Chat } from "@/lib/api";
 
-// Sidebar row in the chat list. Title falls back to a derived label
-// from the chat id when auto-title hasn't fired yet.
-
 export default function ChatListItem({
   chat,
   active,

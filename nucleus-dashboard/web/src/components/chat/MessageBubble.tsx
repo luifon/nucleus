@@ -1,11 +1,5 @@
 import { type ChatMessage } from "@/lib/api";
 
-// One message — user or assistant. Assistant content is treated as
-// markdown-shaped text but rendered as preformatted wrap for v1
-// (real markdown renderer can come later when the content needs it).
-// `personaName` comes from /chat/api/info (resolved from the chat
-// persona's frontmatter — ADR-009).
-
 export default function MessageBubble({
   message,
   personaName,
