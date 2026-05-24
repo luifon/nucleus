@@ -299,6 +299,10 @@ pub struct PoolConfig {
     /// Registry agent name for the run-log (ADR-016); threaded into every
     /// session this pool spawns. `None` = no run-log.
     pub agent_label: Option<String>,
+    /// On-the-fly skill review (ADR-017): after this many `ask`s on a given
+    /// chat_key, the next `AskResult.review_due` is true. 0 = disabled (the
+    /// default; only the conversational pools enable it).
+    pub review_nudge_interval: u32,
 }
 
 impl Default for PoolConfig {
@@ -313,6 +317,7 @@ impl Default for PoolConfig {
             tmux_session: "nucleus".into(),
             idle_timeout: Duration::from_secs(60 * 60 * 4), // 4h
             agent_label: None,
+            review_nudge_interval: 0,
         }
     }
 }
@@ -333,6 +338,8 @@ pub struct SessionPool {
 struct Entry {
     session: Session,
     last_active: Instant,
+    /// Asks on this chat_key since the last on-the-fly review (ADR-017).
+    turns_since_review: u32,
 }
 
 /// Result of a `SessionPool::ask` call.
@@ -342,6 +349,12 @@ pub struct AskResult {
     pub elapsed: Duration,
     /// True if a fresh session was spawned for this call.
     pub was_cold_spawn: bool,
+    /// Absolute path to this session's transcript JSONL (ADR-016/017) — the
+    /// on-the-fly skill reviewer reads it.
+    pub transcript_path: String,
+    /// True when this ask crossed `review_nudge_interval` for the chat_key:
+    /// the caller should fire a detached `skill-gap-learner review` (ADR-017).
+    pub review_due: bool,
 }
 
 impl SessionPool {
@@ -390,6 +403,7 @@ impl SessionPool {
                 let entry = Arc::new(Mutex::new(Entry {
                     session,
                     last_active: Instant::now(),
+                    turns_since_review: 0,
                 }));
                 entries.insert(chat_key.to_string(), entry.clone());
                 entry
@@ -400,13 +414,27 @@ impl SessionPool {
         let mut guard = entry.lock().await;
         let reply = guard.session.ask(message, ask_opts).await?;
         let session_id = guard.session.session_id.clone();
+        let transcript_path = guard.session.transcript_path.to_string_lossy().into_owned();
         guard.last_active = Instant::now();
+
+        // On-the-fly skill-review nudge (ADR-017): count asks per chat_key; when
+        // we cross the interval, flag the caller to fire a detached reviewer.
+        let mut review_due = false;
+        if self.config.review_nudge_interval > 0 {
+            guard.turns_since_review += 1;
+            if guard.turns_since_review >= self.config.review_nudge_interval {
+                review_due = true;
+                guard.turns_since_review = 0;
+            }
+        }
 
         Ok(AskResult {
             reply,
             session_id,
             elapsed: t0.elapsed(),
             was_cold_spawn: was_cold,
+            transcript_path,
+            review_due,
         })
     }
 

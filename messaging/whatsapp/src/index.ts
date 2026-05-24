@@ -184,6 +184,7 @@ async function main() {
     tmuxSession: "nucleus-whatsapp",
     idleTimeoutMs: 4 * 60 * 60 * 1000, // 4h
     agentLabel: "whatsapp",
+    reviewNudgeInterval: config.skillNudgeInterval,
   });
 
   // ADR-005b: a second pool with the DM-context persona. Group JIDs end
@@ -198,6 +199,7 @@ async function main() {
     tmuxSession: "nucleus-whatsapp-dm",
     idleTimeoutMs: 4 * 60 * 60 * 1000, // 4h
     agentLabel: "whatsapp",
+    reviewNudgeInterval: config.skillNudgeInterval,
   });
 
   // Background idle reaper covers both pools.
@@ -661,6 +663,11 @@ async function handleConversational(
       `replied to ${inputKind} in ${(result.elapsedMs / 1000).toFixed(1)}s (${text.length}c in → ${rawReply.length}c out, ${result.wasColdSpawn ? "cold" : "warm"} session ${result.sessionId.slice(0, 8)})`,
       "OBSERVATION",
     );
+
+    // On-the-fly skill review (ADR-017) — detached, never blocks the reply.
+    if (result.reviewDue) {
+      fireSkillReview(config.workspaceRoot, "whatsapp", chatId, result.transcriptPath);
+    }
   } catch (e) {
     const err = (e as Error).message;
     log.error({ err }, "whatsapp: claude call failed");
@@ -669,6 +676,31 @@ async function handleConversational(
     });
   } finally {
     await sock.sendPresenceUpdate("paused", chatId);
+  }
+}
+
+/** Fire a detached on-the-fly skill review (ADR-017). Best-effort and fully
+ *  decoupled — shells out to the built skill-gap-learner binary and returns
+ *  immediately so it never blocks the reply. No-op if the binary isn't built. */
+function fireSkillReview(
+  workspaceRoot: string,
+  venue: string,
+  chatKey: string,
+  transcriptPath: string,
+): void {
+  const release = path.join(workspaceRoot, "target/release/skill-gap-learner");
+  const debug = path.join(workspaceRoot, "target/debug/skill-gap-learner");
+  const bin = fs.existsSync(release) ? release : fs.existsSync(debug) ? debug : null;
+  if (!bin) return;
+  try {
+    const child = spawn(
+      bin,
+      ["review", "--transcript", transcriptPath, "--venue", venue, "--chat-key", chatKey],
+      { cwd: workspaceRoot, detached: true, stdio: "ignore" },
+    );
+    child.unref();
+  } catch {
+    /* best-effort */
   }
 }
 
