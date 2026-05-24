@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import {
   Terminal,
   Clock,
@@ -10,6 +11,7 @@ import {
   ChevronDown,
   ChevronRight,
   RefreshCw,
+  BookOpen,
 } from "lucide-react";
 import { type TmuxSession, captureSessionPane } from "@/lib/api";
 
@@ -189,15 +191,55 @@ export default function SessionTile({ session }: { session: TmuxSession }) {
               <div className="text-[11px] text-[var(--color-status-down)]">{captureErr}</div>
             ) : capture === null ? (
               <div className="text-[11px] text-[var(--color-nucleus-faint)]">loading…</div>
+            ) : isEffectivelyEmpty(capture) ? (
+              <EmptyPaneHint sessionName={session.name} />
             ) : (
               <pre className="max-h-64 overflow-auto rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] p-2 text-[11px] leading-snug text-[var(--color-nucleus-text)]">
-                {capture || "(empty)"}
+                {capture}
               </pre>
             )}
           </div>
         </div>
       )}
     </article>
+  );
+}
+
+// Most Nucleus tmux sessions are one-shot command vehicles — they
+// fire a `claude` invocation, the output streams through the pane
+// while running, the prompt returns when the command exits. So the
+// preview is only useful WHILE a fire is in flight. Outside of that
+// window the pane is just the shell prompt — show a useful hint
+// instead of an empty <pre>.
+//
+// Heuristic: ≤2 non-empty lines AND no occurrence of common
+// activity markers (claude prompt chars, error keywords). Tight
+// enough to not hide real output if it's just brief.
+function isEffectivelyEmpty(text: string): boolean {
+  const nonEmpty = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (nonEmpty.length > 2) return false;
+  const joined = nonEmpty.join(" ");
+  if (/error|panic|warn|claude|\$|>/i.test(joined) && joined.length > 40) return false;
+  return true;
+}
+
+function EmptyPaneHint({ sessionName }: { sessionName: string }) {
+  const agent = sessionName.replace(/^nucleus-/, "");
+  return (
+    <div className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] p-3 text-[11px] leading-relaxed text-[var(--color-nucleus-faint)]">
+      <p className="mb-2">
+        Pane is idle — nothing in scrollback beyond the shell prompt. Nucleus
+        tmux sessions are one-shot command vehicles; their actual output goes
+        to the per-agent diary, not the pane.
+      </p>
+      <Link
+        to={`/diary?agent=${encodeURIComponent(agent)}`}
+        className="inline-flex items-center gap-1.5 text-[var(--color-nucleus-accent)] hover:text-[var(--color-nucleus-text)]"
+      >
+        <BookOpen size={11} strokeWidth={1.75} />
+        see <code>{agent}</code> diary →
+      </Link>
+    </div>
   );
 }
 

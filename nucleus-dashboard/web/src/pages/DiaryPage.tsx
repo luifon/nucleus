@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { RefreshCw, BookOpen, X } from "lucide-react";
 import PageShell from "@/components/PageShell";
 import Select from "@/components/Select";
@@ -9,11 +10,21 @@ import { listDiaryAgents, listRecentDiary } from "@/lib/api";
 const ALL = "__all__";
 
 export default function DiaryPage() {
-  const [agent, setAgent] = useState<string>(ALL);
+  // Honor ?agent=X in the URL so cross-surface links (e.g. from
+  // /sessions when a pane is idle) land pre-filtered.
+  const [params] = useSearchParams();
+  const initialAgent = params.get("agent") ?? ALL;
+  const [agent, setAgent] = useState<string>(initialAgent);
   // Default to today — most common "what happened?" question is
   // about today. X button clears the filter to see the recent feed
   // across days.
   const [date, setDate] = useState<string>(todayLocal());
+
+  // Keep state in sync if the user clicks a different deep-link.
+  useEffect(() => {
+    const next = params.get("agent") ?? ALL;
+    setAgent(next);
+  }, [params]);
 
   const agents = useFetch(listDiaryAgents);
   const entries = useFetch(
