@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { appendEntry as diaryAppendEntry, record as diaryRecord } from "./diary.js";
+import * as runlog from "./runlog.js";
 
 const execAsync = promisify(exec);
 
@@ -32,6 +33,9 @@ export interface SpawnOptions {
   readyTimeoutMs?: number;
   /** If set, resume that existing claude session via `--resume`. */
   resumeSessionId?: string;
+  /** Registry agent name (ADR-016). When set, each spawn appends a row to
+   *  `memory/logs/<agent>/runs.jsonl` pointing at the transcript. */
+  agentLabel?: string;
 }
 
 export interface AskOptions {
@@ -82,6 +86,10 @@ export class Session {
     public readonly tmuxTarget: string,
     public readonly transcriptPath: string,
     private cursor: number,
+    // Run-log bookkeeping (ADR-016); set when spawned with an agentLabel.
+    private readonly workspaceRoot: string = "",
+    private readonly agentLabel?: string,
+    private readonly runId: string = "",
   ) {}
 
   static async spawn(opts: SpawnOptions): Promise<Session> {
@@ -138,7 +146,34 @@ export class Session {
         // No transcript file yet (rare on resume but possible).
       }
     }
-    return new Session(sessionId, target, transcriptPath, initialCursor);
+
+    // Run-log: append an in-flight row so the transcript is recoverable
+    // after the window is killed (ADR-016). Best-effort.
+    const runId = randomUUID();
+    if (opts.agentLabel) {
+      await runlog
+        .recordStart(opts.workspaceRoot, {
+          run_id: runId,
+          agent: opts.agentLabel,
+          session_id: sessionId,
+          transcript_path: transcriptPath,
+          tmux_target: target,
+          started_at: new Date().toISOString(),
+          ended_at: null,
+          ok: null,
+        })
+        .catch(() => {});
+    }
+
+    return new Session(
+      sessionId,
+      target,
+      transcriptPath,
+      initialCursor,
+      opts.workspaceRoot,
+      opts.agentLabel,
+      runId,
+    );
   }
 
   async ask(message: string, opts: AskOptions = {}): Promise<string> {
@@ -161,6 +196,13 @@ export class Session {
   }
 
   async close(): Promise<void> {
+    // Finalize the run-log row (ok = closed cleanly; crashed runs leave
+    // ended_at null). Best-effort. See the Rust counterpart in close().
+    if (this.agentLabel) {
+      await runlog
+        .recordEnd(this.workspaceRoot, this.agentLabel, this.runId, true)
+        .catch(() => {});
+    }
     await tmux(["kill-window", "-t", this.tmuxTarget]).catch(() => {});
   }
 }
@@ -191,6 +233,7 @@ export class SessionPool {
         tmuxSession: this.config.tmuxSession,
         windowName: sanitizeWindowName(chatKey),
         resumeSessionId,
+        agentLabel: this.config.agentLabel,
       });
       entry = { session, lastActive: Date.now(), lock: Promise.resolve() };
       this.entries.set(chatKey, entry);
@@ -311,6 +354,7 @@ export class SessionPool {
         // windowName left undefined → derives from the new session UUID,
         // so it doesn't collide with the still-alive old window.
         readyTimeoutMs: 60_000,
+        agentLabel: this.config.agentLabel,
       });
 
       // Step 4: prime the new session. If priming fails, tear it down so
@@ -360,6 +404,9 @@ export interface PoolConfig {
   addDirs?: string[];
   tmuxSession: string;
   idleTimeoutMs: number;
+  /** Registry agent name for the run-log (ADR-016), threaded into every
+   *  session this pool spawns. */
+  agentLabel?: string;
 }
 
 // ---- internals ----

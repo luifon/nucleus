@@ -12,6 +12,7 @@
 //! - [`discord_sdk`] — outbound Discord helpers (S1).
 //! - [`health`] — `HealthCheck` trait + registry (S3).
 //! - [`memory`] — Tier 2 shared-fact read/write (see ADR-002).
+//! - [`runlog`] — per-agent run-log index over Claude transcripts (ADR-016).
 
 pub mod agents;
 pub mod claude;
@@ -23,6 +24,7 @@ pub mod discord_sdk;
 pub mod health;
 pub mod mem0;
 pub mod memory;
+pub mod runlog;
 
 pub fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
