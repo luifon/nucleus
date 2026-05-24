@@ -59,10 +59,8 @@ calendar_default_duration_min = 30
 default_channels = ["discord-home"]
 
 [ports]
-news_api = 8080
-dashboard = 8090
-chat = 8091
-# ADR-015 — unified operator app subsuming dashboard + chat + news public.
-# Optional during the parallel rollout window; becomes the only one
-# of the four after the sunset PR.
+# Single operator app per ADR-015. Serves dashboard widgets, chat,
+# the public news API, and every admin surface from one origin.
+# Public news routes at /news/api/* stay through cloudflared; the
+# rest gates behind Tailscale per ADR-011.
 nucleus_dashboard = 8092

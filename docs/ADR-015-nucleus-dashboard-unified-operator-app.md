@@ -1,6 +1,6 @@
 # ADR-015 — Nucleus-dashboard: single operator app subsuming dashboard, chat, news, and admin surfaces
 
-**Status:** Accepted (2026-05-23)
+**Status:** Accepted (2026-05-23) — Implemented (2026-05-24)
 
 **Supersedes (in part):**
 - [[ADR-001]] — the "one crate per operator surface" topology.

@@ -186,7 +186,7 @@ async fn main() -> Result<()> {
         })
         .layer(TraceLayer::new_for_http());
 
-    let port = _settings.ports.nucleus_dashboard.unwrap_or(8092);
+    let port = _settings.ports.nucleus_dashboard;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!(
         "nucleus-dashboard listening on http://{} (serving SPA from {:?})",
@@ -235,8 +235,6 @@ async fn init_chat(
         .context("resolving chat persona")?;
     let persona_display_name = persona.display_name.clone();
 
-    // `nucleus-chat-new` while the standalone chat/ crate still owns
-    // `nucleus-chat`. Swap back at sunset.
     let sessions = claude_session::SessionPool::new(claude_session::PoolConfig {
         workspace_root: workspace_root.to_path_buf(),
         append_system_prompt: Some(persona.body),
@@ -244,7 +242,7 @@ async fn init_chat(
         disallowed_tools: settings.claude.disallowed_tools.clone(),
         allowed_tools: vec![],
         add_dirs: vec![vault_path.to_path_buf()],
-        tmux_session: "nucleus-chat-new".into(),
+        tmux_session: "nucleus-chat".into(),
         idle_timeout: std::time::Duration::from_secs(60 * 60 * 2),
     });
 

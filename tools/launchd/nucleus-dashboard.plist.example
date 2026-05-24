@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>__LAUNCHD_PREFIX__.news-api</string>
+    <string>__LAUNCHD_PREFIX__.nucleus-dashboard</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__USER_HOME__/Development/nucleus/target/release/news-api</string>
+        <string>__USER_HOME__/Development/nucleus/target/release/nucleus-dashboard</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__USER_HOME__/Development/nucleus</string>
@@ -18,6 +18,8 @@
         <string>info</string>
         <key>NUCLEUS_CLAUDE_BIN</key>
         <string>__USER_HOME__/.local/bin/claude</string>
+        <key>NUCLEUS_WORKSPACE_ROOT</key>
+        <string>__USER_HOME__/Development/nucleus</string>
         <key>PATH</key>
         <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
@@ -25,9 +27,11 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
     <key>StandardOutPath</key>
-    <string>__USER_HOME__/Development/nucleus/memory/news-api.log</string>
+    <string>__USER_HOME__/Development/nucleus/memory/nucleus-dashboard.log</string>
     <key>StandardErrorPath</key>
-    <string>__USER_HOME__/Development/nucleus/memory/news-api.log</string>
+    <string>__USER_HOME__/Development/nucleus/memory/nucleus-dashboard.log</string>
 </dict>
 </plist>
