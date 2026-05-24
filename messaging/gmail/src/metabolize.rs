@@ -95,9 +95,12 @@ pub async fn run(settings: &Settings, workspace_root: &Path) -> Result<()> {
             "mcp__claude_ai_Gmail__label_thread".into(),
             "mcp__claude_ai_Gmail__unlabel_thread".into(),
         ],
-        tmux_session: "nucleus-jarvis".into(),
+        // Venue-based identifier (Rule 7 / ADR-016); JARVIS is the persona,
+        // resolved via NUCLEUS_PERSONA_GMAIL above — not the code identity.
+        tmux_session: "nucleus-gmail".into(),
         window_name: Some("metabolism".into()),
         ready_timeout: Duration::from_secs(20),
+        agent_label: Some("gmail-metabolism".into()),
         ..SpawnOptions::default()
     })
     .await
