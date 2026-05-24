@@ -1,63 +1,58 @@
-import { Heart, Layers, Compass } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import PageShell from "@/components/PageShell";
-import Tile from "@/components/Tile";
-import { useFetch } from "@/lib/hooks";
-import { getHealth } from "@/lib/api";
+import HealthTile from "@/components/dashboard/HealthTile";
+import GlancesTile from "@/components/dashboard/GlancesTile";
+import DockerTile from "@/components/dashboard/DockerTile";
+import TunnelTile from "@/components/dashboard/TunnelTile";
+import { usePolling } from "@/lib/hooks";
+import {
+  getDashboardHealth,
+  getDashboardGlances,
+  getDashboardDocker,
+  getDashboardTunnel,
+} from "@/lib/api";
 
 export default function HomePage() {
-  const health = useFetch(getHealth);
+  const health = usePolling(getDashboardHealth, 30_000);
+  const glances = usePolling(getDashboardGlances, 30_000);
+  const docker = usePolling(getDashboardDocker, 15_000);
+  const tunnel = usePolling(getDashboardTunnel, 30_000);
+
+  const refresh = () => {
+    health.refetch();
+    glances.refetch();
+    docker.refetch();
+    tunnel.refetch();
+  };
 
   return (
     <PageShell
-      title="nucleus-dashboard"
-      subtitle={
-        <>
-          Unified operator app per ADR-015. The dashboard tiles, chat,
-          sessions, skills, reminders, diary, vault feed, cron view, and news
-          surfaces land in subsequent commits on the{" "}
-          <code className="rounded border border-[var(--color-nucleus-border)] px-1.5 py-0.5 text-[var(--color-nucleus-text)]">
-            nucleus-dashboard
-          </code>{" "}
-          feature branch.
-        </>
+      title="dashboard"
+      actions={
+        <button
+          onClick={refresh}
+          className="flex items-center gap-1.5 rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)] px-2.5 py-1 text-xs text-[var(--color-nucleus-faint)] hover:text-[var(--color-nucleus-accent)]"
+        >
+          <RefreshCw size={12} strokeWidth={1.75} />
+          refresh
+        </button>
       }
     >
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-        <Tile
-          Icon={Heart}
-          label="api/health"
-          status={health.data ? "OK" : health.error ? "DOWN" : "…"}
-          statusKind={health.data ? "ok" : health.error ? "down" : "idle"}
-        >
-          {health.data ? (
-            <pre className="overflow-x-auto text-[11px] leading-snug text-[var(--color-nucleus-faint)]">
-              {JSON.stringify(health.data, null, 2)}
-            </pre>
-          ) : health.error ? (
-            <div className="text-xs text-[var(--color-status-down)]">{health.error}</div>
-          ) : (
-            <div className="text-xs text-[var(--color-nucleus-faint)]">fetching…</div>
-          )}
-        </Tile>
-
-        <Tile Icon={Layers} label="surfaces" status="9" statusKind="idle">
-          <div className="text-xs leading-relaxed text-[var(--color-nucleus-faint)]">
-            2 scaffolded · 7 pending. Each lands as its own commit on the
-            feature branch.
-          </div>
-        </Tile>
-
-        <Tile Icon={Compass} label="aesthetic" status="LOCKED" statusKind="warn">
-          <div className="text-xs leading-relaxed text-[var(--color-nucleus-faint)]">
-            JBM mono · near-black · amber accent · hand-rolled components. No
-            shadcn, no marketplace theme. See ADR-015 §guardrails.
-          </div>
-        </Tile>
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+        <HealthTile data={health.data} />
+        <DockerTile data={docker.data} />
+        <TunnelTile data={tunnel.data} />
+        <div className="md:col-span-2 xl:col-span-3">
+          <GlancesTile data={glances.data} />
+        </div>
       </div>
 
-      <section className="mt-10 border-t border-[var(--color-nucleus-border)] pt-6 text-xs text-[var(--color-nucleus-faint)] opacity-80">
-        parallel rollout — old dashboard, chat, news/api keep running while
-        this app fills in. sunset PR follows once Playwright comparison clears.
+      <section className="mt-8 text-[11px] text-[var(--color-nucleus-faint)] opacity-80">
+        <p>
+          A unified agent-health tile (every operator-facing agent — launchd-daemon,
+          launchd-cron, tmux+claude alike — surfaced from one registry) is deferred
+          until ADR-016 ships the registry + log-capture substrate.
+        </p>
       </section>
     </PageShell>
   );

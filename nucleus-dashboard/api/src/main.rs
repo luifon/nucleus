@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
 
     let mut app = Router::new().nest("/api", infra_routes);
 
-    if let Some(pool) = news_pool {
+    if let Some(pool) = news_pool.clone() {
         let news_state = Arc::new(handlers::news::NewsState { pool });
         app = app.nest("/news/api", handlers::news::router(news_state));
     }
@@ -120,6 +120,22 @@ async fn main() -> Result<()> {
         root: vault_root.clone(),
     });
     app = app.nest("/vault/api", handlers::vault::router(vault_state));
+
+    let diary_root_for_dash = workspace_root.join(&_settings.diary.root);
+    let chat_pool_for_dash = match db::open(&workspace_root.join("memory/chat.db")).await {
+        Ok(p) => Some(p),
+        Err(_) => None,
+    };
+    let dashboard_state = Arc::new(handlers::dashboard::DashboardState {
+        workspace_root: workspace_root.clone(),
+        vault_path: vault_root.clone(),
+        diary_root: diary_root_for_dash,
+        news_pool: news_pool.clone(),
+        reminders_pool: reminders_pool.clone(),
+        chat_pool: chat_pool_for_dash,
+        tunnel_probe_url: _settings.public_urls.nucleus.clone(),
+    });
+    app = app.nest("/api/dashboard", handlers::dashboard::router(dashboard_state));
 
     match init_chat(&workspace_root, &_settings, &vault_root).await {
         Ok(state) => {
