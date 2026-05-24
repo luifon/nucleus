@@ -1618,6 +1618,7 @@ dependencies = [
  "axum",
  "chrono",
  "nucleus-core",
+ "reminders",
  "serde",
  "serde_json",
  "serde_yaml",

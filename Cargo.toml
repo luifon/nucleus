@@ -52,6 +52,7 @@ async-trait = "0.1"
 futures = "0.3"
 
 nucleus-core = { path = "core" }
+reminders = { path = "chores/reminders" }
 
 [profile.release]
 lto = "thin"
