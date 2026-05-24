@@ -2,6 +2,13 @@
 
 **Status:** Accepted (2026-05-23) — Implemented (2026-05-24)
 
+> **Updated by [[ADR-016]] (2026-05-24).** The `/sessions` surface described
+> below was built then **deleted** — it's superseded by `/agents` (the
+> registry-backed front door). The `/sessions` references in the surface and
+> route tables are historical; the tmux copy-attach affordance now lives on
+> each `/agents` tile, and the `/` landing's deferred agents-health tile
+> shipped with ADR-016.
+
 **Supersedes (in part):**
 - [[ADR-001]] — the "one crate per operator surface" topology.
   News-fetcher (the cron worker) and the messaging bots remain
