@@ -6,7 +6,6 @@ members = [
     "messaging/gmail",
     "news/fetcher",
     "chores/distiller",
-    "chores/preference-learner",
     "chores/reminders",
     "nucleus-dashboard/api",
 ]

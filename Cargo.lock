@@ -1786,20 +1786,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "preference-learner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "nucleus-core",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
