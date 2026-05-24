@@ -368,13 +368,12 @@ async fn handle_remember(cmd: &CommandInteraction, settings: &Settings) -> Resul
 
 async fn handle_forget(cmd: &CommandInteraction) -> Result<String> {
     let name = cmd_string(cmd, "name").ok_or_else(|| anyhow::anyhow!("name required"))?;
-    let dir = nucleus_core::memory::tier2_dir()?;
-    let path = dir.join(format!("{}.md", name.replace(' ', "_")));
-    if !path.exists() {
-        return Ok(format!(":question: no memory named `{}`", name));
+    // forget() removes the file AND its MEMORY.md index line (no dangling link).
+    if nucleus_core::memory::forget(&name)? {
+        Ok(format!(":wastebasket: removed `{}`", name))
+    } else {
+        Ok(format!(":question: no memory named `{}`", name))
     }
-    std::fs::remove_file(&path)?;
-    Ok(format!(":wastebasket: removed `{}`", name))
 }
 
 async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
