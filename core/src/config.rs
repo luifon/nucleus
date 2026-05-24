@@ -139,13 +139,7 @@ fn default_reminder_channels() -> Vec<String> {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PortsConfig {
-    pub news_api: u16,
-    pub dashboard: u16,
-    pub chat: u16,
-    // ADR-015 — unified operator app. Optional during the parallel
-    // rollout; required once dashboard/ + chat/ + news/api/ sunset.
-    #[serde(default)]
-    pub nucleus_dashboard: Option<u16>,
+    pub nucleus_dashboard: u16,
 }
 
 // Intermediate struct for what we read from nucleus.toml.

@@ -15,8 +15,7 @@ brain is your existing Claude subscription — no separate API billing.
 | **Discord bot** (Jerry Lewis) | DM or @-mention → wakes Claude → replies with per-channel session continuity. Slash commands: `/status`, `/news`, `/remember`, `/forget`. |
 | **WhatsApp bot** (Alfred) | Self-only group, voice memos transcribed locally via whisper.cpp, brain-dump classified and routed (TODOs → tasks, facts → memory, etc.). Iron-tight allowlist scoping. |
 | **News pipeline** | Daily 9am RSS pull (HN, arXiv cs.AI, Simon Willison, Pragmatic Engineer, Latent Space, …) → Claude scores notability against your learned preferences → top items posted to Discord → full feed at `news.<your-domain>`. Upvote/downvote teaches the scorer. |
-| **Dashboard** | Live health of all local services + container drill-down (`docker top`, ports, logs). At `dashboard.<your-domain>`. |
-| **Obsidian chat** | Persistent multi-chat against your PARA vault. Standalone service behind its own tunnel at `chat.<your-domain>`. |
+| **nucleus-dashboard** | Single operator app subsuming dashboard widgets, chat against your PARA vault, the public news API, and every admin surface (cron, skills, diary, reminders, sessions, vault writes) at `nucleus.<your-domain>`. See ADR-015. |
 | **Distiller** | Hourly + weekly passes that promote diary observations to long-term memory (PROMOTE / MERGE / ARCHIVE / DROP, Mem0-style ops). |
 | **Preference learner** | Weekly pass that reads news votes and rewrites a preferences file the next news fetch reads back. |
 | **Reminders** | Ask either bot "remind me at 16:45 about dentist" → Claude schedules via the `reminders` CLI. Once-per-minute polling delivers to one or more channels (Discord home, Alfred / Brain Dump WhatsApp groups via the Alfred-drained outbound queue). Supports `--at` (one-shot) and `--cron` (recurring) with pause/resume + per-channel retry; daily timesheet nudge is seeded as a recurring system reminder. |
@@ -25,34 +24,31 @@ brain is your existing Claude subscription — no separate API billing.
 
 ```
               ┌────────────────────────────────────────────────────────┐
-              │  Cloudflare tunnels (existing or new)                  │
-              │  news.<dom>   dashboard.<dom>   chat.<dom>              │
-              └─────────┬─────────────┬──────────────┬──────────────────┘
-                        │             │              │
-              ┌─────────▼──┐    ┌─────▼─────┐   ┌────▼─────┐
-   Discord ←─ │  news-api  │    │ dashboard │   │   chat   │  ←── Obsidian vault
-              │ axum :8080 │    │axum :8090 │   │axum :8091│
-              └────┬───────┘    └────┬──────┘   └──────────┘
-                   │ SQLite           │ collectors
-   WhatsApp ←─┐    │  ↑               │ (bollard, http,
-              │ ┌──▼──┴─────────┐     │  launchctl)
-              │ │ news-fetcher  │ ← claude session
-              │ │ (launchd 1x)  │   (one-shot)
-   discord    │ └───────────────┘
+              │  Cloudflare tunnel                                     │
+              │              nucleus.<dom>                             │
+              └──────────────────────┬─────────────────────────────────┘
+                                     │
+                          ┌──────────▼───────────┐
+   Discord ←─             │ nucleus-dashboard    │  ←── Obsidian vault
+                          │ axum :8092           │
+                          │ + React SPA          │
+                          └──────────┬───────────┘
+                                     │ SQLite
+   WhatsApp ←─┐                      │
+              │  ┌───────────────────▼──────┐
+              │  │ news-fetcher (launchd 1x)│ ← claude session
+              │  │ distiller-{hourly,weekly}│
+              │  │ preference-learner       │
+              │  │ reminders-tick (60s)     │
+              │  │ gmail-metabolism         │
+   discord    │  └──────────────────────────┘
    (Rust,     │
-   serenity)  │ ┌─────────────────────┐
-              │ │ distiller-hourly    │ ← claude
-              │ │ distiller-weekly    │   sessions
-              │ │ preference-learner  │   (one-shot)
-              │ │ reminders-tick      │ ← every 60s
-              │ └─────────────────────┘
-              │
-   whatsapp ──┘  ┌──────────────────────────────────────────────┐
-   (TS,          │  nucleus-core (Rust lib)                     │
-   Baileys,      │  - claude_session::{Session, SessionPool}    │
-   whisper.cpp)  │       (tmux-hosted long-lived claude — only  │
-                 │        path to the brain)                    │
-                 │  - memory (Tier 2 promote/read)              │
+   serenity)  │  ┌──────────────────────────────────────────────┐
+              │  │  nucleus-core (Rust lib)                     │
+   whatsapp ──┘  │  - claude_session::{Session, SessionPool}    │
+   (TS,          │       (tmux-hosted long-lived claude — only  │
+   Baileys,      │        path to the brain)                    │
+   whisper.cpp)  │  - memory (Tier 2 promote/read)              │
                  │  - diary (Tier 1.5 per-agent journals)       │
                  │  - health::{Check,Registry}                  │
                  │  - mem0 client (Tier 4, deferred)            │
@@ -101,11 +97,11 @@ reaper keeps the tmux server tidy.
   time with an MCP-unavailable error.
 - **A Discord application + bot** — token in hand. Required intents:
   `Guilds`, `Guild Messages`, `Direct Messages`, `Message Content`.
-- **A Cloudflare tunnel** (optional, but the news + dashboard + chat front-
-  ends expect to be reachable via subdomains; you can also just hit
-  `localhost:8080 / :8090 / :8091` if you don't care about remote access).
+- **A Cloudflare tunnel** (optional, but nucleus-dashboard expects to be
+  reachable via a subdomain; you can also just hit `localhost:8092` if you
+  don't care about remote access).
 - **An Obsidian vault, PARA-organized** — required for brain-dump capture
-  and the Obsidian chat service. The default vault path is
+  and the chat surface. The default vault path is
   `~/Documents/Obsidian/` (override in `nucleus.toml` under
   `[obsidian].vault_path`). The vault MUST have these eight top-level
   folders, each containing a `README.md` describing what belongs there
@@ -149,28 +145,19 @@ cp nucleus.toml.example nucleus.toml
 ```bash
 cargo build --release
 (cd messaging/whatsapp && npm install)
+(cd nucleus-dashboard/web && npm install && npm run build)
 ```
 
 ### 3. Cloudflare tunnel (skip if running localhost-only)
 
 ```bash
-# If you already have a tunnel, just add ingress routes; otherwise:
+# If you already have a tunnel, just add an ingress route; otherwise:
 cloudflared tunnel create my-tunnel
-cloudflared tunnel route dns my-tunnel news.<yourdomain>
-cloudflared tunnel route dns my-tunnel dashboard.<yourdomain>
-cloudflared tunnel route dns my-tunnel chat.<yourdomain>
+cloudflared tunnel route dns my-tunnel nucleus.<yourdomain>
 
-# Generate per-service yamls from the templates — substitutes placeholders
-# from .env (hostname, UUID, $HOME). Each yaml routes ONE hostname.
-TUNNEL_UUID=<tunnel-uuid> ./tools/cloudflared/install.sh
-
-# Run the tunnel. Two patterns work:
-#  (a) one cloudflared process per yaml — simplest, but uses more sockets:
-cloudflared service install --config "$PWD/tools/cloudflared/news.yaml"
-#  (b) one combined ~/.cloudflared/config.yml whose `ingress:` block
-#      multiplexes news / dashboard / chat onto a single tunnel (lighter,
-#      preferred). Copy the ingress entries from the generated yamls into
-#      one config and `cloudflared service install` once.
+# Add an ingress entry in ~/.cloudflared/config.yml routing
+# nucleus.<yourdomain> → http://localhost:8092 and run the tunnel:
+cloudflared service install
 ```
 
 ### 4. Pair WhatsApp (one time)
@@ -189,8 +176,8 @@ npm run discover    # prints a QR code as PNG (opens in Preview) + ASCII
 ./tools/launchd/install.sh
 # Substitutes __USER_HOME__ → $HOME and __TZ__ → $NUCLEUS_TZ (auto-
 # detected from /etc/localtime if unset) in each plist template, copies
-# to ~/Library/LaunchAgents/, loads via launchctl. 10 services total
-# (discord, whatsapp, news-api, news-fetcher, dashboard, chat,
+# to ~/Library/LaunchAgents/, loads via launchctl. 8 services total
+# (discord, whatsapp, nucleus-dashboard, news-fetcher,
 # distiller-hourly, distiller-weekly, preference-learner,
 # reminders-tick).
 ```
@@ -269,8 +256,7 @@ metabolism_cron = "0 * * * *"
 contemplation_cron = "0 4 * * 0"
 
 [ports]
-news_api = 8080
-dashboard = 8090
+nucleus_dashboard = 8092
 ```
 
 ## Memory model
