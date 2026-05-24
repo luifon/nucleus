@@ -15,6 +15,7 @@ import {
 import HomePage from "./pages/HomePage";
 import NewsPage from "./pages/NewsPage";
 import CronPage from "./pages/CronPage";
+import SkillsPage from "./pages/SkillsPage";
 
 type RouteEntry = {
   path: string;
@@ -32,7 +33,7 @@ const ROUTES: RouteEntry[] = [
   { path: "/chat",      label: "chat",      icon: MessageSquare,   group: "primary",       impl: "pending"    },
   { path: "/news",      label: "news",      icon: Newspaper,       group: "primary",       impl: "scaffolded" },
   { path: "/sessions",  label: "sessions",  icon: Terminal,        group: "observability", impl: "pending"    },
-  { path: "/skills",    label: "skills",    icon: Sparkles,        group: "observability", impl: "pending"    },
+  { path: "/skills",    label: "skills",    icon: Sparkles,        group: "observability", impl: "scaffolded" },
   { path: "/reminders", label: "reminders", icon: Bell,            group: "observability", impl: "pending"    },
   { path: "/diary",     label: "diary",     icon: BookOpen,        group: "observability", impl: "pending"    },
   { path: "/vault",     label: "vault",     icon: Database,        group: "observability", impl: "pending"    },
@@ -66,6 +67,7 @@ export default function App() {
             <Route path="/" element={<HomePage />} />
             <Route path="/news" element={<NewsPage />} />
             <Route path="/cron" element={<CronPage />} />
+            <Route path="/skills" element={<SkillsPage />} />
             {ROUTES.filter((r) => r.impl === "pending").map((r) => (
               <Route key={r.path} path={r.path} element={<PendingPage label={r.label} Icon={r.icon} />} />
             ))}

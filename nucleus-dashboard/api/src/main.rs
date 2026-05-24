@@ -91,6 +91,20 @@ async fn main() -> Result<()> {
     });
     app = app.nest("/cron/api", handlers::cron::router(cron_state));
 
+    // Skills router — walks both skill trees. Operator tier resolves
+    // to $HOME/.claude/skills/; repo tier is relative to the workspace
+    // root. Both tolerated-missing.
+    let operator_skills = std::env::var("HOME")
+        .map(PathBuf::from)
+        .map(|h| h.join(".claude/skills"))
+        .unwrap_or_else(|_| PathBuf::from(".claude/skills"));
+    let repo_skills = workspace_root.join(".claude/skills");
+    let skills_state = Arc::new(handlers::skills::SkillsState {
+        operator_root: operator_skills,
+        repo_root: repo_skills,
+    });
+    app = app.nest("/skills/api", handlers::skills::router(skills_state));
+
     // SPA fallback — any path that ServeDir can't resolve (React Router
     // routes like /news, /chat) returns index.html with 200 so the
     // client-side router takes over. ServeDir's own not_found_service
