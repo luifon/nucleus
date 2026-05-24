@@ -3,7 +3,7 @@ import { RefreshCw, AlertTriangle } from "lucide-react";
 import PageShell from "@/components/PageShell";
 import SectionHeader from "@/components/SectionHeader";
 import FilterDropdown from "@/components/FilterDropdown";
-import NewsCard from "@/components/NewsCard";
+import NewsCard from "@/components/news/NewsCard";
 import { useFetch, todayLocal } from "@/lib/hooks";
 import {
   listNewsItems,
