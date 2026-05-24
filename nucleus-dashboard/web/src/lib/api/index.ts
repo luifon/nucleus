@@ -9,3 +9,4 @@ export * from "./client";
 export * from "./health";
 export * from "./news";
 export * from "./cron";
+export * from "./skills";
