@@ -2,6 +2,25 @@
 
 **Status:** Proposed (2026-05-17)
 
+> **Post-ADR-015 reframing (2026-05-24).** ADR-015 collapsed the
+> three operator-facing crates (`dashboard`, `chat`, `news/api`) into
+> one binary served at a single origin (`nucleus.northmark.tech`,
+> port 8092). The body below describes per-tunnel migrations that
+> no longer apply — there's no `chat.<domain>` or
+> `dashboard.<domain>` Cloudflare route left to remove.
+>
+> **What this ADR actually does now**: gate path-scoped on the single
+> nucleus-dashboard origin. Everything under `nucleus.<domain>`
+> moves to Tailscale Serve EXCEPT `/news/api/*` (the only path that
+> needs to stay publicly reachable for downstream subscribers).
+> Cloudflared keeps a narrow ingress entry routing only `/news/api/*`
+> through the public tunnel; the rest of the hostname resolves only
+> on the tailnet.
+>
+> The body's framing of three separate surfaces, three URLs, and a
+> three-way migration is historical context — read it as a single
+> path-scoped split, not three tunnel deletions.
+
 ## Context
 
 Three Nucleus surfaces are exposed via Cloudflare tunnel today: dashboard, chat, and news. All three are reachable at public URLs; none of the operator-only surfaces (dashboard, chat) have auth in front of them. The only thing keeping the dashboard private is the obscurity of its hostname — discoverable by anyone who runs a subdomain scan against the operator's registered domain or stumbles onto it via a referrer leak.
