@@ -21,6 +21,7 @@ pub struct Settings {
     pub obsidian: ObsidianConfig,
     pub diary: DiaryConfig,
     pub distiller: DistillerConfig,
+    pub skill_learner: SkillLearnerConfig,
     pub news: NewsConfig,
     pub gmail: GmailConfig,
     pub reminders: RemindersConfig,
@@ -107,6 +108,56 @@ fn default_distiller_cron() -> String {
     "0 4 * * *".to_string()
 }
 
+/// Skill-gap learner settings (ADR-017). All defaulted so an operator's
+/// nucleus.toml without a `[skill_learner]` table still loads.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SkillLearnerConfig {
+    /// On-the-fly: review a conversation after this many turns per chat.
+    #[serde(default = "default_nudge_interval")]
+    pub nudge_interval: u32,
+    /// Periodic `learn` schedule (informational; real schedule in the plist).
+    #[serde(default = "default_skill_learner_cron")]
+    pub cron: String,
+    /// Agent-created skills idle this long are marked stale.
+    #[serde(default = "default_stale_days")]
+    pub stale_after_days: u32,
+    /// Agent-created skills idle this long are auto-archived (never deleted).
+    #[serde(default = "default_archive_days")]
+    pub archive_after_days: u32,
+    /// Master switch for the on-the-fly arm (the periodic arm is gated by
+    /// whether the launchd job is installed).
+    #[serde(default = "default_true_bool")]
+    pub enabled: bool,
+}
+
+impl Default for SkillLearnerConfig {
+    fn default() -> Self {
+        Self {
+            nudge_interval: default_nudge_interval(),
+            cron: default_skill_learner_cron(),
+            stale_after_days: default_stale_days(),
+            archive_after_days: default_archive_days(),
+            enabled: true,
+        }
+    }
+}
+
+fn default_nudge_interval() -> u32 {
+    12
+}
+fn default_skill_learner_cron() -> String {
+    "30 4 * * *".to_string()
+}
+fn default_stale_days() -> u32 {
+    30
+}
+fn default_archive_days() -> u32 {
+    90
+}
+fn default_true_bool() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NewsConfig {
     pub fetch_cron: String,
@@ -168,6 +219,8 @@ struct TomlConfig {
     diary: DiaryConfig,
     #[serde(default)]
     distiller: DistillerConfig,
+    #[serde(default)]
+    skill_learner: SkillLearnerConfig,
     news: NewsConfig,
     gmail: GmailConfig,
     #[serde(default)]
@@ -227,6 +280,7 @@ impl Settings {
             obsidian: toml.obsidian,
             diary: toml.diary,
             distiller: toml.distiller,
+            skill_learner: toml.skill_learner,
             news: toml.news,
             gmail,
             reminders: toml.reminders,
