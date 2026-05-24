@@ -254,6 +254,16 @@ async fn send_message(
 
     tx.commit().await?;
 
+    // On-the-fly skill review (ADR-017) — detached, fire-and-forget.
+    if ask_result.review_due {
+        nucleus_core::skills::fire_skill_review(
+            &s.workspace_root,
+            "chat",
+            &id,
+            &ask_result.transcript_path,
+        );
+    }
+
     // Title in a separate one-shot session — keeps it out of the
     // main chat's context.
     let mut new_title = chat.title.clone();
