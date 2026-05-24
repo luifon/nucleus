@@ -1,6 +1,3 @@
-// Chat API — multi-chat against the Obsidian vault.
-// Mirrors nucleus-dashboard/api/src/handlers/chat.rs.
-
 import { jsonGet, jsonPost } from "./client";
 
 export type Chat = {
@@ -34,8 +31,6 @@ export type SendResp = {
 };
 
 export type ChatInfo = {
-  /** Display name from the chat persona's frontmatter (ADR-009).
-   *  Used as the assistant-role label in the UI. */
   persona_name: string;
 };
 

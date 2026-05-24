@@ -14,6 +14,8 @@ import { useFetch } from "@/lib/hooks";
 import ChatListItem from "@/components/chat/ChatListItem";
 import MessageBubble from "@/components/chat/MessageBubble";
 
+const OPTIMISTIC_ID = -1;
+
 export default function ChatPage() {
   const chats = useFetch(listChats);
   const info = useFetch(getChatInfo);
@@ -26,15 +28,12 @@ export default function ChatPage() {
   const [error, setError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Auto-select the most-recent chat on first load (or after refetch
-  // if nothing is selected). Match the standalone chat UI's behavior.
   useEffect(() => {
     if (!activeId && chats.data && chats.data.length > 0) {
       setActiveId(chats.data[0].id);
     }
   }, [chats.data, activeId]);
 
-  // Load the active chat's messages whenever the selection changes.
   useEffect(() => {
     if (!activeId) {
       setDetail(null);
@@ -50,7 +49,6 @@ export default function ChatPage() {
     return () => { cancelled = true; };
   }, [activeId]);
 
-  // Scroll to bottom on new messages.
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [detail?.messages.length, sending]);
@@ -82,22 +80,14 @@ export default function ChatPage() {
     setSending(true);
     setError(null);
 
-    // Optimistic: append the user message to the local view so the
-    // operator's typing doesn't vanish into the void during the
-    // multi-second wait. The server response replaces both the
-    // optimistic user-msg and adds the real assistant reply.
+    // ask() can take many seconds; render the user message immediately
+    // so the operator doesn't watch a blank box waiting for it to land.
     const optimisticTs = new Date().toISOString();
     setDetail((d) => d && {
       ...d,
       messages: [
         ...d.messages,
-        {
-          id: -1,
-          chat_id: activeId,
-          role: "user",
-          content: message,
-          ts: optimisticTs,
-        },
+        { id: OPTIMISTIC_ID, chat_id: activeId, role: "user", content: message, ts: optimisticTs },
       ],
     });
 
@@ -110,20 +100,17 @@ export default function ChatPage() {
           claude_session_id: resp.session_id,
           last_active: resp.assistant_message.ts,
         },
-        // Replace the optimistic user-msg with the persisted one + append the assistant reply.
         messages: [
-          ...d.messages.filter((m) => m.id !== -1),
+          ...d.messages.filter((m) => m.id !== OPTIMISTIC_ID),
           resp.user_message,
           resp.assistant_message,
         ],
       });
-      // Refresh the chat list so titles / last_active drift correctly.
       await chats.refetch();
     } catch (e) {
       setError(String(e));
-      // Rewind the optimistic user-msg on failure so the operator
-      // can edit and retry.
-      setDetail((d) => d && { ...d, messages: d.messages.filter((m) => m.id !== -1) });
+      // Restore the draft so the operator can edit and retry.
+      setDetail((d) => d && { ...d, messages: d.messages.filter((m) => m.id !== OPTIMISTIC_ID) });
       setDraft(message);
     } finally {
       setSending(false);
@@ -131,7 +118,6 @@ export default function ChatPage() {
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Enter sends; Shift+Enter inserts a newline.
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void onSend();
@@ -145,7 +131,6 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-full overflow-hidden">
-      {/* Left: chat list */}
       <aside className="flex w-64 shrink-0 flex-col border-r border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)]">
         <div className="flex items-center justify-between border-b border-[var(--color-nucleus-border)] px-3 py-2.5">
           <span className="text-xs uppercase tracking-widest text-[var(--color-nucleus-faint)] opacity-70">
@@ -196,7 +181,6 @@ export default function ChatPage() {
         </div>
       </aside>
 
-      {/* Right: message thread + input */}
       <main className="flex flex-1 flex-col overflow-hidden">
         {!activeId ? (
           <div className="flex flex-1 items-center justify-center text-sm text-[var(--color-nucleus-faint)]">
@@ -228,7 +212,7 @@ export default function ChatPage() {
               ) : (
                 <ul className="space-y-3">
                   {detail?.messages.map((m, i) => (
-                    <li key={m.id === -1 ? `opt-${i}` : m.id}>
+                    <li key={m.id === OPTIMISTIC_ID ? `opt-${i}` : m.id}>
                       <MessageBubble message={m} personaName={personaName} />
                     </li>
                   ))}

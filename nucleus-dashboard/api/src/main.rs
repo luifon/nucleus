@@ -121,52 +121,10 @@ async fn main() -> Result<()> {
     });
     app = app.nest("/vault/api", handlers::vault::router(vault_state));
 
-    // Chat — multi-chat against the Obsidian vault. Lifted from the
-    // standalone chat/ crate; reuses its tmux session name
-    // (`nucleus-chat`) so the parallel rollout doesn't collide with
-    // a still-running chat/ binary if the operator left it up.
-    // Tolerated-missing on init failure so the rest of the dashboard
-    // still serves.
     match init_chat(&workspace_root, &_settings, &vault_root).await {
         Ok(state) => {
             let state = Arc::new(state);
-            // Background task: daily 04:00 local rotation across all
-            // live obsidian chats. Keeps the user-facing ask() path
-            // out of Claude's inline "Resume from summary?" compaction.
-            {
-                let chat_state = state.clone();
-                tokio::spawn(async move {
-                    loop {
-                        nucleus_core::claude_session::sleep_until_next_4am().await;
-                        let pool_for_cb = chat_state.pool.clone();
-                        let stats = chat_state
-                            .sessions
-                            .daily_rotate("chat", move |chat_key, new_session_id| {
-                                let pool_for_cb = pool_for_cb.clone();
-                                async move {
-                                    let now = chrono::Utc::now().to_rfc3339();
-                                    sqlx::query(
-                                        "UPDATE obsidian_chats \
-                                         SET claude_session_id = ?1, last_active = ?2 \
-                                         WHERE id = ?3",
-                                    )
-                                    .bind(&new_session_id)
-                                    .bind(&now)
-                                    .bind(&chat_key)
-                                    .execute(&pool_for_cb)
-                                    .await
-                                    .map(|_| ())
-                                    .context("rotation callback: update obsidian_chats")
-                                }
-                            })
-                            .await;
-                        tracing::info!(
-                            "chat: daily rotation done — considered={} rotated={} skipped={} failed={}",
-                            stats.considered, stats.rotated, stats.skipped, stats.failed
-                        );
-                    }
-                });
-            }
+            spawn_daily_rotation(state.clone());
             app = app.nest("/chat/api", handlers::chat::router(state));
         }
         Err(e) => {
@@ -241,11 +199,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Spin up the chat surface's state: open chat.db, ensure schema,
-/// resolve the chat persona (ADR-009), and build a SessionPool
-/// scoped to the `nucleus-chat` tmux session. Mirrors the standalone
-/// `chat/` crate's startup so behavior stays identical during the
-/// parallel rollout.
 async fn init_chat(
     workspace_root: &std::path::Path,
     settings: &Settings,
@@ -254,16 +207,13 @@ async fn init_chat(
     const CHAT_DB_PATH: &str = "memory/chat.db";
     const LEGACY_DASHBOARD_DB: &str = "memory/dashboard.db";
 
-    // One-time migration: if chat.db doesn't exist but the pre-split
-    // dashboard.db does, copy it (where obsidian_chats / messages used
-    // to live). Same logic the standalone chat/ crate uses.
     let chat_db = workspace_root.join(CHAT_DB_PATH);
     let legacy_db = workspace_root.join(LEGACY_DASHBOARD_DB);
     if !chat_db.exists() && legacy_db.exists() {
         if let Err(e) = std::fs::copy(&legacy_db, &chat_db) {
-            tracing::warn!("chat: failed to migrate dashboard.db → chat.db: {}", e);
+            tracing::warn!("chat: dashboard.db → chat.db migration failed: {}", e);
         } else {
-            tracing::info!("chat: migrated dashboard.db → chat.db (one-time copy)");
+            tracing::info!("chat: migrated dashboard.db → chat.db");
         }
     }
 
@@ -275,21 +225,18 @@ async fn init_chat(
         None => {
             tracing::warn!(
                 mode = %settings.claude.permission_mode,
-                "chat: unknown claude permission_mode in config — using default"
+                "chat: unknown claude permission_mode — using default"
             );
             None
         }
     };
 
-    // ADR-009: chat venue resolves its persona via NUCLEUS_PERSONA_CHAT.
     let persona = nucleus_core::config::resolve_persona(&settings.identity, "chat", None)
-        .context("resolving chat persona (ADR-009)")?;
+        .context("resolving chat persona")?;
     let persona_display_name = persona.display_name.clone();
 
-    // Tmux session: deliberately distinct from the standalone chat/
-    // crate's `nucleus-chat` so the two surfaces can coexist during
-    // the ADR-015 parallel rollout. When chat/ sunsets we can rename
-    // this back to `nucleus-chat` in one commit.
+    // `nucleus-chat-new` while the standalone chat/ crate still owns
+    // `nucleus-chat`. Swap back at sunset.
     let sessions = claude_session::SessionPool::new(claude_session::PoolConfig {
         workspace_root: workspace_root.to_path_buf(),
         append_system_prompt: Some(persona.body),
@@ -308,4 +255,41 @@ async fn init_chat(
         workspace_root: workspace_root.to_path_buf(),
         sessions,
     })
+}
+
+fn spawn_daily_rotation(state: Arc<handlers::chat::ChatState>) {
+    tokio::spawn(async move {
+        loop {
+            nucleus_core::claude_session::sleep_until_next_4am().await;
+            let pool = state.pool.clone();
+            let stats = state
+                .sessions
+                .daily_rotate("chat", move |chat_key, new_session_id| {
+                    let pool = pool.clone();
+                    async move {
+                        let now = chrono::Utc::now().to_rfc3339();
+                        sqlx::query(
+                            "UPDATE obsidian_chats \
+                             SET claude_session_id = ?1, last_active = ?2 \
+                             WHERE id = ?3",
+                        )
+                        .bind(&new_session_id)
+                        .bind(&now)
+                        .bind(&chat_key)
+                        .execute(&pool)
+                        .await
+                        .map(|_| ())
+                        .context("rotation: update obsidian_chats")
+                    }
+                })
+                .await;
+            tracing::info!(
+                "chat: daily rotation — considered={} rotated={} skipped={} failed={}",
+                stats.considered,
+                stats.rotated,
+                stats.skipped,
+                stats.failed
+            );
+        }
+    });
 }
