@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
         &pool,
         &settings.discord.home_channel_id,
         TOP_N_NOTABLE_TO_POST,
-        settings.public_urls.news.as_deref(),
+        settings.public_urls.nucleus.as_deref(),
     )
     .await?;
     tracing::info!("fetcher: posted {} notable items to discord", posted);

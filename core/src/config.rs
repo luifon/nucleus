@@ -32,10 +32,8 @@ pub struct Settings {
 /// any cross-link to it is hidden in the UI.
 #[derive(Debug, Clone, Default)]
 pub struct PublicUrls {
-    pub news: Option<String>,
-    pub dashboard: Option<String>,
+    pub nucleus: Option<String>,
     pub containers: Option<String>,
-    pub chat: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,10 +190,8 @@ impl Settings {
         };
 
         let public_urls = PublicUrls {
-            news: env_optional("NUCLEUS_NEWS_PUBLIC_URL"),
-            dashboard: env_optional("NUCLEUS_DASHBOARD_PUBLIC_URL"),
+            nucleus: env_optional("NUCLEUS_PUBLIC_URL"),
             containers: env_optional("NUCLEUS_CONTAINERS_PUBLIC_URL"),
-            chat: env_optional("NUCLEUS_CHAT_PUBLIC_URL"),
         };
 
         let mut gmail = toml.gmail;

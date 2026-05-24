@@ -15,3 +15,4 @@ export * from "./reminders";
 export * from "./sessions";
 export * from "./vault";
 export * from "./chat";
+export * from "./dashboard";
