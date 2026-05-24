@@ -6,6 +6,7 @@ import {
   getChat,
   deleteChat,
   sendMessage,
+  getChatInfo,
   type Chat,
   type ChatMessage,
 } from "@/lib/api";
@@ -15,6 +16,8 @@ import MessageBubble from "@/components/chat/MessageBubble";
 
 export default function ChatPage() {
   const chats = useFetch(listChats);
+  const info = useFetch(getChatInfo);
+  const personaName = info.data?.persona_name ?? "assistant";
   const [activeId, setActiveId] = useState<string | null>(null);
   const [detail, setDetail] = useState<{ chat: Chat; messages: ChatMessage[] } | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
@@ -226,14 +229,14 @@ export default function ChatPage() {
                 <ul className="space-y-3">
                   {detail?.messages.map((m, i) => (
                     <li key={m.id === -1 ? `opt-${i}` : m.id}>
-                      <MessageBubble message={m} />
+                      <MessageBubble message={m} personaName={personaName} />
                     </li>
                   ))}
                   {sending && (
                     <li>
                       <div className="flex justify-start">
                         <div className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)] px-3 py-2 text-xs text-[var(--color-nucleus-faint)]">
-                          <span className="opacity-70">q is thinking</span>
+                          <span className="opacity-70">{personaName} is thinking</span>
                           <span className="ml-1 inline-block animate-pulse">▸▸▸</span>
                         </div>
                       </div>

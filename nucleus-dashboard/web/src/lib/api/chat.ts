@@ -33,6 +33,13 @@ export type SendResp = {
   session_id: string;
 };
 
+export type ChatInfo = {
+  /** Display name from the chat persona's frontmatter (ADR-009).
+   *  Used as the assistant-role label in the UI. */
+  persona_name: string;
+};
+
+export const getChatInfo = () => jsonGet<ChatInfo>("/chat/api/info");
 export const listChats = () => jsonGet<Chat[]>("/chat/api/chats");
 export const createChat = () =>
   jsonPost<CreatedChat, Record<string, never>>("/chat/api/chats", {});

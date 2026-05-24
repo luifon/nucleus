@@ -38,14 +38,30 @@ pub struct ChatState {
     pub vault_path: PathBuf,
     pub workspace_root: PathBuf,
     pub sessions: SessionPool,
+    /// Display name resolved from the chat persona's `display_name`
+    /// frontmatter (ADR-009). Used as the assistant-role label in
+    /// the UI so we don't hardcode "Q" or "Assistant".
+    pub persona_display_name: String,
 }
 
 pub fn router(state: Arc<ChatState>) -> Router {
     Router::new()
+        .route("/info", get(get_info))
         .route("/chats", get(list_chats).post(create_chat))
         .route("/chats/{id}", get(get_chat).delete(delete_chat))
         .route("/chats/{id}/messages", post(send_message))
         .with_state(state)
+}
+
+#[derive(Serialize)]
+struct ChatInfo {
+    persona_name: String,
+}
+
+async fn get_info(State(s): State<Arc<ChatState>>) -> Json<ChatInfo> {
+    Json(ChatInfo {
+        persona_name: s.persona_display_name.clone(),
+    })
 }
 
 pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {

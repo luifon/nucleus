@@ -284,6 +284,7 @@ async fn init_chat(
     // ADR-009: chat venue resolves its persona via NUCLEUS_PERSONA_CHAT.
     let persona = nucleus_core::config::resolve_persona(&settings.identity, "chat", None)
         .context("resolving chat persona (ADR-009)")?;
+    let persona_display_name = persona.display_name.clone();
 
     // Tmux session: deliberately distinct from the standalone chat/
     // crate's `nucleus-chat` so the two surfaces can coexist during
@@ -302,6 +303,7 @@ async fn init_chat(
 
     Ok(handlers::chat::ChatState {
         pool,
+        persona_display_name,
         vault_path: vault_path.to_path_buf(),
         workspace_root: workspace_root.to_path_buf(),
         sessions,

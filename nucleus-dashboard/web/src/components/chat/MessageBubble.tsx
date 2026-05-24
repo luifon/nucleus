@@ -3,8 +3,16 @@ import { type ChatMessage } from "@/lib/api";
 // One message — user or assistant. Assistant content is treated as
 // markdown-shaped text but rendered as preformatted wrap for v1
 // (real markdown renderer can come later when the content needs it).
+// `personaName` comes from /chat/api/info (resolved from the chat
+// persona's frontmatter — ADR-009).
 
-export default function MessageBubble({ message }: { message: ChatMessage }) {
+export default function MessageBubble({
+  message,
+  personaName,
+}: {
+  message: ChatMessage;
+  personaName: string;
+}) {
   const isUser = message.role === "user";
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
@@ -17,7 +25,7 @@ export default function MessageBubble({ message }: { message: ChatMessage }) {
         ].join(" ")}
       >
         <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-widest text-[var(--color-nucleus-faint)] opacity-70">
-          <span>{isUser ? "you" : "q"}</span>
+          <span>{isUser ? "you" : personaName}</span>
           <span>·</span>
           <span>{shortTime(message.ts)}</span>
         </div>
