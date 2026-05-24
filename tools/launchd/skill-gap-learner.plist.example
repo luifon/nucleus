@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LAUNCHD_PREFIX__.skill-gap-learner</string>
+    <!-- ADR-017: the periodic arm. `learn` proposes missing skills across all
+         agent diaries, then curates (stale/archive + consolidate). The
+         on-the-fly arm runs inside the conversational agents, not here. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__USER_HOME__/Development/nucleus/target/release/skill-gap-learner</string>
+        <string>learn</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__USER_HOME__/Development/nucleus</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TZ</key>
+        <string>__TZ__</string>
+        <key>NUCLEUS_LOG</key>
+        <string>info</string>
+        <key>NUCLEUS_CLAUDE_BIN</key>
+        <string>__USER_HOME__/.local/bin/claude</string>
+        <key>PATH</key>
+        <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/skill-gap-learner.log</string>
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/skill-gap-learner.log</string>
+</dict>
+</plist>

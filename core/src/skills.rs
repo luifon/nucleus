@@ -245,6 +245,39 @@ pub fn default_roots(home: &Path, workspace_root: &Path) -> Vec<(PathBuf, &'stat
     ]
 }
 
+/// Fire a detached on-the-fly skill review (ADR-017) for a conversation that
+/// just crossed the nudge interval. Best-effort and fully decoupled: it shells
+/// out to the built `skill-gap-learner` binary and returns immediately, so it
+/// never blocks the caller's reply or fails it. A no-op if the binary isn't
+/// built yet. The conversational agents call this when `AskResult.review_due`.
+pub fn fire_skill_review(workspace_root: &Path, venue: &str, chat_key: &str, transcript_path: &str) {
+    use std::process::{Command, Stdio};
+    let release = workspace_root.join("target/release/skill-gap-learner");
+    let bin = if release.exists() {
+        release
+    } else {
+        workspace_root.join("target/debug/skill-gap-learner")
+    };
+    if !bin.exists() {
+        return;
+    }
+    let _ = Command::new(bin)
+        .current_dir(workspace_root)
+        .args([
+            "review",
+            "--transcript",
+            transcript_path,
+            "--venue",
+            venue,
+            "--chat-key",
+            chat_key,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

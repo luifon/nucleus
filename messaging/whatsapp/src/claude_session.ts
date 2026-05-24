@@ -49,6 +49,10 @@ export interface AskResult {
   sessionId: string;
   elapsedMs: number;
   wasColdSpawn: boolean;
+  /** Absolute path to the session transcript (ADR-016/017). */
+  transcriptPath: string;
+  /** True when this ask crossed reviewNudgeInterval for the chat (ADR-017). */
+  reviewDue: boolean;
 }
 
 const DEFAULT_ASK: Required<AskOptions> = {
@@ -209,7 +213,10 @@ export class Session {
 
 /** Manages a Map<chatKey, Session>. One claude per chat, lazily spawned. */
 export class SessionPool {
-  private entries = new Map<string, { session: Session; lastActive: number; lock: Promise<void> }>();
+  private entries = new Map<
+    string,
+    { session: Session; lastActive: number; lock: Promise<void>; turnsSinceReview: number }
+  >();
   constructor(private readonly config: PoolConfig) {}
 
   async ask(
@@ -235,7 +242,7 @@ export class SessionPool {
         resumeSessionId,
         agentLabel: this.config.agentLabel,
       });
-      entry = { session, lastActive: Date.now(), lock: Promise.resolve() };
+      entry = { session, lastActive: Date.now(), lock: Promise.resolve(), turnsSinceReview: 0 };
       this.entries.set(chatKey, entry);
     }
 
@@ -247,11 +254,23 @@ export class SessionPool {
     try {
       const reply = await entry.session.ask(message, opts);
       entry.lastActive = Date.now();
+      // On-the-fly skill-review nudge (ADR-017).
+      let reviewDue = false;
+      const interval = this.config.reviewNudgeInterval ?? 0;
+      if (interval > 0) {
+        entry.turnsSinceReview += 1;
+        if (entry.turnsSinceReview >= interval) {
+          reviewDue = true;
+          entry.turnsSinceReview = 0;
+        }
+      }
       return {
         reply,
         sessionId: entry.session.sessionId,
         elapsedMs: Date.now() - t0,
         wasColdSpawn,
+        transcriptPath: entry.session.transcriptPath,
+        reviewDue,
       };
     } finally {
       release();
@@ -407,6 +426,9 @@ export interface PoolConfig {
   /** Registry agent name for the run-log (ADR-016), threaded into every
    *  session this pool spawns. */
   agentLabel?: string;
+  /** On-the-fly skill review (ADR-017): after this many asks on a chat, the
+   *  next AskResult.reviewDue is true. 0/undefined = disabled. */
+  reviewNudgeInterval?: number;
 }
 
 // ---- internals ----

@@ -173,6 +173,8 @@ export interface Config {
   vaultPath: string;
   diaryRoot: string;
   dbPath: string;
+  /** ADR-017: on-the-fly skill-review nudge interval (asks per chat). 0 = off. */
+  skillNudgeInterval: number;
 }
 
 export type { Config as default };
@@ -188,6 +190,7 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
   const claude = parsed.claude ?? {};
   const diary = parsed.diary ?? { root: "memory/diaries" };
   const obsidian = parsed.obsidian ?? {};
+  const skillLearner = parsed.skill_learner ?? {};
 
   const userName = envRequired("NUCLEUS_USER_NAME");
   // ADR-005b: three context-scoped resolutions; each falls back to the
@@ -231,5 +234,8 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
     vaultPath,
     diaryRoot: path.resolve(workspaceRoot, diary.root ?? "memory/diaries"),
     dbPath: path.join(workspaceRoot, "memory/whatsapp.db"),
+    // ADR-017 on-the-fly skill review: 0 disables (enabled=false in toml).
+    skillNudgeInterval:
+      skillLearner.enabled === false ? 0 : Number(skillLearner.nudge_interval ?? 12),
   };
 }
