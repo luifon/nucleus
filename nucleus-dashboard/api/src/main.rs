@@ -235,18 +235,11 @@ async fn init_chat(
     vault_path: &std::path::Path,
 ) -> Result<handlers::chat::ChatState> {
     const CHAT_DB_PATH: &str = "memory/chat.db";
-    const LEGACY_DASHBOARD_DB: &str = "memory/dashboard.db";
 
+    // The one-time dashboard.db → chat.db migration is retired (ADR-016):
+    // chat.db has long existed, so the `if !chat_db.exists()` guard never
+    // fired, and dashboard.db's sole chat is already present in chat.db.
     let chat_db = workspace_root.join(CHAT_DB_PATH);
-    let legacy_db = workspace_root.join(LEGACY_DASHBOARD_DB);
-    if !chat_db.exists() && legacy_db.exists() {
-        if let Err(e) = std::fs::copy(&legacy_db, &chat_db) {
-            tracing::warn!("chat: dashboard.db → chat.db migration failed: {}", e);
-        } else {
-            tracing::info!("chat: migrated dashboard.db → chat.db");
-        }
-    }
-
     let pool = db::open(&chat_db).await?;
     handlers::chat::ensure_schema(&pool).await?;
 

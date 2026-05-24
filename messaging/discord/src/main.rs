@@ -221,7 +221,7 @@ impl EventHandler for Handler {
         let reply = match cmd.data.name.as_str() {
             "status" => handle_status().await,
             "news" => handle_news(&cmd).await,
-            "remember" => handle_remember(&cmd).await,
+            "remember" => handle_remember(&cmd, &self.settings).await,
             "forget" => handle_forget(&cmd).await,
             other => Ok(format!(":question: unknown command `{}`", other)),
         };
@@ -323,7 +323,7 @@ async fn handle_news(cmd: &CommandInteraction) -> Result<String> {
     Ok(out)
 }
 
-async fn handle_remember(cmd: &CommandInteraction) -> Result<String> {
+async fn handle_remember(cmd: &CommandInteraction, settings: &Settings) -> Result<String> {
     use nucleus_core::memory::{Kind, Memory, promote};
     let fact = cmd_string(cmd, "fact").ok_or_else(|| anyhow::anyhow!("fact required"))?;
     let kind_str = cmd_string(cmd, "kind").unwrap_or_else(|| "reference".into());
@@ -340,11 +340,16 @@ async fn handle_remember(cmd: &CommandInteraction) -> Result<String> {
         .collect::<String>()
         .to_lowercase();
     let slug = if slug.is_empty() { format!("note-{}", chrono::Utc::now().timestamp()) } else { slug };
+    // Sign with the resolved persona display name (ADR-009), not a hardcoded
+    // "Jerry" — this footer is persisted into the Tier-2 memory file.
+    let signer = nucleus_core::config::resolve_persona(&settings.identity, "discord", None)
+        .map(|p| p.display_name)
+        .unwrap_or_else(|_| "nucleus".into());
     let mem = Memory {
         name: slug.clone(),
         description: fact.chars().take(120).collect(),
         kind,
-        body: format!("{}\n\n_Saved via /remember by Jerry at {}._", fact.trim(), chrono::Utc::now().to_rfc3339()),
+        body: format!("{}\n\n_Saved via /remember by {} at {}._", fact.trim(), signer, chrono::Utc::now().to_rfc3339()),
     };
     let path = promote(&mem)?;
     Ok(format!(":white_check_mark: saved **{}** ({:?}) → `{}`", slug, kind, path.display()))
