@@ -260,6 +260,7 @@ async fn init_chat(
         add_dirs: vec![vault_path.to_path_buf()],
         tmux_session: "nucleus-chat".into(),
         idle_timeout: std::time::Duration::from_secs(60 * 60 * 2),
+        agent_label: Some("chat".into()),
     });
 
     Ok(handlers::chat::ChatState {

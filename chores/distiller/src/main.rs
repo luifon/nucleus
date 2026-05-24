@@ -108,6 +108,7 @@ async fn metabolism(workspace_root: &Path, diary_root: &Path) -> Result<()> {
         permission_mode: Some(PermissionMode::Auto),
         tmux_session: "nucleus-distiller".into(),
         window_name: Some("metabolism".into()),
+        agent_label: Some("distiller".into()),
         ..SpawnOptions::default()
     })
     .await
@@ -219,6 +220,7 @@ async fn contemplation(workspace_root: &Path, diary_root: &Path, settings: &Sett
         add_dirs: vec![vault_path.clone()],
         tmux_session: "nucleus-distiller".into(),
         window_name: Some("contemplation".into()),
+        agent_label: Some("distiller".into()),
         ..SpawnOptions::default()
     })
     .await

@@ -475,6 +475,7 @@ async fn main() -> Result<()> {
         add_dirs: vec![],
         tmux_session: "nucleus-discord".into(),
         idle_timeout: std::time::Duration::from_secs(60 * 60 * 4),
+        agent_label: Some("discord".into()),
     }));
 
     // Background task: reap idle sessions every 30 minutes.
