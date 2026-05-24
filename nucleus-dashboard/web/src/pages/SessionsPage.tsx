@@ -19,7 +19,7 @@ export default function SessionsPage() {
           sessions <span className="text-[var(--color-nucleus-faint)]">/ tmux</span>
         </>
       }
-      subtitle="Long-lived nucleus-* tmux sessions hosting bot Claude sessions (Rule 4). Read-only; copy the attach command and run it in your terminal."
+      subtitle="Long-lived nucleus-* tmux sessions hosting bot Claude sessions (Rule 4). The actual claude windows die on exit (claude_session.rs:149) so this surface intentionally doesn't show pane content — see the diary for each session's real output. ADR-016 will unify this with the launchd-direct agents."
       actions={
         <button
           onClick={sessions.refetch}
