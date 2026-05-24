@@ -1,20 +1,29 @@
 import { useMemo, useState } from "react";
-import { RefreshCw, BookOpen } from "lucide-react";
+import { RefreshCw, BookOpen, X } from "lucide-react";
 import PageShell from "@/components/PageShell";
 import Select from "@/components/Select";
 import DiaryEntryCard from "@/components/diary/DiaryEntryCard";
-import { useFetch } from "@/lib/hooks";
+import { useFetch, todayLocal } from "@/lib/hooks";
 import { listDiaryAgents, listRecentDiary } from "@/lib/api";
 
 const ALL = "__all__";
 
 export default function DiaryPage() {
   const [agent, setAgent] = useState<string>(ALL);
+  // Default to today — most common "what happened?" question is
+  // about today. X button clears the filter to see the recent feed
+  // across days.
+  const [date, setDate] = useState<string>(todayLocal());
 
   const agents = useFetch(listDiaryAgents);
   const entries = useFetch(
-    () => listRecentDiary({ agent: agent === ALL ? undefined : agent, limit: 30 }),
-    [agent],
+    () =>
+      listRecentDiary({
+        agent: agent === ALL ? undefined : agent,
+        date: date || undefined,
+        limit: 30,
+      }),
+    [agent, date],
   );
 
   const options = useMemo(() => {
@@ -47,9 +56,27 @@ export default function DiaryPage() {
     >
       <div className="mb-5 flex flex-wrap items-center gap-4 rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)] px-4 py-2.5">
         <Select label="agent" options={options} value={agent} onChange={setAgent} />
+        <label className="flex items-center gap-2 text-xs text-[var(--color-nucleus-faint)]">
+          <span>date</span>
+          <input
+            type="date"
+            value={date}
+            onChange={(e) => setDate(e.target.value)}
+            className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-1.5 py-1 text-xs text-[var(--color-nucleus-text)] [color-scheme:dark]"
+          />
+          {date && (
+            <button
+              onClick={() => setDate("")}
+              title="clear date filter"
+              className="flex items-center text-[var(--color-nucleus-faint)] hover:text-[var(--color-nucleus-accent)]"
+            >
+              <X size={11} strokeWidth={2} />
+            </button>
+          )}
+        </label>
         <div className="ml-auto text-xs text-[var(--color-nucleus-faint)]">
           {entries.data
-            ? `${entries.data.length} ${entries.data.length === 1 ? "entry" : "entries"}`
+            ? `${entries.data.length} ${entries.data.length === 1 ? "entry" : "entries"}${date ? ` on ${date}` : ""}`
             : entries.loading
               ? "fetching…"
               : (entries.error ?? "")}
