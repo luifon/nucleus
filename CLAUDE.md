@@ -371,6 +371,16 @@ Default to `~/.claude/skills/` for anything that names a real tool,
 contact, URL, or routine. Rule 1 still applies — identifiers don't go
 into committed files even via skill bodies.
 
+**Skills are now also written autonomously** by the `skill-gap-learner`
+(ADR-017): an on-the-fly reviewer after conversations + a daily curator.
+Its skills land in `~/.claude/skills/` with `flavor: learned` +
+`created_by: agent`, validated against the SKILL.md contract (the
+`# Failure modes` requirement below is enforced mechanically — malformed
+writes are quarantined to `.rejected/`). So expect agent-authored skills
+to appear there; the curator archives stale ones to `.archive/` (never
+deletes; skips `pinned: true`). `/skill-creator` remains the operator's
+*manual* path. The authoring discipline below governs both.
+
 When invoking `/skill-creator create`, **name the destination path in
 the prompt** rather than letting the model infer it. Example:
 `/skill-creator create daily-digest at ~/.claude/skills/daily-digest` (personal)

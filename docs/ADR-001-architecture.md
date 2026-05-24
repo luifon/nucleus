@@ -8,7 +8,8 @@
 > the dashboard's `/agents`. Since then: ADR-015 collapsed `dashboard/`,
 > `chat/`, and `news/api/` into the single `nucleus-dashboard` binary;
 > ADR-016 consolidated the distiller to one daily pass and **sunset
-> `preference-learner`**; ADR-009 moved persona names out of code into
+> `preference-learner`** (ADR-017 replaced it with the autonomous
+> `skill-gap-learner`); ADR-009 moved persona names out of code into
 > config (so "Jerry Lewis"/"Alfred" below are now operator-configurable
 > personas, not hardcoded). Read the table with those substitutions.
 
