@@ -126,6 +126,12 @@ async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
         // firing path adds a generic reminders persona for that).
         // body XOR system_prompt is enforced in code, not SQL.
         "ALTER TABLE reminders ADD COLUMN system_prompt TEXT",
+        // ADR-015: short human-friendly name shown in nucleus-dashboard
+        // /cron + /reminders. For --body reminders the body is usually
+        // descriptive enough on its own (default = NULL); for
+        // --system-prompt reminders the prompt reads as instructions,
+        // not as a name, so a title is strongly recommended.
+        "ALTER TABLE reminders ADD COLUMN title TEXT",
     ];
     for stmt in alters {
         if let Err(e) = sqlx::query(stmt).execute(pool).await {
@@ -356,6 +362,10 @@ async fn backfill_pre_adr6(pool: &SqlitePool) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct Reminder {
     pub id: i64,
+    /// ADR-015: short human-friendly name. When None, display layers
+    /// fall back to `body` (if non-empty) or a derived label from
+    /// `system_prompt`. Skill-fire reminders should always set this.
+    pub title: Option<String>,
     pub body: String,
     pub cron: String,
     pub one_shot: bool,
@@ -386,7 +396,7 @@ pub struct ChannelRow {
 
 async fn load_reminder(pool: &SqlitePool, id: i64) -> Result<Option<Reminder>> {
     let row = sqlx::query(
-        "SELECT id, body, cron, one_shot, status, next_fire_at,
+        "SELECT id, title, body, cron, one_shot, status, next_fire_at,
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt
            FROM reminders WHERE id = ?1",
@@ -400,6 +410,7 @@ async fn load_reminder(pool: &SqlitePool, id: i64) -> Result<Option<Reminder>> {
 fn row_to_reminder(r: sqlx::sqlite::SqliteRow) -> Reminder {
     Reminder {
         id: r.get("id"),
+        title: r.try_get::<Option<String>, _>("title").ok().flatten(),
         body: r.get("body"),
         cron: r.try_get::<Option<String>, _>("cron").ok().flatten().unwrap_or_default(),
         one_shot: r.try_get::<i64, _>("one_shot").unwrap_or(0) != 0,
@@ -440,10 +451,25 @@ pub fn one_shot_cron(at_local: DateTime<Tz>) -> (String, DateTime<Utc>) {
     (cron, at_local.with_timezone(&Utc))
 }
 
+/// Set or clear the human-friendly title on an existing reminder.
+/// Pass `Some("")` or `None` to clear. Returns the number of rows
+/// updated (0 if the reminder doesn't exist).
+pub async fn set_title(pool: &SqlitePool, id: i64, title: Option<&str>) -> Result<u64> {
+    let stored: Option<&str> = title.filter(|t| !t.trim().is_empty());
+    let res = sqlx::query("UPDATE reminders SET title = ?1 WHERE id = ?2")
+        .bind(stored)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 /// Insert a reminder + its channel rows in a single transaction.
 /// Returns the new reminder id.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_with_channels(
     pool: &SqlitePool,
+    title: Option<&str>,
     body: &str,
     cron: &str,
     one_shot: bool,
@@ -470,10 +496,11 @@ pub async fn insert_with_channels(
     let mut tx = pool.begin().await?;
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO reminders
-            (body, cron, one_shot, status, next_fire_at, created_at, created_by, system_prompt)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            (title, body, cron, one_shot, status, next_fire_at, created_at, created_by, system_prompt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          RETURNING id",
     )
+    .bind(title)
     .bind(body)
     .bind(cron)
     .bind(one_shot as i64)
@@ -509,7 +536,7 @@ pub async fn list_all(
     include_cancelled: bool,
 ) -> Result<Vec<Reminder>> {
     let mut q = String::from(
-        "SELECT id, body, cron, one_shot, status, next_fire_at,
+        "SELECT id, title, body, cron, one_shot, status, next_fire_at,
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt
            FROM reminders WHERE 1=1",
@@ -934,6 +961,7 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
         let channels: Vec<String> = seed.channels.iter().map(|s| s.to_string()).collect();
         let id = insert_with_channels(
             pool,
+            None, // title — system-seeded reminders use body as their display name
             seed.body,
             seed.cron,
             seed.one_shot,

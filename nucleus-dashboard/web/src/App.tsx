@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import HomePage from "./pages/HomePage";
 import NewsPage from "./pages/NewsPage";
+import CronPage from "./pages/CronPage";
 
 type RouteEntry = {
   path: string;
@@ -35,7 +36,7 @@ const ROUTES: RouteEntry[] = [
   { path: "/reminders", label: "reminders", icon: Bell,            group: "observability", impl: "pending"    },
   { path: "/diary",     label: "diary",     icon: BookOpen,        group: "observability", impl: "pending"    },
   { path: "/vault",     label: "vault",     icon: Database,        group: "observability", impl: "pending"    },
-  { path: "/cron",      label: "cron",      icon: Timer,           group: "observability", impl: "pending"    },
+  { path: "/cron",      label: "cron",      icon: Timer,           group: "observability", impl: "scaffolded" },
 ];
 
 function PendingPage({ label, Icon }: { label: string; Icon: LucideIcon }) {
@@ -64,6 +65,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<HomePage />} />
             <Route path="/news" element={<NewsPage />} />
+            <Route path="/cron" element={<CronPage />} />
             {ROUTES.filter((r) => r.impl === "pending").map((r) => (
               <Route key={r.path} path={r.path} element={<PendingPage label={r.label} Icon={r.icon} />} />
             ))}

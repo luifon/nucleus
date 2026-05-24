@@ -41,6 +41,13 @@ enum Cmd {
     /// and ONE of --body (post text) or --system-prompt (spawn a Claude session
     /// at fire time and orchestrate skills — ADR-008).
     Add {
+        /// Short human-friendly name (≤60 chars recommended). Shown in
+        /// the nucleus-dashboard /cron + /reminders surfaces. Optional
+        /// for --body reminders (the body itself is descriptive enough),
+        /// strongly recommended for --system-prompt reminders (the
+        /// prompt reads as instructions, not as a label). ADR-015.
+        #[arg(long)]
+        title: Option<String>,
         /// One-shot fire time. ISO-8601; offset optional (no offset = local TZ).
         #[arg(long, conflicts_with = "cron")]
         at: Option<String>,
@@ -62,6 +69,13 @@ enum Cmd {
         /// back to discord-home if unset).
         #[arg(long, value_delimiter = ',')]
         channels: Vec<String>,
+    },
+    /// Set (or clear with empty string) the title on an existing reminder.
+    SetTitle {
+        #[arg(value_name = "ID")]
+        id: i64,
+        #[arg(value_name = "TITLE")]
+        title: String,
     },
     /// List reminders (active/pending by default).
     List {
@@ -113,10 +127,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Add { at, cron, body, system_prompt, channels } => {
+        Cmd::Add { title, at, cron, body, system_prompt, channels } => {
             add(
                 &settings,
                 &workspace_root,
+                title.as_deref(),
                 at.as_deref(),
                 cron.as_deref(),
                 body.as_deref(),
@@ -125,6 +140,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Cmd::SetTitle { id, title } => set_title(&workspace_root, id, &title).await,
         Cmd::List { include_fired, include_cancelled } => {
             list(&workspace_root, include_fired, include_cancelled).await
         }
@@ -147,9 +163,11 @@ async fn open_pool(workspace_root: &Path) -> Result<sqlx::SqlitePool> {
     Ok(pool)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn add(
     settings: &Settings,
     workspace_root: &Path,
+    title: Option<&str>,
     at: Option<&str>,
     cron: Option<&str>,
     body: Option<&str>,
@@ -210,6 +228,7 @@ async fn add(
 
     let id = store::insert_with_channels(
         &pool,
+        title.filter(|t| !t.trim().is_empty()),
         &body_stored,
         &cron_expr,
         one_shot,
@@ -268,9 +287,13 @@ async fn list(
         let ch: Vec<&str> = channels.iter().map(|c| c.channel.as_str()).collect();
         // 🪄 prefix marks system-prompt (skill-fire) reminders so it's
         // visually obvious which fires will spawn a Claude session.
-        let payload_display = match r.system_prompt.as_deref() {
-            Some(sp) => format!("🪄 {}", truncate(sp, 60)),
-            None => r.body.clone(),
+        // Title (if set) takes precedence as the display name; the
+        // body/system_prompt becomes the secondary line.
+        let payload_display = match (r.title.as_deref(), r.system_prompt.as_deref()) {
+            (Some(t), Some(_)) => format!("🪄 {}", t),
+            (Some(t), None)    => t.to_string(),
+            (None, Some(sp))   => format!("🪄 {}", truncate(sp, 60)),
+            (None, None)       => r.body.clone(),
         };
         println!(
             "#{:<4} {}  [{}] {:>5}  ({})  {}{}",
@@ -347,6 +370,20 @@ async fn show(workspace_root: &Path, id: i64) -> Result<()> {
             "    {}  {}  {:12}  {}  {}",
             f.fired_at, outcome, f.channel, f.id, extra
         );
+    }
+    Ok(())
+}
+
+async fn set_title(workspace_root: &Path, id: i64, title: &str) -> Result<()> {
+    let pool = open_pool(workspace_root).await?;
+    let stored = if title.trim().is_empty() { None } else { Some(title) };
+    let rows = store::set_title(&pool, id, stored).await?;
+    if rows == 0 {
+        bail!("#{} not found", id);
+    }
+    match stored {
+        Some(t) => println!("#{} title set to {:?}", id, t),
+        None => println!("#{} title cleared", id),
     }
     Ok(())
 }
