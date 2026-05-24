@@ -129,7 +129,12 @@ struct RecentQ {
     /// Restrict to one agent. When omitted, returns most-recent
     /// entries across all agents.
     agent: Option<String>,
-    /// Total entries to return. Defaults to 20, clamped to [1, 100].
+    /// Restrict to one date (`YYYY-MM-DD`). When set, returns every
+    /// matching entry for that day (one per agent at most) and
+    /// `limit` is ignored — a single day is small.
+    date: Option<String>,
+    /// Total entries to return when `date` is unset. Defaults to 20,
+    /// clamped to [1, 100].
     limit: Option<usize>,
 }
 
@@ -192,11 +197,20 @@ async fn list_recent(
         }
     }
 
+    // Date filter (server-side) — when set, narrow to that exact date
+    // and skip the limit truncation since a single day is bounded by
+    // the number of agents.
+    if let Some(date) = q.date.as_ref() {
+        candidates.retain(|(_, d, _)| d == date);
+    }
+
     // Sort by date DESC (lex sort on ISO dates is correct), tie-break
     // by agent name so the order is deterministic when multiple agents
     // wrote on the same day.
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    candidates.truncate(limit);
+    if q.date.is_none() {
+        candidates.truncate(limit);
+    }
 
     let mut out = Vec::with_capacity(candidates.len());
     for (agent, date, path) in candidates {
