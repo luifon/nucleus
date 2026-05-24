@@ -97,6 +97,10 @@ async fn main() -> Result<()> {
         app = app.nest("/reminders/api", handlers::reminders::router(state));
     }
 
+    // Sessions — tmux inspector. Stateless; shells out to tmux per
+    // request. Tolerates no-server-running by returning [].
+    app = app.nest("/sessions/api", handlers::sessions::router());
+
     // Skills router — walks both skill trees. Operator tier resolves
     // to $HOME/.claude/skills/; repo tier is relative to the workspace
     // root. Both tolerated-missing.
