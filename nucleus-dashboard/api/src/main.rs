@@ -13,7 +13,7 @@ mod handlers;
 
 use anyhow::{Context, Result};
 use axum::{
-    response::{Html, Json},
+    response::{Html, IntoResponse, Json},
     routing::get,
     Router,
 };
@@ -57,13 +57,20 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| PathBuf::from("web/dist"))
         });
 
-    // news.db: tolerated-missing — if the news pipeline isn't set up,
-    // the /news/api/* routes still mount but return 500s. That's the
-    // same posture the old dashboard collector used for news.
+    // Both DBs are tolerated-missing — if the news / reminders subsystem
+    // hasn't been initialized yet on this machine the routes mount and
+    // return 503s rather than crashing the whole binary.
     let news_pool = match db::open(&workspace_root.join("memory/news.db")).await {
         Ok(p) => Some(p),
         Err(e) => {
             tracing::warn!("nucleus-dashboard: news.db not openable: {}", e);
+            None
+        }
+    };
+    let reminders_pool = match db::open(&workspace_root.join("memory/reminders.db")).await {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!("nucleus-dashboard: reminders.db not openable: {}", e);
             None
         }
     };
@@ -77,21 +84,44 @@ async fn main() -> Result<()> {
         app = app.nest("/news/api", handlers::news::router(news_state));
     }
 
+    // Cron router always mounts so the launchd-list endpoint works
+    // even when reminders.db doesn't exist yet.
+    let cron_state = Arc::new(handlers::cron::CronState {
+        reminders_pool: reminders_pool.clone(),
+    });
+    app = app.nest("/cron/api", handlers::cron::router(cron_state));
+
     // SPA fallback — any path that ServeDir can't resolve (React Router
     // routes like /news, /chat) returns index.html with 200 so the
     // client-side router takes over. ServeDir's own not_found_service
     // preserves the 404 status which Playwright + browsers treat as a
-    // failed navigation, so we do the fallback ourselves via a closure
-    // that captures the cached index.html bytes.
-    let index_html = std::fs::read_to_string(web_dist.join("index.html"))
-        .context("reading index.html for SPA fallback")?;
-    let index_html = Arc::new(index_html);
+    // failed navigation, so we do the fallback ourselves.
+    //
+    // index.html is re-read on every request: it's tiny (<1KB), the OS
+    // caches the file in page cache so the disk hit is free, and it
+    // saves us from a stale cached copy after `npm run build` swaps
+    // the content-hashed asset filenames out from under a long-running
+    // server. Production-fine; we serve at most one of these per
+    // navigation.
+    let index_html_path = Arc::new(web_dist.join("index.html"));
 
     let app = app
         .nest_service("/assets", ServeDir::new(web_dist.join("assets")))
         .fallback(move || {
-            let html = index_html.clone();
-            async move { Html(html.as_ref().clone()) }
+            let path = index_html_path.clone();
+            async move {
+                match tokio::fs::read_to_string(path.as_ref()).await {
+                    Ok(html) => Html(html).into_response(),
+                    Err(e) => {
+                        tracing::error!("nucleus-dashboard: reading SPA index.html: {}", e);
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "SPA shell not found",
+                        )
+                            .into_response()
+                    }
+                }
+            }
         })
         .layer(TraceLayer::new_for_http());
 
