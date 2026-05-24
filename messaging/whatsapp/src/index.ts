@@ -183,6 +183,7 @@ async function main() {
     disallowedTools: config.disallowedTools,
     tmuxSession: "nucleus-whatsapp",
     idleTimeoutMs: 4 * 60 * 60 * 1000, // 4h
+    agentLabel: "whatsapp",
   });
 
   // ADR-005b: a second pool with the DM-context persona. Group JIDs end
@@ -196,6 +197,7 @@ async function main() {
     disallowedTools: config.disallowedTools,
     tmuxSession: "nucleus-whatsapp-dm",
     idleTimeoutMs: 4 * 60 * 60 * 1000, // 4h
+    agentLabel: "whatsapp",
   });
 
   // Background idle reaper covers both pools.

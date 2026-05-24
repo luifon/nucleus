@@ -743,6 +743,7 @@ async fn deliver_skill_fire(
         tmux_session: "nucleus-reminders-fire".into(),
         window_name: Some(format!("fire-{}", r.id)),
         ready_timeout: Duration::from_secs(20),
+        agent_label: Some("reminders-fire".into()),
         ..SpawnOptions::default()
     })
     .await
@@ -947,6 +948,7 @@ After the tool succeeds, reply with ONLY the event id on its own line — no pro
         tmux_session: "nucleus-jarvis".into(),
         window_name: Some(format!("cal-{}", r.id)),
         ready_timeout: Duration::from_secs(20),
+        agent_label: Some("calendar-fire".into()),
         ..SpawnOptions::default()
     })
     .await

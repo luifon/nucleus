@@ -713,6 +713,7 @@ Items:
         permission_mode: Some(PermissionMode::Auto),
         tmux_session: "nucleus-news-fetcher".into(),
         window_name: Some("score".into()),
+        agent_label: Some("news-fetcher".into()),
         ..SpawnOptions::default()
     })
     .await

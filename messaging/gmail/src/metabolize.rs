@@ -98,6 +98,7 @@ pub async fn run(settings: &Settings, workspace_root: &Path) -> Result<()> {
         tmux_session: "nucleus-jarvis".into(),
         window_name: Some("metabolism".into()),
         ready_timeout: Duration::from_secs(20),
+        agent_label: Some("gmail-metabolism".into()),
         ..SpawnOptions::default()
     })
     .await
