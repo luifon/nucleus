@@ -35,10 +35,11 @@ root = "memory/diaries"
 retain_days = 7
 
 [distiller]
-metabolism_cron = "0 * * * *"
-contemplation_cron = "0 4 * * 0"
-metabolism_model = "claude-haiku-4-5"
-contemplation_model = "claude-sonnet-4-6"
+# ADR-016: one consolidated daily pass (extract → judge → archive → prune),
+# replacing the old hourly-metabolism + weekly-contemplation split. The real
+# schedule lives in tools/launchd/distiller.plist.example; this is documentary.
+cron = "0 4 * * *"
+# model = "claude-sonnet-4-6"   # optional override (reserved; unused today)
 
 [gmail]
 # Daily inbox metabolism (ADR-007). 5am local; cron evaluated in NUCLEUS_TZ.

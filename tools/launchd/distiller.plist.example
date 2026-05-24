@@ -3,11 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>__LAUNCHD_PREFIX__.distiller-hourly</string>
+    <string>__LAUNCHD_PREFIX__.distiller</string>
+    <!-- ADR-016: consolidated single daily pass (was distiller-hourly +
+         distiller-weekly). One invocation extracts diary candidates, judges
+         them (promote to T2 / merge / archive to vault / drop), and prunes. -->
     <key>ProgramArguments</key>
     <array>
         <string>__USER_HOME__/Development/nucleus/target/release/distiller</string>
-        <string>metabolism</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__USER_HOME__/Development/nucleus</string>
@@ -22,8 +24,13 @@
         <key>PATH</key>
         <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
-    <key>StartInterval</key>
-    <integer>3600</integer>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
     <key>RunAtLoad</key>
     <false/>
     <key>StandardOutPath</key>

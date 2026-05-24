@@ -80,12 +80,31 @@ pub struct DiaryConfig {
     pub retain_days: u32,
 }
 
+/// Distiller settings. Consolidated to a single daily pass (ADR-016); the
+/// old hourly/weekly cron split is gone. All fields default so an operator's
+/// pre-ADR-016 `nucleus.toml` (with `metabolism_cron` etc.) still loads —
+/// the unknown keys are ignored and `cron` falls back to the daily default.
+/// Note: the binary doesn't read these today (the real schedule lives in the
+/// plist); they're documentary + reserved.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DistillerConfig {
-    pub metabolism_cron: String,
-    pub contemplation_cron: String,
-    pub metabolism_model: Option<String>,
-    pub contemplation_model: Option<String>,
+    #[serde(default = "default_distiller_cron")]
+    pub cron: String,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl Default for DistillerConfig {
+    fn default() -> Self {
+        Self {
+            cron: default_distiller_cron(),
+            model: None,
+        }
+    }
+}
+
+fn default_distiller_cron() -> String {
+    "0 4 * * *".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -147,6 +166,7 @@ struct TomlConfig {
     discord: TomlDiscord,
     obsidian: ObsidianConfig,
     diary: DiaryConfig,
+    #[serde(default)]
     distiller: DistillerConfig,
     news: NewsConfig,
     gmail: GmailConfig,
@@ -379,6 +399,40 @@ fn extract_yaml_field(frontmatter: &str, field: &str) -> Option<String> {
         return Some(v.to_string());
     }
     None
+}
+
+#[cfg(test)]
+mod distiller_config_tests {
+    use super::*;
+
+    // An operator's pre-ADR-016 [distiller] table (hourly/weekly keys, no
+    // `cron`) must still deserialize — unknown keys ignored, `cron` defaults.
+    #[test]
+    fn old_distiller_shape_still_loads() {
+        let toml = r#"
+metabolism_cron = "0 * * * *"
+contemplation_cron = "0 4 * * 0"
+metabolism_model = "claude-haiku-4-5"
+contemplation_model = "claude-sonnet-4-6"
+"#;
+        let cfg: DistillerConfig = toml::from_str(toml).expect("old shape deserializes");
+        assert_eq!(cfg.cron, "0 4 * * *", "missing cron falls back to daily default");
+        assert!(cfg.model.is_none());
+    }
+
+    #[test]
+    fn new_distiller_shape_loads() {
+        let cfg: DistillerConfig =
+            toml::from_str("cron = \"30 3 * * *\"\nmodel = \"claude-sonnet-4-6\"").unwrap();
+        assert_eq!(cfg.cron, "30 3 * * *");
+        assert_eq!(cfg.model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn empty_distiller_table_uses_defaults() {
+        let cfg: DistillerConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.cron, "0 4 * * *");
+    }
 }
 
 #[cfg(test)]
