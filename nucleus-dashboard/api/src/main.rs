@@ -105,6 +105,12 @@ async fn main() -> Result<()> {
     });
     app = app.nest("/skills/api", handlers::skills::router(skills_state));
 
+    // Diary router — per ADR-004, every bot writes to
+    // memory/diaries/<agent>/<YYYY-MM-DD>.md.
+    let diary_root = workspace_root.join(&_settings.diary.root);
+    let diary_state = Arc::new(handlers::diary::DiaryState { root: diary_root });
+    app = app.nest("/diary/api", handlers::diary::router(diary_state));
+
     // SPA fallback — any path that ServeDir can't resolve (React Router
     // routes like /news, /chat) returns index.html with 200 so the
     // client-side router takes over. ServeDir's own not_found_service

@@ -10,3 +10,4 @@ export * from "./health";
 export * from "./news";
 export * from "./cron";
 export * from "./skills";
+export * from "./diary";
