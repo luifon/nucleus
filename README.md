@@ -37,11 +37,11 @@ brain is your existing Claude subscription — no separate API billing.
    WhatsApp ←─┐                      │
               │  ┌───────────────────▼──────┐
               │  │ news-fetcher (launchd 1x)│ ← claude session
-              │  │ distiller-{hourly,weekly}│
-              │  │ preference-learner       │
-              │  │ reminders-tick (60s)     │
+              │  │ distiller (daily)        │
               │  │ gmail-metabolism         │
+              │  │ reminders-tick (60s)     │
    discord    │  └──────────────────────────┘
+              │   (all agents declared in agents.toml — ADR-016)
    (Rust,     │
    serenity)  │  ┌──────────────────────────────────────────────┐
               │  │  nucleus-core (Rust lib)                     │
@@ -262,8 +262,7 @@ vault_path = "~/Documents/Obsidian"
 fetch_cron = "0 9,18 * * *"
 
 [distiller]
-metabolism_cron = "0 * * * *"
-contemplation_cron = "0 4 * * 0"
+cron = "0 4 * * *"          # one consolidated daily pass (ADR-016)
 
 [ports]
 nucleus_dashboard = 8092
@@ -349,18 +348,18 @@ nucleus/
 ├── Cargo.toml              workspace manifest
 ├── nucleus.toml            non-identifying tunables (gitignored copy)
 ├── .env                    identifiers + secrets (gitignored)
-├── core/                   shared Rust lib — claude wrapper, config, memory, diary, …
+├── agents.toml             agent registry — single source of truth (ADR-016)
+├── core/                   shared Rust lib — claude wrapper, config, memory, diary, agents, runlog, …
 ├── messaging/
 │   ├── discord/            Discord bot — bin `discord` (Rust, serenity)
-│   └── whatsapp/           Alfred (TS, Baileys, whisper.cpp)
+│   ├── whatsapp/           WhatsApp bot (TS, Baileys, whisper.cpp)
+│   └── gmail/              gmail-metabolism — inbox triage via JARVIS persona (ADR-007)
 ├── news/
-│   ├── fetcher/            launchd-driven RSS pull + scorer
-│   └── api/                axum, day-bucketed feed + votes
-├── dashboard/              axum, health collectors + container drill-down
-├── chat/                   axum, Obsidian chat against the PARA vault
+│   └── fetcher/            launchd-driven RSS pull + scorer
+├── nucleus-dashboard/      unified operator app (ADR-015) — axum API + React SPA;
+│                           subsumes the old dashboard/, chat/, news/api/ crates
 ├── chores/
-│   ├── distiller/          metabolism + contemplation passes
-│   ├── preference-learner/ weekly votes → preferences file
+│   ├── distiller/          one daily distillation pass (ADR-016; was hourly+weekly)
 │   └── reminders/          ad-hoc reminders CLI + once-per-minute polling tick
 ├── tools/
 │   ├── launchd/            plist templates + install.sh
@@ -414,8 +413,8 @@ cargo build --release && ./tools/launchd/install.sh discord
 
 # Manually trigger a scheduled job (re-uses the launchd-configured environment)
 launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.news-fetcher
-launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.distiller-hourly
-launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.preference-learner
+launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.distiller       # daily pass (prunes diaries + writes memory/vault)
+launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.gmail-metabolism
 
 # Force a stuck per-chat session to respawn fresh (next message cold-spawns,
 # but with --resume so prior turns are still there)
