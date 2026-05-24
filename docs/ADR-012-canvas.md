@@ -2,6 +2,25 @@
 
 **Status:** Proposed (2026-05-16)
 
+> **Post-ADR-015 reframing (2026-05-24).** Two things in the body
+> below are no longer accurate:
+>
+> 1. **No new binary.** The "ship canvas as a new binary at
+>    `$NUCLEUS_CHAT_V2_PUBLIC_URL` alongside the old chat" rollout
+>    plan dies with the standalone `chat/` crate (sunset in ADR-015).
+>    Canvas now ships as a feature inside `nucleus-dashboard`'s
+>    `/chat` route, behind a feature flag if needed.
+> 2. **No "Q" persona.** ADR-009 generalized persona resolution to
+>    `NUCLEUS_PERSONA_CHAT`; the chat venue currently resolves to
+>    `robot` (display name `ROBOT`), threaded through
+>    `/chat/api/info`. The "Q" naming in the body was aspirational
+>    and never shipped; substitute whatever persona is configured.
+>
+> Canvas behavior — the structured-block render + submit-back
+> protocol, where it works (one surface only), the destructive-action
+> policy — remains valid. Only the deployment shape and persona
+> naming changed.
+
 ## Context
 
 The dashboard chat (`chat/` crate, served at the URL in `$NUCLEUS_CHAT_PUBLIC_URL`) is text-in / text-out. Agent output is rendered as markdown via `marked`. Anything that would be faster as an *interaction* — "pick which PARA bucket for this capture", "uncheck the ops you don't want", "fill in date + duration" — gets serialized to "give me one of: A, B, C" and the operator types back. Slower and noisier than a click.

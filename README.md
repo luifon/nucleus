@@ -1,7 +1,7 @@
 # Nucleus
 
 A personal-assistant stack that wires the Claude Code CLI into your Discord,
-WhatsApp, news, and dashboard surfaces.
+WhatsApp, and a unified operator dashboard.
 
 Every brain call runs as a long-lived interactive `claude` session inside a
 tmux window — so you can `tmux attach -t nucleus-discord` and watch a bot

@@ -2,6 +2,16 @@
 
 **Status:** Proposed (2026-05-18)
 
+> **Post-ADR-015 reframing (2026-05-24).** When this lands, the
+> wizard's multi-select stops listing `dashboard / chat / news-api`
+> as three separable services. They were collapsed into one binary
+> (`nucleus-dashboard`) by ADR-015. The selectable services are now:
+> `discord`, `whatsapp`, `nucleus-dashboard`, `news-fetcher`,
+> `distiller-hourly`, `distiller-weekly`, `preference-learner`,
+> `gmail-metabolism`, `reminders-tick`. The body below preserves
+> the original 3-service framing as historical context — read it
+> with that substitution.
+
 ## Context
 
 Setting up Nucleus on a fresh machine today is a multi-step manual sequence
