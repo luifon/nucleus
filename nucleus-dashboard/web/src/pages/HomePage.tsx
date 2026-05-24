@@ -1,48 +1,64 @@
-import { useEffect, useState } from "react";
-import { getHealth, type Health } from "@/lib/api";
+import { Heart, Layers, Compass } from "lucide-react";
+import PageShell from "@/components/PageShell";
+import Tile from "@/components/Tile";
+import { useFetch } from "@/lib/hooks";
+import { getHealth } from "@/lib/api";
 
 export default function HomePage() {
-  const [health, setHealth] = useState<Health | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-
-  useEffect(() => {
-    getHealth().then(setHealth).catch((e) => setErr(String(e)));
-  }, []);
+  const health = useFetch(getHealth);
 
   return (
-    <div className="p-6">
-      <div className="mb-4 text-xs text-[var(--color-nucleus-faint)]">
-        ┌── scaffold ──────────────────────────────
+    <PageShell
+      title="nucleus-dashboard"
+      subtitle={
+        <>
+          Unified operator app per ADR-015. The dashboard tiles, chat,
+          sessions, skills, reminders, diary, vault feed, cron view, and news
+          surfaces land in subsequent commits on the{" "}
+          <code className="rounded border border-[var(--color-nucleus-border)] px-1.5 py-0.5 text-[var(--color-nucleus-text)]">
+            nucleus-dashboard
+          </code>{" "}
+          feature branch.
+        </>
+      }
+    >
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+        <Tile
+          Icon={Heart}
+          label="api/health"
+          status={health.data ? "OK" : health.error ? "DOWN" : "…"}
+          statusKind={health.data ? "ok" : health.error ? "down" : "idle"}
+        >
+          {health.data ? (
+            <pre className="overflow-x-auto text-[11px] leading-snug text-[var(--color-nucleus-faint)]">
+              {JSON.stringify(health.data, null, 2)}
+            </pre>
+          ) : health.error ? (
+            <div className="text-xs text-[var(--color-status-down)]">{health.error}</div>
+          ) : (
+            <div className="text-xs text-[var(--color-nucleus-faint)]">fetching…</div>
+          )}
+        </Tile>
+
+        <Tile Icon={Layers} label="surfaces" status="9" statusKind="idle">
+          <div className="text-xs leading-relaxed text-[var(--color-nucleus-faint)]">
+            2 scaffolded · 7 pending. Each lands as its own commit on the
+            feature branch.
+          </div>
+        </Tile>
+
+        <Tile Icon={Compass} label="aesthetic" status="LOCKED" statusKind="warn">
+          <div className="text-xs leading-relaxed text-[var(--color-nucleus-faint)]">
+            JBM mono · near-black · amber accent · hand-rolled components. No
+            shadcn, no marketplace theme. See ADR-015 §guardrails.
+          </div>
+        </Tile>
       </div>
 
-      <h1 className="mb-2 text-base">
-        nucleus-dashboard <span className="text-[var(--color-nucleus-faint)]">/ home</span>
-      </h1>
-
-      <p className="mb-6 max-w-2xl text-xs text-[var(--color-nucleus-faint)]">
-        Unified operator app per ADR-015. This page is the scaffold cut — the
-        dashboard tiles, chat, sessions, skills, reminders, diary, vault feed,
-        cron view, and news surfaces land in subsequent commits on the
-        <code className="mx-1 border border-[var(--color-nucleus-border)] px-1">nucleus-dashboard</code>
-        feature branch. Verify the backend is reachable and the aesthetic
-        baseline reads right before scope grows.
-      </p>
-
-      <section className="border border-[var(--color-nucleus-border)] p-3 text-xs">
-        <div className="mb-2 flex items-center gap-2">
-          <span className="text-[var(--color-nucleus-faint)]">api/health</span>
-          {health ? (
-            <span className="text-[var(--color-status-ok)]">[OK]</span>
-          ) : err ? (
-            <span className="text-[var(--color-status-down)]">[DOWN]</span>
-          ) : (
-            <span className="text-[var(--color-nucleus-faint)]">[…]</span>
-          )}
-        </div>
-        <pre className="overflow-x-auto text-[var(--color-nucleus-faint)]">
-          {health ? JSON.stringify(health, null, 2) : err ? `error: ${err}` : "fetching…"}
-        </pre>
+      <section className="mt-10 border-t border-[var(--color-nucleus-border)] pt-6 text-xs text-[var(--color-nucleus-faint)] opacity-80">
+        parallel rollout — old dashboard, chat, news/api keep running while
+        this app fills in. sunset PR follows once Playwright comparison clears.
       </section>
-    </div>
+    </PageShell>
   );
 }

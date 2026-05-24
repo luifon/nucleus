@@ -13,14 +13,15 @@ mod handlers;
 
 use anyhow::{Context, Result};
 use axum::{
-    response::Json,
+    response::{Html, Json},
     routing::get,
     Router,
 };
-use nucleus_core::config::Settings;
+use nucleus_core::{config::Settings, db};
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
 #[derive(Serialize)]
@@ -41,7 +42,8 @@ async fn health() -> Json<HealthResponse> {
 #[tokio::main]
 async fn main() -> Result<()> {
     nucleus_core::init_tracing();
-    let settings = Settings::load().context("loading settings")?;
+    let _settings = Settings::load().context("loading settings")?;
+    let workspace_root = std::env::current_dir()?;
 
     // Vite build output. In dev, the Vite dev server runs separately and
     // proxies /api/* to this server; the ServeDir below is only used in
@@ -55,16 +57,51 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| PathBuf::from("web/dist"))
         });
 
-    let api_routes = Router::new().route("/health", get(health));
+    // news.db: tolerated-missing — if the news pipeline isn't set up,
+    // the /news/api/* routes still mount but return 500s. That's the
+    // same posture the old dashboard collector used for news.
+    let news_pool = match db::open(&workspace_root.join("memory/news.db")).await {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!("nucleus-dashboard: news.db not openable: {}", e);
+            None
+        }
+    };
 
-    let app = Router::new()
-        .nest("/api", api_routes)
-        .fallback_service(ServeDir::new(&web_dist).append_index_html_on_directories(true))
+    let infra_routes = Router::new().route("/health", get(health));
+
+    let mut app = Router::new().nest("/api", infra_routes);
+
+    if let Some(pool) = news_pool {
+        let news_state = Arc::new(handlers::news::NewsState { pool });
+        app = app.nest("/news/api", handlers::news::router(news_state));
+    }
+
+    // SPA fallback — any path that ServeDir can't resolve (React Router
+    // routes like /news, /chat) returns index.html with 200 so the
+    // client-side router takes over. ServeDir's own not_found_service
+    // preserves the 404 status which Playwright + browsers treat as a
+    // failed navigation, so we do the fallback ourselves via a closure
+    // that captures the cached index.html bytes.
+    let index_html = std::fs::read_to_string(web_dist.join("index.html"))
+        .context("reading index.html for SPA fallback")?;
+    let index_html = Arc::new(index_html);
+
+    let app = app
+        .nest_service("/assets", ServeDir::new(web_dist.join("assets")))
+        .fallback(move || {
+            let html = index_html.clone();
+            async move { Html(html.as_ref().clone()) }
+        })
         .layer(TraceLayer::new_for_http());
 
-    let port = settings.ports.nucleus_dashboard.unwrap_or(8092);
+    let port = _settings.ports.nucleus_dashboard.unwrap_or(8092);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    tracing::info!("nucleus-dashboard listening on http://{} (serving SPA from {:?})", addr, web_dist);
+    tracing::info!(
+        "nucleus-dashboard listening on http://{} (serving SPA from {:?})",
+        addr,
+        web_dist
+    );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
