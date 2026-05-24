@@ -91,6 +91,12 @@ async fn main() -> Result<()> {
     });
     app = app.nest("/cron/api", handlers::cron::router(cron_state));
 
+    // Reminders admin — requires the DB. Mount only when openable.
+    if let Some(pool) = reminders_pool.clone() {
+        let state = Arc::new(handlers::reminders::RemindersState { pool });
+        app = app.nest("/reminders/api", handlers::reminders::router(state));
+    }
+
     // Skills router — walks both skill trees. Operator tier resolves
     // to $HOME/.claude/skills/; repo tier is relative to the workspace
     // root. Both tolerated-missing.

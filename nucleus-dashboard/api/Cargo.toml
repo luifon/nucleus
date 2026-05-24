@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 nucleus-core = { workspace = true }
+reminders = { workspace = true }
 
 tokio = { workspace = true }
 axum = { workspace = true }

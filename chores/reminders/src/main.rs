@@ -10,7 +10,7 @@
 //!   history  query the per-fire audit log
 //!   due      polling tick — run from launchd every minute
 
-mod store;
+use reminders::store;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, Utc};

@@ -359,7 +359,7 @@ async fn backfill_pre_adr6(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Reminder {
     pub id: i64,
     /// ADR-015: short human-friendly name. When None, display layers
@@ -383,8 +383,7 @@ pub struct Reminder {
     pub system_prompt: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ChannelRow {
     pub reminder_id: i64,
     pub channel: String,
