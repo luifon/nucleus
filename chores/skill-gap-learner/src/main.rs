@@ -54,19 +54,21 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     nucleus_core::init_tracing();
-    let _settings = Settings::load().context("loading settings")?;
+    let settings = Settings::load().context("loading settings")?;
     let workspace_root = std::env::current_dir()?;
     let cli = Cli::parse();
+
+    // A stale tmux session left from a prior crash blocks `new-window`.
+    let _ = tokio::process::Command::new("tmux")
+        .args(["kill-session", "-t", TMUX_SESSION])
+        .output()
+        .await;
 
     match cli.command.unwrap_or(Cmd::Learn) {
         Cmd::Review { transcript, venue, chat_key } => {
             review(&workspace_root, &transcript, &venue, chat_key.as_deref()).await
         }
-        Cmd::Learn => {
-            // Filled in by the `learn` step (ADR-017 phase 3).
-            tracing::info!("skill-gap-learner: `learn` not yet implemented");
-            Ok(())
-        }
+        Cmd::Learn => learn(&workspace_root, &settings).await,
     }
 }
 
@@ -101,36 +103,8 @@ async fn review(
     let library = render_library(&lib);
 
     let prompt = build_review_prompt(&operator_root, &library, venue, &conversation);
-
-    // Snapshot before, so we can find what the reviewer actually wrote.
-    let started = SystemTime::now();
-
-    let mut session = Session::spawn(SpawnOptions {
-        workspace_root: workspace_root.to_path_buf(),
-        permission_mode: Some(PermissionMode::Auto),
-        // Let the session write into the operator-personal skills tree.
-        add_dirs: vec![operator_root.clone()],
-        tmux_session: TMUX_SESSION.into(),
-        window_name: Some(format!("review-{venue}")),
-        agent_label: Some(AGENT_NAME.into()),
-        ready_timeout: Duration::from_secs(20),
-        ..SpawnOptions::default()
-    })
-    .await
-    .context("spawning skill-review session")?;
-
-    let raw = session
-        .ask(&prompt, AskOptions {
-            max_wait: Duration::from_secs(300),
-            quiescent_window: Duration::from_secs(5),
-        })
-        .await;
-    let _ = session.close().await;
-    let reply = raw.context("skill-review ask() failed")?;
-
-    // Validation gate: any SKILL.md the reviewer touched must conform, or it's
-    // quarantined out of the live library (ADR-017 format gate).
-    let quarantined = gate_touched_skills(&operator_root, started)?;
+    let (reply, quarantined) =
+        run_skill_session(workspace_root, &operator_root, &format!("review-{venue}"), &prompt).await?;
 
     let summary = if quarantined.is_empty() {
         format!("reviewed {venue} ({} turns): {}", turns.len(), truncate(&reply, 240))
@@ -291,6 +265,314 @@ Conversation to review ({venue}):
 ---
 
 Do the work now, then reply with a ONE-LINE summary of what you changed (e.g. "patched git-rebase-recovery: added the detached-HEAD pitfall") or exactly "Nothing to save."."#,
+        today = chrono::Local::now().format("%Y-%m-%d"),
+    )
+}
+
+/// Spawn a one-shot skill-writing session, run the prompt, then run the
+/// validation gate over anything it touched. Shared by review / gap / curate.
+/// Returns (reply, quarantined skill names).
+async fn run_skill_session(
+    workspace_root: &Path,
+    operator_root: &Path,
+    window: &str,
+    prompt: &str,
+) -> Result<(String, Vec<String>)> {
+    let started = SystemTime::now();
+    let mut session = Session::spawn(SpawnOptions {
+        workspace_root: workspace_root.to_path_buf(),
+        permission_mode: Some(PermissionMode::Auto),
+        add_dirs: vec![operator_root.to_path_buf()],
+        tmux_session: TMUX_SESSION.into(),
+        window_name: Some(window.to_string()),
+        agent_label: Some(AGENT_NAME.into()),
+        ready_timeout: Duration::from_secs(20),
+        ..SpawnOptions::default()
+    })
+    .await
+    .with_context(|| format!("spawning skill session ({window})"))?;
+    let raw = session
+        .ask(prompt, AskOptions {
+            max_wait: Duration::from_secs(300),
+            quiescent_window: Duration::from_secs(5),
+        })
+        .await;
+    let _ = session.close().await;
+    let reply = raw.with_context(|| format!("skill session ask() failed ({window})"))?;
+    let quarantined = gate_touched_skills(operator_root, started)?;
+    Ok((reply, quarantined))
+}
+
+// ── periodic arm: gap detection + curator ──────────────────────────────────
+
+/// The periodic pass (launchd-cron). Pure auto-archive of stale agent-created
+/// skills, then an LLM gap-detection pass over recent diaries, then an LLM
+/// curator/consolidation pass. Mirrors the distiller's two-phase shape.
+async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
+    let operator_root = operator_skills_root();
+    let repo_root = workspace_root.join(".claude/skills");
+    let cfg = &settings.skill_learner;
+
+    // 1. Pure auto-transitions (no LLM): archive agent-created, unpinned skills
+    // idle past archive_after_days; count the merely-stale for the log.
+    let (stale, archived) =
+        apply_auto_transitions(&operator_root, cfg.stale_after_days, cfg.archive_after_days);
+    if !archived.is_empty() {
+        tracing::info!("learn: auto-archived {} stale skill(s): {}", archived.len(), archived.join(", "));
+    }
+
+    // 2. Gap detection over recent diaries (skip our own).
+    let diaries = read_all_diaries(workspace_root, &settings.diary.root, 7);
+    let mut lib = skills::read_skills(&operator_root, "personal");
+    lib.extend(skills::read_skills(&repo_root, "repo"));
+    let library = render_library(&lib);
+
+    let mut gap_summary = "no diaries to scan".to_string();
+    if !diaries.trim().is_empty() {
+        let prompt = build_gap_prompt(&operator_root, &library, &diaries);
+        let (reply, q) = run_skill_session(workspace_root, &operator_root, "gap", &prompt).await?;
+        gap_summary = truncate(&reply, 200);
+        if !q.is_empty() {
+            gap_summary = format!("{gap_summary} (quarantined: {})", q.join(", "));
+        }
+    }
+
+    // 3. Curator consolidation over the (refreshed) agent-created library.
+    let mut lib2 = skills::read_skills(&operator_root, "personal");
+    lib2.extend(skills::read_skills(&repo_root, "repo"));
+    let curate_summary = {
+        let prompt = build_curate_prompt(&operator_root, &render_library(&lib2));
+        let (reply, q) = run_skill_session(workspace_root, &operator_root, "curate", &prompt).await?;
+        let mut s = truncate(&reply, 200);
+        if !q.is_empty() {
+            s = format!("{s} (quarantined: {})", q.join(", "));
+        }
+        s
+    };
+
+    let summary = format!(
+        "stale={stale} archived={} · gap: {gap_summary} · curate: {curate_summary}",
+        archived.len()
+    );
+    let _ = diary::record_observation(workspace_root, AGENT_NAME, "learn", &summary, diary::Tag::Observation);
+    tracing::info!("learn: {summary}");
+    Ok(())
+}
+
+/// Archive agent-created, unpinned skills whose last activity is older than
+/// `archive_days`; return (stale_count, archived_names). "Activity" = the
+/// later of frontmatter `last_used` and the SKILL.md mtime. Hand-written
+/// skills (created_by != "agent") and pinned skills are never auto-managed.
+fn apply_auto_transitions(root: &Path, stale_days: u32, archive_days: u32) -> (usize, Vec<String>) {
+    let mut stale = 0usize;
+    let mut archived = Vec::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return (0, archived),
+    };
+    let now = chrono::Utc::now();
+    for dirent in entries.flatten() {
+        let dir = dirent.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let skill_md = dir.join(skills::SKILL_FILE);
+        let Ok(content) = std::fs::read_to_string(&skill_md) else { continue };
+        let fm = skills::parse_frontmatter(&content, &skill_md).unwrap_or_default();
+        if fm.created_by.as_deref() != Some("agent") || fm.pinned {
+            continue; // only auto-manage our own, never pinned
+        }
+        let age_days = skill_age_days(&fm, &skill_md, now);
+        if age_days >= archive_days as i64 {
+            let ts = now.format("%Y%m%dT%H%M%S");
+            let dest = root.join(".archive").join(format!("{name}-{ts}"));
+            if let Some(p) = dest.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            if std::fs::rename(&dir, &dest).is_ok() {
+                archived.push(name);
+            }
+        } else if age_days >= stale_days as i64 {
+            stale += 1;
+        }
+    }
+    (stale, archived)
+}
+
+/// Days since a skill's last activity: max(last_used, mtime).
+fn skill_age_days(fm: &skills::Frontmatter, skill_md: &Path, now: chrono::DateTime<chrono::Utc>) -> i64 {
+    let mut newest: Option<chrono::DateTime<chrono::Utc>> = None;
+    if let Some(lu) = &fm.last_used {
+        // accept YYYY-MM-DD or RFC3339
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(lu.trim(), "%Y-%m-%d") {
+            newest = d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+        } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(lu.trim()) {
+            newest = Some(dt.with_timezone(&chrono::Utc));
+        }
+    }
+    if let Ok(meta) = std::fs::metadata(skill_md) {
+        if let Ok(modified) = meta.modified() {
+            let dt: chrono::DateTime<chrono::Utc> = modified.into();
+            newest = Some(newest.map_or(dt, |n| n.max(dt)));
+        }
+    }
+    match newest {
+        Some(n) => (now - n).num_days(),
+        None => 0,
+    }
+}
+
+/// Concatenate the last `days` of every agent's diary (skipping our own and
+/// hidden files) so the gap pass sees what the system has been doing.
+fn read_all_diaries(workspace_root: &Path, diary_root_rel: &str, days: i64) -> String {
+    let root = workspace_root.join(diary_root_rel);
+    let today = chrono::Local::now().date_naive();
+    let mut out = String::new();
+    let Ok(entries) = std::fs::read_dir(&root) else { return out };
+    for dirent in entries.flatten() {
+        let dir = dirent.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let agent = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        if agent == AGENT_NAME || agent.starts_with('.') {
+            continue; // never learn from our own diary
+        }
+        let mut agent_block = String::new();
+        for back in 0..days {
+            let Some(date) = today.checked_sub_signed(chrono::Duration::days(back)) else { continue };
+            let path = dir.join(format!("{date}.md"));
+            if let Ok(c) = std::fs::read_to_string(&path) {
+                agent_block.push_str(&c);
+                agent_block.push('\n');
+            }
+        }
+        if !agent_block.trim().is_empty() {
+            out.push_str(&format!("\n### agent: {agent}\n{agent_block}\n"));
+        }
+    }
+    out
+}
+
+fn build_gap_prompt(operator_root: &Path, library: &str, diaries: &str) -> String {
+    let dir = operator_root.display();
+    format!(
+        r#"You are Nucleus' skill-gap detector. Below are recent diary entries from every agent (what the system has actually been doing) and the current skill library. Find RECURRING tasks or workflows that lack a skill and would clearly benefit from one, and CREATE a class-level skill for each.
+
+Rules:
+  • Only create a skill for a pattern that recurs or is clearly a reusable class of work — not a one-off task someone did once.
+  • Do NOT duplicate or near-duplicate an existing library skill. If the gap is "an existing skill is thin", that's the periodic curator's job, not yours — skip it.
+  • Class-level names only (no dates, PR numbers, codenames).
+  • Write to {dir}/<skill-name>/SKILL.md (operator-personal tree ONLY) via your file tools, with the required contract:
+      ---
+      name: <kebab-case>
+      description: <one line>
+      flavor: learned
+      created_by: agent
+      last_used: {today}
+      ---
+      # When to invoke
+      …
+      # Steps
+      …
+      # Failure modes
+      …  (REQUIRED, never empty)
+  • Never write a secret, token, email, phone, or personal identifier into a skill.
+
+Current skill library:
+{library}
+
+Recent agent diaries:
+---
+{diaries}
+---
+
+Create the missing skills now, then reply with ONE line per skill created, or exactly "No gaps."."#,
+        today = chrono::Local::now().format("%Y-%m-%d"),
+    )
+}
+
+/// Ported Hermes CURATOR_REVIEW_PROMPT, adapted: candidates are the
+/// agent-created skills; consolidation happens via file tools; archive =
+/// move the dir into `.archive/` (never delete); pinned + hand-written
+/// (created_by != agent) skills are off-limits.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_skill(root: &Path, name: &str, frontmatter: &str, backdate: bool) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("SKILL.md");
+        std::fs::write(
+            &md,
+            format!("---\nname: {name}\ndescription: d\nflavor: learned\n{frontmatter}\n---\n\n# When to invoke\nx\n# Steps\n1\n# Failure modes\n- z\n"),
+        )
+        .unwrap();
+        if backdate {
+            // mtime is part of the activity anchor — backdate it well past
+            // archive_after_days so the age test is meaningful.
+            let _ = std::process::Command::new("touch")
+                .args(["-t", "202001010000", md.to_str().unwrap()])
+                .status();
+        }
+    }
+
+    #[test]
+    fn auto_transitions_archive_old_agent_skills_only() {
+        let root = std::env::temp_dir().join(format!(
+            "sgl-auto-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // old + agent + unpinned → archived
+        write_skill(&root, "old-agent", "created_by: agent\nlast_used: 2020-01-01", true);
+        // old + agent + pinned → skipped
+        write_skill(&root, "pinned-agent", "created_by: agent\npinned: true\nlast_used: 2020-01-01", true);
+        // old + hand-written (no created_by) → skipped
+        write_skill(&root, "hand-written", "last_used: 2020-01-01", true);
+        // fresh agent → skipped (not old)
+        write_skill(&root, "fresh-agent", "created_by: agent", false);
+
+        let (_stale, archived) = apply_auto_transitions(&root, 30, 90);
+
+        assert_eq!(archived, vec!["old-agent".to_string()], "only the old unpinned agent skill archives");
+        assert!(root.join(".archive").exists(), "archive dir created");
+        assert!(!root.join("old-agent").exists(), "archived skill moved out");
+        assert!(root.join("pinned-agent").exists(), "pinned skill stays");
+        assert!(root.join("hand-written").exists(), "hand-written skill stays");
+        assert!(root.join("fresh-agent").exists(), "fresh skill stays");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+fn build_curate_prompt(operator_root: &Path, library: &str) -> String {
+    let dir = operator_root.display();
+    format!(
+        r#"You are Nucleus' background skill CURATOR. This is an UMBRELLA-BUILDING consolidation pass, not a passive audit and not a duplicate-finder. The goal is a LIBRARY OF CLASS-LEVEL skills — one broad umbrella with labeled subsections beats five narrow siblings for discoverability (an agent matches skills on description, not exact name).
+
+Hard rules — do not violate:
+  1. Only touch skills with `created_by: agent` in their frontmatter. NEVER touch hand-written skills (no created_by, or created_by != agent) or anything marked `pinned: true`.
+  2. NEVER delete a skill. The maximum action is ARCHIVING — move its directory into {dir}/.archive/ (recoverable). Use your terminal/file tools: `mv {dir}/<name> {dir}/.archive/<name>`.
+  3. Do not use age/recency as a reason to skip consolidation — judge overlap on CONTENT.
+  4. "Each has a distinct trigger" is NOT a reason to keep them separate. The bar is: would a maintainer write these as N skills, or one skill with N labeled subsections? If the latter, merge.
+
+How to work:
+  1. Identify clusters of agent-created skills sharing a domain/first word.
+  2. For each cluster of 2+: pick or create the umbrella (a class-level SKILL.md), patch it to add a labeled subsection (or a references/<topic>.md support file) for each sibling's unique content, then ARCHIVE the absorbed siblings.
+  3. Keep the SKILL.md contract intact on anything you write (frontmatter incl. flavor: learned + created_by: agent + the # When to invoke / # Steps / # Failure modes sections). Bump last_used: {today} on skills you patch.
+
+Current skill library (only act on created_by: agent entries):
+{library}
+
+Do the consolidation now via your file tools, then reply with a short summary: which umbrellas you built and which siblings you archived into them. If nothing needs consolidating, reply exactly "Library is already well-shaped."."#,
         today = chrono::Local::now().format("%Y-%m-%d"),
     )
 }
