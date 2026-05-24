@@ -41,6 +41,15 @@ retain_days = 7
 cron = "0 4 * * *"
 # model = "claude-sonnet-4-6"   # optional override (reserved; unused today)
 
+[skill_learner]
+# ADR-017: the skill-gap learner. On-the-fly arm reviews a conversation after
+# this many turns per chat; periodic arm proposes missing skills + curates.
+nudge_interval = 12
+cron = "30 4 * * *"          # periodic `learn` (informational; truth in the plist)
+stale_after_days = 30        # agent-created skills idle this long → stale
+archive_after_days = 90      # …this long → auto-archived (never deleted)
+enabled = true
+
 [gmail]
 # Daily inbox metabolism (ADR-007). 5am local; cron evaluated in NUCLEUS_TZ.
 metabolism_cron = "0 5 * * *"
