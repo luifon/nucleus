@@ -2,18 +2,19 @@
 
 **Status:** Proposed (2026-05-18)
 
-> **Post-ADR-015/016 reframing (2026-05-24).** When this lands, the
+> **Post-ADR-015/016/017 reframing (2026-05-24).** When this lands, the
 > wizard's multi-select stops listing `dashboard / chat / news-api`
 > as three separable services — they were collapsed into one binary
 > (`nucleus-dashboard`) by ADR-015. The selectable services are now
-> the **7** in `agents.toml` (ADR-016, the single source of truth the
+> the **8** in `agents.toml` (ADR-016, the single source of truth the
 > wizard should read rather than hardcoding): `discord`, `whatsapp`,
 > `nucleus-dashboard`, `news-fetcher`, `gmail-metabolism`, `distiller`
 > (one consolidated daily pass — `distiller-hourly`/`-weekly` were
-> merged), `reminders-tick`. `preference-learner` was sunset (ADR-016).
-> The body below preserves the original framing as historical context —
-> read it with those substitutions, and treat any service enumeration
-> as superseded by `agents.toml`.
+> merged), `reminders-tick`, and `skill-gap-learner` (ADR-017).
+> `preference-learner` was sunset (ADR-016/017). The body below preserves
+> the original framing as historical context — read it with those
+> substitutions, and treat any service enumeration as superseded by
+> `agents.toml`.
 
 ## Context
 
