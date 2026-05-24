@@ -22,9 +22,9 @@ export type DiaryEntry = {
 
 export const listDiaryAgents = () => jsonGet<DiaryAgent[]>("/diary/api/agents");
 
-export const listRecentDiary = (opts: { agent?: string; limit?: number } = {}) =>
+export const listRecentDiary = (opts: { agent?: string; date?: string; limit?: number } = {}) =>
   jsonGet<DiaryEntry[]>(
-    `/diary/api/recent${qs({ agent: opts.agent, limit: opts.limit })}`,
+    `/diary/api/recent${qs({ agent: opts.agent, date: opts.date, limit: opts.limit })}`,
   );
 
 /** Raw markdown text of a single entry. Used for re-fetching if the
