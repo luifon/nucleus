@@ -20,6 +20,7 @@ import DiaryPage from "./pages/DiaryPage";
 import RemindersPage from "./pages/RemindersPage";
 import SessionsPage from "./pages/SessionsPage";
 import VaultPage from "./pages/VaultPage";
+import ChatPage from "./pages/ChatPage";
 
 type RouteEntry = {
   path: string;
@@ -34,7 +35,7 @@ type RouteEntry = {
 // the rest in. Icons mirror the Iconize convention from ADR-014.
 const ROUTES: RouteEntry[] = [
   { path: "/",          label: "dashboard", icon: LayoutDashboard, group: "primary",       impl: "scaffolded" },
-  { path: "/chat",      label: "chat",      icon: MessageSquare,   group: "primary",       impl: "pending"    },
+  { path: "/chat",      label: "chat",      icon: MessageSquare,   group: "primary",       impl: "scaffolded" },
   { path: "/news",      label: "news",      icon: Newspaper,       group: "primary",       impl: "scaffolded" },
   { path: "/sessions",  label: "sessions",  icon: Terminal,        group: "observability", impl: "scaffolded" },
   { path: "/skills",    label: "skills",    icon: Sparkles,        group: "observability", impl: "scaffolded" },
@@ -76,6 +77,7 @@ export default function App() {
             <Route path="/reminders" element={<RemindersPage />} />
             <Route path="/sessions" element={<SessionsPage />} />
             <Route path="/vault" element={<VaultPage />} />
+            <Route path="/chat" element={<ChatPage />} />
             {ROUTES.filter((r) => r.impl === "pending").map((r) => (
               <Route key={r.path} path={r.path} element={<PendingPage label={r.label} Icon={r.icon} />} />
             ))}
