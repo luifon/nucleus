@@ -12,16 +12,19 @@
 //!     sessions × 1 window each); no need for a second hop.
 
 use axum::{
+    extract::Query,
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::get,
     Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 pub fn router() -> Router {
-    Router::new().route("/list", get(list_sessions))
+    Router::new()
+        .route("/list", get(list_sessions))
+        .route("/capture", get(capture_pane))
 }
 
 #[derive(Serialize)]
@@ -127,6 +130,65 @@ async fn list_sessions() -> Result<Json<Vec<TmuxSession>>, SessionsError> {
     // moved last.
     sessions.sort_by(|a, b| b.activity_unix.cmp(&a.activity_unix));
     Ok(Json(sessions))
+}
+
+#[derive(Deserialize)]
+struct CaptureQ {
+    session: String,
+    /// Lines of scrollback to include (most-recent N). Defaults to
+    /// 20, clamped to [1, 200] — keep responses small and the
+    /// capture cheap.
+    lines: Option<i32>,
+}
+
+/// `tmux capture-pane -p` for the session's active pane. Used by the
+/// frontend when an operator expands a session tile — gives a "what
+/// is this session showing right now?" peek without forcing them to
+/// `tmux attach`.
+///
+/// Session name is validated against the actual tmux session list
+/// (and the `nucleus-` prefix) before being passed to tmux. tmux's
+/// own arg parsing would also reject obvious shell metacharacters,
+/// but defense-in-depth: only known sessions resolve.
+async fn capture_pane(Query(q): Query<CaptureQ>) -> Result<String, SessionsError> {
+    if !q.session.starts_with("nucleus-") {
+        return Err(SessionsError::TmuxFailed(
+            "session name must start with `nucleus-`".into(),
+        ));
+    }
+    // Confirm the session actually exists right now — saves a tmux
+    // round-trip error and keeps the surface area to known names.
+    let sess_check = Command::new("tmux")
+        .args(["has-session", "-t", &q.session])
+        .output()
+        .await
+        .map_err(|e| SessionsError::Spawn(e.to_string()))?;
+    if !sess_check.status.success() {
+        return Err(SessionsError::TmuxFailed(format!(
+            "session {:?} not found",
+            q.session
+        )));
+    }
+    let lines = q.lines.unwrap_or(20).clamp(1, 200);
+    let scrollback = format!("-{}", lines);
+    let out = Command::new("tmux")
+        .args([
+            "capture-pane",
+            "-p",
+            "-t",
+            &q.session,
+            "-S",
+            &scrollback,
+        ])
+        .output()
+        .await
+        .map_err(|e| SessionsError::Spawn(e.to_string()))?;
+    if !out.status.success() {
+        return Err(SessionsError::TmuxFailed(
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[derive(Debug)]

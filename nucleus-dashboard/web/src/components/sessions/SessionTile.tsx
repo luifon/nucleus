@@ -7,17 +7,29 @@ import {
   Activity,
   CircleDashed,
   AppWindow,
+  ChevronDown,
+  ChevronRight,
+  RefreshCw,
 } from "lucide-react";
-import { type TmuxSession } from "@/lib/api";
+import { type TmuxSession, captureSessionPane } from "@/lib/api";
 
-// One tile per tmux session. Read-only — operator copies the attach
-// command and runs it in their own terminal. Per ADR-015 the
-// dashboard never attaches/kills tmux directly.
+// One tile per tmux session. Header row is always visible (name +
+// state + idle/uptime + attach button). Click the chevron / header
+// to expand: shows window list + a 20-line tmux capture-pane preview
+// of the session's active pane.
+//
+// Read-only — operator copies the attach command and runs it in their
+// own terminal. Per ADR-015 the dashboard never attaches/kills.
 
 const IDLE_WARN_HOURS = 24;
 
 export default function SessionTile({ session }: { session: TmuxSession }) {
   const [copied, setCopied] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [capture, setCapture] = useState<string | null>(null);
+  const [captureErr, setCaptureErr] = useState<string | null>(null);
+  const [reloading, setReloading] = useState(false);
+
   const idleSec = Math.max(0, Math.floor(Date.now() / 1000) - session.activity_unix);
   const idleClass =
     session.attached === 1
@@ -27,15 +39,34 @@ export default function SessionTile({ session }: { session: TmuxSession }) {
         : "text-[var(--color-nucleus-faint)]";
 
   const attachCmd = `tmux attach -t ${session.name}`;
-  const copy = async () => {
+  const copy = async (e: React.MouseEvent) => {
+    e.stopPropagation();
     try {
       await navigator.clipboard.writeText(attachCmd);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      // Clipboard API requires a secure context; if it's missing
-      // (e.g. accessed over plain http), silently no-op. The command
-      // is still visible in the title attribute.
+      /* clipboard API needs a secure context */
+    }
+  };
+
+  const loadCapture = async () => {
+    setReloading(true);
+    setCaptureErr(null);
+    try {
+      setCapture(await captureSessionPane(session.name, 20));
+    } catch (e) {
+      setCaptureErr(String(e));
+    } finally {
+      setReloading(false);
+    }
+  };
+
+  const toggle = async () => {
+    const next = !expanded;
+    setExpanded(next);
+    if (next && capture === null && !captureErr) {
+      await loadCapture();
     }
   };
 
@@ -44,8 +75,16 @@ export default function SessionTile({ session }: { session: TmuxSession }) {
   const short = session.name.replace(/^nucleus-/, "");
 
   return (
-    <article className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)] p-3.5">
-      <div className="flex items-start gap-3">
+    <article className="overflow-hidden rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)]">
+      <button
+        onClick={toggle}
+        className="flex w-full items-start gap-3 p-3.5 text-left transition-colors hover:bg-[var(--color-nucleus-bg)]"
+      >
+        {expanded ? (
+          <ChevronDown size={14} strokeWidth={1.75} className="mt-0.5 shrink-0 text-[var(--color-nucleus-faint)]" />
+        ) : (
+          <ChevronRight size={14} strokeWidth={1.75} className="mt-0.5 shrink-0 text-[var(--color-nucleus-faint)]" />
+        )}
         <Terminal
           size={14}
           strokeWidth={1.75}
@@ -86,8 +125,10 @@ export default function SessionTile({ session }: { session: TmuxSession }) {
             </span>
           </div>
         </div>
-        <button
+        <span
           onClick={copy}
+          role="button"
+          tabIndex={0}
           title={attachCmd}
           className="flex shrink-0 items-center gap-1 rounded border border-[var(--color-nucleus-border)] px-2 py-1 text-[11px] text-[var(--color-nucleus-faint)] hover:border-[var(--color-nucleus-accent)] hover:text-[var(--color-nucleus-accent)]"
         >
@@ -102,8 +143,60 @@ export default function SessionTile({ session }: { session: TmuxSession }) {
               attach
             </>
           )}
-        </button>
-      </div>
+        </span>
+      </button>
+
+      {expanded && (
+        <div className="border-t border-[var(--color-nucleus-border)] px-4 py-3 text-[12px]">
+          <div className="mb-3">
+            <div className="mb-1 flex items-center gap-1 text-[10px] uppercase tracking-widest text-[var(--color-nucleus-faint)] opacity-70">
+              <AppWindow size={10} strokeWidth={1.75} />
+              windows · {session.windows.length}
+            </div>
+            <ul className="space-y-0.5">
+              {session.windows.map((w) => (
+                <li
+                  key={w.index}
+                  className="flex items-center gap-2 text-[11px] text-[var(--color-nucleus-faint)]"
+                >
+                  <span className="tabular-nums opacity-70">#{w.index}</span>
+                  <span className="text-[var(--color-nucleus-text)]">{w.name}</span>
+                  <span className="opacity-70">· {w.panes} {w.panes === 1 ? "pane" : "panes"}</span>
+                  <span className="ml-auto" title={fullTime(w.activity_unix)}>
+                    active {relDuration(Math.max(0, Math.floor(Date.now() / 1000) - w.activity_unix))} ago
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div>
+            <div className="mb-1 flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1 text-[10px] uppercase tracking-widest text-[var(--color-nucleus-faint)] opacity-70">
+                <Terminal size={10} strokeWidth={1.75} />
+                pane preview · last 20 lines
+              </span>
+              <button
+                onClick={(e) => { e.stopPropagation(); void loadCapture(); }}
+                disabled={reloading}
+                title="re-capture"
+                className="text-[var(--color-nucleus-faint)] hover:text-[var(--color-nucleus-accent)] disabled:opacity-40"
+              >
+                <RefreshCw size={10} strokeWidth={1.75} className={reloading ? "animate-spin" : ""} />
+              </button>
+            </div>
+            {captureErr ? (
+              <div className="text-[11px] text-[var(--color-status-down)]">{captureErr}</div>
+            ) : capture === null ? (
+              <div className="text-[11px] text-[var(--color-nucleus-faint)]">loading…</div>
+            ) : (
+              <pre className="max-h-64 overflow-auto rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] p-2 text-[11px] leading-snug text-[var(--color-nucleus-text)]">
+                {capture || "(empty)"}
+              </pre>
+            )}
+          </div>
+        </div>
+      )}
     </article>
   );
 }
