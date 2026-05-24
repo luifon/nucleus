@@ -84,14 +84,9 @@ async fn main() -> Result<()> {
         app = app.nest("/news/api", handlers::news::router(news_state));
     }
 
-    // Cron router always mounts so the launchd-list endpoint works
-    // even when reminders.db doesn't exist yet.
-    let cron_state = Arc::new(handlers::cron::CronState {
-        reminders_pool: reminders_pool.clone(),
-    });
-    app = app.nest("/cron/api", handlers::cron::router(cron_state));
-
     // Reminders admin — requires the DB. Mount only when openable.
+    // (The retired /cron surface's upcoming + fire-history views were folded
+    // in here; its launchd list is superseded by /agents. ADR-016.)
     if let Some(pool) = reminders_pool.clone() {
         let state = Arc::new(handlers::reminders::RemindersState { pool });
         app = app.nest("/reminders/api", handlers::reminders::router(state));

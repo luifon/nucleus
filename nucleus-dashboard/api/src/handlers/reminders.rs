@@ -37,6 +37,7 @@ pub struct RemindersState {
 pub fn router(state: Arc<RemindersState>) -> Router {
     Router::new()
         .route("/list", get(list))
+        .route("/history", get(list_history))
         .route("/pause", post(pause))
         .route("/resume", post(resume))
         .route("/cancel", post(cancel))
@@ -78,6 +79,50 @@ async fn list(
         out.push(ReminderView { inner: r, channels });
     }
     Ok(Json(out))
+}
+
+// ─── fire history (folded in from the retired /cron surface) ─────────────────
+//
+// "Upcoming" needs no endpoint of its own — it's the active/pending rows of
+// `/list`, which the frontend sorts by next_fire. Only the fire-attempt audit
+// log was unique to /cron, so that's all that moves here.
+
+#[derive(Serialize, sqlx::FromRow)]
+struct FireRow {
+    id: i64,
+    reminder_id: i64,
+    fired_at: String,
+    channel: String,
+    success: i64,
+    msg_id: Option<String>,
+    error: Option<String>,
+    reminder_title: Option<String>,
+    reminder_body: Option<String>,
+    is_skill_fire: i64,
+}
+
+/// Recent fire-attempt audit log, newest first (was `/cron/api/recent`) — the
+/// one view `/reminders` lacked. Per-channel success/error.
+async fn list_history(
+    State(s): State<Arc<RemindersState>>,
+) -> Result<Json<Vec<FireRow>>, RemindersError> {
+    let rows = sqlx::query_as::<_, FireRow>(
+        r#"
+        SELECT f.id, f.reminder_id, f.fired_at, f.channel, f.success,
+               f.msg_id, f.error,
+               r.title AS reminder_title, r.body AS reminder_body,
+               CASE WHEN r.system_prompt IS NOT NULL AND r.system_prompt != ''
+                    THEN 1 ELSE 0 END AS is_skill_fire
+        FROM reminder_fires f
+        LEFT JOIN reminders r ON r.id = f.reminder_id
+        ORDER BY f.fired_at DESC
+        LIMIT 60
+        "#,
+    )
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|e| RemindersError::Other(e.to_string()))?;
+    Ok(Json(rows))
 }
 
 // ─── write actions ─────────────────────────────────────────────────────────
