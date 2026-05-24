@@ -1,6 +1,7 @@
 //! Nucleus shared library.
 //!
 //! Modules:
+//! - [`agents`] — the agent registry loaded from `agents.toml` (see ADR-016).
 //! - [`claude`] — shared `PermissionMode` enum.
 //! - [`claude_session`] — long-lived interactive `claude` sessions driven via
 //!   tmux. The way to run claude under the Max subscription — `-p` headless
@@ -12,6 +13,7 @@
 //! - [`health`] — `HealthCheck` trait + registry (S3).
 //! - [`memory`] — Tier 2 shared-fact read/write (see ADR-002).
 
+pub mod agents;
 pub mod claude;
 pub mod claude_session;
 pub mod config;
