@@ -97,9 +97,23 @@ async fn main() -> Result<()> {
         app = app.nest("/reminders/api", handlers::reminders::router(state));
     }
 
-    // Sessions — tmux inspector. Stateless; shells out to tmux per
-    // request. Tolerates no-server-running by returning [].
-    app = app.nest("/sessions/api", handlers::sessions::router());
+    // Agents — the ADR-016 front door (supersedes the old /sessions tmux
+    // inspector, which is deleted). Reads agents.toml and probes
+    // liveness per agent. Tolerated-missing: if the registry can't load
+    // the surface is simply absent rather than crashing the binary.
+    match nucleus_core::agents::Registry::load_from(workspace_root.join("agents.toml")) {
+        Ok(registry) => {
+            let agents_state = Arc::new(handlers::agents::AgentsState {
+                workspace_root: workspace_root.clone(),
+                registry,
+                identity: _settings.identity.clone(),
+            });
+            app = app.nest("/agents/api", handlers::agents::router(agents_state));
+        }
+        Err(e) => {
+            tracing::warn!("nucleus-dashboard: agents.toml not loadable: {} — /agents disabled", e);
+        }
+    }
 
     // Vault — filesystem mtime feed over the Obsidian vault.
     // Tilde-expand the configured vault_path since the config loader

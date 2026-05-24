@@ -4,12 +4,14 @@ import HealthTile from "@/components/dashboard/HealthTile";
 import GlancesTile from "@/components/dashboard/GlancesTile";
 import DockerTile from "@/components/dashboard/DockerTile";
 import TunnelTile from "@/components/dashboard/TunnelTile";
+import AgentsHealthTile from "@/components/dashboard/AgentsHealthTile";
 import { usePolling } from "@/lib/hooks";
 import {
   getDashboardHealth,
   getDashboardGlances,
   getDashboardDocker,
   getDashboardTunnel,
+  listAgents,
 } from "@/lib/api";
 
 export default function HomePage() {
@@ -17,12 +19,14 @@ export default function HomePage() {
   const glances = usePolling(getDashboardGlances, 30_000);
   const docker = usePolling(getDashboardDocker, 15_000);
   const tunnel = usePolling(getDashboardTunnel, 30_000);
+  const agents = usePolling(listAgents, 20_000);
 
   const refresh = () => {
     health.refetch();
     glances.refetch();
     docker.refetch();
     tunnel.refetch();
+    agents.refetch();
   };
 
   return (
@@ -40,20 +44,13 @@ export default function HomePage() {
     >
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
         <HealthTile data={health.data} />
+        <AgentsHealthTile data={agents.data} />
         <DockerTile data={docker.data} />
         <TunnelTile data={tunnel.data} />
         <div className="md:col-span-2 xl:col-span-3">
           <GlancesTile data={glances.data} />
         </div>
       </div>
-
-      <section className="mt-8 text-[11px] text-[var(--color-nucleus-faint)] opacity-80">
-        <p>
-          A unified agent-health tile (every operator-facing agent — launchd-daemon,
-          launchd-cron, tmux+claude alike — surfaced from one registry) is deferred
-          until ADR-016 ships the registry + log-capture substrate.
-        </p>
-      </section>
     </PageShell>
   );
 }

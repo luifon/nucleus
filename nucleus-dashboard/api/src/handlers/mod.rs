@@ -1,9 +1,9 @@
+pub mod agents;
 pub mod chat;
 pub mod cron;
 pub mod dashboard;
 pub mod diary;
 pub mod news;
 pub mod reminders;
-pub mod sessions;
 pub mod skills;
 pub mod vault;
