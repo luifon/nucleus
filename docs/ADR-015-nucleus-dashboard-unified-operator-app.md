@@ -16,6 +16,16 @@
 > The current operator surfaces: `/` `/chat` `/news` `/agents` `/skills`
 > `/reminders` `/diary` `/vault`.
 
+> **Reframed by [[ADR-011]] (2026-05-24, implemented).** This ADR's
+> perimeter plan was **path-scoped** — keep `/news/api/*` public via
+> cloudflared, Tailscale-gate the rest. At implementation the operator
+> chose to **lock the whole origin down**: news included, no public path
+> at all. So everywhere below that says news is "public", "whitelisted
+> from Tailscale gating", "path-scoped", or served "via cloudflared"
+> (Scope table, Routes table, Phase 4) is **superseded** — the origin is
+> reached only over the tailnet, served by a local Caddy TLS terminator at
+> `$NUCLEUS_PUBLIC_URL`'s real hostname; cloudflared no longer fronts it.
+
 **Supersedes (in part):**
 - [[ADR-001]] — the "one crate per operator surface" topology.
   News-fetcher (the cron worker) and the messaging bots remain
