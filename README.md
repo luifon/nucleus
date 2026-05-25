@@ -419,7 +419,6 @@ nucleus/
 ├── tools/
 │   ├── launchd/            plist templates + install.sh
 │   └── cloudflared/        tunnel config templates
-├── assets/icons/           favicons / page logos (RSS arcs + pulse line)
 ├── docs/                   ADRs + roadmap + secrets policy
 └── memory/                 runtime state (DBs, diaries, logs) — gitignored
 ```
