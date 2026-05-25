@@ -33,7 +33,7 @@ export default function NewsCard({
               {item.title}
             </a>
             {item.summary && (
-              <p className="mt-3 line-clamp-6 text-sm leading-relaxed text-[var(--color-nucleus-faint)]">
+              <p className="mt-3 line-clamp-6 break-words text-sm leading-relaxed text-[var(--color-nucleus-faint)]">
                 {item.summary}
               </p>
             )}
@@ -80,7 +80,7 @@ export default function NewsCard({
           {item.title}
         </a>
         {item.summary && (
-          <p className="mt-2 line-clamp-3 text-[12px] leading-relaxed text-[var(--color-nucleus-faint)]">
+          <p className="mt-2 line-clamp-3 break-words text-[12px] leading-relaxed text-[var(--color-nucleus-faint)]">
             {item.summary}
           </p>
         )}
