@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!-- Nucleus mark: a bold amber "N" on a near-black tile. Kept to a single
+       heavy glyph (no thin brackets/borders) so it stays legible at 16px /
+       pinned-tab size. Palette = the locked ADR-015 tokens (#0a0a0a / #e6b450). -->
+  <rect width="32" height="32" rx="6" fill="#0a0a0a"/>
+  <path d="M8.5 23.5 V8.5 L23.5 23.5 V8.5" fill="none" stroke="#e6b450"
+        stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
