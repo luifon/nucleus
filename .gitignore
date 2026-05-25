@@ -37,6 +37,11 @@ tools/cloudflared/*.yaml
 !tools/cloudflared/*.yaml.example
 tools/launchd/*.plist
 !tools/launchd/*.plist.example
+tools/caddy/caddy
+tools/caddy/Caddyfile
+tools/caddy/*.plist
+!tools/caddy/*.plist.example
+tools/caddy/data/
 
 # personal Claude Code overrides (hooks + permissions for this operator only)
 .claude/settings.local.json
