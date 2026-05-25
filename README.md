@@ -162,6 +162,10 @@ cloudflared tunnel route dns my-tunnel nucleus.<yourdomain>
 cloudflared service install
 ```
 
+> This exposes the whole dashboard publicly. Step 6 (Perimeter) locks the
+> operator paths down to Tailscale and keeps only the public news API on
+> the tunnel. See `tools/cloudflared/` for the path-scoped template.
+
 ### 4. Pair WhatsApp (one time)
 
 ```bash
@@ -217,6 +221,47 @@ cargo test --release -p nucleus-core --test session_smoke -- --ignored --nocaptu
 # in the same channel ~5s warm. While replying, in another terminal:
 tmux attach -t nucleus-discord       # detach with Ctrl-b d
 ```
+
+### 6. Perimeter — make the dashboard tailnet-private at its real hostname (ADR-011)
+
+The whole operator surface goes behind Tailscale (no public path, news
+included), while keeping `$NUCLEUS_PUBLIC_URL`'s real hostname and a valid
+cert via Caddy. No login — tailnet membership is the access control.
+
+```bash
+# One-time bootstrap (interactive — browser auth + admin-console steps):
+brew install tailscale && sudo tailscale up   # authenticate via printed URL
+#   admin console: approve device, rename it `nucleus`, ENABLE HTTPS (DNS tab).
+#   Install the Tailscale client on every device you want access from
+#   (macOS/iOS/Windows `winget install tailscale`/Linux install.sh).
+
+# Caddy terminates TLS for the real hostname (cert via ACME DNS-01), so put
+# a Cloudflare token (Edit zone DNS, scoped to your zone) in .env:
+#   CF_API_TOKEN=...
+# Fetch a Caddy build with the cloudflare DNS module → ~/.local/bin/caddy
+# (caddyserver.com/download, or xcaddy build --with github.com/caddy-dns/cloudflare).
+
+./tools/caddy/install.sh          # generates Caddyfile + LaunchDaemon plist
+sudo tailscale serve --https=443 off                      # free :443 for Caddy
+sudo cp tools/caddy/<prefix>.caddy.plist /Library/LaunchDaemons/
+sudo chown root:wheel /Library/LaunchDaemons/<prefix>.caddy.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/<prefix>.caddy.plist
+
+# Point the hostname's public DNS at the tailnet IP, DNS-only (grey cloud):
+#   A  <nucleus-host>  →  $(tailscale ip -4)     proxied = false
+# (do it in the CF dashboard, or via the API with the same token)
+
+# Finally drop the now-dead nucleus route from ~/.cloudflared/config.yml
+# (keep containers) and restart the tunnel.
+```
+
+After this, `$NUCLEUS_PUBLIC_URL` resolves to your tailnet IP and serves the
+dashboard with a Let's Encrypt cert — reachable from any device on the
+tailnet, and nowhere else (off-tailnet the name resolves to an unroutable
+`100.x` and times out). Full rationale, the exact commands, rollback, and
+the `tools/caddy/` setup are in
+[`docs/ADR-011-perimeter-tailscale.md`](docs/ADR-011-perimeter-tailscale.md)
+and [`tools/caddy/README.md`](tools/caddy/README.md).
 
 ## Configuration
 
