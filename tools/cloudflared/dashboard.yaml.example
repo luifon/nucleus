@@ -1,7 +1,0 @@
-tunnel: __TUNNEL_UUID__
-credentials-file: __USER_HOME__/.cloudflared/__TUNNEL_UUID__.json
-
-ingress:
-  - hostname: __DASHBOARD_HOSTNAME__
-    service: http://localhost:8090
-  - service: http_status:404

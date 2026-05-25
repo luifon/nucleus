@@ -92,7 +92,7 @@ means one design system, one component vocabulary, one type ramp.
 
 Build **`nucleus-dashboard/`** — a new workspace member that
 consolidates every operator-facing HTTP surface into one binary
-(`nucleus-dashboard`), served at a single origin (`web.northmark.tech`).
+(`nucleus-dashboard`), served at a single origin (`$NUCLEUS_PUBLIC_URL`).
 
 ### Stack
 
@@ -258,7 +258,7 @@ produces. The React app at `nucleus-dashboard/web/` is built by a
 
 ### Routes (axum)
 
-Single origin (`web.northmark.tech`), path-scoped:
+Single origin (`$NUCLEUS_PUBLIC_URL`), path-scoped:
 
 | Path prefix | Auth posture (post-ADR-011) | Source |
 |---|---|---|
@@ -311,7 +311,7 @@ stays as written.
    - Build all new surfaces (`/sessions`, `/skills`, `/reminders`,
      `/diary`, `/vault`, `/cron`).
    - Add `tools/launchd/nucleus-dashboard.plist.example`.
-   - Add cloudflared route `web.northmark.tech` → local port.
+   - Add cloudflared route `$NUCLEUS_PUBLIC_URL` → local port.
    - Commit to the feature branch incrementally surface-by-surface;
      merge to main only when feature-complete.
 
@@ -331,7 +331,7 @@ stays as written.
 
 4. **Phase 4 — Tailscale gating ([[ADR-011]] proper).** Apply
    Tailscale-Serve gating to the operator paths on
-   `web.northmark.tech` (everything except `/news/api/*` and
+   the origin in `$NUCLEUS_PUBLIC_URL` (everything except `/news/api/*` and
    `/api/health`). News stays publicly accessible via cloudflared.
 
 5. **Phase 5 — Canvas ([[ADR-012]]).** Implement canvas as a

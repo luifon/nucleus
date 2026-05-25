@@ -2,7 +2,8 @@
 
 Unified operator app per [ADR-015](../docs/ADR-015-nucleus-dashboard-unified-operator-app.md).
 Subsumes the standalone `dashboard/`, `chat/`, and `news/api/` crates
-into one axum binary serving a React SPA at `web.northmark.tech`.
+into one axum binary serving a React SPA at the origin in
+`$NUCLEUS_PUBLIC_URL` (port 8092).
 
 ## Layout
 

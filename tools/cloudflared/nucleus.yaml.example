@@ -1,0 +1,32 @@
+# Single combined cloudflared ingress for the Nucleus host.
+#
+# The real config lives at ~/.cloudflared/config.yml (gitignored, one
+# combined file per the cloudflared_setup convention). Generate it from
+# this template with:
+#
+#   TUNNEL_UUID=<uuid> ./tools/cloudflared/install.sh
+#
+# Placeholders (substituted at install time):
+#   __USER_HOME__          → $HOME
+#   __TUNNEL_UUID__        → $TUNNEL_UUID (required)
+#   __NUCLEUS_HOSTNAME__   → host portion of NUCLEUS_PUBLIC_URL
+#   __CONTAINERS_HOSTNAME__→ host portion of NUCLEUS_CONTAINERS_PUBLIC_URL
+
+tunnel: __TUNNEL_UUID__
+credentials-file: __USER_HOME__/.cloudflared/__TUNNEL_UUID__.json
+
+ingress:
+  # Containers surface — a separate project sharing this tunnel.
+  # Out of scope for ADR-011; its perimeter is that project's call.
+  - hostname: __CONTAINERS_HOSTNAME__
+    service: http://localhost:4000
+
+  # Nucleus operator origin (nucleus-dashboard on :8092). This is the
+  # PRE-LOCKDOWN public config used during initial bring-up. ADR-011 then
+  # makes the dashboard tailnet-private (Tailscale + Caddy at the real
+  # hostname) and REMOVES this nucleus route entirely — once locked down,
+  # only the containers route above remains here.
+  - hostname: __NUCLEUS_HOSTNAME__
+    service: http://localhost:8092
+
+  - service: http_status:404

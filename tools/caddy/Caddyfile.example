@@ -1,0 +1,27 @@
+# Caddy reverse proxy — terminates TLS for the Nucleus dashboard on the
+# tailnet, so the operator surface is reachable at its real hostname
+# (NUCLEUS_PUBLIC_URL) but ONLY from tailnet members. See ADR-011.
+#
+# The real Caddyfile is generated from this template by install.sh and is
+# gitignored. Placeholders substituted at install time:
+#   __NUCLEUS_HOSTNAME__ → host portion of NUCLEUS_PUBLIC_URL
+#   __TAILNET_IP__       → `tailscale ip -4` of this host (a 100.x CGNAT addr)
+#
+# CF_API_TOKEN is read from the environment (set in the LaunchDaemon plist),
+# never baked into this file. The cert is issued via the ACME DNS-01
+# challenge against Cloudflare DNS — the host needs no public :80/:443
+# inbound, which is the whole point (it sits on a CGNAT tailnet IP).
+
+__NUCLEUS_HOSTNAME__ {
+	# Listen only on the tailnet interface. The public DNS A record points
+	# here (100.x), which is unroutable off-tailnet, so off-tailnet clients
+	# can't even reach this socket.
+	bind __TAILNET_IP__
+
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+		resolvers 1.1.1.1
+	}
+
+	reverse_proxy localhost:8092
+}
