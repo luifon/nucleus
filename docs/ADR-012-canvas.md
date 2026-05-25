@@ -20,6 +20,14 @@
 > protocol, where it works (one surface only), the destructive-action
 > policy — remains valid. Only the deployment shape and persona
 > naming changed.
+>
+> 3. **Perimeter prerequisite is satisfied — and stricter than described.**
+>    [[ADR-011]] shipped (2026-05-24): the whole `nucleus-dashboard` origin
+>    is tailnet-only behind Tailscale + Caddy, **news included**. So the
+>    body's "News stays publicly accessible; dashboard and chat are
+>    operator-only" framing is superseded — *nothing* is public now, which
+>    only strengthens the precondition for canvas. The chat surface canvas
+>    runs on is reachable only over the tailnet.
 
 ## Context
 
