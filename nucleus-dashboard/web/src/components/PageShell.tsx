@@ -15,7 +15,7 @@ export default function PageShell({
   children: ReactNode;
 }) {
   return (
-    <div className="mx-auto max-w-6xl px-4 py-6 sm:px-8 sm:py-7">
+    <div className="px-4 py-6 sm:px-8 sm:py-7">
       {(title || actions || subtitle) && (
         <header className="mb-6 flex flex-col gap-3 sm:mb-7 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
           <div className="min-w-0">
