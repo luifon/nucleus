@@ -12,6 +12,11 @@
 > `skill-gap-learner`); ADR-009 moved persona names out of code into
 > config (so "Jerry Lewis"/"Alfred" below are now operator-configurable
 > personas, not hardcoded). Read the table with those substitutions.
+> Finally, **ADR-011 (2026-05-24) put the whole origin behind Tailscale +
+> Caddy and made news private too** — so the table's `NUCLEUS_NEWS_PUBLIC_URL`
+> / "Public by design" / "Two Cloudflare tunnel ingress routes" framing
+> below no longer holds: nothing under `$NUCLEUS_PUBLIC_URL` is publicly
+> reachable anymore.
 
 ## Context
 
