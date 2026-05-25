@@ -1,23 +1,20 @@
 #!/usr/bin/env bash
-# Substitute placeholders into the cloudflared yaml templates and write the
-# real configs to the same dir. Pulls values from `.env` and a per-template
-# TUNNEL_UUID env var.
+# Substitute placeholders into the combined cloudflared template and write the
+# real config. Pulls hostnames from `.env` and the TUNNEL_UUID env var.
 #
 # Usage:
-#   TUNNEL_UUID=<uuid> ./tools/cloudflared/install.sh news
-#   TUNNEL_UUID=<uuid> ./tools/cloudflared/install.sh dashboard
-#   TUNNEL_UUID=<uuid> ./tools/cloudflared/install.sh        # all templates
+#   TUNNEL_UUID=<uuid> ./tools/cloudflared/install.sh
 #
 # Placeholders substituted:
-#   __USER_HOME__         → $HOME
-#   __TUNNEL_UUID__       → $TUNNEL_UUID (required)
-#   __NEWS_HOSTNAME__     → host portion of NUCLEUS_NEWS_PUBLIC_URL
-#   __DASHBOARD_HOSTNAME__→ host portion of NUCLEUS_DASHBOARD_PUBLIC_URL
-#   __CHAT_HOSTNAME__     → host portion of NUCLEUS_CHAT_PUBLIC_URL
+#   __USER_HOME__          → $HOME
+#   __TUNNEL_UUID__        → $TUNNEL_UUID (required)
+#   __NUCLEUS_HOSTNAME__   → host portion of NUCLEUS_PUBLIC_URL
+#   __CONTAINERS_HOSTNAME__→ host portion of NUCLEUS_CONTAINERS_PUBLIC_URL
 #
-# Output: real *.yaml files alongside the *.yaml.example. These are
-# gitignored (see .gitignore). After generating, point cloudflared at them:
-#   cloudflared tunnel --config tools/cloudflared/news.yaml run
+# Output: tools/cloudflared/nucleus.yaml (gitignored). Copy it to the location
+# cloudflared reads (the combined ~/.cloudflared/config.yml) and restart the
+# tunnel:
+#   cp tools/cloudflared/nucleus.yaml ~/.cloudflared/config.yml
 
 set -euo pipefail
 
@@ -38,57 +35,22 @@ fi
 host_from_url() {
   local url="$1"
   [ -z "$url" ] && return 1
-  # strip scheme + path
   echo "${url}" | sed -E 's#^[a-z]+://##; s#/.*$##'
 }
 
-NEWS_HOSTNAME="$(host_from_url "${NUCLEUS_NEWS_PUBLIC_URL:-}")"
-DASHBOARD_HOSTNAME="$(host_from_url "${NUCLEUS_DASHBOARD_PUBLIC_URL:-}")"
-CHAT_HOSTNAME="$(host_from_url "${NUCLEUS_CHAT_PUBLIC_URL:-}")"
+NUCLEUS_HOSTNAME="$(host_from_url "${NUCLEUS_PUBLIC_URL:-}")"
+CONTAINERS_HOSTNAME="$(host_from_url "${NUCLEUS_CONTAINERS_PUBLIC_URL:-}")"
 
-FILTER="${1:-}"
-for template in "$SCRIPT_DIR"/*.yaml.example; do
-  base="$(basename "$template" .example)"
-  stem="${base%.yaml}"
-  if [ -n "$FILTER" ] && [[ "$stem" != *"$FILTER"* ]]; then
-    continue
-  fi
-  case "$stem" in
-    news)
-      if [ -z "$NEWS_HOSTNAME" ]; then
-        echo "skipping $base — NUCLEUS_NEWS_PUBLIC_URL not set" >&2
-        continue
-      fi
-      hostname="$NEWS_HOSTNAME"
-      placeholder="__NEWS_HOSTNAME__"
-      ;;
-    dashboard)
-      if [ -z "$DASHBOARD_HOSTNAME" ]; then
-        echo "skipping $base — NUCLEUS_DASHBOARD_PUBLIC_URL not set" >&2
-        continue
-      fi
-      hostname="$DASHBOARD_HOSTNAME"
-      placeholder="__DASHBOARD_HOSTNAME__"
-      ;;
-    chat)
-      if [ -z "$CHAT_HOSTNAME" ]; then
-        echo "skipping $base — NUCLEUS_CHAT_PUBLIC_URL not set" >&2
-        continue
-      fi
-      hostname="$CHAT_HOSTNAME"
-      placeholder="__CHAT_HOSTNAME__"
-      ;;
-    *)
-      echo "skipping $base — no hostname mapping known" >&2
-      continue
-      ;;
-  esac
+: "${NUCLEUS_HOSTNAME:?NUCLEUS_PUBLIC_URL not set in .env}"
+: "${CONTAINERS_HOSTNAME:?NUCLEUS_CONTAINERS_PUBLIC_URL not set in .env}"
 
-  dest="$SCRIPT_DIR/$base"
-  sed \
-    -e "s|__USER_HOME__|$HOME|g" \
-    -e "s|__TUNNEL_UUID__|$TUNNEL_UUID|g" \
-    -e "s|$placeholder|$hostname|g" \
-    "$template" > "$dest"
-  echo "wrote $dest (hostname=$hostname, tunnel=$TUNNEL_UUID)"
-done
+template="$SCRIPT_DIR/nucleus.yaml.example"
+dest="$SCRIPT_DIR/nucleus.yaml"
+sed \
+  -e "s|__USER_HOME__|$HOME|g" \
+  -e "s|__TUNNEL_UUID__|$TUNNEL_UUID|g" \
+  -e "s|__NUCLEUS_HOSTNAME__|$NUCLEUS_HOSTNAME|g" \
+  -e "s|__CONTAINERS_HOSTNAME__|$CONTAINERS_HOSTNAME|g" \
+  "$template" > "$dest"
+echo "wrote $dest (nucleus=$NUCLEUS_HOSTNAME, containers=$CONTAINERS_HOSTNAME, tunnel=$TUNNEL_UUID)"
+echo "next: cp $dest ~/.cloudflared/config.yml && restart cloudflared"
