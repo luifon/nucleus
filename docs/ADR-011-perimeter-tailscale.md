@@ -1,152 +1,169 @@
-# ADR-011 — Perimeter: Tailscale-gating the operator surfaces
+# ADR-011 — Perimeter: Tailscale + Caddy, private dashboard at its real hostname
 
-**Status:** Proposed (2026-05-17)
+**Status:** Accepted — **Implemented (2026-05-24).**
 
-> **Post-ADR-015 reframing (2026-05-24).** ADR-015 collapsed the
-> three operator-facing crates (`dashboard`, `chat`, `news/api`) into
-> one binary served at a single origin (`nucleus.northmark.tech`,
-> port 8092). The body below describes per-tunnel migrations that
-> no longer apply — there's no `chat.<domain>` or
-> `dashboard.<domain>` Cloudflare route left to remove.
->
-> **What this ADR actually does now**: gate path-scoped on the single
-> nucleus-dashboard origin. Everything under `nucleus.<domain>`
-> moves to Tailscale Serve EXCEPT `/news/api/*` (the only path that
-> needs to stay publicly reachable for downstream subscribers).
-> Cloudflared keeps a narrow ingress entry routing only `/news/api/*`
-> through the public tunnel; the rest of the hostname resolves only
-> on the tailnet.
->
-> The body's framing of three separate surfaces, three URLs, and a
-> three-way migration is historical context — read it as a single
-> path-scoped split, not three tunnel deletions.
+> **History.** Drafted 2026-05-17 against the pre-ADR-015 topology (three
+> operator crates at three public Cloudflare hostnames). [[ADR-015]]
+> collapsed those into one binary (`nucleus-dashboard`, `localhost:8092`)
+> at a single origin (`$NUCLEUS_PUBLIC_URL`). An interim rewrite proposed a
+> *path-scoped* split (operator paths private, `/news/api/*` left public).
+> At implementation the operator chose to **lock the whole origin down** —
+> news included — **and keep the real hostname** rather than fall back to a
+> `*.ts.net` URL. This document records the as-built result. See git
+> history for the superseded path-scoped framing.
 
 ## Context
 
-Three Nucleus surfaces are exposed via Cloudflare tunnel today: dashboard, chat, and news. All three are reachable at public URLs; none of the operator-only surfaces (dashboard, chat) have auth in front of them. The only thing keeping the dashboard private is the obscurity of its hostname — discoverable by anyone who runs a subdomain scan against the operator's registered domain or stumbles onto it via a referrer leak.
+Every operator HTTP surface is one binary (`nucleus-dashboard`,
+`localhost:8092`) at `$NUCLEUS_PUBLIC_URL`, fronted by a Cloudflare tunnel.
+None of it had auth — the only thing keeping it private was hostname
+obscurity. ADR-012 (canvas) made an interactive agent surface on a public
+URL untenable, so a real perimeter became a prerequisite.
 
-ADR-012 (canvas) raised the stakes: canvas adds an interactive, agent-rendered surface to chat. Even with the destructive-action policy (canvas presents choices, never executes destructive ops without a typed confirmation), running that surface on a publicly addressable URL is the wrong default. ADR-011 declared this perimeter work a hard prerequisite for shipping canvas.
+Two constraints shaped the final design:
 
-The work is also useful independent of canvas. Dashboard and chat are operator-only by nature; only the operator's devices ever need to reach them. They should not be on the public internet at all. News is intentionally public (read-only RSS-shape content; ADR-001).
+1. **No login.** Network membership should be the access control, not an
+   SSO/login gate (Cloudflare Access was considered and declined for the
+   login friction).
+2. **Keep `$NUCLEUS_PUBLIC_URL`'s real hostname.** A `*.ts.net` URL was
+   rejected; the dashboard should stay reachable at its existing name so
+   bookmarks and the news-fetcher's links keep working.
+
+Those two together rule out both Cloudflare Access (login) and bare
+Tailscale Serve (which can only issue certs for `*.ts.net`). The answer is
+Tailscale for the network + a local TLS terminator for the real hostname.
 
 ## Decision
 
-Move dashboard and chat behind **Tailscale Serve**. News stays on Cloudflare tunnel (unchanged). The Cloudflare routes for dashboard and chat are removed in the same migration step — no parallel period, no preserved fallback. Per the cleanup-over-parallel principle, the old routes go away when the new ones come up.
+Lock the entire `nucleus-dashboard` origin behind the tailnet. **Nothing**
+is publicly reachable anymore — including `/news/api/*` (this reverses
+ADR-001's "news is public"; the operator confirmed no external consumer).
+The dashboard stays at its real hostname, reachable only by tailnet
+members:
 
-URL shape uses Tailscale's default `<machine>.<tailnet>.ts.net` form for v1 — no custom domain, no split-DNS gymnastics. A future iteration may preserve `dashboard.<domain>` via split-DNS + a locally-terminated ACME cert; that is explicitly deferred.
+- **Tailscale** provides the private network (the host + the operator's
+  devices on one tailnet).
+- **Caddy** (local, on the host) terminates TLS for the real hostname
+  using a **Let's Encrypt cert obtained via the ACME DNS-01 challenge**
+  (Cloudflare DNS API), and reverse-proxies to `localhost:8092`. DNS-01 is
+  required because the host has no public inbound — it proves domain
+  ownership by writing a TXT record, not by answering on :80/:443.
+- **DNS:** the public A record for the hostname points at the host's
+  **tailnet IP** (a `100.x` CGNAT address), **DNS-only** (not proxied).
+  CGNAT is not internet-routable, so off-tailnet clients resolve the name
+  but cannot reach it; tailnet members route to it over the mesh.
+- **Cloudflared** no longer fronts the nucleus hostname at all (its
+  ingress route was removed). The tunnel remains only for the unrelated
+  `$NUCLEUS_CONTAINERS_PUBLIC_URL` project.
 
-## What moves and what stays
+Net effect: `https://<nucleus-host>/` serves the full dashboard with a
+valid public cert, no login, **only** from devices on the tailnet. From
+anywhere else the name resolves to an unroutable `100.x` and times out.
 
-| Surface | Before | After |
-|---|---|---|
-| `dashboard` | Cloudflare tunnel at `$NUCLEUS_DASHBOARD_PUBLIC_URL` | Tailscale Serve at `https://<machine>.<tailnet>.ts.net/` (or a dedicated port path). CF route removed. |
-| `chat` | Cloudflare tunnel at `$NUCLEUS_CHAT_PUBLIC_URL` | Tailscale Serve at `https://<machine>.<tailnet>.ts.net/chat/` (or similar). CF route removed. |
-| `chat-v2` (per ADR-012) | not yet deployed | Tailscale Serve from day one; never gets a public CF route. |
-| `news-api` | Cloudflare tunnel at `$NUCLEUS_NEWS_PUBLIC_URL` | Unchanged. Stays public. |
-| Other cloudflared routes | Whatever's in `~/.cloudflared/config.yml` | Audit during rollout; remove anything that's operator-only and now redundant. |
+## Access model
 
-## URL shape (v1)
+Every device reaches the dashboard the same way: install the **Tailscale
+client**, sign into the tailnet, toggle it on. Then `$NUCLEUS_PUBLIC_URL`
+works from that device anywhere (wifi or cellular) — transparently, no
+login. Clients exist for macOS, iOS, **Windows** (`winget install
+tailscale`), **Linux** (`curl -fsSL https://tailscale.com/install.sh |
+sh`), Android, etc. The only devices that can't get in are ones you can't
+install Tailscale on (a work-managed or borrowed machine) — which is the
+point.
 
-Default Tailscale Serve hostnames: `https://<machine>.<tailnet>.ts.net`.
+## Components (as built)
 
-- Pick a short machine name on the Nucleus host (e.g., rename the lab box to `nucleus`)
-- Pick a short tailnet name during Tailscale account setup
-- Result: URLs like `https://nucleus.<tailnet>.ts.net/dashboard` and `https://nucleus.<tailnet>.ts.net/chat/`
+| Piece | Role |
+|---|---|
+| Tailscale (`tailscale up`) | The private mesh. Host renamed `nucleus`; HTTPS/MagicDNS enabled in the admin console. |
+| Caddy (custom build w/ `caddy-dns/cloudflare`) | TLS terminator + reverse proxy. Binds the tailnet IP `:443`, cert via DNS-01, → `localhost:8092`. Runs as a **root LaunchDaemon** (`__LAUNCHD_PREFIX__.caddy`) since :443 is privileged. |
+| Cloudflare DNS A record | `$NUCLEUS_PUBLIC_URL` host → tailnet `100.x`, DNS-only. Flipped from the old proxied CNAME→tunnel via the CF API. |
+| `CF_API_TOKEN` (`.env`) | Cloudflare token scoped Zone:DNS:Edit on the zone. Used by Caddy for cert issuance/renewal **and** for the one-time DNS flip. |
+| cloudflared | nucleus ingress **removed**; only the containers route remains. |
+| `tailscale serve` | **Not used** (it can't do custom-domain certs); turned off so Caddy owns :443. |
 
-Path-based routing on the same host vs. per-service hostnames is an install-time choice. Path-based is simpler (one Tailscale Serve config, multiple proxies); per-service hostnames need separate Serve configs but produce cleaner URLs. Default: path-based. If it gets confusing in practice, revisit.
+Repo artifacts: `tools/caddy/` (`Caddyfile.example`, `caddy.plist.example`,
+`install.sh`, `README.md`). Generated `Caddyfile` + real plist + cert store
+(`tools/caddy/data/`) are gitignored; the cert store and the token-bearing
+plist never touch git.
 
-The pretty-URL upgrade path (split-DNS + ACME for `dashboard.<domain>`) is documented in [Future work](#future-work). Not v1.
+## Migration steps (as executed)
 
-## Tailscale bootstrap
+Ordering rule: **prove the new path before removing the old one.**
 
-Fresh install. Steps the operator runs once:
-
-1. **Account.** Create a Tailscale account (free tier covers solo-operator scale).
-2. **Pick a tailnet name** at account creation. Short, memorable, not personal-identifying.
-3. **Install client on the Nucleus host:**
-   ```
-   brew install tailscale         # or the official installer
-   sudo tailscale up
-   ```
-   Authenticate via the URL it prints. Approve the device in the admin console.
-4. **Name the host:** in the Tailscale admin console, rename the machine to something like `nucleus`.
-5. **Install client on operator devices** that need to reach the dashboard: Mac (`brew install tailscale`), iPhone (App Store), any others. Authenticate each.
-
-The bootstrap is one-time, manual, and does not need to land in the repo. The operator-facing instructions live in `README.md` (a short "Setup → Perimeter" section).
-
-## Tailscale Serve config
-
-On the Nucleus host, after `tailscale up`:
-
-```
-sudo tailscale serve --bg --https=443 --set-path /dashboard http://localhost:8090
-sudo tailscale serve --bg --https=443 --set-path /chat      http://localhost:<chat-port>
-sudo tailscale serve --bg --https=443 --set-path /chat-v2   http://localhost:<chat-v2-port>
-```
-
-(Exact ports come from `nucleus.toml`; the example values are placeholders.)
-
-This terminates TLS on the Tailscale node using a Tailscale-provisioned cert valid for `<machine>.<tailnet>.ts.net`. Backend services keep listening on `localhost:<port>` — no changes to the dashboard or chat binaries.
-
-To persist the Serve config across reboots, the operator runs the same commands once (they're sticky), or commits a `tailscale serve --set-path` invocation to a launchd plist. Plist template: `tools/launchd/tailscale-serve.plist.example`. (Optional — Tailscale's `--bg` mode persists by default; the plist is belt-and-suspenders.)
-
-## ACLs
-
-Default Tailscale ACL is "tailnet members can reach each other" — fine for solo operator.
-
-If the operator ever shares the tailnet (family member, contractor), tighten ACLs to restrict the Nucleus host to the operator's own devices. ACL config lives in the Tailscale admin console; can be committed as a JSON file at `tools/tailscale/acl.hujson` if desired (not v1).
-
-## Migration steps (one sitting)
-
-1. Stand up Tailscale on the Nucleus host (bootstrap above). Verify `https://<machine>.<tailnet>.ts.net/` reaches `nginx` or a placeholder page.
-2. Configure `tailscale serve` to proxy `/dashboard`, `/chat`, `/chat-v2` to the corresponding localhost ports.
-3. Update `.env` on the Nucleus host:
-   - `NUCLEUS_DASHBOARD_PUBLIC_URL=https://<machine>.<tailnet>.ts.net/dashboard`
-   - `NUCLEUS_CHAT_PUBLIC_URL=https://<machine>.<tailnet>.ts.net/chat`
-   - `NUCLEUS_CHAT_V2_PUBLIC_URL=https://<machine>.<tailnet>.ts.net/chat-v2`
-4. Restart any binaries that read these env vars at startup (dashboard, news-fetcher if it links to the dashboard, etc.).
-5. Install Tailscale on the operator's devices that need access (Mac, phone).
-6. Verify reach from Mac and phone — both tailnet-connected and not.
-7. **Same change**, remove `dashboard` and `chat` routes from `~/.cloudflared/config.yml`. Restart cloudflared.
-8. Verify the old public URLs no longer resolve to anything (`dig` returns NXDOMAIN or the apex page).
-9. Delete any DNS records (CF dashboard) that pointed at the old tunnel routes for dashboard / chat.
-10. Audit `~/.cloudflared/config.yml` for any other operator-only routes that snuck in over time. If found and confirmed operator-only, remove them.
+1. Tailscale bootstrap: `brew install tailscale`, `sudo tailscale up`,
+   approve + rename host to `nucleus`, enable HTTPS in the admin console,
+   install clients on operator devices.
+2. Mint a Cloudflare API token (Edit zone DNS, scoped to the zone) → `.env`
+   as `CF_API_TOKEN`.
+3. `./tools/caddy/install.sh` — generate the real `Caddyfile` (binds the
+   tailnet IP, DNS-01 via Cloudflare) + the LaunchDaemon plist.
+4. `sudo tailscale serve --https=443 off` (free :443), then load Caddy:
+   `sudo cp … /Library/LaunchDaemons/`, `sudo chown root:wheel …`,
+   `sudo launchctl bootstrap system …`. Caddy obtains the cert via DNS-01.
+5. Verify Caddy serves HTTPS on the tailnet IP with a valid cert (the
+   tunnel still fronts the public name at this point — no outage).
+6. **Flip DNS** via the CF API: proxied CNAME→tunnel becomes DNS-only
+   `A → <tailnet-ip>`. Confirm propagation, then verify
+   `$NUCLEUS_PUBLIC_URL` end-to-end (resolves to `100.x`, serves via Caddy,
+   Let's Encrypt cert).
+7. Remove the nucleus ingress from `~/.cloudflared/config.yml` (keep
+   containers), `cloudflared … ingress validate`, restart the tunnel.
 
 ## Rollback
 
-If Tailscale setup fails or the operator is locked out mid-migration:
+Fully reversible, no lockout risk — the host always has localhost +
+direct SSH:
 
-- The Nucleus host is still reachable via direct SSH (Tailscale doesn't change that).
-- The dashboard / chat services are still listening on `localhost:<port>` — `ssh -L 8090:localhost:8090 <host>` gets you there from any machine with SSH access.
-- The cloudflared routes for dashboard / chat were removed in step 7; restoring them is reverting that one change.
-
-No "preserve the CF route as fallback" path. SSH tunneling covers the rollback case; reinstating the public CF route is a deliberate decision, not a default.
-
-## Operator-facing changes
-
-- **Bookmarks.** Old `dashboard.<domain>` bookmarks die. Replace with `https://<machine>.<tailnet>.ts.net/dashboard`. Two devices (Mac + phone), should take five minutes.
-- **Phone access.** Phone needs the Tailscale app installed + logged in. After that, it's transparent — opening the bookmarked URL works whether you're on Wi-Fi or cellular.
-- **Café / hotel access.** Works as long as Tailscale is on (default behavior when the app is running).
-- **A device that's not on the tailnet** (e.g., borrowed laptop, work-managed device) cannot reach the dashboard. That's the point.
+- **DNS:** restore the record to the proxied CNAME →
+  `<tunnel-uuid>.cfargotunnel.com` via the CF API (old value was captured
+  before the flip).
+- **cloudflared:** restore `~/.cloudflared/config.yml.pre-adr011.bak` and
+  restart — re-adds the nucleus ingress.
+- **Caddy:** `sudo launchctl bootout system/__LAUNCHD_PREFIX__.caddy`.
+- Reaching the dashboard while rolling back: `ssh -L 8092:localhost:8092
+  <host>`, or just localhost on the box.
 
 ## What this does NOT do
 
-- **Does not gate news.** News stays public via the existing Cloudflare tunnel.
-- **Does not add SSO / login.** Tailscale itself is the access control. No Cloudflare Access, no Google login, no Authelia.
-- **Does not implement the pretty-URL preservation.** `dashboard.<domain>` does not survive v1. The cosmetic loss is accepted.
-- **Does not move SSH / launchctl / system admin behind a different gate.** Existing SSH access patterns unchanged.
+- **No public surface for nucleus at all** — news included. (ADR-001's
+  public-news premise is reversed here per operator decision; revisit if
+  an external news consumer ever appears.)
+- **No login / SSO.** Tailscale membership is the only gate.
+- **Does not touch `$NUCLEUS_CONTAINERS_PUBLIC_URL`** — separate project,
+  still public via the tunnel; its perimeter is that project's call.
+- **Does not gate SSH / launchctl / system admin** differently. Unchanged.
+
+## Operational notes
+
+- **Cert renewal** is automatic — Caddy renews via DNS-01 on the same
+  token. Keep `CF_API_TOKEN` valid; if it's rotated, regenerate the plist
+  (`install.sh`) and reload Caddy. Certs persist in `tools/caddy/data/`.
+- **Token rotation:** the token is the standing credential for renewals.
+  Treat it like any secret in `.env`.
+- **Boot ordering:** Caddy binds the tailnet IP, so it needs `tailscaled`
+  up first. `KeepAlive` + `ThrottleInterval` make it retry until the
+  interface is present; no hard dependency wiring needed.
+- **`$NUCLEUS_PUBLIC_URL` stays the real hostname** in `.env` — every
+  consumer (news-fetcher "full feed" links, the dashboard tunnel-probe
+  tile) now resolves it to the tailnet path and keeps working for the
+  operator.
 
 ## Future work
 
-- **Pretty-URL preservation.** Split-DNS within the tailnet maps `dashboard.<domain>` to the tailnet IP of the Nucleus host; a locally-terminated ACME cert (DNS-01 challenge against Cloudflare DNS) provides valid HTTPS for that hostname. Result: same URL as before, only reachable from the tailnet. Estimated effort: half a day. Tracked as a follow-up once v1 is stable and the operator has formed an opinion about whether the URL matters enough.
-- **Tailscale SSH.** Tailscale offers SSH-over-tailnet with key management in the admin console. Worth evaluating once the basic Tailscale plumbing is in place.
-- **ACL formalization.** If the tailnet ever has more than the operator's devices, commit an ACL file (`tools/tailscale/acl.hujson`) rather than relying on console state.
-- **Other tunnels audit.** During migration, log any other cloudflared routes that turn out to be operator-only. Either bring them behind Tailscale or document why they need to stay public.
+- **ACL formalization.** If the tailnet ever holds more than the operator's
+  own devices, commit `tools/tailscale/acl.hujson` restricting the nucleus
+  host to the operator's devices.
+- **Tailscale SSH.** Evaluate SSH-over-tailnet now that the mesh exists.
+- **Subnet/exit-node** considerations if the host's tailnet IP ever needs
+  to be reached by name internally beyond `$NUCLEUS_PUBLIC_URL`.
 
 ## References
 
-- ADR-001 — architecture / which surfaces exist and what they're for
-- ADR-012 — canvas; declared this work as a hard prerequisite
-- CLAUDE.md Rule 1 — secrets stay in `.env`; URLs are referenced via `NUCLEUS_*_PUBLIC_URL`
-- `cloudflared_setup` (T2 memory) — current tunnel config conventions
-- Tailscale Serve docs — https://tailscale.com/kb/1242/tailscale-serve
+- [[ADR-001]] — surfaces; its "news is public" is reversed here
+- [[ADR-015]] — single-origin consolidation this builds on
+- [[ADR-012]] — canvas; declared this work a hard prerequisite
+- CLAUDE.md Rule 1 — secrets in `.env` (`CF_API_TOKEN`, URLs via `NUCLEUS_*`)
+- [[cloudflared_setup]] (T2 memory) — combined `~/.cloudflared/config.yml`
+- `tools/caddy/README.md` — the Caddy terminator setup
+- Tailscale DNS-01 / CGNAT-IP pattern; Caddy `caddy-dns/cloudflare`

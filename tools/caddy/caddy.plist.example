@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  System LaunchDaemon (NOT a user LaunchAgent) — Caddy must run as root to
+  bind port 443. install.sh substitutes the placeholders and writes the real
+  plist; load it with:
+    sudo cp tools/caddy/<prefix>.caddy.plist /Library/LaunchDaemons/
+    sudo launchctl bootstrap system /Library/LaunchDaemons/<prefix>.caddy.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LAUNCHD_PREFIX__.caddy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__USER_HOME__/.local/bin/caddy</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>__USER_HOME__/Development/nucleus/tools/caddy/Caddyfile</string>
+        <string>--adapter</string>
+        <string>caddyfile</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CF_API_TOKEN</key>
+        <string>__CF_API_TOKEN__</string>
+        <key>XDG_DATA_HOME</key>
+        <string>__USER_HOME__/Development/nucleus/tools/caddy/data</string>
+        <key>XDG_CONFIG_HOME</key>
+        <string>__USER_HOME__/Development/nucleus/tools/caddy/data</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/caddy.log</string>
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/caddy.log</string>
+</dict>
+</plist>
