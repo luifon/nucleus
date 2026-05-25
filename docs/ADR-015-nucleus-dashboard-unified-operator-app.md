@@ -369,9 +369,12 @@ stays as written.
 - **Plugin system.** Hermes has plugins. Nucleus doesn't, and
   nucleus-dashboard doesn't introduce one. Capabilities are crates
   in the workspace.
-- **Mobile-first design.** Desktop-only. The operator already has
-  Obsidian mobile + WhatsApp on the phone; nucleus-dashboard is a
-  desktop surface.
+- **Mobile-first design.** Not mobile-*first* — desktop stays the primary
+  surface. But the layout is now **responsive** (2026-05-24): once
+  [[ADR-011]] made the dashboard reachable from the phone over the tailnet,
+  a mobile pass added an off-canvas nav drawer + hamburger, single-pane
+  list-or-conversation chat, and fluid tiles/rows so every surface is
+  usable on a phone. The original "desktop-only" stance is retired.
 - **Auth beyond Tailscale.** No login, no session cookies, no API
   keys for the operator routes. Tailscale-network membership IS
   the auth. (Per ADR-011.)

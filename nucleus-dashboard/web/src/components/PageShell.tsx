@@ -15,11 +15,11 @@ export default function PageShell({
   children: ReactNode;
 }) {
   return (
-    <div className="mx-auto max-w-6xl px-8 py-7">
+    <div className="mx-auto max-w-6xl px-4 py-6 sm:px-8 sm:py-7">
       {(title || actions || subtitle) && (
-        <header className="mb-7 flex items-start justify-between gap-6">
+        <header className="mb-6 flex flex-col gap-3 sm:mb-7 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
           <div className="min-w-0">
-            {title && <h1 className="text-2xl leading-tight">{title}</h1>}
+            {title && <h1 className="text-xl leading-tight sm:text-2xl">{title}</h1>}
             {subtitle && (
               <p className="mt-1.5 max-w-2xl text-sm leading-relaxed text-[var(--color-nucleus-faint)]">
                 {subtitle}

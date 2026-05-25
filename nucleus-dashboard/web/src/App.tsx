@@ -1,3 +1,4 @@
+import { useState, useEffect } from "react";
 import { Routes, Route, NavLink, useLocation } from "react-router-dom";
 import {
   LayoutDashboard,
@@ -9,6 +10,8 @@ import {
   Database,
   Newspaper,
   Activity,
+  Menu,
+  X,
   type LucideIcon,
 } from "lucide-react";
 import HomePage from "./pages/HomePage";
@@ -59,11 +62,27 @@ function PendingPage({ label, Icon }: { label: string; Icon: LucideIcon }) {
 }
 
 export default function App() {
+  const [navOpen, setNavOpen] = useState(false);
+  const location = useLocation();
+
+  // Close the mobile drawer whenever the route changes.
+  useEffect(() => {
+    setNavOpen(false);
+  }, [location.pathname]);
+
   return (
     <div className="flex h-full">
-      <Sidebar />
-      <main className="flex flex-1 flex-col overflow-hidden">
-        <TopBar />
+      {/* Backdrop — mobile only, dismisses the drawer on tap. */}
+      {navOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/60 md:hidden"
+          onClick={() => setNavOpen(false)}
+          aria-hidden
+        />
+      )}
+      <Sidebar open={navOpen} onClose={() => setNavOpen(false)} />
+      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <TopBar onMenuToggle={() => setNavOpen((v) => !v)} navOpen={navOpen} />
         <div className="flex-1 overflow-auto">
           <Routes>
             <Route path="/" element={<HomePage />} />
@@ -84,25 +103,42 @@ export default function App() {
   );
 }
 
-function Sidebar() {
+function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
   const primary = ROUTES.filter((r) => r.group === "primary");
   const observability = ROUTES.filter((r) => r.group === "observability");
 
   return (
-    <nav className="flex w-60 shrink-0 flex-col border-r border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)]">
-      <div className="border-b border-[var(--color-nucleus-border)] px-4 py-4">
-        <div className="text-base tracking-wide">
-          [<span className="text-[var(--color-nucleus-accent)]">nucleus</span>]
+    <nav
+      className={[
+        "flex w-60 shrink-0 flex-col border-r border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)]",
+        // Mobile: off-canvas drawer slid in from the left. Desktop (md+):
+        // a static column in normal flow, always visible.
+        "fixed inset-y-0 left-0 z-50 transition-transform duration-200 ease-out md:static md:z-auto md:translate-x-0",
+        open ? "translate-x-0" : "-translate-x-full",
+      ].join(" ")}
+    >
+      <div className="flex items-center justify-between border-b border-[var(--color-nucleus-border)] px-4 py-4">
+        <div>
+          <div className="text-base tracking-wide">
+            [<span className="text-[var(--color-nucleus-accent)]">nucleus</span>]
+          </div>
+          <div className="mt-0.5 text-xs text-[var(--color-nucleus-faint)]">
+            operator dashboard
+          </div>
         </div>
-        <div className="mt-0.5 text-xs text-[var(--color-nucleus-faint)]">
-          operator dashboard
-        </div>
+        <button
+          onClick={onClose}
+          aria-label="close menu"
+          className="md:hidden text-[var(--color-nucleus-faint)] hover:text-[var(--color-nucleus-accent)]"
+        >
+          <X size={18} strokeWidth={1.75} />
+        </button>
       </div>
 
       <div className="flex-1 overflow-y-auto px-2 py-4">
-        <SidebarSection label="surfaces" items={primary} />
+        <SidebarSection label="surfaces" items={primary} onNavigate={onClose} />
         <div className="my-4 border-t border-[var(--color-nucleus-border)]" />
-        <SidebarSection label="observability" items={observability} />
+        <SidebarSection label="observability" items={observability} onNavigate={onClose} />
       </div>
 
       <div className="border-t border-[var(--color-nucleus-border)] px-4 py-3 text-xs text-[var(--color-nucleus-faint)]">
@@ -115,7 +151,15 @@ function Sidebar() {
   );
 }
 
-function SidebarSection({ label, items }: { label: string; items: RouteEntry[] }) {
+function SidebarSection({
+  label,
+  items,
+  onNavigate,
+}: {
+  label: string;
+  items: RouteEntry[];
+  onNavigate: () => void;
+}) {
   return (
     <div>
       <div className="mb-1.5 px-2 text-[10px] uppercase tracking-widest text-[var(--color-nucleus-faint)] opacity-70">
@@ -127,6 +171,7 @@ function SidebarSection({ label, items }: { label: string; items: RouteEntry[] }
             <NavLink
               to={r.path}
               end={r.path === "/"}
+              onClick={onNavigate}
               className={({ isActive }) =>
                 [
                   "group flex items-center gap-2.5 rounded px-2 py-1.5 text-sm transition-colors",
@@ -150,21 +195,32 @@ function SidebarSection({ label, items }: { label: string; items: RouteEntry[] }
   );
 }
 
-function TopBar() {
+function TopBar({ onMenuToggle, navOpen }: { onMenuToggle: () => void; navOpen: boolean }) {
   const location = useLocation();
   const current = ROUTES.find((r) => (r.path === "/" ? location.pathname === "/" : location.pathname.startsWith(r.path)));
   const Icon = current?.icon ?? LayoutDashboard;
 
   return (
-    <header className="flex shrink-0 items-center justify-between border-b border-[var(--color-nucleus-border)] px-5 py-3">
-      <div className="flex items-center gap-2 text-sm">
-        <span className="text-[var(--color-nucleus-faint)]">[</span>
-        <span className="text-[var(--color-nucleus-accent)]">nucleus</span>
-        <span className="text-[var(--color-nucleus-faint)]">]</span>
-        <span className="text-[var(--color-nucleus-faint)]">/</span>
-        <span className="flex items-center gap-1.5 text-[var(--color-nucleus-text)]">
-          <Icon size={14} strokeWidth={1.75} />
-          {current?.label ?? "dashboard"}
+    <header className="flex shrink-0 items-center justify-between border-b border-[var(--color-nucleus-border)] px-4 py-3 md:px-5">
+      <div className="flex min-w-0 items-center gap-2 text-sm">
+        <button
+          onClick={onMenuToggle}
+          aria-label="toggle menu"
+          aria-expanded={navOpen}
+          className="md:hidden text-[var(--color-nucleus-faint)] hover:text-[var(--color-nucleus-accent)]"
+        >
+          <Menu size={18} strokeWidth={1.75} />
+        </button>
+        {/* [nucleus] / prefix — hidden on the narrowest screens to leave room. */}
+        <span className="hidden items-center gap-2 sm:flex">
+          <span className="text-[var(--color-nucleus-faint)]">[</span>
+          <span className="text-[var(--color-nucleus-accent)]">nucleus</span>
+          <span className="text-[var(--color-nucleus-faint)]">]</span>
+          <span className="text-[var(--color-nucleus-faint)]">/</span>
+        </span>
+        <span className="flex min-w-0 items-center gap-1.5 text-[var(--color-nucleus-text)]">
+          <Icon size={14} strokeWidth={1.75} className="shrink-0" />
+          <span className="truncate">{current?.label ?? "dashboard"}</span>
         </span>
       </div>
 

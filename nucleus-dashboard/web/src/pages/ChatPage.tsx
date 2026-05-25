@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Send, MessageSquare, RefreshCw } from "lucide-react";
+import { Plus, Send, MessageSquare, RefreshCw, ChevronLeft } from "lucide-react";
 import {
   listChats,
   createChat,
@@ -29,7 +29,12 @@ export default function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!activeId && chats.data && chats.data.length > 0) {
+    // Auto-open the first chat only on desktop (the side-by-side split). On
+    // mobile, /chat opens to the full-width list so the conversation's "back"
+    // control can return to it — otherwise this effect would immediately
+    // re-select the first chat and the list would be unreachable.
+    const isDesktop = window.matchMedia("(min-width: 768px)").matches;
+    if (isDesktop && !activeId && chats.data && chats.data.length > 0) {
       setActiveId(chats.data[0].id);
     }
   }, [chats.data, activeId]);
@@ -131,7 +136,9 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-full overflow-hidden">
-      <aside className="flex w-64 shrink-0 flex-col border-r border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)]">
+      <aside
+        className={`${activeId ? "hidden md:flex" : "flex"} w-full shrink-0 flex-col border-r border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)] md:w-64`}
+      >
         <div className="flex items-center justify-between border-b border-[var(--color-nucleus-border)] px-3 py-2.5">
           <span className="text-xs uppercase tracking-widest text-[var(--color-nucleus-faint)] opacity-70">
             chats
@@ -181,7 +188,7 @@ export default function ChatPage() {
         </div>
       </aside>
 
-      <main className="flex flex-1 flex-col overflow-hidden">
+      <main className={`${activeId ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col overflow-hidden`}>
         {!activeId ? (
           <div className="flex flex-1 items-center justify-center text-sm text-[var(--color-nucleus-faint)]">
             <div className="flex items-center gap-2">
@@ -191,11 +198,20 @@ export default function ChatPage() {
           </div>
         ) : (
           <>
-            <header className="flex items-center justify-between border-b border-[var(--color-nucleus-border)] px-5 py-2.5">
-              <div className="min-w-0 truncate text-sm text-[var(--color-nucleus-text)]">
-                {activeChat?.title ?? (activeId ? `chat ${activeId.slice(0, 8)}` : "")}
+            <header className="flex items-center justify-between gap-2 border-b border-[var(--color-nucleus-border)] px-4 py-2.5 md:px-5">
+              <div className="flex min-w-0 items-center gap-2">
+                <button
+                  onClick={() => setActiveId(null)}
+                  aria-label="back to chats"
+                  className="shrink-0 text-[var(--color-nucleus-faint)] hover:text-[var(--color-nucleus-accent)] md:hidden"
+                >
+                  <ChevronLeft size={18} strokeWidth={1.75} />
+                </button>
+                <div className="min-w-0 truncate text-sm text-[var(--color-nucleus-text)]">
+                  {activeChat?.title ?? (activeId ? `chat ${activeId.slice(0, 8)}` : "")}
+                </div>
               </div>
-              <div className="text-[10px] text-[var(--color-nucleus-faint)]">
+              <div className="shrink-0 text-[10px] text-[var(--color-nucleus-faint)]">
                 {activeChat?.claude_session_id
                   ? `session ${activeChat.claude_session_id.slice(0, 8)}`
                   : "no session yet"}
