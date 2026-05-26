@@ -295,6 +295,10 @@ async fn run_skill_session(
         .ask(prompt, AskOptions {
             max_wait: Duration::from_secs(300),
             quiescent_window: Duration::from_secs(5),
+            // Candidate for await_turn_complete: true (agentic, writes skill
+            // files). Left legacy for now to keep this change scoped to the
+            // dsu-prep fire fix; revisit if it shows mid-task cutoffs.
+            await_turn_complete: false,
         })
         .await;
     let _ = session.close().await;

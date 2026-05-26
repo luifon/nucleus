@@ -102,6 +102,15 @@ pub struct AskOptions {
     pub max_wait: Duration,
     /// "Stopped writing for this long" → consider claude done.
     pub quiescent_window: Duration,
+    /// Wait for the model's turn to genuinely end (`stop_reason: end_turn`)
+    /// instead of treating a quiet transcript as "done". REQUIRED for
+    /// multi-step agentic asks (skill fires): the model goes quiet while it
+    /// thinks between tool calls, and the quiescent heuristic alone tears the
+    /// session down mid-task — the bug behind the dsu-prep fire failures
+    /// (GH/FS, 2026-05-26). Leave `false` for short interactive turns
+    /// (Discord) where the legacy quiescent behavior is fine and a hung tool
+    /// shouldn't block up to `max_wait`.
+    pub await_turn_complete: bool,
 }
 
 impl Default for AskOptions {
@@ -109,6 +118,7 @@ impl Default for AskOptions {
         Self {
             max_wait: Duration::from_secs(180),
             quiescent_window: Duration::from_secs(3),
+            await_turn_complete: false,
         }
     }
 }
@@ -244,6 +254,7 @@ impl Session {
             from,
             opts.max_wait,
             opts.quiescent_window,
+            opts.await_turn_complete,
         )
         .await?;
         self.cursor = tokio::fs::metadata(&self.transcript_path)
@@ -574,6 +585,7 @@ impl SessionPool {
             .ask(SUMMARY_PROMPT, AskOptions {
                 max_wait: Duration::from_secs(300),
                 quiescent_window: Duration::from_secs(5),
+                await_turn_complete: false,
             })
             .await
             .context("daily_rotate: summary ask failed")?;
@@ -614,6 +626,7 @@ impl SessionPool {
             .ask(&priming, AskOptions {
                 max_wait: Duration::from_secs(300),
                 quiescent_window: Duration::from_secs(5),
+                await_turn_complete: false,
             })
             .await
         {
@@ -1048,15 +1061,28 @@ async fn wait_for_transcript_quiet(path: &Path, settle_window: Duration) -> Opti
     }
 }
 
-/// Poll the transcript file from `from_offset` onward until we've seen at
-/// least one assistant message AND no new bytes have arrived for
-/// `quiescent_window`. Returns the concatenated text of the last assistant
-/// message.
+/// Poll the transcript from `from_offset` until the assistant's turn is
+/// genuinely complete, then return the text of its final message.
+///
+/// "Complete" is decided by `stop_reason`, NOT by a quiet transcript:
+/// - `end_turn` / `stop_sequence` / `max_tokens` on the last assistant
+///   message → done; return immediately (also makes normal replies snappy).
+/// - `tool_use` → the model is mid-action and a tool result is coming; we
+///   must NOT return, no matter how long the file stays quiet (it goes quiet
+///   while the model thinks between steps). Returning here was the bug that
+///   tore down dsu-prep fires one step before they read the live-doc dialog
+///   (GH/FS, 2026-05-26).
+///
+/// The `quiescent_window` survives only as a fallback for transcripts whose
+/// last assistant message carries no usable `stop_reason` — and even then we
+/// refuse to return while the last known reason is `tool_use`. `max_wait` is
+/// the hard cap; blowing it returns an error the caller treats as a failure.
 async fn wait_for_assistant(
     path: &Path,
     from_offset: u64,
     max_wait: Duration,
     quiescent_window: Duration,
+    await_turn_complete: bool,
 ) -> Result<String> {
     let start = Instant::now();
     let mut last_change = Instant::now();
@@ -1091,9 +1117,33 @@ async fn wait_for_assistant(
             }
         }
 
-        if have_assistant && last_change.elapsed() > quiescent_window {
-            if let Some(text) = extract_last_assistant_text(&buffer) {
-                return Ok(text);
+        if have_assistant {
+            if await_turn_complete {
+                let stop = last_assistant_stop_reason(&buffer);
+                let mid_action = stop.as_deref() == Some("tool_use");
+                let turn_done = matches!(
+                    stop.as_deref(),
+                    Some("end_turn") | Some("stop_sequence") | Some("max_tokens")
+                );
+                // Primary signal: the model said it's finished. Return at once.
+                if turn_done {
+                    if let Some(text) = extract_last_assistant_text(&buffer) {
+                        return Ok(text);
+                    }
+                }
+                // Fallback for messages with no usable stop_reason — quiescent
+                // behavior — but NEVER bail mid-tool_use: that pause is the
+                // model thinking between steps, not the turn ending.
+                if !mid_action && last_change.elapsed() > quiescent_window {
+                    if let Some(text) = extract_last_assistant_text(&buffer) {
+                        return Ok(text);
+                    }
+                }
+            } else if last_change.elapsed() > quiescent_window {
+                // Legacy: short interactive turns (Discord). Unchanged.
+                if let Some(text) = extract_last_assistant_text(&buffer) {
+                    return Ok(text);
+                }
             }
         }
 
@@ -1116,6 +1166,39 @@ fn line_is_assistant(line: &str) -> bool {
     serde_json::from_str::<EventEnvelope>(line)
         .map(|e| e.kind == "assistant")
         .unwrap_or(false)
+}
+
+/// The `stop_reason` of the *last* assistant message in `buffer`, if any.
+///
+/// Claude Code stamps each assistant message with why it stopped:
+/// `"tool_use"` means it paused to call a tool and WILL continue once the
+/// tool result comes back; `"end_turn"` (also `"stop_sequence"` /
+/// `"max_tokens"`) means the turn is genuinely over. Completion detection
+/// keys on this — a quiet transcript during a multi-step agentic task is the
+/// model thinking between tools, NOT the task being done.
+fn last_assistant_stop_reason(buffer: &str) -> Option<String> {
+    let mut last: Option<String> = None;
+    for line in buffer.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<EventEnvelope>(line) else {
+            continue;
+        };
+        if event.kind != "assistant" {
+            continue;
+        }
+        if let Some(reason) = event
+            .message
+            .as_ref()
+            .and_then(|m| m.get("stop_reason"))
+            .and_then(|s| s.as_str())
+        {
+            last = Some(reason.to_string());
+        }
+    }
+    last
 }
 
 fn extract_last_assistant_text(buffer: &str) -> Option<String> {
@@ -1715,5 +1798,29 @@ mod tests {
         let tmp = std::env::temp_dir().join("nucleus-clean-nope.jsonl");
         let _ = std::fs::remove_file(&tmp);
         assert!(!transcript_ends_with_clean_reply(&tmp));
+    }
+
+    /// stop_reason drives completion: the LAST assistant message's reason
+    /// wins, and a mid-action turn reports `tool_use` so `wait_for_assistant`
+    /// keeps waiting instead of tearing the session down (the GH/FS bug).
+    #[test]
+    fn last_assistant_stop_reason_tracks_final_message() {
+        // Mid-action: clicked a card, result came back, no follow-up yet.
+        let mid = [
+            r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"text","text":"Let me click the card."},{"type":"tool_use","id":"t1","name":"browser_click","input":{}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"clicked"}]}}"#,
+        ].join("\n");
+        assert_eq!(last_assistant_stop_reason(&mid).as_deref(), Some("tool_use"));
+
+        // Finished: the model emitted its final answer.
+        let done = format!(
+            "{mid}\n{}",
+            r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"📋 Astro-GH DSU — …"}]}}"#
+        );
+        assert_eq!(last_assistant_stop_reason(&done).as_deref(), Some("end_turn"));
+
+        // No assistant message at all → None (fall back to quiescent).
+        let none = r#"{"type":"user","message":{"role":"user","content":"hi"}}"#;
+        assert_eq!(last_assistant_stop_reason(none), None);
     }
 }
