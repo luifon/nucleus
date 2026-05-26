@@ -761,11 +761,30 @@ async fn deliver_skill_fire(
         )
         .await;
     let session_id = session.session_id.clone();
+    // Capture before close(); the transcript file persists after the tmux
+    // window dies, so we can inspect how the session ended.
+    let transcript_path = session.transcript_path.clone();
     let _ = session.close().await;
     let reply = raw.with_context(|| format!("ask() for reminder #{}", r.id))?;
 
     if reply.trim().is_empty() {
         bail!("session returned an empty reply (treated as failure)");
+    }
+
+    // Durable guard against the narration-leak failure mode. `ask()` returns
+    // the last assistant *text* block regardless of what followed it, so a
+    // session that crashed or was cut off mid-action hands back a stale
+    // mid-process line ("Let me click…", "I accidentally opened…") instead of
+    // a finished deliverable — and we'd forward THAT to the operator as their
+    // standup (a DSU skill-fire did, 2026-05-26). Only forward when
+    // the session ended on a clean assistant text turn; otherwise fail into
+    // the ⚠️ alert path so the operator gets a "fire failed" notice, never
+    // a leaked internal monologue.
+    if !nucleus_core::claude_session::transcript_ends_with_clean_reply(&transcript_path) {
+        bail!(
+            "session ended mid-action (last assistant output was a tool call, not a \
+             final reply) — suppressing forward to avoid leaking narration as the post"
+        );
     }
 
     let _ = diary::record_observation(

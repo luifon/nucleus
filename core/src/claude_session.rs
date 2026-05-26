@@ -1151,6 +1151,75 @@ fn extract_last_assistant_text(buffer: &str) -> Option<String> {
     last
 }
 
+/// Did the session end on a *clean* assistant turn — i.e. is the final
+/// assistant message a text answer, with no `tool_use` block?
+///
+/// `extract_last_assistant_text` (and thus `ask`) returns the last *text*
+/// block regardless of what events followed it. That's fine for interactive
+/// callers, but unattended fire paths (the reminders skill-fire) forward the
+/// reply verbatim to an external audience. When a session crashes or is cut
+/// off mid-action, its final events are `tool_use` calls and the "last text"
+/// is a stale mid-process narration line ("Let me click…", "I accidentally
+/// opened…") — which has shipped to the operator as a "standup" twice
+/// (a DSU skill-fire, 2026-05-26).
+///
+/// This lets a caller distinguish a finished reply from a cut-off run:
+/// `true` only if the last content-bearing assistant message has text and no
+/// `tool_use`. A skill that ends by stating its answer (the contract for any
+/// skill-fire) passes; one still navigating when the session died fails.
+/// Returns `false` if the transcript can't be read or has no assistant turn.
+pub fn transcript_ends_with_clean_reply(transcript_path: &Path) -> bool {
+    let Ok(buffer) = std::fs::read_to_string(transcript_path) else {
+        return false;
+    };
+    let mut saw_assistant = false;
+    let mut last_has_text = false;
+    let mut last_has_tool_use = false;
+    for line in buffer.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<EventEnvelope>(line) else {
+            continue;
+        };
+        if event.kind != "assistant" {
+            continue;
+        }
+        let Some(msg) = event.message else { continue };
+        let Some(content) = msg.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        let mut has_text = false;
+        let mut has_tool_use = false;
+        for block in content {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|t| !t.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        has_text = true;
+                    }
+                }
+                Some("tool_use") => has_tool_use = true,
+                _ => {}
+            }
+        }
+        // Ignore content-less messages (e.g. thinking-only) — we care about
+        // the last assistant message that actually said or did something.
+        if !has_text && !has_tool_use {
+            continue;
+        }
+        saw_assistant = true;
+        last_has_text = has_text;
+        last_has_tool_use = has_tool_use;
+    }
+    saw_assistant && last_has_text && !last_has_tool_use
+}
+
 /// Role of a transcript turn. Used by [`last_n_turns`] to label what came
 /// from the user vs. the assistant for downstream prompt construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1576,5 +1645,75 @@ mod tests {
                 None => std::env::remove_var("TZ"),
             }
         }
+    }
+
+    fn write_jsonl(name: &str, lines: &[&str]) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!("{name}-{}.jsonl", std::process::id()));
+        std::fs::write(&tmp, lines.join("\n")).expect("write tmp jsonl");
+        tmp
+    }
+
+    /// A finished run ends on an assistant text message → clean reply.
+    #[test]
+    fn clean_reply_when_session_ends_on_text() {
+        let tmp = write_jsonl("nucleus-clean-text", &[
+            r#"{"type":"user","message":{"role":"user","content":"prep my standup"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me open the board."},{"type":"tool_use","id":"t1","name":"Skill","input":{}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"📋 Sample-A DSU — …"}]}}"#,
+        ]);
+        let clean = transcript_ends_with_clean_reply(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(clean, "session ending on assistant text should be clean");
+    }
+
+    /// The FS/GH narration-leak shape: the last assistant *text* is a
+    /// mid-process line, but the session's final events are `tool_use`
+    /// calls (it was cut off / crashed mid-action) → NOT a clean reply.
+    #[test]
+    fn dirty_reply_when_session_ends_on_tool_use() {
+        let tmp = write_jsonl("nucleus-dirty-tooluse", &[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I accidentally opened the add-group input. Pressing Escape to cancel."}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"mcp__playwright__browser_press_key","input":{"key":"Escape"}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"mcp__playwright__browser_evaluate","input":{}}]}}"#,
+        ]);
+        let clean = transcript_ends_with_clean_reply(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(!clean, "session ending on a tool_use must not be a clean reply");
+    }
+
+    /// A trailing assistant message that mixes text + tool_use is still
+    /// mid-action (the tool would have produced a result it never closed) →
+    /// NOT clean. Guards against a skill narrating-and-acting in one turn.
+    #[test]
+    fn dirty_reply_when_final_message_mixes_text_and_tool_use() {
+        let tmp = write_jsonl("nucleus-dirty-mixed", &[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"📋 Sample-A DSU — …"}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Now closing the dialog."},{"type":"tool_use","id":"t4","name":"mcp__playwright__browser_press_key","input":{"key":"Escape"}}]}}"#,
+        ]);
+        let clean = transcript_ends_with_clean_reply(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(!clean, "a final text+tool_use message is mid-action, not clean");
+    }
+
+    /// Thinking-only trailing messages don't count as the final turn; the
+    /// real last content-bearing message (text) decides.
+    #[test]
+    fn clean_reply_ignores_trailing_thinking_only_message() {
+        let tmp = write_jsonl("nucleus-clean-thinking", &[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"📋 Sample-B DSU — …"}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"done"}]}}"#,
+        ]);
+        let clean = transcript_ends_with_clean_reply(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(clean, "a thinking-only tail should not invalidate a text reply");
+    }
+
+    /// Missing/unreadable transcript → not clean (caller suppresses forward).
+    #[test]
+    fn dirty_reply_when_transcript_missing() {
+        let tmp = std::env::temp_dir().join("nucleus-clean-nope.jsonl");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(!transcript_ends_with_clean_reply(&tmp));
     }
 }
