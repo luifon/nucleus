@@ -757,6 +757,12 @@ async fn deliver_skill_fire(
             AskOptions {
                 max_wait: Duration::from_secs(300),
                 quiescent_window: Duration::from_secs(5),
+                // Agentic, multi-step browser work: wait for the model to
+                // actually finish its turn (end_turn), never treat a pause
+                // between tool calls as "done". Without this, ask() tore the
+                // session down mid-task — one step before reading the live-doc
+                // dialog (DSU skill-fire failures, 2026-05-26).
+                await_turn_complete: true,
             },
         )
         .await;
@@ -981,6 +987,10 @@ After the tool succeeds, reply with ONLY the event id on its own line — no pro
             AskOptions {
                 max_wait: Duration::from_secs(60),
                 quiescent_window: Duration::from_secs(3),
+                // Agentic fire (JARVIS calls the calendar MCP tool then
+                // confirms). Same rationale as the skill-fire path: wait for
+                // end_turn, don't cut off mid-tool.
+                await_turn_complete: true,
             },
         )
         .await;

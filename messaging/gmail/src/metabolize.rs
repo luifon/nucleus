@@ -115,6 +115,10 @@ pub async fn run(settings: &Settings, workspace_root: &Path) -> Result<()> {
                 // put and the next 5am cron retries.
                 max_wait: Duration::from_secs(60 * 8),
                 quiescent_window: Duration::from_secs(5),
+                // Candidate for await_turn_complete: true (agentic, multi-step
+                // classification). Left legacy for now to scope this change to
+                // the dsu-prep fire fix.
+                await_turn_complete: false,
             },
         )
         .await;
