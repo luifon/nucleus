@@ -187,7 +187,11 @@ export async function planCapture(
   try {
     // 10 min ceiling: long captures (~5min audio, ~3000+ chars) take 2-3min
     // to plan against the vault, and the default 3min cuts them off.
-    raw = await session.ask(prompt, { maxWaitMs: 10 * 60_000 });
+    // awaitTurnComplete: the planner acks, reads vault context, THEN emits
+    // the ops JSON — without waiting for end_turn, a pre-tool narration line
+    // ("Ack posted. Reading the two reference braindumps…") gets returned and
+    // fails JSON parsing. Observed 2026-05-28.
+    raw = await session.ask(prompt, { maxWaitMs: 10 * 60_000, awaitTurnComplete: true });
   } finally {
     await session.close().catch(() => {});
   }
@@ -247,7 +251,9 @@ export async function interpretResponse(
   const session = await Session.spawn(spawnOpts);
   let raw: string;
   try {
-    raw = await session.ask(prompt);
+    // Same end-of-turn guard as planCapture: the interpreter must return
+    // its {action,…} JSON, not any pre-tool narration line.
+    raw = await session.ask(prompt, { awaitTurnComplete: true });
   } finally {
     await session.close().catch(() => {});
   }
