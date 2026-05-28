@@ -119,6 +119,19 @@ let consecutiveConnectionFailures = 0;
 let outboundDrainTimer: NodeJS.Timeout | null = null;
 let planExpirySweepTimer: NodeJS.Timeout | null = null;
 
+// Re-entrancy guard for the outbound drain. setInterval fires the async
+// callback every OUTBOUND_DRAIN_INTERVAL_MS regardless of whether the prior
+// tick has resolved. A single sock.sendMessage takes ~2s over the network,
+// which exceeds the 1s interval — so without this guard tick N+1 starts
+// while tick N is still awaiting sendMessage, re-SELECTs the same still-
+// pending row (pending() doesn't claim/lock; markSent only runs post-send),
+// and sends it a second time. Result: one outbound_queue row, two WhatsApp
+// messages. Hit DSU forwards specifically because long bodies send slower.
+// Incident 2026-05-28 (duplicate DSU notifications). The 2026-05-22
+// clearInterval guard stopped reconnect-spawned parallel drains but not a
+// single timer overlapping itself.
+let outboundDraining = false;
+
 // ADR-005a: braindump plan timeout + sweep cadence.
 const PLAN_TIMEOUT_MS = 30 * 60 * 1000;
 const PLAN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
@@ -392,48 +405,57 @@ async function resolveAllowlist(sock: any, config: Config): Promise<void> {
 function startOutboundDrain(sock: any, outbound: OutboundQueueStore, config: Config): void {
   if (outboundDrainTimer) clearInterval(outboundDrainTimer);
   outboundDrainTimer = setInterval(async () => {
-    let rows: OutboundRow[];
+    // Skip this tick if the previous one is still draining — otherwise two
+    // ticks grab the same not-yet-markSent row and double-send it. See the
+    // outboundDraining comment above.
+    if (outboundDraining) return;
+    outboundDraining = true;
     try {
-      rows = outbound.pending(20);
-    } catch (e) {
-      log.warn({ err: (e as Error).message }, "whatsapp: outbound pending() failed");
-      return;
-    }
-    if (rows.length === 0) return;
-    log.info({ count: rows.length }, "whatsapp: draining outbound queue");
-    for (const r of rows) {
-      const jid = resolveOutboundTarget(r.target, config);
-      if (!jid) {
-        outbound.markFailure(r.id, `unknown target: ${r.target}`, OUTBOUND_MAX_ATTEMPTS);
-        log.warn({ id: r.id, target: r.target }, "whatsapp: outbound target not in allowlist — failed");
-        continue;
-      }
+      let rows: OutboundRow[];
       try {
-        if (process.env.NUCLEUS_WHATSAPP_FORCE_SEND_FAIL === "1") {
-          throw new Error("Connection Closed (synthetic — NUCLEUS_WHATSAPP_FORCE_SEND_FAIL)");
-        }
-        const sent = await sock.sendMessage(jid, { text: r.body });
-        outbound.markSent(r.id, sent?.key?.id ?? "");
-        consecutiveConnectionFailures = 0;
-        log.info({ id: r.id, target: r.target, jid }, "whatsapp: outbound sent");
+        rows = outbound.pending(20);
       } catch (e) {
-        const err = (e as Error).message;
-        outbound.markFailure(r.id, err, OUTBOUND_MAX_ATTEMPTS);
-        log.warn({ id: r.id, err, attempts: r.attempts + 1 }, "whatsapp: outbound send failed");
-        if (/connection closed/i.test(err)) {
-          consecutiveConnectionFailures += 1;
-          log.warn(
-            { consecutive: consecutiveConnectionFailures, threshold: CONNECTION_ROT_THRESHOLD },
-            "whatsapp: connection-rot counter incremented",
-          );
-          if (consecutiveConnectionFailures >= CONNECTION_ROT_THRESHOLD) {
-            const alert = `⚠️ WhatsApp bot exiting: ${consecutiveConnectionFailures} consecutive "Connection Closed" sendMessage failures — launchd will respawn.`;
-            log.error(alert);
-            await alertDiscordHome(alert);
-            process.exit(1);
+        log.warn({ err: (e as Error).message }, "whatsapp: outbound pending() failed");
+        return;
+      }
+      if (rows.length === 0) return;
+      log.info({ count: rows.length }, "whatsapp: draining outbound queue");
+      for (const r of rows) {
+        const jid = resolveOutboundTarget(r.target, config);
+        if (!jid) {
+          outbound.markFailure(r.id, `unknown target: ${r.target}`, OUTBOUND_MAX_ATTEMPTS);
+          log.warn({ id: r.id, target: r.target }, "whatsapp: outbound target not in allowlist — failed");
+          continue;
+        }
+        try {
+          if (process.env.NUCLEUS_WHATSAPP_FORCE_SEND_FAIL === "1") {
+            throw new Error("Connection Closed (synthetic — NUCLEUS_WHATSAPP_FORCE_SEND_FAIL)");
+          }
+          const sent = await sock.sendMessage(jid, { text: r.body });
+          outbound.markSent(r.id, sent?.key?.id ?? "");
+          consecutiveConnectionFailures = 0;
+          log.info({ id: r.id, target: r.target, jid }, "whatsapp: outbound sent");
+        } catch (e) {
+          const err = (e as Error).message;
+          outbound.markFailure(r.id, err, OUTBOUND_MAX_ATTEMPTS);
+          log.warn({ id: r.id, err, attempts: r.attempts + 1 }, "whatsapp: outbound send failed");
+          if (/connection closed/i.test(err)) {
+            consecutiveConnectionFailures += 1;
+            log.warn(
+              { consecutive: consecutiveConnectionFailures, threshold: CONNECTION_ROT_THRESHOLD },
+              "whatsapp: connection-rot counter incremented",
+            );
+            if (consecutiveConnectionFailures >= CONNECTION_ROT_THRESHOLD) {
+              const alert = `⚠️ WhatsApp bot exiting: ${consecutiveConnectionFailures} consecutive "Connection Closed" sendMessage failures — launchd will respawn.`;
+              log.error(alert);
+              await alertDiscordHome(alert);
+              process.exit(1);
+            }
           }
         }
       }
+    } finally {
+      outboundDraining = false;
     }
   }, OUTBOUND_DRAIN_INTERVAL_MS);
 }
