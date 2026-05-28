@@ -11,6 +11,7 @@ import {
   lastNTurns,
   buildPrimingPreamble,
   msUntilNext4am,
+  extractLastAssistantText,
   Turn,
 } from "./claude_session.js";
 
@@ -198,4 +199,50 @@ test("waitForTuiReady times out on an unknown stuck prompt", async () => {
   } finally {
     await tmuxKill(session);
   }
+});
+
+// --- end-of-turn gating (awaitTurnComplete) — braindump narration-leak regression ---
+
+// A transcript where the model emits a pre-tool narration line (stop_reason
+// "tool_use"), then a tool result, then the real JSON reply (stop_reason
+// "end_turn"). This is the shape that returned "Ack posted. Reading the two
+// reference braindumps…" as a braindump plan on 2026-05-28.
+const NARRATION_THEN_JSON = [
+  JSON.stringify({
+    type: "assistant",
+    message: { stop_reason: "tool_use", content: [{ type: "text", text: "Ack posted. Reading the two reference braindumps to mirror their structure." }] },
+  }),
+  JSON.stringify({
+    type: "assistant",
+    message: { stop_reason: "tool_use", content: [{ type: "tool_use", name: "Read", input: {} }] },
+  }),
+  JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: "..." }] } }),
+  JSON.stringify({
+    type: "assistant",
+    message: { stop_reason: "end_turn", content: [{ type: "text", text: '{"ops":[],"summary":"nothing to file","confidence":0.9}' }] },
+  }),
+].join("\n");
+
+test("extractLastAssistantText (default) returns the last assistant text — incl. mid-turn narration", () => {
+  // The pre-fix quiescence path: if the model paused after the narration line,
+  // THIS is what got returned and failed JSON parsing.
+  const buffer = NARRATION_THEN_JSON.split("\n").slice(0, 2).join("\n");
+  assert.equal(
+    extractLastAssistantText(buffer),
+    "Ack posted. Reading the two reference braindumps to mirror their structure.",
+  );
+});
+
+test("extractLastAssistantText(requireEndTurn) skips tool_use narration, returns the end_turn JSON", () => {
+  assert.equal(
+    extractLastAssistantText(NARRATION_THEN_JSON, true),
+    '{"ops":[],"summary":"nothing to file","confidence":0.9}',
+  );
+});
+
+test("extractLastAssistantText(requireEndTurn) returns null until the turn actually ends", () => {
+  // Only the narration + tool_use seen so far — no end_turn yet. awaitTurnComplete
+  // keeps waiting (bounded by maxWaitMs) instead of returning the narration.
+  const partial = NARRATION_THEN_JSON.split("\n").slice(0, 3).join("\n");
+  assert.equal(extractLastAssistantText(partial, true), null);
 });

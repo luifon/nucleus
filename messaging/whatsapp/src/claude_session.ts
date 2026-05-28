@@ -42,6 +42,19 @@ export interface AskOptions {
   maxWaitMs?: number;
   /** "No new transcript lines for this long" → claude is done. */
   quiescentMs?: number;
+  /** Only return once the model's turn actually ended (an assistant
+   *  message with `stop_reason: "end_turn"`), instead of returning the
+   *  last assistant text after `quiescentMs` of silence. Set this for
+   *  agentic, multi-step asks (read context → call tools → produce a
+   *  final JSON/answer): without it, a narration line emitted before a
+   *  tool call — which carries `stop_reason: "tool_use"`, not
+   *  `end_turn` — gets returned as the reply if the model then pauses
+   *  >quiescentMs (e.g. reading files). That's how a braindump plan came
+   *  back as "Ack posted. Reading the two reference braindumps…" instead
+   *  of the ops JSON. Mirrors nucleus_core's `await_turn_complete`
+   *  (cfe6238). Bounded by `maxWaitMs`; on timeout we throw rather than
+   *  return mid-turn narration. */
+  awaitTurnComplete?: boolean;
 }
 
 export interface AskResult {
@@ -58,6 +71,7 @@ export interface AskResult {
 const DEFAULT_ASK: Required<AskOptions> = {
   maxWaitMs: 180_000,
   quiescentMs: 3_000,
+  awaitTurnComplete: false,
 };
 
 /** Prepend a fresh wall-clock context line to every payload. Long-lived
@@ -189,6 +203,7 @@ export class Session {
       fromOffset,
       ask.maxWaitMs,
       ask.quiescentMs,
+      ask.awaitTurnComplete,
     );
     try {
       const stat = await fs.stat(this.transcriptPath);
@@ -573,6 +588,7 @@ async function waitForAssistant(
   fromOffset: number,
   maxWaitMs: number,
   quiescentMs: number,
+  awaitTurnComplete: boolean,
 ): Promise<string> {
   const start = Date.now();
   let lastChange = Date.now();
@@ -604,7 +620,14 @@ async function waitForAssistant(
         haveAssistant = buffer.split("\n").some(lineIsAssistant);
       }
     }
-    if (haveAssistant && Date.now() - lastChange > quiescentMs) {
+    if (awaitTurnComplete) {
+      // Definitive end-of-turn: once the model has emitted an assistant
+      // message with stop_reason "end_turn" past our offset, the reply is
+      // complete — return immediately, no quiescence wait. Text from a
+      // tool_use-terminated message is mid-turn narration and is ignored.
+      const finalText = extractLastAssistantText(buffer, true);
+      if (finalText) return finalText;
+    } else if (haveAssistant && Date.now() - lastChange > quiescentMs) {
       const text = extractLastAssistantText(buffer);
       if (text) return text;
     }
@@ -624,7 +647,11 @@ function lineIsAssistant(line: string): boolean {
   }
 }
 
-function extractLastAssistantText(buffer: string): string | null {
+/** Last assistant message's concatenated text. When `requireEndTurn` is
+ *  set, only assistant messages whose `stop_reason` is "end_turn" count —
+ *  text emitted before a tool call (stop_reason "tool_use") is mid-turn
+ *  narration, not the final reply, and is skipped. */
+export function extractLastAssistantText(buffer: string, requireEndTurn = false): string | null {
   let last: string | null = null;
   for (const raw of buffer.split("\n")) {
     const line = raw.trim();
@@ -636,6 +663,7 @@ function extractLastAssistantText(buffer: string): string | null {
       continue;
     }
     if (ev?.type !== "assistant") continue;
+    if (requireEndTurn && ev?.message?.stop_reason !== "end_turn") continue;
     const content = ev?.message?.content;
     if (!Array.isArray(content)) continue;
     let text = "";
