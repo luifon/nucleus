@@ -208,6 +208,14 @@ fn default_reminder_channels() -> Vec<String> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PortsConfig {
     pub nucleus_dashboard: u16,
+    /// Loopback port for the Bonsai image-generation FastAPI backend
+    /// (ADR-019). Default 8093; the dashboard's /gallery surface proxies here.
+    #[serde(default = "default_bonsai_port")]
+    pub bonsai: u16,
+}
+
+fn default_bonsai_port() -> u16 {
+    8093
 }
 
 // Intermediate struct for what we read from nucleus.toml.

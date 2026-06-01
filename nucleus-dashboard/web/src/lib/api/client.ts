@@ -53,6 +53,14 @@ export async function jsonPost<T, B>(path: string, body: B): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export async function jsonDelete<T>(path: string): Promise<T> {
+  const res = await fetch(path, { method: "DELETE" });
+  if (!res.ok) {
+    throw new ApiError(path, res.status, await readErrorMessage(res, path));
+  }
+  return res.json() as Promise<T>;
+}
+
 /** URL-search-params builder with omit-undefined semantics. Most
  *  list endpoints take optional filters; this saves every domain
  *  module from re-implementing the same null check. */

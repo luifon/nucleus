@@ -177,6 +177,36 @@ async fn main() -> Result<()> {
     let diary_state = Arc::new(handlers::diary::DiaryState { root: diary_root });
     app = app.nest("/diary/api", handlers::diary::router(diary_state));
 
+    // Image generation (gallery) — proxies prompts to the Bonsai FastAPI
+    // backend on the configured loopback port and persists results (ADR-019).
+    // Tolerated-missing: if gallery.db can't open, the surface is simply absent.
+    // The PNG bytes are served by the /gallery/files ServeDir mount below.
+    let gallery_files_dir = workspace_root.join("memory/gallery");
+    match db::open(&workspace_root.join("memory/gallery.db")).await {
+        Ok(pool) => match handlers::gallery::ensure_schema(&pool).await {
+            Ok(()) => {
+                let _ = std::fs::create_dir_all(&gallery_files_dir);
+                let http = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(180))
+                    .build()
+                    .unwrap_or_default();
+                let gallery_state = Arc::new(handlers::gallery::GalleryState {
+                    pool,
+                    files_dir: gallery_files_dir.clone(),
+                    bonsai_url: format!("http://127.0.0.1:{}", _settings.ports.bonsai),
+                    http,
+                });
+                app = app.nest("/gallery/api", handlers::gallery::router(gallery_state));
+            }
+            Err(e) => {
+                tracing::warn!("nucleus-dashboard: gallery schema init failed: {} — /gallery disabled", e);
+            }
+        },
+        Err(e) => {
+            tracing::warn!("nucleus-dashboard: gallery.db not openable: {} — /gallery disabled", e);
+        }
+    }
+
     // SPA fallback — any path that ServeDir can't resolve (React Router
     // routes like /news, /chat) returns index.html with 200 so the
     // client-side router takes over. ServeDir's own not_found_service
@@ -193,6 +223,7 @@ async fn main() -> Result<()> {
 
     let app = app
         .nest_service("/assets", ServeDir::new(web_dist.join("assets")))
+        .nest_service("/gallery/files", ServeDir::new(gallery_files_dir))
         .fallback(move |uri: axum::http::Uri| {
             let path = index_html_path.clone();
             async move {
