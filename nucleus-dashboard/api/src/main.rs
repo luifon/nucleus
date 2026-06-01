@@ -186,14 +186,21 @@ async fn main() -> Result<()> {
         Ok(pool) => match handlers::gallery::ensure_schema(&pool).await {
             Ok(()) => {
                 let _ = std::fs::create_dir_all(&gallery_files_dir);
+                // SDXL (NoobAI) on MPS can take minutes per image — generous timeout.
                 let http = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(180))
+                    .timeout(std::time::Duration::from_secs(360))
                     .build()
                     .unwrap_or_default();
                 let gallery_state = Arc::new(handlers::gallery::GalleryState {
                     pool,
                     files_dir: gallery_files_dir.clone(),
-                    bonsai_url: format!("http://127.0.0.1:{}", _settings.ports.bonsai),
+                    backends: vec![
+                        ("bonsai".to_string(), format!("http://127.0.0.1:{}", _settings.ports.bonsai)),
+                        ("noobai".to_string(), format!("http://127.0.0.1:{}", _settings.ports.noobai)),
+                    ],
+                    // Safe API fallback when a request omits `model` (always-up);
+                    // the UI defaults its selector to noobai independently.
+                    default_model: "bonsai".to_string(),
                     http,
                 });
                 app = app.nest("/gallery/api", handlers::gallery::router(gallery_state));

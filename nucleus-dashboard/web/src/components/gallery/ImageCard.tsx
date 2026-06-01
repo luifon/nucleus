@@ -35,6 +35,9 @@ export default function ImageCard({
             className="aspect-square w-full object-cover"
           />
         </a>
+        <span className="absolute left-1.5 top-1.5 rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)]/80 px-1.5 py-0.5 text-[10px] text-[var(--color-nucleus-accent)]">
+          {image.model}
+        </span>
         <button
           onClick={onDelete}
           disabled={busy}

@@ -3,6 +3,25 @@
 **Status:** Accepted (implemented 2026-06-01)
 **Related:** ADR-015 (unified dashboard), ADR-018 (WhatsApp media — brick 3), ADR-011 (perimeter)
 
+## Amendments (2026-06-01)
+
+- **Multi-model.** The gallery backend is now a name→url **registry**, not a
+  single Bonsai URL: a second model, **NoobAI-XL (SDXL)** — a self-contained
+  diffusers+MPS service (`tools/noobai/`, `dev.nucleus.noobai` :8094) — was added
+  with a per-image **model selector** in the UI. Each image records its `model`.
+  NoobAI wins on anime/character work (with booru-style tags); Bonsai stays the
+  fast, photoreal/general option. Both kept (each owns a lane).
+- **Lazy load + idle-unload (supersedes "always-warm" below).** Two warm models
+  was too much RAM. Now neither loads at startup; each loads on first
+  `/generate` and frees its weights when idle — so an idle service holds ~0 model
+  memory. **Bonsai**: built-in eviction via env
+  (`MFLUX_STUDIO_LAZY_COMPONENTS/EVICT_TRANSFORMER/EVICT_VAE=true`), evicts after
+  each gen (reloads in ~1s). **NoobAI**: in-process lazy-load + a 10-min
+  idle-unload reaper (`serve.py`). Measured: NoobAI MPS memory 0 MB idle →
+  ~11.9 GB during a 1024² gen → ~0.8 GB after unload. First gen after idle pays
+  the reload (~15s NoobAI / ~1s Bonsai). Status probes (`/backends`) deliberately
+  do NOT load the model or reset the idle timer.
+
 ## Context
 
 Nucleus gained the ability to generate images locally: PrismML's **Bonsai

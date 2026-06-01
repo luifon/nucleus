@@ -1,11 +1,14 @@
 //! Image-generation (gallery) surface — ADR-019.
 //!
-//! Proxies prompts to the local Bonsai FastAPI backend (`POST /generate`
-//! → raw PNG bytes), persists each result as a file under `memory/gallery/`
-//! plus a row in `memory/gallery.db`, and serves the gallery list. The PNG
-//! bytes themselves are served by a `ServeDir` mount at `/gallery/files/*`
-//! wired in `main.rs`. The Bonsai backend runs as an always-warm loopback
-//! service (`tools/bonsai-serve.sh` via launchd); see ADR-019.
+//! Proxies prompts to a registry of local image-model backends (each a FastAPI
+//! service exposing `POST /generate` → raw PNG bytes), persists each result as a
+//! file under `memory/gallery/` plus a row in `memory/gallery.db`, and serves
+//! the gallery list. PNG bytes are served by a `ServeDir` mount at
+//! `/gallery/files/*` wired in `main.rs`.
+//!
+//! Backends are name→url pairs (e.g. `bonsai` → :8093, `noobai` → :8094), all
+//! speaking the same JSON→PNG contract, so this handler stays model-agnostic.
+//! Each image records which `model` produced it. See ADR-019.
 
 use anyhow::Result;
 use axum::{
@@ -26,9 +29,32 @@ pub struct GalleryState {
     pub pool: SqlitePool,
     /// Directory the generated PNGs are written to (served at /gallery/files).
     pub files_dir: PathBuf,
-    /// Base URL of the Bonsai FastAPI backend, e.g. http://127.0.0.1:8093.
-    pub bonsai_url: String,
+    /// Ordered name→base-URL registry of image-model backends, e.g.
+    /// `[("bonsai","http://127.0.0.1:8093"), ("noobai","http://127.0.0.1:8094")]`.
+    pub backends: Vec<(String, String)>,
+    /// Model used when a request omits one.
+    pub default_model: String,
     pub http: reqwest::Client,
+}
+
+impl GalleryState {
+    fn backend_url(&self, model: &str) -> Option<&str> {
+        self.backends
+            .iter()
+            .find(|(n, _)| n == model)
+            .map(|(_, u)| u.as_str())
+    }
+}
+
+/// Per-model generation defaults (steps, width, height) used when the request
+/// omits them. Bonsai is a 4-step distilled model at 512²; NoobAI is SDXL at
+/// 1024² with ~26 steps.
+fn model_defaults(model: &str) -> (i64, i64, i64) {
+    match model {
+        "bonsai" => (4, 512, 512),
+        "noobai" => (26, 1024, 1024),
+        _ => (20, 1024, 1024),
+    }
 }
 
 pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
@@ -41,12 +67,20 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
           width      INTEGER NOT NULL,
           height     INTEGER NOT NULL,
           steps      INTEGER NOT NULL,
-          created_at TEXT    NOT NULL
+          created_at TEXT    NOT NULL,
+          model      TEXT    NOT NULL DEFAULT 'bonsai'
         );
         "#,
     )
     .execute(pool)
     .await?;
+    // Idempotent migration for DBs created before the multi-model change
+    // (ADR-019). Ignore the "duplicate column" error on already-migrated DBs.
+    let _ = sqlx::query(
+        "ALTER TABLE generated_images ADD COLUMN model TEXT NOT NULL DEFAULT 'bonsai'",
+    )
+    .execute(pool)
+    .await;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_generated_created ON generated_images(created_at DESC)")
         .execute(pool)
         .await?;
@@ -71,20 +105,22 @@ struct ImageRow {
     height: i64,
     steps: i64,
     created_at: String,
+    model: String,
 }
 
 #[derive(Deserialize)]
 struct GenerateReq {
     prompt: String,
+    model: Option<String>,
     seed: Option<i64>,
     steps: Option<i64>,
     width: Option<i64>,
     height: Option<i64>,
 }
 
-/// Body forwarded to the Bonsai FastAPI backend (matches its GenerateRequest).
+/// Body forwarded to a model backend (all speak this same shape).
 #[derive(Serialize)]
-struct BonsaiReq {
+struct BackendReq {
     prompt: String,
     seed: i64,
     steps: i64,
@@ -100,35 +136,42 @@ async fn generate(
     if prompt.is_empty() {
         return Err(GalleryError::BadRequest("prompt is required".into()));
     }
+    let model = req.model.unwrap_or_else(|| s.default_model.clone());
+    let url = s
+        .backend_url(&model)
+        .ok_or_else(|| GalleryError::BadRequest(format!("unknown model: {model}")))?
+        .to_string();
+
+    let (def_steps, def_w, def_h) = model_defaults(&model);
     // Default to a time-derived seed so repeated identical prompts vary, unless
     // the caller pins one for reproducibility.
-    let seed = req.seed.unwrap_or_else(|| {
-        (Utc::now().timestamp_subsec_nanos() & 0x7fff_ffff) as i64
-    });
-    let steps = req.steps.unwrap_or(4).clamp(1, 50);
-    let width = req.width.unwrap_or(512).clamp(64, 1536);
-    let height = req.height.unwrap_or(512).clamp(64, 1536);
+    let seed = req
+        .seed
+        .unwrap_or_else(|| (Utc::now().timestamp_subsec_nanos() & 0x7fff_ffff) as i64);
+    let steps = req.steps.unwrap_or(def_steps).clamp(1, 60);
+    let width = req.width.unwrap_or(def_w).clamp(64, 1536);
+    let height = req.height.unwrap_or(def_h).clamp(64, 1536);
 
-    let body = BonsaiReq { prompt: prompt.clone(), seed, steps, width, height };
+    let body = BackendReq { prompt: prompt.clone(), seed, steps, width, height };
     let resp = s
         .http
-        .post(format!("{}/generate", s.bonsai_url))
+        .post(format!("{url}/generate"))
         .json(&body)
         .send()
         .await
-        .map_err(|e| GalleryError::Backend(format!("bonsai unreachable: {e}")))?;
+        .map_err(|e| GalleryError::Backend(format!("{model} unreachable: {e}")))?;
     if !resp.status().is_success() {
         let code = resp.status();
         let detail = resp.text().await.unwrap_or_default();
         return Err(GalleryError::Backend(format!(
-            "bonsai returned {code}: {}",
+            "{model} returned {code}: {}",
             detail.chars().take(300).collect::<String>()
         )));
     }
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| GalleryError::Backend(format!("reading bonsai PNG: {e}")))?;
+        .map_err(|e| GalleryError::Backend(format!("reading {model} PNG: {e}")))?;
 
     let id = uuid::Uuid::new_v4().to_string();
     tokio::fs::create_dir_all(&s.files_dir)
@@ -141,8 +184,8 @@ async fn generate(
 
     let created_at = Utc::now().to_rfc3339();
     sqlx::query(
-        "INSERT INTO generated_images (id, prompt, seed, width, height, steps, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO generated_images (id, prompt, seed, width, height, steps, created_at, model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )
     .bind(&id)
     .bind(&prompt)
@@ -151,6 +194,7 @@ async fn generate(
     .bind(height)
     .bind(steps)
     .bind(&created_at)
+    .bind(&model)
     .execute(&s.pool)
     .await?;
 
@@ -162,6 +206,7 @@ async fn generate(
         height,
         steps,
         created_at,
+        model,
     }))
 }
 
@@ -169,7 +214,7 @@ async fn list_images(
     State(s): State<Arc<GalleryState>>,
 ) -> Result<Json<Vec<ImageRow>>, GalleryError> {
     let rows: Vec<ImageRow> = sqlx::query_as::<_, ImageRow>(
-        "SELECT id, prompt, seed, width, height, steps, created_at
+        "SELECT id, prompt, seed, width, height, steps, created_at, model
            FROM generated_images
           ORDER BY created_at DESC
           LIMIT 200",
@@ -196,33 +241,40 @@ async fn delete_image(
 }
 
 #[derive(Serialize)]
-struct StatusResp {
+struct BackendStatus {
+    name: String,
     reachable: bool,
-    backend_url: String,
+}
+
+#[derive(Serialize)]
+struct StatusResp {
+    backends: Vec<BackendStatus>,
+    default_model: String,
 }
 
 async fn status(State(s): State<Arc<GalleryState>>) -> Json<StatusResp> {
-    // Quick reachability probe with a short timeout — the model backend exposes
-    // GET /backends. Don't surface errors; the UI only needs up/down.
-    let reachable = s
-        .http
-        .get(format!("{}/backends", s.bonsai_url))
-        .timeout(Duration::from_secs(3))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-    Json(StatusResp {
-        reachable,
-        backend_url: s.bonsai_url.clone(),
-    })
+    // Probe each backend's GET /backends with a short timeout — the UI only
+    // needs up/down per model.
+    let mut backends = Vec::with_capacity(s.backends.len());
+    for (name, url) in &s.backends {
+        let reachable = s
+            .http
+            .get(format!("{url}/backends"))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        backends.push(BackendStatus { name: name.clone(), reachable });
+    }
+    Json(StatusResp { backends, default_model: s.default_model.clone() })
 }
 
 #[derive(Debug)]
 pub enum GalleryError {
     Sqlx(sqlx::Error),
     BadRequest(String),
-    /// The Bonsai backend was unreachable or returned an error.
+    /// A model backend was unreachable or returned an error.
     Backend(String),
     Io(String),
     NotFound,
