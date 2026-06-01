@@ -1,8 +1,9 @@
 import { jsonGet, jsonPost, jsonDelete } from "./client";
 
 // Image-generation (gallery) surface — ADR-019. Talks to the axum
-// /gallery/api/* routes, which proxy to the local Bonsai FastAPI backend
-// and persist results. PNG bytes are served at /gallery/files/<id>.png.
+// /gallery/api/* routes, which proxy to a registry of local image-model
+// backends (bonsai, noobai) and persist results. PNG bytes are served at
+// /gallery/files/<id>.png.
 
 export type GeneratedImage = {
   id: string;
@@ -12,17 +13,20 @@ export type GeneratedImage = {
   height: number;
   steps: number;
   created_at: string;
+  model: string;
 };
 
 export type GenerateBody = {
   prompt: string;
+  model?: string;
   seed?: number;
   steps?: number;
   width?: number;
   height?: number;
 };
 
-export type GalleryStatus = { reachable: boolean; backend_url: string };
+export type BackendStatus = { name: string; reachable: boolean };
+export type GalleryStatus = { backends: BackendStatus[]; default_model: string };
 
 export const imageUrl = (id: string) => `/gallery/files/${id}.png`;
 

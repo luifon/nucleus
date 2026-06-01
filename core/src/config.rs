@@ -212,10 +212,18 @@ pub struct PortsConfig {
     /// (ADR-019). Default 8093; the dashboard's /gallery surface proxies here.
     #[serde(default = "default_bonsai_port")]
     pub bonsai: u16,
+    /// Loopback port for the NoobAI-XL (SDXL) image-generation backend
+    /// (ADR-019). Default 8094; the /gallery surface proxies here too.
+    #[serde(default = "default_noobai_port")]
+    pub noobai: u16,
 }
 
 fn default_bonsai_port() -> u16 {
     8093
+}
+
+fn default_noobai_port() -> u16 {
+    8094
 }
 
 // Intermediate struct for what we read from nucleus.toml.

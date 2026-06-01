@@ -12,24 +12,48 @@ import {
   type GenerateBody,
 } from "@/lib/api/gallery";
 
-// Image generation surface (ADR-019). Prompt → local Bonsai model → gallery.
-const SIZES = [512, 768, 1024];
+// Image generation surface (ADR-019). Prompt → a selectable local model → gallery.
+// Per-model sizes: SDXL (NoobAI) is incoherent below ~768² — only offer the
+// resolutions each model actually renders well at.
+const MODELS = [
+  { id: "noobai", label: "NoobAI · SDXL", est: "~3 min", defaultSize: 1024, sizes: [768, 1024] },
+  { id: "bonsai", label: "Bonsai · fast", est: "~30s", defaultSize: 512, sizes: [512, 768, 1024] },
+] as const;
+
+const MODEL_KEY = "gallery_model";
+
+function initialModel(): string {
+  const saved = localStorage.getItem(MODEL_KEY);
+  return MODELS.some((m) => m.id === saved) ? (saved as string) : "noobai";
+}
 
 export default function GalleryPage() {
   const images = useFetch(listImages);
   const status = useFetch(galleryStatus);
   const [prompt, setPrompt] = useState("");
-  const [size, setSize] = useState(512);
+  const [model, setModel] = useState(initialModel);
+  const [size, setSize] = useState<number>(
+    () => MODELS.find((m) => m.id === initialModel())?.defaultSize ?? 1024,
+  );
   const [seed, setSeed] = useState("");
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const current = MODELS.find((m) => m.id === model) ?? MODELS[0];
+
+  const onModelChange = (id: string) => {
+    setModel(id);
+    localStorage.setItem(MODEL_KEY, id);
+    // Snap the size to the model's native default (SDXL wants 1024, Bonsai 512).
+    setSize(MODELS.find((m) => m.id === id)?.defaultSize ?? size);
+  };
 
   const onGenerate = async () => {
     const p = prompt.trim();
     if (!p || generating) return;
     setGenerating(true);
     setError(null);
-    const body: GenerateBody = { prompt: p, width: size, height: size };
+    const body: GenerateBody = { prompt: p, model, width: size, height: size };
     const s = parseInt(seed, 10);
     if (Number.isFinite(s)) body.seed = s;
     try {
@@ -47,17 +71,24 @@ export default function GalleryPage() {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") onGenerate();
   };
 
-  const reachable = status.data?.reachable ?? false;
   const count = images.data?.length ?? 0;
 
   return (
     <PageShell
       title="gallery"
-      subtitle="Local Bonsai Image 4B (MLX) — prompts run on-device; results persist in the gallery."
+      subtitle="Local image generation (MLX / diffusers) — prompts run on-device; results persist here."
       actions={
-        <StatusPill kind={status.loading ? "idle" : reachable ? "ok" : "down"}>
-          {status.loading ? "…" : reachable ? "model up" : "model down"}
-        </StatusPill>
+        <div className="flex items-center gap-2">
+          {status.loading ? (
+            <StatusPill kind="idle">…</StatusPill>
+          ) : (
+            (status.data?.backends ?? []).map((b) => (
+              <StatusPill key={b.name} kind={b.reachable ? "ok" : "down"}>
+                {b.name}
+              </StatusPill>
+            ))
+          )}
+        </div>
       }
     >
       <div className="mb-6 rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)] p-3">
@@ -72,6 +103,21 @@ export default function GalleryPage() {
         />
         <div className="mt-2 flex flex-wrap items-center gap-3">
           <label className="flex items-center gap-1.5 text-xs text-[var(--color-nucleus-faint)]">
+            model
+            <select
+              value={model}
+              onChange={(e) => onModelChange(e.target.value)}
+              disabled={generating}
+              className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-2 py-1 text-xs text-[var(--color-nucleus-text)] focus:border-[var(--color-nucleus-accent)] focus:outline-none"
+            >
+              {MODELS.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-1.5 text-xs text-[var(--color-nucleus-faint)]">
             size
             <select
               value={size}
@@ -79,7 +125,7 @@ export default function GalleryPage() {
               disabled={generating}
               className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-2 py-1 text-xs text-[var(--color-nucleus-text)] focus:border-[var(--color-nucleus-accent)] focus:outline-none"
             >
-              {SIZES.map((s) => (
+              {current.sizes.map((s) => (
                 <option key={s} value={s}>
                   {s}²
                 </option>
@@ -106,7 +152,7 @@ export default function GalleryPage() {
             className="ml-auto flex items-center gap-1.5 rounded border border-[var(--color-nucleus-accent)] bg-[color-mix(in_srgb,var(--color-nucleus-accent)_12%,transparent)] px-3 py-1.5 text-sm text-[var(--color-nucleus-accent)] transition-opacity disabled:opacity-50"
           >
             <Wand2 size={13} strokeWidth={1.75} />
-            {generating ? "generating… ~35s" : "generate"}
+            {generating ? `generating… ${current.est}` : "generate"}
           </button>
         </div>
         {error && (
@@ -128,7 +174,7 @@ export default function GalleryPage() {
         {generating && (
           <div className="flex aspect-square items-center justify-center rounded border border-dashed border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)] text-xs text-[var(--color-nucleus-faint)]">
             <span className="flex items-center gap-1.5">
-              <RefreshCw size={13} className="animate-spin" /> generating…
+              <RefreshCw size={13} className="animate-spin" /> {current.label.split(" ")[0]} {current.est}
             </span>
           </div>
         )}

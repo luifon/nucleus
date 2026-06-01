@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LAUNCHD_PREFIX__.noobai</string>
+    <!-- Always-warm NoobAI-XL (SDXL) image-generation backend (ADR-019), a
+         self-contained diffusers+MPS service. The dashboard's /gallery surface
+         proxies to it on NUCLEUS_NOOBAI_PORT. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__USER_HOME__/Development/nucleus/tools/noobai-serve.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__USER_HOME__/Development/nucleus/tools/noobai</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TZ</key>
+        <string>__TZ__</string>
+        <!-- Keep in sync with [ports].noobai in nucleus.toml (default 8094). -->
+        <key>NUCLEUS_NOOBAI_PORT</key>
+        <string>8094</string>
+        <key>PYTORCH_ENABLE_MPS_FALLBACK</key>
+        <string>1</string>
+        <!-- launchd inherits no PATH; uv must be reachable (Rule 5). -->
+        <key>PATH</key>
+        <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/noobai.log</string>
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/noobai.log</string>
+</dict>
+</plist>

@@ -31,5 +31,8 @@ exec env \
   MFLUX_STUDIO_BAKED_BINARY_MODEL_PATH="$DEMO_DIR/models/bonsai-image-4B-binary-mlx" \
   MFLUX_STUDIO_TE_4BIT=true \
   MFLUX_STUDIO_FORCE_DISABLE_GPU=true \
+  MFLUX_STUDIO_LAZY_COMPONENTS=true \
+  MFLUX_STUDIO_EVICT_TRANSFORMER=true \
+  MFLUX_STUDIO_EVICT_VAE=true \
   "$DEMO_DIR/.venv/bin/uvicorn" scripts.local_backend_mac:app \
     --host 127.0.0.1 --port "$PORT"
