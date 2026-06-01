@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LAUNCHD_PREFIX__.bonsai</string>
+    <!-- Always-warm Bonsai image-generation FastAPI backend (ADR-019). The
+         dashboard's /gallery surface proxies to it on NUCLEUS_BONSAI_PORT.
+         Installed only when NUCLEUS_BONSAI_DIR is set in .env. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__USER_HOME__/Development/nucleus/tools/bonsai-serve.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__NUCLEUS_BONSAI_DIR__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TZ</key>
+        <string>__TZ__</string>
+        <key>NUCLEUS_BONSAI_DIR</key>
+        <string>__NUCLEUS_BONSAI_DIR__</string>
+        <!-- Keep in sync with [ports].bonsai in nucleus.toml (default 8093). -->
+        <key>NUCLEUS_BONSAI_PORT</key>
+        <string>8093</string>
+        <key>BONSAI_VARIANT</key>
+        <string>ternary</string>
+        <!-- launchd inherits no PATH; the wrapper uses the demo's .venv but
+             keep uv + homebrew reachable for any child tooling (Rule 5). -->
+        <key>PATH</key>
+        <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/bonsai.log</string>
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/bonsai.log</string>
+</dict>
+</plist>

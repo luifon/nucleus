@@ -74,3 +74,6 @@ default_channels = ["discord-home"]
 # Public news routes at /news/api/* stay through cloudflared; the
 # rest gates behind Tailscale per ADR-011.
 nucleus_dashboard = 8092
+# Bonsai image-generation FastAPI backend (loopback only). The /gallery surface
+# proxies generation requests here (ADR-019). Set NUCLEUS_BONSAI_DIR in .env.
+bonsai = 8093

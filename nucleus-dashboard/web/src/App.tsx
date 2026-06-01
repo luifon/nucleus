@@ -9,6 +9,7 @@ import {
   BookOpen,
   Database,
   Newspaper,
+  Image as ImageIcon,
   Activity,
   Menu,
   X,
@@ -22,6 +23,7 @@ import RemindersPage from "./pages/RemindersPage";
 import AgentsPage from "./pages/AgentsPage";
 import VaultPage from "./pages/VaultPage";
 import ChatPage from "./pages/ChatPage";
+import GalleryPage from "./pages/GalleryPage";
 
 type RouteEntry = {
   path: string;
@@ -37,6 +39,7 @@ type RouteEntry = {
 const ROUTES: RouteEntry[] = [
   { path: "/",          label: "dashboard", icon: LayoutDashboard, group: "primary",       impl: "scaffolded" },
   { path: "/chat",      label: "chat",      icon: MessageSquare,   group: "primary",       impl: "scaffolded" },
+  { path: "/gallery",   label: "gallery",   icon: ImageIcon,       group: "primary",       impl: "scaffolded" },
   { path: "/news",      label: "news",      icon: Newspaper,       group: "primary",       impl: "scaffolded" },
   { path: "/agents",    label: "agents",    icon: Boxes,           group: "observability", impl: "scaffolded" },
   { path: "/skills",    label: "skills",    icon: Sparkles,        group: "observability", impl: "scaffolded" },
@@ -93,6 +96,7 @@ export default function App() {
             <Route path="/agents" element={<AgentsPage />} />
             <Route path="/vault" element={<VaultPage />} />
             <Route path="/chat" element={<ChatPage />} />
+            <Route path="/gallery" element={<GalleryPage />} />
             {ROUTES.filter((r) => r.impl === "pending").map((r) => (
               <Route key={r.path} path={r.path} element={<PendingPage label={r.label} Icon={r.icon} />} />
             ))}

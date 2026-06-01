@@ -107,11 +107,18 @@ for template in "$SCRIPT_DIR"/*.plist.example; do
   if [ -n "$FILTER" ] && [[ "$service" != *"$FILTER"* ]]; then
     continue
   fi
+  # The bonsai image-gen backend (ADR-019) is opt-in: skip it unless the
+  # operator has pointed NUCLEUS_BONSAI_DIR at a Bonsai-Image-Demo checkout.
+  if [ "$service" = "bonsai" ] && [ -z "${NUCLEUS_BONSAI_DIR:-}" ]; then
+    echo "skipping bonsai — NUCLEUS_BONSAI_DIR not set in .env"
+    continue
+  fi
   dest="$DEST/${PREFIX}.${service}.plist"
   sed \
     -e "s|__USER_HOME__|$HOME|g" \
     -e "s|__LAUNCHD_PREFIX__|$PREFIX|g" \
     -e "s|__TZ__|$NUCLEUS_TZ|g" \
+    -e "s|__NUCLEUS_BONSAI_DIR__|${NUCLEUS_BONSAI_DIR:-}|g" \
     "$template" > "$dest"
   launchctl unload "$dest" 2>/dev/null || true
   launchctl load "$dest"
