@@ -1,294 +1,173 @@
-# ADR-018 — WhatsApp media: inbound ingestion + outbound delivery
+# ADR-018 — WhatsApp media + personal document library (encrypted Drive)
 
-**Status:** Proposed
+**Status:** Proposed (revised 2026-06-01 — supersedes the vault-binding draft)
 **Date:** 2026-06-01
 **Related:** ADR-005b (WhatsApp DM mode), ADR-006 (reminders / `outbound_queue`),
-ADR-008 (skills), ADR-016 (agent registry / run-log)
+ADR-007 (Gmail/Calendar via claude.ai MCP — trash account), ADR-008 (skills),
+ADR-019 (image-generation gallery — a producer for the outbound media path)
 
 ## Context
 
-The WhatsApp surface is **text-only in both directions** today.
+WhatsApp is **text-only in both directions** today:
 
-**Inbound** (`messaging/whatsapp/src/index.ts`):
-- `extractText()` only reads `conversation`, `extendedTextMessage.text`, and the
-  `caption` of `imageMessage` / `videoMessage`. Everything else returns `""` and
-  is dropped at `if (!text.trim()) return;`.
-- The one media type actually fetched is **audio** — `downloadMediaMessage` →
-  `transcribe()` (Whisper) — but only because it collapses to text.
-- Images and documents are silently discarded; their binaries are never
-  downloaded. `Session.ask()` (`claude_session.ts`) takes a **string only** and
-  pastes it into the tmux TUI, so there is no path to put a file in front of the
-  model even if we had it.
+- **Inbound** (`messaging/whatsapp/src/index.ts`): `extractText()` reads only
+  `conversation` / `extendedTextMessage` / image|video `caption`; everything else
+  drops at `if (!text.trim()) return;`. Audio is the lone media type fetched
+  (`downloadMediaMessage` → Whisper) because it collapses to text.
+- **Outbound** (`outbound_queue` in `memory/whatsapp.db`, drained 1s): text-only
+  schema; the drain calls `sock.sendMessage(jid, { text })`. Baileys *does*
+  support `{ image }` / `{ document, mimetype, fileName }` — never called.
 
-**Outbound** (the `outbound_queue` table in `memory/whatsapp.db`, drained by
-`startOutboundDrain` every 1s):
-- Schema is text-body-only: `(id, target, body, source, enqueued_at, status,
-  attempts, last_error, sent_at, msg_id)` — no media/mimetype/path column.
-- The drain calls `sock.sendMessage(jid, { text: r.body })` and nothing else.
-- Baileys **fully supports** media sends (`{ image }`, `{ document, mimetype,
-  fileName }`, `{ video }`, `{ audio }`) — it's simply never been called.
+The original trigger was delivering generated images. That's now **subsumed and
+sharpened**: the real goal is **WhatsApp as a working surface for documents**,
+and the headline is **on-demand retrieval of personal documents** — "send me my
+RG / CPF / passport" from the DM, and I deliver the file. Generated images
+(ADR-019's gallery) become just *one producer* feeding the same outbound path.
 
-The trigger for this ADR: a local image-generation model. The vision is that
-Nucleus can generate an image (or assemble a document) and **deliver it to the
-operator over WhatsApp** — and, symmetrically, that the operator can send an
-image or PDF *to* Nucleus and have the model actually see it.
+**This revision changes the storage model.** The prior draft bound media into the
+Obsidian vault via a new brain-dump `attach` op. That's dropped. Binary
+docs/media now live in **encrypted Google Drive**; the vault keeps only a
+**text manifest** (index + audit). Rationale below.
 
-## Decision
+## Decision — three planes + two cross-cutting rules
 
-Add media support as **three independent bricks**, so each can ship and be
-tested on its own:
+- **Storage = encrypted Google Drive** (the trash account, `$NUCLEUS_GMAIL_ACCOUNT`),
+  client-side encrypted. Not the vault.
+- **Index/audit = Obsidian manifest** — text only: logical name, tags, Drive file
+  id, mimetype, direction, timestamp. Never the bytes, never decrypted content.
+- **Transport = WhatsApp** — inbound via `downloadMediaMessage`; outbound via the
+  `outbound_queue` extended for media.
 
-1. **Inbound media** — download image/document attachments, stage them on disk,
-   and instruct the session to `Read` them (rather than pasting `@`-mentions).
-2. **Outbound media** — extend `outbound_queue` with a `kind` + media columns;
-   the drain branches to Baileys media shapes; a venue-correct enqueue CLI +
-   skill lets a Claude session queue a file for delivery.
-3. **Local image generation** — a separate model wrapped behind a CLI/skill that
-   emits a file path; it feeds brick 2 and is otherwise decoupled.
+Cross-cutting:
+- **By-reference orchestration** (privacy-critical).
+- **Security model** (encryption + DM-lock + audit).
 
-The crux is brick 2's queue. Riding the **existing `outbound_queue`** (not a new
-channel) is what lets slow generation never block a session: the session's last
-act is to enqueue a row pointing at a file, and the 1s drain does the actual
-send. The GPU and the WhatsApp socket are never coupled.
+### Storage: encrypted Drive, not the vault
 
-### Brick 1 — Inbound media
+- Binary docs/media live in the trash account's Drive, **client-side encrypted**
+  before upload. Operator's choice: it's the account Nucleus already has wired
+  (ADR-007), and encryption means a **trash-account compromise yields only
+  ciphertext**.
+- **Encryption:** symmetric, client-side (tool TBD — `age` preferred). The key
+  lives in the **macOS Keychain** (read on demand by the plumbing), with a backup
+  copy in the operator's password manager. *Lost key = unrecoverable docs* — the
+  backup is mandatory, not optional.
+- **Threat model:** protects against Drive / Google-account compromise. Does NOT
+  protect against a fully-compromised Mac — but the Mac already holds `.env`,
+  every bot token, and the WhatsApp session, so that's already game-over;
+  Keychain doesn't make it worse. (This is why we didn't pick passphrase-per-
+  retrieval: it would either ride through WhatsApp as plaintext or kill the
+  from-anywhere use case, for marginal gain against an already-lost Mac.)
 
-**New branch in `handleMessage()`**, alongside the existing `audioMessage` branch:
+### Index & audit: the Obsidian manifest
 
-```
-if (msg.message?.imageMessage || msg.message?.documentMessage) {
-  // 1. downloadMediaMessage(msg, "buffer", …)  (same call audio already uses)
-  // 2. write buffer to memory/whatsapp-media/inbound/<uuid>.<ext>  (TRANSIENT)
-  //    ext derived from the message's mimetype
-  // 3. caption (imageMessage.caption / documentMessage.caption) → the text body
-  // 4. frame the message so the session is TOLD to Read the staged file
-}
-```
+- A text-only manifest in the vault records every stored item: logical name
+  (`passport`, `RG`, `CPF`, …) + tags, Drive file id, mimetype, direction
+  (in/out), source, timestamp. **No payload, no decrypted text.**
+- It serves double duty: the **lookup index** that resolves "send me my passport"
+  → a Drive file id, and the **audit log** of every store + retrieval.
+- Lives in its own area (e.g. `4-Areas/Documents/`), distinct from knowledge
+  brain-dumps. Text knowledge still flows to the vault as before; this is just a
+  registry of where the encrypted binaries are.
 
-The `memory/whatsapp-media/inbound/` write is **transient ingest only** — the
-place the session can `Read` the bytes from. The *durable* home is the Obsidian
-vault, bound in via the brain-dump plan (see **Vault binding** below), exactly
-the way text captures live in the vault, not in `memory/`.
+### By-reference orchestration (privacy-critical)
 
-**Decision: instruct-to-`Read`, not `@`-mention.** Claude Code's `@path` mention
-is parsed by the TUI and is fragile through a bracketed `tmux paste-buffer` (the
-same paste path that already needs `waitForInputSettled` to avoid eaten
-Enters). Instead, `frame()` emits an explicit instruction and the session uses
-its **Read tool**, which natively renders images and reads PDF pages:
+The model resolves *which* file (by name/tags from the manifest) — it never holds
+the document bytes. The plumbing does: download the ciphertext from Drive →
+decrypt locally to a temp path → hand that path to the outbound queue → Baileys
+sends → wipe the temp. **The bytes flow Drive → disk → WhatsApp, never into the
+model context or session transcripts.** Your passport never lands in an LLM log.
+(Inbound is symmetric: the model only *sees* an inbound doc when you explicitly
+ask it to act on one — see below; pure archival is by-reference too.)
 
-```
-[WhatsApp image — chat <id>]
-The operator sent an image, staged at memory/whatsapp-media/inbound/<uuid>.png
-Read that file to see it, then respond.
-<caption, if any>
-```
+### Inbound (operator → Nucleus)
 
-This is more robust than mention-parsing and uses a documented capability. The
-staging dir lives under `memory/` (already inside the workspace and FDA-readable
-by the bot — see the FDA-on-upgrade memory), so no `--add-dir` change is needed.
+`handleMessage` gains an `imageMessage`/`documentMessage` branch
+(`downloadMediaMessage`, mirroring the audio path). Two outcomes by intent:
 
-**Cleanup:** a sweeper deletes transient `inbound/` files older than 24h (the
-session has read them, and any keeper has already been copied into the vault by
-the plan). Mirror the brain-dump expiry sweep already in the codebase.
+- **"act on this"** ("summarize this contract", "what's the total on this
+  receipt") → stage to a transient path and **instruct the session to `Read`
+  it** (Read renders images + PDF pages natively; robust through the tmux paste
+  path, unlike `@`-mentions). Respond, then sweep the temp.
+- **archive** → encrypt → upload to Drive → write a manifest entry. Per the scope
+  decision, **all inbound media is archived** to encrypted Drive; the model only
+  reads it when you ask it to act.
 
-**Scope guard:** images (`image/*`) and documents (`application/pdf` and common
-doc types) only. Video/sticker stay dropped — Claude can't usefully consume a
-video, and stickers are noise. Log the dropped kind so it's visible.
+### Outbound (Nucleus → operator) — the headline
 
-### Brick 2 — Outbound media
+"send me my passport" → resolve via the manifest → fetch + decrypt → enqueue a
+media row → the drain delivers to the DM. Mechanism = the extended
+`outbound_queue` (below). **DM-locked:** only the operator's JID
+(`resolveOutboundTarget` already gates the allowlist). Identity docs go to the
+operator's own DM and **never** a group/other contact — the catastrophic failure
+mode. Generated images (ADR-019) enqueue the same way: one delivery path, many
+producers.
 
-**Schema migration (both writers).** The table is created identically in two
-places — `messaging/whatsapp/src/db.ts` (TS, `node:sqlite`) and
-`chores/reminders/src/store.rs` (Rust, `sqlx`). Both must gain the new columns,
-and because `CREATE TABLE IF NOT EXISTS` won't alter an existing table, both must
-run idempotent `ALTER TABLE … ADD COLUMN` migrations (guarded against the
-"duplicate column" error so whichever process opens the DB first wins):
+### Outbound queue — media extension (carried from the prior draft, still valid)
+
+Extend `outbound_queue` (created identically in `messaging/whatsapp/src/db.ts`
+and `chores/reminders/src/store.rs`) with idempotent `ALTER TABLE … ADD COLUMN`
+(guard the duplicate-column error):
 
 ```sql
 ALTER TABLE outbound_queue ADD COLUMN kind       TEXT NOT NULL DEFAULT 'text';
-ALTER TABLE outbound_queue ADD COLUMN media_path TEXT;   -- abs path on disk
-ALTER TABLE outbound_queue ADD COLUMN mimetype   TEXT;   -- document sends
-ALTER TABLE outbound_queue ADD COLUMN filename   TEXT;   -- document display name
+ALTER TABLE outbound_queue ADD COLUMN media_path TEXT;   -- abs path to the decrypted temp
+ALTER TABLE outbound_queue ADD COLUMN mimetype   TEXT;
+ALTER TABLE outbound_queue ADD COLUMN filename   TEXT;   -- display name
 ```
 
-`kind ∈ {text, image, document}`. **`body` is reused as the caption** for media
-rows (it's already `NOT NULL`; empty string = no caption) — no separate caption
-column. Existing rows default to `kind='text'` and behave exactly as before.
+`kind ∈ {text, image, document}`; `body` doubles as the caption. The drain
+branches: `{ image, caption }` / `{ document, mimetype, fileName, caption }` /
+`{ text }`. A venue-correct enqueue CLI (`messaging/whatsapp/src/enqueue-media.ts`)
++ a thin skill let a session queue a file; **authorization is enforced at the
+drain** (allowlisted JID), not the enqueue.
 
-**Drain branch** (`startOutboundDrain`, the per-row loop) replaces the single
-`sendMessage(jid, { text })` with:
+### Headless Drive access — the real implementation wrinkle
 
-```
-let content;
-if (r.kind === "image")    content = { image: readFileSync(r.mediaPath), caption: r.body || undefined };
-else if (r.kind === "document") content = { document: readFileSync(r.mediaPath), mimetype: r.mimetype, fileName: r.filename, caption: r.body || undefined };
-else                       content = { text: r.body };
-const sent = await sock.sendMessage(jid, content);
-```
-
-A missing/unreadable `media_path` → `markFailure` (do **not** bump the
-connection-rot counter; that's reserved for `connection closed`). `OutboundRow`,
-`OutboundQueueStore.enqueue()`, and `.pending()` gain the four new fields.
-
-**Enqueue interface for the session.** Venue rule (Rule 7) puts this in
-`messaging/whatsapp/`, mirroring `send.ts` / `ack.ts` which already use
-`OutboundQueueStore`. Two layers:
-
-- A CLI — `messaging/whatsapp/src/enqueue-media.ts` (run as `node` against the
-  built JS) — args `--kind image|document --path <abs> [--caption …]
-  [--mimetype …] [--filename …] [--target whatsapp-dm]`. It inserts one media
-  row. `target` defaults to the operator DM (first `WHATSAPP_ALLOWED_DM_JIDS`).
-- A thin **skill** (`~/.claude/skills/whatsapp-send-media/`, ADR-008) wrapping
-  the CLI, so a session can invoke it ergonomically by name and it carries a
-  `# Failure modes` section. Personal tree, not committed (Rule 11).
-
-**Authorization is enforced at the drain, not the enqueue** (defense in depth):
-`resolveOutboundTarget()` already refuses any JID not on the allowlist, so even a
-mis-targeted enqueue can't escape to an arbitrary chat. Delivering a generated
-image to the operator's own DM is pre-authorized under Rule 6 / ADR-005b; any
-*other* destination still requires explicit user authorization and the skill
-must not default elsewhere.
-
-**Cleanup:** the file referenced by a media row is a *send* artifact, not the
-durable copy. If it's a keeper it was already bound into the vault (see **Vault
-binding**); the queue only needs it until `markSent`, after which a sweep of the
-outbound staging dir (older than 24h) reclaims it.
-
-### Brick 3 — Local image generation
-
-Out of scope for the heavy lift here; it only has to satisfy a contract: a CLI
-`gen-image --prompt "…" --out <abs.png>` that **blocks until the file exists**.
-Nucleus wraps it in a skill that (1) runs the model, (2) calls the brick-2
-enqueue CLI with the resulting path. The model choice (the local-model news item
-that prompted this) is an implementation detail behind that CLI.
-
-### Vault binding — media lives where every other capture lives
-
-Media is **not** a special citizen with its own storage scheme. A binary worth
-keeping binds into the Obsidian vault through the **same brain-dump multi-op plan
-(Rule 9)** that files text captures — same PARA bucket routing, same
-append-over-create, same sibling-linking. `memory/whatsapp-media/` is only
-transient ingest/send scratch; the vault is the home.
-
-The brain-dump `CaptureOp` union (`messaging/whatsapp/src/braindump.ts:43`) is
-**text-only today** — `create`/`append` carry a markdown `body`, `move` renames.
-Binding media therefore requires a **new op kind**:
-
-```
-| {
-    op: "attach";
-    sourcePath: string;        // transient path the binary currently sits at
-    bucket: string;            // SAME bucket vocabulary as `create`
-    filename: string;          // leaf name inside the bucket, e.g. "screenshot.png"
-    createsSubfolder: boolean; // gated identically to `create`/`move`
-    embedInPath?: string;      // a note (create/append target) to embed ![[filename]] into
-    reason: string;
-  }
-```
-
-`attach` copies the binary into the destination **bucket** (co-located with the
-notes there — "the same places other stuff goes"), and, when `embedInPath` is
-set, inserts an Obsidian embed (`![[filename]]`) into that note so the image/PDF
-renders inline. It obeys every Rule-9 guard the text ops do: bucket validity,
-the `createsSubfolder` gate, append-over-create, can't-classify → `0-Inbox/`.
-
-**Persistence default: explicit "save this."** A binary the operator sends over
-is **not** filed by default — the session Reads it for context and the transient
-copy is swept. The `attach` op only fires on an explicit save intent ("save
-this", "keep this", "file that screenshot"). This holds across roles, including
-brain-dump: a captured *thought* still files as text, but its attached image is
-persisted only when asked. Rationale: most images sent over are
-ask-about-this-screenshot, not keepers; auto-filing every one clutters the vault.
-
-Routing, then:
-
-- **Inbound media, any role** → Read for context, transient by default. On an
-  explicit save intent, emit an `attach` op (for a brain-dump capture, paired
-  with the `create`/`append` that holds the surrounding text + the `![[…]]`
-  embed) so the binary lands in the chosen bucket.
-- **Kept outbound artifacts** (a generated image the operator says "save this")
-  → the same `attach` op binds it into the vault. Delivery (the queue) and
-  archival (the vault) stay separate concerns; an image can be sent without being
-  saved, and saved without being re-sent.
-
-**Where the binary lands.** The vault currently sets no `attachmentFolderPath`
-and has no embedded media yet (`.obsidian/app.json` only carries the `_`-prefix
-ignore filter), so this ADR *establishes* the convention:
-
-- **Default: co-located in the destination bucket**, embedded by wiki-embed
-  (`![[filename]]`).
-- **Flat, high-churn buckets** (`2-Daily-Notes`, `6-Slipbox`): the binary goes in
-  a `_attachments/` sibling instead of inline, so it doesn't clutter the graph.
-  The `_` prefix is already graph/search-ignored per `app.json`, so the embed
-  still renders in the note while the file stays out of the graph. The `attach`
-  applier picks co-located vs `_attachments/` from the destination bucket.
-
-### The timeout question — decouple, don't inflate
-
-The operator's instinct was "raise the session timeout." The send itself is
-fast; the slow part is generation. Two patterns, by who's waiting:
-
-- **Nobody waiting** (reminder-fired / proactive "make and send me X"): let the
-  fire session run generation synchronously with a generous `maxWaitMs`, then
-  enqueue. Simple, fine — no user is blocked.
-- **Operator waiting in the DM** ("make me an image now"): the session replies
-  immediately with text ("on it — sending shortly"), and generation runs
-  **detached**; its final step enqueues the media row. The 1s drain delivers the
-  image whenever it's ready. The conversational `ask()` never holds for minutes.
-
-Either way `maxWaitMs` on the *conversational* path stays at today's 180s. Only
-the detached/fire generation step gets a long budget, and it isn't on the
-critical path of a reply. This is the whole reason brick 2 rides the queue.
+The Google Drive access Nucleus has today is a **claude.ai connector
+(interactive auth)**. The WhatsApp bot runs as a **headless** tmux session and
+likely won't have it (cf. the memory: interactively-authed MCP servers are absent
+in headless runs). So store/retrieve needs a **non-interactive Drive path** — a
+Google **service account** (or an OAuth refresh token / `rclone`) with creds on
+the Mac (`.env` / Keychain). This is where most of the build effort concentrates,
+and it's independent of the WhatsApp + encryption work.
 
 ## Rollout phases
 
-1. **Inbound Read (brick 1a).** Add the image/document branch + transient staging
-   + sweeper + `frame()` instruction. Lowest risk, no schema change, immediately
-   useful (send Nucleus a screenshot/PDF and ask about it). Validate the
-   `Read`-tool path end-to-end from a live DM.
-2. **Vault binding (`attach` op).** Extend the `CaptureOp` union + the plan
-   validator + applier with the `attach` opcode (copy-into-bucket + optional
-   `![[…]]` embed), obeying the existing Rule-9 gates. This is the shared
-   primitive both inbound keepers and outbound keepers route through. Validate by
-   capturing a braindump image and confirming it lands embedded in the right
-   bucket.
-3. **Outbound queue (brick 2).** Schema migration on both writers; drain branch;
-   `OutboundRow`/store changes; enqueue CLI; skill wrapper. Validate by enqueuing
-   a static test PNG and confirming delivery to the operator DM. Verify legacy
-   `kind='text'` rows (reminders) still send unchanged.
-4. **Generation (brick 3).** Stand up the local model behind `gen-image`; wire
-   the generate→enqueue skill; choose synchronous-vs-detached per the timeout
-   section. Validate the detached path doesn't stall the conversational reply.
+1. **Outbound media queue** — schema migration (both writers) + drain branch +
+   enqueue CLI/skill. The delivery substrate; also unblocks ADR-019 image
+   delivery. Validate with a static PNG to the DM; verify legacy `text` rows
+   unaffected.
+2. **Drive plumbing** — non-interactive Drive access (service account) + the
+   encrypt/decrypt helpers (Keychain key + backup) + temp-file hygiene.
+3. **Manifest** — the Obsidian text index/audit + resolve-by-name lookup.
+4. **Outbound retrieval** ("send me my X") — the headline skill, DM-locked,
+   by-reference, audited. This is the payoff.
+5. **Inbound capture** — the image/document branch → archive (encrypt→Drive→
+   manifest) + the act-on-this `Read` path.
 
-Phase 1a needs nothing. Phase 2 (the `attach` op) is what makes media durable and
-gates filing any keeper, inbound or outbound. Phases 1a, 2, and 3 are otherwise
-independent; phase 4 (generation) depends on phase 3 (the queue).
+Phases 1–3 are independent; 4 needs 1+2+3; 5 needs 2+3.
 
 ## Consequences
 
-- `outbound_queue` becomes the single typed delivery primitive for *all* WhatsApp
-  output (text, image, document) — reminders, brain-dump acks, and generated
-  media all ride one drain with one auth gate.
-- Media has no parallel storage scheme: durable copies live in the vault via the
-  `attach` op, alongside every text capture. The cost is extending the brain-dump
-  `CaptureOp` contract (type + validator + applier), and that union is now the
-  one place media filing converges — inbound keepers and outbound keepers share it.
-- Two DB writers must keep the migration in lockstep; document the column set in
-  both files so they don't drift (they already note the cross-process contract).
-- Inbound media adds disk churn under `memory/whatsapp-media/`; bounded by the
-  24h sweeper. Large PDFs/images cost session context when `Read`.
-- Baileys media uploads can be slower/flakier than text; the existing
-  per-row retry (`OUTBOUND_MAX_ATTEMPTS`) covers it, but a stuck large upload
-  could slow a drain tick — the 20-row batch cap already bounds that.
+- `outbound_queue` becomes the single media-delivery primitive (reminders,
+  gallery, doc retrieval) with one auth gate.
+- Storage is fully decoupled from the vault — the vault holds only the manifest.
+  No binary churn, no graph clutter; the prior draft's `_attachments`/`attach`-op
+  complexity disappears.
+- Encryption adds a key-management surface (Keychain + a mandatory backup) and a
+  lost-key footgun.
+- Headless Drive access (service account) is real, separable work.
+- Sensitive-document delivery is a high-consequence path: the DM JID-lock,
+  by-reference handling, and audit manifest are all load-bearing, not nice-to-have.
 
 ## Open questions
 
-- **Document inbound breadth:** PDF is clearly worth it (Read supports pages).
-  Office formats (`.docx`, `.xlsx`) aren't natively rendered — convert, or drop
-  with a note? Lean drop-with-note initially.
-- **Save-intent detection:** the explicit-"save this" default needs the planning
-  session to reliably recognize save intent ("save this", "keep that", "file it")
-  vs an ask-about-this image. Worth a few phrasings in the brain-dump persona /
-  `attach`-op prompt so it doesn't under- or over-trigger.
-- **Voice-note *output*** (`{ audio, ptt: true }`): natural future extension
-  (TTS replies) once brick 2's `kind` enum exists — not in this ADR.
+- Encryption tool + container format (`age` vs `gpg` vs `openssl enc`).
+- Manifest shape: one note + per-entry rows/tags, vs a small DB; where under
+  `4-Areas/Documents/`.
+- Name resolution: a tag/alias convention so "passport" / "RG" / "CPF" map
+  unambiguously to one file (and disambiguation when several match).
+- Office formats inbound (`.docx`/`.xlsx`): convert to render, or store-only.
+- Confirm-before-send for identity docs? (DM-to-self is pre-authorized; mis-
+  delivery is the real risk and the JID-lock already covers it — likely no.)
