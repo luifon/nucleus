@@ -6,9 +6,14 @@
 //! the gallery list. PNG bytes are served by a `ServeDir` mount at
 //! `/gallery/files/*` wired in `main.rs`.
 //!
-//! Backends are name→url pairs (e.g. `bonsai` → :8093, `noobai` → :8094), all
-//! speaking the same JSON→PNG contract, so this handler stays model-agnostic.
-//! Each image records which `model` produced it. See ADR-019.
+//! Generation is **asynchronous** (a slow model like NoobAI takes minutes — far
+//! longer than a phone/proxy will hold an HTTP request, which would 'TypeError:
+//! Load Failed' on iOS and, worse, get the dashboard handler cancelled mid-flight
+//! so the result was discarded). So `/generate` inserts a `pending` row, spawns
+//! the actual generation on a background task **decoupled from the request**, and
+//! returns immediately. The task writes the PNG + flips the row to `ready`
+//! (or `failed`) whether or not any client is still connected. The frontend
+//! polls the list while anything is `pending`.
 
 use anyhow::Result;
 use axum::{
@@ -46,13 +51,11 @@ impl GalleryState {
     }
 }
 
-/// Per-model generation defaults (steps, width, height) used when the request
-/// omits them. Bonsai is a 4-step distilled model at 512²; NoobAI is SDXL at
-/// 1024² with ~26 steps.
+/// Per-model generation defaults (steps, width, height) when the request omits
+/// them. Bonsai is a 4-step distilled model at 512²; NoobAI is SDXL at 1024².
 fn model_defaults(model: &str) -> (i64, i64, i64) {
     match model {
         "bonsai" => (4, 512, 512),
-        "noobai" => (26, 1024, 1024),
         _ => (20, 1024, 1024),
     }
 }
@@ -68,19 +71,23 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
           height     INTEGER NOT NULL,
           steps      INTEGER NOT NULL,
           created_at TEXT    NOT NULL,
-          model      TEXT    NOT NULL DEFAULT 'bonsai'
+          model      TEXT    NOT NULL DEFAULT 'bonsai',
+          status     TEXT    NOT NULL DEFAULT 'ready',
+          error      TEXT
         );
         "#,
     )
     .execute(pool)
     .await?;
-    // Idempotent migration for DBs created before the multi-model change
-    // (ADR-019). Ignore the "duplicate column" error on already-migrated DBs.
-    let _ = sqlx::query(
+    // Idempotent migrations for DBs created before these columns (ADR-019).
+    // Ignore the duplicate-column error on already-migrated DBs.
+    for stmt in [
         "ALTER TABLE generated_images ADD COLUMN model TEXT NOT NULL DEFAULT 'bonsai'",
-    )
-    .execute(pool)
-    .await;
+        "ALTER TABLE generated_images ADD COLUMN status TEXT NOT NULL DEFAULT 'ready'",
+        "ALTER TABLE generated_images ADD COLUMN error TEXT",
+    ] {
+        let _ = sqlx::query(stmt).execute(pool).await;
+    }
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_generated_created ON generated_images(created_at DESC)")
         .execute(pool)
         .await?;
@@ -106,6 +113,8 @@ struct ImageRow {
     steps: i64,
     created_at: String,
     model: String,
+    status: String,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -143,8 +152,6 @@ async fn generate(
         .to_string();
 
     let (def_steps, def_w, def_h) = model_defaults(&model);
-    // Default to a time-derived seed so repeated identical prompts vary, unless
-    // the caller pins one for reproducibility.
     let seed = req
         .seed
         .unwrap_or_else(|| (Utc::now().timestamp_subsec_nanos() & 0x7fff_ffff) as i64);
@@ -152,40 +159,15 @@ async fn generate(
     let width = req.width.unwrap_or(def_w).clamp(64, 1536);
     let height = req.height.unwrap_or(def_h).clamp(64, 1536);
 
-    let body = BackendReq { prompt: prompt.clone(), seed, steps, width, height };
-    let resp = s
-        .http
-        .post(format!("{url}/generate"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| GalleryError::Backend(format!("{model} unreachable: {e}")))?;
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(GalleryError::Backend(format!(
-            "{model} returned {code}: {}",
-            detail.chars().take(300).collect::<String>()
-        )));
-    }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| GalleryError::Backend(format!("reading {model} PNG: {e}")))?;
-
     let id = uuid::Uuid::new_v4().to_string();
-    tokio::fs::create_dir_all(&s.files_dir)
-        .await
-        .map_err(|e| GalleryError::Io(format!("create gallery dir: {e}")))?;
-    let path = s.files_dir.join(format!("{id}.png"));
-    tokio::fs::write(&path, &bytes)
-        .await
-        .map_err(|e| GalleryError::Io(format!("write png: {e}")))?;
-
     let created_at = Utc::now().to_rfc3339();
+
+    // Insert the pending row up front so it's persisted regardless of the client
+    // connection's fate.
     sqlx::query(
-        "INSERT INTO generated_images (id, prompt, seed, width, height, steps, created_at, model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO generated_images
+           (id, prompt, seed, width, height, steps, created_at, model, status, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', NULL)",
     )
     .bind(&id)
     .bind(&prompt)
@@ -198,6 +180,35 @@ async fn generate(
     .execute(&s.pool)
     .await?;
 
+    // Run the actual generation detached from this request — survives a client
+    // disconnect (iOS ~60s timeout) and persists the result either way.
+    let s2 = s.clone();
+    let (id2, prompt2, model2) = (id.clone(), prompt.clone(), model.clone());
+    tokio::spawn(async move {
+        let body = BackendReq { prompt: prompt2, seed, steps, width, height };
+        let outcome = run_generation(&s2, &url, &id2, &body).await;
+        match outcome {
+            Ok(()) => {
+                let _ = sqlx::query(
+                    "UPDATE generated_images SET status='ready', error=NULL WHERE id=?1",
+                )
+                .bind(&id2)
+                .execute(&s2.pool)
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!("gallery: {model2} generation {id2} failed: {e}");
+                let _ = sqlx::query(
+                    "UPDATE generated_images SET status='failed', error=?2 WHERE id=?1",
+                )
+                .bind(&id2)
+                .bind(e)
+                .execute(&s2.pool)
+                .await;
+            }
+        }
+    });
+
     Ok(Json(ImageRow {
         id,
         prompt,
@@ -207,14 +218,52 @@ async fn generate(
         steps,
         created_at,
         model,
+        status: "pending".into(),
+        error: None,
     }))
+}
+
+/// Proxy to the model backend and write the PNG. Returns a short error string on
+/// failure (stored on the row). Does not touch DB status — the caller does.
+async fn run_generation(
+    s: &GalleryState,
+    url: &str,
+    id: &str,
+    body: &BackendReq,
+) -> Result<(), String> {
+    let resp = s
+        .http
+        .post(format!("{url}/generate"))
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("backend unreachable: {e}"))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "backend {code}: {}",
+            detail.chars().take(300).collect::<String>()
+        ));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("reading PNG: {e}"))?;
+    tokio::fs::create_dir_all(&s.files_dir)
+        .await
+        .map_err(|e| format!("create gallery dir: {e}"))?;
+    tokio::fs::write(s.files_dir.join(format!("{id}.png")), &bytes)
+        .await
+        .map_err(|e| format!("write png: {e}"))?;
+    Ok(())
 }
 
 async fn list_images(
     State(s): State<Arc<GalleryState>>,
 ) -> Result<Json<Vec<ImageRow>>, GalleryError> {
     let rows: Vec<ImageRow> = sqlx::query_as::<_, ImageRow>(
-        "SELECT id, prompt, seed, width, height, steps, created_at, model
+        "SELECT id, prompt, seed, width, height, steps, created_at, model, status, error
            FROM generated_images
           ORDER BY created_at DESC
           LIMIT 200",
@@ -235,7 +284,6 @@ async fn delete_image(
     if res.rows_affected() == 0 {
         return Err(GalleryError::NotFound);
     }
-    // Best-effort file removal — a missing file shouldn't fail the delete.
     let _ = tokio::fs::remove_file(s.files_dir.join(format!("{id}.png"))).await;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
@@ -253,8 +301,6 @@ struct StatusResp {
 }
 
 async fn status(State(s): State<Arc<GalleryState>>) -> Json<StatusResp> {
-    // Probe each backend's GET /backends with a short timeout — the UI only
-    // needs up/down per model.
     let mut backends = Vec::with_capacity(s.backends.len());
     for (name, url) in &s.backends {
         let reachable = s
@@ -274,9 +320,6 @@ async fn status(State(s): State<Arc<GalleryState>>) -> Json<StatusResp> {
 pub enum GalleryError {
     Sqlx(sqlx::Error),
     BadRequest(String),
-    /// A model backend was unreachable or returned an error.
-    Backend(String),
-    Io(String),
     NotFound,
 }
 
@@ -291,8 +334,6 @@ impl IntoResponse for GalleryError {
         let (code, msg) = match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-            Self::Backend(m) => (StatusCode::BAD_GATEWAY, m),
-            Self::Io(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             Self::Sqlx(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}")),
         };
         (code, Json(serde_json::json!({ "error": msg }))).into_response()

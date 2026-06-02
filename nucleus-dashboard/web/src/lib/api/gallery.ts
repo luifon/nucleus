@@ -14,6 +14,8 @@ export type GeneratedImage = {
   steps: number;
   created_at: string;
   model: string;
+  status: "pending" | "ready" | "failed";
+  error?: string | null;
 };
 
 export type GenerateBody = {

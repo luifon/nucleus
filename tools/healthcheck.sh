@@ -26,7 +26,7 @@ HEAD(){ printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 # KeepAlive bots must have a live PID; periodic jobs (StartInterval /
 # StartCalendarInterval) normally have no PID between fires — absence there
 # is fine, we only flag a nonzero last-exit status.
-PERSISTENT="dev.nucleus.discord dev.nucleus.whatsapp dev.nucleus.nucleus-dashboard dev.nucleus.bonsai dev.nucleus.noobai tech.northmark.cloudflared tech.northmark.container-service"
+PERSISTENT="dev.nucleus.discord dev.nucleus.whatsapp dev.nucleus.nucleus-dashboard dev.nucleus.bonsai tech.northmark.cloudflared tech.northmark.container-service"
 PERIODIC="dev.nucleus.reminders-tick dev.nucleus.news-fetcher dev.nucleus.distiller dev.nucleus.distiller-hourly dev.nucleus.distiller-weekly dev.nucleus.gmail-metabolism dev.nucleus.skill-gap-learner dev.nucleus.preference-learner"
 
 svc_line(){ launchctl list 2>/dev/null | awk -v l="$1" '$3==l{print $1" "$2}'; }

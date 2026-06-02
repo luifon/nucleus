@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { Trash2 } from "lucide-react";
+import { Trash2, RefreshCw, AlertTriangle } from "lucide-react";
 import { type GeneratedImage, imageUrl, deleteImage } from "@/lib/api/gallery";
 
 // One generated image — thumbnail + prompt + metadata, with a hover delete.
-// Mirrors components/news/NewsCard.tsx styling (locked palette, JBM mono).
+// Renders a spinner while pending and an error state if generation failed, so
+// the async lifecycle (ADR-019) shows inline. Mirrors news/NewsCard styling.
 export default function ImageCard({
   image,
   onDeleted,
@@ -27,14 +28,26 @@ export default function ImageCard({
   return (
     <div className="group overflow-hidden rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)]">
       <div className="relative">
-        <a href={imageUrl(image.id)} target="_blank" rel="noreferrer">
-          <img
-            src={imageUrl(image.id)}
-            alt={image.prompt}
-            loading="lazy"
-            className="aspect-square w-full object-cover"
-          />
-        </a>
+        {image.status === "ready" ? (
+          <a href={imageUrl(image.id)} target="_blank" rel="noreferrer">
+            <img
+              src={imageUrl(image.id)}
+              alt={image.prompt}
+              loading="lazy"
+              className="aspect-square w-full object-cover"
+            />
+          </a>
+        ) : image.status === "failed" ? (
+          <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-[var(--color-nucleus-bg)] px-3 text-center text-[var(--color-status-down)]">
+            <AlertTriangle size={18} strokeWidth={1.75} />
+            <span className="text-[10px]">generation failed</span>
+          </div>
+        ) : (
+          <div className="flex aspect-square w-full items-center justify-center gap-1.5 bg-[var(--color-nucleus-bg)] text-xs text-[var(--color-nucleus-faint)]">
+            <RefreshCw size={14} className="animate-spin" />
+            generating…
+          </div>
+        )}
         <span className="absolute left-1.5 top-1.5 rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)]/80 px-1.5 py-0.5 text-[10px] text-[var(--color-nucleus-accent)]">
           {image.model}
         </span>
@@ -49,10 +62,14 @@ export default function ImageCard({
       </div>
       <div className="p-2.5">
         <p className="line-clamp-2 text-xs text-[var(--color-nucleus-text)]">{image.prompt}</p>
-        <p className="mt-1 text-[10px] tabular-nums text-[var(--color-nucleus-faint)] opacity-70">
-          {image.width}×{image.height} · seed {image.seed} ·{" "}
-          {new Date(image.created_at).toLocaleString()}
-        </p>
+        {image.status === "failed" && image.error ? (
+          <p className="mt-1 line-clamp-2 text-[10px] text-[var(--color-status-down)]">{image.error}</p>
+        ) : (
+          <p className="mt-1 text-[10px] tabular-nums text-[var(--color-nucleus-faint)] opacity-70">
+            {image.width}×{image.height} · seed {image.seed} ·{" "}
+            {new Date(image.created_at).toLocaleString()}
+          </p>
+        )}
       </div>
     </div>
   );

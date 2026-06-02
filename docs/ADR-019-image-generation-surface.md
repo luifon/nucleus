@@ -5,12 +5,20 @@
 
 ## Amendments (2026-06-01)
 
-- **Multi-model.** The gallery backend is now a name→url **registry**, not a
-  single Bonsai URL: a second model, **NoobAI-XL (SDXL)** — a self-contained
-  diffusers+MPS service (`tools/noobai/`, `dev.nucleus.noobai` :8094) — was added
-  with a per-image **model selector** in the UI. Each image records its `model`.
-  NoobAI wins on anime/character work (with booru-style tags); Bonsai stays the
-  fast, photoreal/general option. Both kept (each owns a lane).
+- **NoobAI sunset (2026-06-02) — back to single-model (Bonsai).** NoobAI didn't
+  clear the bar for self-use: even after fixing the obvious setup faults
+  (negative prompt, portrait aspect for full-body, lower `guidance_rescale`),
+  output was inconsistent ("great feet, broken everything else"). Diagnosis: the
+  "modern anime" quality people expect is a *pipeline* (base model + character
+  LoRAs + ADetailer face/hand inpaint + hires fix), not a single txt2img call —
+  not worth building for an experimental personal tool. So the `dev.nucleus.noobai`
+  service, plist, `tools/noobai/`, the `[ports].noobai`/`PortsConfig.noobai`
+  config, and the UI model option were all removed; the ~6.5 GB checkpoint freed.
+  The **registry stays** (re-adding a model is a one-config change) — the gallery
+  just has Bonsai for now. Historical noobai images keep rendering (files remain).
+- **Multi-model.** The gallery backend is a name→url **registry**, not a single
+  Bonsai URL: each image records its `model`, with a per-image **model selector**
+  in the UI. (Briefly ran NoobAI-XL as a second model — see sunset above.)
 - **Lazy load + idle-unload (supersedes "always-warm" below).** Two warm models
   was too much RAM. Now neither loads at startup; each loads on first
   `/generate` and frees its weights when idle — so an idle service holds ~0 model
@@ -21,6 +29,14 @@
   ~11.9 GB during a 1024² gen → ~0.8 GB after unload. First gen after idle pays
   the reload (~15s NoobAI / ~1s Bonsai). Status probes (`/backends`) deliberately
   do NOT load the model or reset the idle timer.
+- **Async generation (supersedes "synchronous" in the Decision below).** Holding
+  the HTTP request open for the whole generation broke over a real network: iOS
+  cut it at ~60s (`TypeError: Load Failed`) and the cancelled axum handler
+  discarded the finished result. Now `/generate` inserts a **`pending`** row, runs
+  the generation on a **detached background task**, and returns immediately; the
+  row flips to `ready`/`failed` regardless of the client connection, and the UI
+  **polls while pending**. The "no job queue needed at this scale" note below was
+  wrong for slow models over the network.
 
 ## Context
 

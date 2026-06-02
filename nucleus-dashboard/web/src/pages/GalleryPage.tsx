@@ -1,5 +1,5 @@
-import { useState, type KeyboardEvent } from "react";
-import { Wand2, RefreshCw } from "lucide-react";
+import { useState, useEffect, type KeyboardEvent } from "react";
+import { Wand2 } from "lucide-react";
 import PageShell from "@/components/PageShell";
 import SectionHeader from "@/components/SectionHeader";
 import StatusPill from "@/components/StatusPill";
@@ -13,18 +13,30 @@ import {
 } from "@/lib/api/gallery";
 
 // Image generation surface (ADR-019). Prompt → a selectable local model → gallery.
-// Per-model sizes: SDXL (NoobAI) is incoherent below ~768² — only offer the
-// resolutions each model actually renders well at.
+// Per-model aspect presets: SDXL (NoobAI) wants ~1MP buckets and a PORTRAIT ratio
+// for full-body characters (a square frame squashes proportions). Bonsai is square.
 const MODELS = [
-  { id: "noobai", label: "NoobAI · SDXL", est: "~3 min", defaultSize: 1024, sizes: [768, 1024] },
-  { id: "bonsai", label: "Bonsai · fast", est: "~30s", defaultSize: 512, sizes: [512, 768, 1024] },
+  {
+    id: "bonsai",
+    label: "Bonsai · fast",
+    defaultDim: "512x512",
+    dims: [
+      { label: "512² · square", w: 512, h: 512 },
+      { label: "768² · square", w: 768, h: 768 },
+      { label: "1024² · square", w: 1024, h: 1024 },
+    ],
+  },
 ] as const;
 
 const MODEL_KEY = "gallery_model";
 
 function initialModel(): string {
   const saved = localStorage.getItem(MODEL_KEY);
-  return MODELS.some((m) => m.id === saved) ? (saved as string) : "noobai";
+  return MODELS.some((m) => m.id === saved) ? (saved as string) : "bonsai";
+}
+
+function defaultDimFor(id: string): string {
+  return MODELS.find((m) => m.id === id)?.defaultDim ?? "1024x1024";
 }
 
 export default function GalleryPage() {
@@ -32,9 +44,7 @@ export default function GalleryPage() {
   const status = useFetch(galleryStatus);
   const [prompt, setPrompt] = useState("");
   const [model, setModel] = useState(initialModel);
-  const [size, setSize] = useState<number>(
-    () => MODELS.find((m) => m.id === initialModel())?.defaultSize ?? 1024,
-  );
+  const [dim, setDim] = useState<string>(() => defaultDimFor(initialModel()));
   const [seed, setSeed] = useState("");
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -44,8 +54,8 @@ export default function GalleryPage() {
   const onModelChange = (id: string) => {
     setModel(id);
     localStorage.setItem(MODEL_KEY, id);
-    // Snap the size to the model's native default (SDXL wants 1024, Bonsai 512).
-    setSize(MODELS.find((m) => m.id === id)?.defaultSize ?? size);
+    // Snap to the model's native default aspect (NoobAI → portrait, Bonsai → 512²).
+    setDim(defaultDimFor(id));
   };
 
   const onGenerate = async () => {
@@ -53,7 +63,8 @@ export default function GalleryPage() {
     if (!p || generating) return;
     setGenerating(true);
     setError(null);
-    const body: GenerateBody = { prompt: p, model, width: size, height: size };
+    const [w, h] = dim.split("x").map(Number);
+    const body: GenerateBody = { prompt: p, model, width: w, height: h };
     const s = parseInt(seed, 10);
     if (Number.isFinite(s)) body.seed = s;
     try {
@@ -70,6 +81,16 @@ export default function GalleryPage() {
   const onKey = (e: KeyboardEvent) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") onGenerate();
   };
+
+  // Async generation (ADR-019): generation runs server-side, so poll the list
+  // while anything is still pending and let the tiles flip to images on their
+  // own — survives navigating away / closing the tab.
+  const anyPending = (images.data ?? []).some((i) => i.status === "pending");
+  useEffect(() => {
+    if (!anyPending) return;
+    const t = setTimeout(() => images.refetch(), 4000);
+    return () => clearTimeout(t);
+  }, [anyPending, images.data, images.refetch]);
 
   const count = images.data?.length ?? 0;
 
@@ -120,14 +141,14 @@ export default function GalleryPage() {
           <label className="flex items-center gap-1.5 text-xs text-[var(--color-nucleus-faint)]">
             size
             <select
-              value={size}
-              onChange={(e) => setSize(Number(e.target.value))}
+              value={dim}
+              onChange={(e) => setDim(e.target.value)}
               disabled={generating}
               className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-2 py-1 text-xs text-[var(--color-nucleus-text)] focus:border-[var(--color-nucleus-accent)] focus:outline-none"
             >
-              {current.sizes.map((s) => (
-                <option key={s} value={s}>
-                  {s}²
+              {current.dims.map((d) => (
+                <option key={d.label} value={`${d.w}x${d.h}`}>
+                  {d.label}
                 </option>
               ))}
             </select>
@@ -152,7 +173,7 @@ export default function GalleryPage() {
             className="ml-auto flex items-center gap-1.5 rounded border border-[var(--color-nucleus-accent)] bg-[color-mix(in_srgb,var(--color-nucleus-accent)_12%,transparent)] px-3 py-1.5 text-sm text-[var(--color-nucleus-accent)] transition-opacity disabled:opacity-50"
           >
             <Wand2 size={13} strokeWidth={1.75} />
-            {generating ? `generating… ${current.est}` : "generate"}
+            {generating ? "queuing…" : "generate"}
           </button>
         </div>
         {error && (
@@ -171,13 +192,6 @@ export default function GalleryPage() {
       )}
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
-        {generating && (
-          <div className="flex aspect-square items-center justify-center rounded border border-dashed border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)] text-xs text-[var(--color-nucleus-faint)]">
-            <span className="flex items-center gap-1.5">
-              <RefreshCw size={13} className="animate-spin" /> {current.label.split(" ")[0]} {current.est}
-            </span>
-          </div>
-        )}
         {(images.data ?? []).map((img) => (
           <ImageCard key={img.id} image={img} onDeleted={images.refetch} />
         ))}
