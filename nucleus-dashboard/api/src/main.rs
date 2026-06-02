@@ -196,7 +196,6 @@ async fn main() -> Result<()> {
                     files_dir: gallery_files_dir.clone(),
                     backends: vec![
                         ("bonsai".to_string(), format!("http://127.0.0.1:{}", _settings.ports.bonsai)),
-                        ("noobai".to_string(), format!("http://127.0.0.1:{}", _settings.ports.noobai)),
                     ],
                     // Safe API fallback when a request omits `model` (always-up);
                     // the UI defaults its selector to noobai independently.

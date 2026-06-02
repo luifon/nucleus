@@ -77,6 +77,3 @@ nucleus_dashboard = 8092
 # Bonsai image-generation FastAPI backend (loopback only). The /gallery surface
 # proxies generation requests here (ADR-019). Set NUCLEUS_BONSAI_DIR in .env.
 bonsai = 8093
-# NoobAI-XL (SDXL) image-generation backend (loopback only) — a second /gallery
-# model option, in-repo service (tools/noobai/). ADR-019.
-noobai = 8094
