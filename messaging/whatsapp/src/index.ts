@@ -909,11 +909,14 @@ async function handlePlanResponse(
     return;
   }
 
-  // action === "apply"
-  await sendBotAck(sock, chatId, "📂 aplicando…");
+  // action === "apply" | "modify". `modify` carries field-level patches
+  // (a placement/naming correction the operator made at review) which
+  // applyPlan applies to the ops before filing — so a date/bucket/rename
+  // fix files the same turn instead of cancelling the plan.
+  await sendBotAck(sock, chatId, result.action === "modify" ? "✏️ corrigindo e aplicando…" : "📂 aplicando…");
   let outcome: import("./braindump.js").CaptureOutcome;
   try {
-    outcome = applyPlan(pending.id, result.ids ?? "all", plansStore, config);
+    outcome = applyPlan(pending.id, result.ids ?? "all", plansStore, config, result.patches ?? []);
   } catch (e) {
     const err = (e as Error).message;
     log.error({ err, planId: shortId }, "whatsapp: applyPlan failed");

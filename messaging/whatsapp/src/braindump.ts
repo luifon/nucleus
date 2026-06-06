@@ -30,7 +30,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { Session, type SpawnOptions } from "./claude_session.js";
+import { Session, resolveTz, type SpawnOptions } from "./claude_session.js";
 import {
   PendingPlansStore,
   shortPlanId,
@@ -99,9 +99,25 @@ export interface PlanForReview {
   elapsedMs: number;              // planning latency
 }
 
+/** A field-level correction to a single op, keyed by its 1-based rundown id.
+ *  Only structural/placement fields are patchable — the interpreter has no
+ *  vault access and never sees op bodies, so a *content* correction (the
+ *  captured text itself was wrong) is a re-capture, not a patch. Each field
+ *  is optional; only the present ones override. Invalid fields for the op's
+ *  type are ignored at apply time. */
+export interface OpPatch {
+  id: number;
+  bucket?: string;        // create
+  filename?: string;      // create
+  targetPath?: string;    // append
+  toBucket?: string;      // move
+  toFilename?: string;    // move
+}
+
 export interface InterpretResult {
-  action: "apply" | "reject" | "ambiguous" | "new_capture";
-  ids?: number[];                 // 1-based; required when action === "apply"
+  action: "apply" | "modify" | "reject" | "ambiguous" | "new_capture";
+  ids?: number[];                 // 1-based; required when action === "apply"/"modify"
+  patches?: OpPatch[];            // present when action === "modify"
   note?: string;
 }
 
@@ -132,6 +148,22 @@ const NEEDS_DIRECTIVE_FOR_SUBFOLDER = new Set([
 
 const TMUX_SESSION = "nucleus-whatsapp-braindump";
 
+/** Today's date as YYYY-MM-DD in the operator's wall-clock zone (NUCLEUS_TZ,
+ *  falling back to TZ then UTC) — NOT UTC unconditionally. Daily-note
+ *  filenames and frontmatter must match the day the operator perceives: an
+ *  evening BRT capture (21:00–23:59) is already "tomorrow" in UTC, so
+ *  `new Date().toISOString()` would misfile it a day ahead (observed
+ *  2026-06-04 22:07 BRT → note dated 2026-06-05). */
+export function localToday(): string {
+  // en-CA renders ISO-style YYYY-MM-DD.
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: resolveTz(),
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
 // ==================== PLAN ====================
 
 /** Spawn Claude planning session, return parsed plan + persisted row id.
@@ -153,7 +185,7 @@ export async function planCapture(
 ): Promise<PlanForReview> {
   const t0 = Date.now();
   const vaultSummary = summarizeVault(config.vaultPath);
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localToday();
   const windowSuffix = randomBytes(2).toString("hex");
 
   const prompt = buildPlanPrompt(
@@ -196,7 +228,35 @@ export async function planCapture(
     await session.close().catch(() => {});
   }
 
-  const plan = parsePlan(raw);
+  // A capture must NEVER be lost to a serialization slip. parsePlan throws
+  // when Claude returns prose instead of the ops JSON (e.g. "Plan emitted.
+  // Ack posted (id=72). **Decomposition:** …", observed 2026-06-03 — the
+  // planner narrated its plan as markdown instead of emitting it). Recover
+  // in two tiers: (1) re-ask once with a strict JSON-only nudge in a fresh
+  // session — usually recovers the proper decomposition; (2) if that also
+  // fails to parse, synthesize a fallback plan that files the verbatim
+  // capture into 0-Inbox so it reaches the operator's review instead of
+  // vanishing. Either way the operator still gets a reviewable plan.
+  let plan = safeParsePlan(raw);
+  if (!plan) {
+    const retry = await Session.spawn({
+      ...spawnOpts,
+      windowName: `plan-${windowSuffix}-retry`,
+    });
+    let rawRetry = "";
+    try {
+      rawRetry = await retry.ask(prompt + JSON_ONLY_RETRY_SUFFIX, {
+        maxWaitMs: 10 * 60_000,
+        awaitTurnComplete: true,
+      });
+    } catch {
+      // spawn/ask failure on the retry must not lose the capture either —
+      // fall through to the 0-Inbox fallback below.
+    } finally {
+      await retry.close().catch(() => {});
+    }
+    plan = safeParsePlan(rawRetry) ?? buildFallbackPlan(text, inputKind, today, raw, rawRetry);
+  }
 
   const planId = plansStore.insert({
     chatId,
@@ -276,12 +336,24 @@ export function applyPlan(
   acceptedIds: number[] | "all",
   plansStore: PendingPlansStore,
   config: Config,
+  patches: OpPatch[] = [],
 ): CaptureOutcome {
   const t0 = Date.now();
   const row = plansStore.get(planId);
   if (!row) throw new Error(`braindump: plan ${planId} not found`);
 
-  const ops: CaptureOp[] = JSON.parse(row.opsJson);
+  let ops: CaptureOp[] = JSON.parse(row.opsJson);
+
+  // Operator course-corrections (a `modify` interpretation): apply the
+  // field-level patches to the persisted ops BEFORE filing, then re-persist
+  // so the corrected plan is what the audit trail reflects. The operator
+  // approved the *corrected* placement, so we file it the same turn — no
+  // second review round-trip.
+  if (patches.length > 0) {
+    ops = ops.map((op, i) => applyOpPatch(op, patches.find((p) => p.id === i + 1)));
+    plansStore.updateOps(planId, JSON.stringify(ops));
+  }
+
   const idsToApply =
     acceptedIds === "all"
       ? ops.map((_, i) => i + 1)
@@ -297,7 +369,7 @@ export function applyPlan(
   const approvedAll = idsToApply.length === ops.length;
   const anyOk = applied.some((a) => a.status === "ok");
   if (approvedAll && !anyOk && ops.length > 0) {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localToday();
     const fallbackOp: CaptureOp = {
       op: "create",
       bucket: FALLBACK_BUCKET,
@@ -388,6 +460,46 @@ export async function captureToPara(
 }
 
 // ==================== APPLY HELPERS (unchanged) ====================
+
+/** Apply a field-level operator correction to one op, returning a new op
+ *  (never mutates the input). Only fields valid for the op's type are taken;
+ *  everything else passes through unchanged. When a `create` correction
+ *  retargets a 2-Daily-Notes note to a `YYYY-MM-DD.md` filename, the body's
+ *  `created:` frontmatter is re-synced to match — so a date correction
+ *  doesn't leave a stale created-date inside the file. */
+function applyOpPatch(op: CaptureOp, patch: OpPatch | undefined): CaptureOp {
+  if (!patch) return op;
+  switch (op.op) {
+    case "create": {
+      const next = {
+        ...op,
+        bucket: patch.bucket ?? op.bucket,
+        filename: patch.filename ?? op.filename,
+      };
+      next.body = syncDailyNoteCreated(next.bucket, next.filename, next.body);
+      return next;
+    }
+    case "append":
+      return { ...op, targetPath: patch.targetPath ?? op.targetPath };
+    case "move":
+      return {
+        ...op,
+        toBucket: patch.toBucket ?? op.toBucket,
+        toFilename: patch.toFilename ?? op.toFilename,
+      };
+  }
+}
+
+/** When a create op files a daily note (`2-Daily-Notes`, `YYYY-MM-DD.md`),
+ *  force the frontmatter `created:` line to match the filename date. Keeps the
+ *  note's stamped date and its filename in lockstep — relevant both for the
+ *  TZ fix and for operator date corrections. No-op for any other op. */
+function syncDailyNoteCreated(bucket: string, filename: string, body: string): string {
+  if (bucket.replace(/\/+$/, "") !== "2-Daily-Notes") return body;
+  const m = (filename ?? "").match(/^(\d{4}-\d{2}-\d{2})\.md$/);
+  if (!m) return body;
+  return body.replace(/^(created:[ \t]*).*$/m, `created: ${m[1]}`);
+}
 
 function applyOp(vaultPath: string, op: CaptureOp): AppliedOp {
   switch (op.op) {
@@ -482,7 +594,7 @@ function applyMove(
 }
 
 function appendWithSeparator(absPath: string, fragment: string): void {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localToday();
   const existing = fs.readFileSync(absPath, "utf-8");
   const trimmed = fragment.trim();
   fs.writeFileSync(
@@ -597,6 +709,76 @@ function extractJsonBlock(raw: string): string {
   return trimmed;
 }
 
+/** Strict-mode reminder appended to the planning prompt on a retry after the
+ *  first attempt returned unparseable output. Targets the exact failure mode
+ *  seen 2026-06-03: the planner described its plan in prose ("Plan emitted.
+ *  Ack posted…") instead of emitting the JSON object. */
+const JSON_ONLY_RETRY_SUFFIX = `
+
+——————————————————————————————————————————————
+RETRY — your previous response could not be parsed. It contained prose or a
+narration of the plan instead of the plan itself. Output ONLY the single JSON
+object specified in OUTPUT SHAPE above: no preamble, no "Plan emitted", no
+"Ack posted", no markdown explanation, no code fence. Your entire response
+must begin with "{" and end with "}". Run the ack command first if you
+haven't, then emit the JSON and nothing else.`;
+
+/** parsePlan that returns null instead of throwing — used so a serialization
+ *  slip routes into the retry / fallback path rather than dropping the
+ *  capture entirely. */
+function safeParsePlan(raw: string | undefined): ClaudePlan | null {
+  if (!raw || !raw.trim()) return null;
+  try {
+    return parsePlan(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** Last-resort plan when Claude never produced parseable ops. Files the
+ *  verbatim capture into 0-Inbox as a single create op so the operator's
+ *  normal review/apply flow preserves it. Low confidence flags that the
+ *  decomposition is the operator's to do by hand. */
+function buildFallbackPlan(
+  text: string,
+  inputKind: "text" | "voice",
+  today: string,
+  rawFirst: string,
+  rawRetry: string,
+): ClaudePlan {
+  const stamp = Date.now().toString(36);
+  const body = `---
+created: ${today}
+source: whatsapp-braindump
+tags: [fallback, needs-manual-sort]
+---
+
+# Capture preservada (${today})
+
+O planejador do brain-dump não conseguiu produzir um plano de operações válido
+(retornou prosa em vez de JSON, duas vezes). A captura ${inputKind} original
+está preservada abaixo para classificação manual.
+
+## Captura original
+
+${text.trim()}
+`;
+  return {
+    ops: [
+      {
+        op: "create",
+        bucket: FALLBACK_BUCKET,
+        filename: `${today}-fallback-${stamp}.md`,
+        body,
+        createsSubfolder: false,
+        reason: "planning returned unparseable output twice; preserving verbatim capture",
+      },
+    ],
+    summary: "⚠️ planejamento falhou — captura preservada em 0-Inbox para classificação manual",
+    confidence: 0.2,
+  };
+}
+
 function parsePlan(raw: string): ClaudePlan {
   const cleaned = extractJsonBlock(raw);
   let obj: any;
@@ -660,6 +842,29 @@ function parsePlan(raw: string): ClaudePlan {
   };
 }
 
+/** Pull a clean OpPatch[] out of the interpreter's `patches` field. Drops
+ *  entries without a valid in-range id and string-coerces the recognized
+ *  fields; an entry that carries an id but no patchable field is dropped. */
+function parseOpPatches(raw: any, opCount: number): OpPatch[] {
+  if (!Array.isArray(raw)) return [];
+  const out: OpPatch[] = [];
+  for (const r of raw) {
+    if (!r || typeof r !== "object") continue;
+    const id = typeof r.id === "number" ? Math.trunc(r.id) : Number.parseInt(String(r.id), 10);
+    if (!Number.isFinite(id) || id < 1 || id > opCount) continue;
+    const patch: OpPatch = { id };
+    let touched = false;
+    for (const f of ["bucket", "filename", "targetPath", "toBucket", "toFilename"] as const) {
+      if (typeof r[f] === "string" && r[f].trim()) {
+        patch[f] = r[f].trim();
+        touched = true;
+      }
+    }
+    if (touched) out.push(patch);
+  }
+  return out;
+}
+
 function parseInterpretResponse(raw: string, opCount: number): InterpretResult {
   const cleaned = extractJsonBlock(raw);
   let obj: any;
@@ -686,7 +891,7 @@ function parseInterpretResponse(raw: string, opCount: number): InterpretResult {
       note: typeof obj.note === "string" ? obj.note : "não entendi, pode reformular?",
     };
   }
-  if (action === "apply") {
+  if (action === "apply" || action === "modify") {
     const rawIds = Array.isArray(obj.ids) ? obj.ids : [];
     const ids = rawIds
       .map((n: any) => (typeof n === "number" ? Math.trunc(n) : Number.parseInt(String(n), 10)))
@@ -697,7 +902,14 @@ function parseInterpretResponse(raw: string, opCount: number): InterpretResult {
         note: "não entendi quais ops aplicar. pode reformular?",
       };
     }
-    return { action: "apply", ids, note: typeof obj.note === "string" ? obj.note : undefined };
+    const note = typeof obj.note === "string" ? obj.note : undefined;
+    if (action === "modify") {
+      const patches = parseOpPatches(obj.patches, opCount);
+      // A modify with no usable patch is just an apply — don't strand it.
+      if (patches.length === 0) return { action: "apply", ids, note };
+      return { action: "modify", ids, patches, note };
+    }
+    return { action: "apply", ids, note };
   }
   return {
     action: "ambiguous",
@@ -914,6 +1126,7 @@ ${replyText}
 Output one of these JSON shapes (and NOTHING ELSE):
 
   {"action": "apply",  "ids": [1,2,3], "note": "(optional)"}
+  {"action": "modify", "ids": [1,2,3], "patches": [{"id": 2, "filename": "2026-06-04.md"}], "note": "(optional)"}
   {"action": "reject", "note": "(optional)"}
   {"action": "new_capture", "note": "(optional)"}
   {"action": "ambiguous", "note": "<short question or clarification request, in Brazilian Portuguese>"}
@@ -924,6 +1137,25 @@ Rules:
   1-based op ids to apply (from the list above). Include ALL ids the
   operator approved. Empty ids[] is invalid — use "reject" or
   "ambiguous" instead.
+- "modify" means the operator approved the plan BUT asked for a
+  placement/naming correction to one or more ops — a different date,
+  bucket, filename, or move destination ("é dia 4 não 5", "põe em
+  Projects/X", "renomeia pra Y", "esse append é no arquivo errado").
+  Emit BOTH:
+    • \`ids\` — every op to apply (the corrected ones AND the untouched
+      ones the operator still approved), exactly as in "apply".
+    • \`patches\` — one entry per op being corrected. \`id\` is the op's
+      1-based id; then ONLY the changed fields:
+        create → "bucket" and/or "filename"
+        append → "targetPath"
+        move   → "toBucket" and/or "toFilename"
+      Carry the FULL corrected value (e.g. a whole "2026-06-04.md"
+      filename), not a fragment. The bot re-syncs daily-note frontmatter
+      dates automatically, so you only need the filename for a date fix.
+  Use "modify" — NOT "reject" — whenever the only issue is where/how an
+  op files. Reject is for "throw it all away", not "fix and file".
+  A content correction (the captured TEXT itself is wrong, not its
+  placement) is NOT patchable: return "reject" asking for a re-capture.
 - "reject" means the operator wants nothing applied. Examples: "no",
   "não", "deixa pra lá", "esquece", "cancela".
 - "new_capture" means the reply ISN'T a reply to the plan at all —
@@ -942,10 +1174,6 @@ Rules:
 - Default interpretations: bare "y"/"yes"/"sim"/"ok" → apply all ids.
   Bare "n"/"no"/"não" → reject. A multi-sentence message that
   describes a new thought/event/idea → new_capture.
-- You CANNOT modify ops (change buckets, rename files, etc). If the
-  operator asks for a modification, return "reject" with a note
-  explaining they should resend the capture with the correction.
-
 Output the JSON now. Nothing else.`;
 }
 

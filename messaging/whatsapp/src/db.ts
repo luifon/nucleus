@@ -479,6 +479,15 @@ export class PendingPlansStore {
     return rowToPlan(row);
   }
 
+  /** Replace the persisted ops for a pending plan. Used when the operator
+   *  course-corrects an op during review (a `modify` interpretation): the
+   *  patched ops are what we actually apply, so persist them for audit. */
+  updateOps(id: string, opsJson: string): void {
+    this.db
+      .prepare(`UPDATE pending_plans SET ops_json = ? WHERE id = ?`)
+      .run(opsJson, id);
+  }
+
   /** Set terminal status with resolution note. */
   resolve(id: string, status: PlanStatus, resolution: string): void {
     const now = new Date().toISOString();
