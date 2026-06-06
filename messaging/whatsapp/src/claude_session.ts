@@ -828,7 +828,7 @@ export async function sleepUntilNext4am(): Promise<void> {
   await sleep(delayMs);
 }
 
-function resolveTz(): string {
+export function resolveTz(): string {
   const cands = [process.env.NUCLEUS_TZ, process.env.TZ];
   for (const c of cands) {
     if (!c) continue;
