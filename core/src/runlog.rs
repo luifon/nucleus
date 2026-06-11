@@ -45,6 +45,13 @@ pub struct RunRow {
     /// process leaves this null, which reads as "ran, outcome unknown".)
     #[serde(default)]
     pub ok: Option<bool>,
+    /// `claude --version` output captured at spawn (ADR-020: forensics,
+    /// NOT pinning — the latest binary always runs; this records which one
+    /// did). None on legacy rows and when capture failed. Cached once per
+    /// process, so a `claude update` mid-process shows the pre-update
+    /// version until the next restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_version: Option<String>,
 }
 
 /// `memory/logs/<agent>/runs.jsonl` under the workspace root.
@@ -162,7 +169,18 @@ mod tests {
             started_at: now_rfc3339(),
             ended_at: None,
             ok: None,
+            claude_version: None,
         }
+    }
+
+    #[test]
+    fn legacy_rows_without_claude_version_deserialize() {
+        let legacy = r#"{"run_id":"r","agent":"a","session_id":"s","transcript_path":"/t","tmux_target":"@1","started_at":"2026-01-01T00:00:00Z"}"#;
+        let row: RunRow = serde_json::from_str(legacy).unwrap();
+        assert!(row.claude_version.is_none());
+        // And the field is omitted on write when None, so new code writing
+        // next to legacy rows keeps the same shape.
+        assert!(!serde_json::to_string(&row).unwrap().contains("claude_version"));
     }
 
     #[test]

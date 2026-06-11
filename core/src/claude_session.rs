@@ -27,6 +27,41 @@ use tokio::process::Command;
 
 use crate::claude::PermissionMode;
 
+/// The claude binary Session spawns: `NUCLEUS_CLAUDE_BIN` if set (launchd
+/// plists set it per Rule 5 — launchd inherits no user PATH), else bare
+/// `claude` resolved on PATH.
+pub fn claude_bin() -> String {
+    std::env::var("NUCLEUS_CLAUDE_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "claude".into())
+}
+
+static CLAUDE_VERSION: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
+
+/// `claude --version` output, executed once per process and cached
+/// (ADR-020: version is logged for forensics, never pinned). Best-effort —
+/// None when the exec fails. Runs the same binary `Session::spawn` runs,
+/// so the recorded version is provably the one that served the session;
+/// a `claude update` mid-process shows up after the next restart.
+pub async fn claude_version() -> Option<String> {
+    CLAUDE_VERSION
+        .get_or_init(|| async {
+            let out = tokio::process::Command::new(claude_bin())
+                .arg("--version")
+                .output()
+                .await
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (!v.is_empty()).then_some(v)
+        })
+        .await
+        .clone()
+}
+
 /// A live tmux-hosted claude session.
 pub struct Session {
     pub session_id: String,
@@ -138,9 +173,12 @@ impl Session {
             .unwrap_or_else(|| session_id.chars().take(8).collect());
 
         let claude_args = build_claude_args(&session_id, resuming, &opts);
+        // claude_bin(): same resolution as claude_version(), so the version
+        // recorded in the run-log is provably the binary that ran.
         let inner = format!(
-            "cd {} && claude {}",
+            "cd {} && {} {}",
             shell_quote(&opts.workspace_root.to_string_lossy()),
+            shell_quote(&claude_bin()),
             claude_args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
         );
 
@@ -239,6 +277,7 @@ impl Session {
                 started_at: chrono::Utc::now().to_rfc3339(),
                 ended_at: None,
                 ok: None,
+                claude_version: claude_version().await,
             };
             if let Err(e) = crate::runlog::record_start(&opts.workspace_root, &row) {
                 tracing::warn!("run-log record_start failed for {agent}: {e:#}");
