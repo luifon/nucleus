@@ -15,13 +15,13 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nucleus_core::{
-    claude::PermissionMode,
-    claude_session::{last_n_turns, AskOptions, Session, SpawnOptions, TurnRole},
+    claude_session::{last_n_turns, TurnRole},
     config::Settings,
     diary, skills,
+    session_profile::{ProfileContext, SessionProfile},
 };
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 const AGENT_NAME: &str = "skill-gap-learner";
 const TMUX_SESSION: &str = "nucleus-skill-gap-learner";
@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Cmd::Learn) {
         Cmd::Review { transcript, venue, chat_key } => {
-            review(&workspace_root, &transcript, &venue, chat_key.as_deref()).await
+            review(&workspace_root, &settings, &transcript, &venue, chat_key.as_deref()).await
         }
         Cmd::Learn => learn(&workspace_root, &settings).await,
     }
@@ -80,6 +80,7 @@ fn operator_skills_root() -> PathBuf {
 /// On-the-fly review of a single conversation (the Hermes skill-review arm).
 async fn review(
     workspace_root: &Path,
+    settings: &Settings,
     transcript: &Path,
     venue: &str,
     chat_key: Option<&str>,
@@ -103,8 +104,14 @@ async fn review(
     let library = render_library(&lib);
 
     let prompt = build_review_prompt(&operator_root, &library, venue, &conversation);
-    let (reply, quarantined) =
-        run_skill_session(workspace_root, &operator_root, &format!("review-{venue}"), &prompt).await?;
+    let (reply, quarantined) = run_skill_session(
+        workspace_root,
+        settings,
+        &operator_root,
+        &format!("review-{venue}"),
+        &prompt,
+    )
+    .await?;
 
     let summary = if quarantined.is_empty() {
         format!("reviewed {venue} ({} turns): {}", turns.len(), truncate(&reply, 240))
@@ -272,39 +279,32 @@ Do the work now, then reply with a ONE-LINE summary of what you changed (e.g. "p
 /// Spawn a one-shot skill-writing session, run the prompt, then run the
 /// validation gate over anything it touched. Shared by review / gap / curate.
 /// Returns (reply, quarantined skill names).
+///
+/// ADR-020: goes through `SessionProfile::one_shot_agentic`, which fixes two
+/// long-standing config drops by construction — this path used to run with
+/// `await_turn_complete: false` (mid-task cutoff risk while writing skill
+/// files) and without the Settings `disallowed_tools` denylist.
 async fn run_skill_session(
     workspace_root: &Path,
+    settings: &Settings,
     operator_root: &Path,
     window: &str,
     prompt: &str,
 ) -> Result<(String, Vec<String>)> {
     let started = SystemTime::now();
-    let mut session = Session::spawn(SpawnOptions {
-        workspace_root: workspace_root.to_path_buf(),
-        permission_mode: Some(PermissionMode::Auto),
-        add_dirs: vec![operator_root.to_path_buf()],
-        tmux_session: TMUX_SESSION.into(),
-        window_name: Some(window.to_string()),
-        agent_label: Some(AGENT_NAME.into()),
-        ready_timeout: Duration::from_secs(20),
-        ..SpawnOptions::default()
+    let outcome = SessionProfile::one_shot_agentic(&ProfileContext {
+        workspace_root,
+        claude: &settings.claude,
+        tmux_session: TMUX_SESSION,
+        agent_label: AGENT_NAME,
     })
+    .add_dirs(vec![operator_root.to_path_buf()])
+    .window_name(window)
+    .run_one_shot(prompt)
     .await
-    .with_context(|| format!("spawning skill session ({window})"))?;
-    let raw = session
-        .ask(prompt, AskOptions {
-            max_wait: Duration::from_secs(300),
-            quiescent_window: Duration::from_secs(5),
-            // Candidate for await_turn_complete: true (agentic, writes skill
-            // files). Left legacy for now to keep this change scoped to the
-            // dsu-prep fire fix; revisit if it shows mid-task cutoffs.
-            await_turn_complete: false,
-        })
-        .await;
-    let _ = session.close().await;
-    let reply = raw.with_context(|| format!("skill session ask() failed ({window})"))?;
+    .with_context(|| format!("skill session ({window})"))?;
     let quarantined = gate_touched_skills(operator_root, started)?;
-    Ok((reply, quarantined))
+    Ok((outcome.reply, quarantined))
 }
 
 // ── periodic arm: gap detection + curator ──────────────────────────────────
@@ -334,7 +334,8 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
     let mut gap_summary = "no diaries to scan".to_string();
     if !diaries.trim().is_empty() {
         let prompt = build_gap_prompt(&operator_root, &library, &diaries);
-        let (reply, q) = run_skill_session(workspace_root, &operator_root, "gap", &prompt).await?;
+        let (reply, q) =
+            run_skill_session(workspace_root, settings, &operator_root, "gap", &prompt).await?;
         gap_summary = truncate(&reply, 200);
         if !q.is_empty() {
             gap_summary = format!("{gap_summary} (quarantined: {})", q.join(", "));
@@ -346,7 +347,8 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
     lib2.extend(skills::read_skills(&repo_root, "repo"));
     let curate_summary = {
         let prompt = build_curate_prompt(&operator_root, &render_library(&lib2));
-        let (reply, q) = run_skill_session(workspace_root, &operator_root, "curate", &prompt).await?;
+        let (reply, q) =
+            run_skill_session(workspace_root, settings, &operator_root, "curate", &prompt).await?;
         let mut s = truncate(&reply, 200);
         if !q.is_empty() {
             s = format!("{s} (quarantined: {})", q.join(", "));

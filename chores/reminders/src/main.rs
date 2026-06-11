@@ -16,10 +16,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
 use nucleus_core::{
-    claude::PermissionMode,
-    claude_session::{AskOptions, Session, SpawnOptions},
     config::{self, Settings},
     diary, discord_sdk,
+    session_profile::{ProfileContext, SessionProfile},
 };
 use std::path::Path;
 use std::time::Duration;
@@ -732,48 +731,26 @@ async fn deliver_skill_fire(
         system_prompt,
     );
 
-    let mut session = Session::spawn(SpawnOptions {
-        workspace_root: workspace_root.to_path_buf(),
-        append_system_prompt: Some(persona),
-        permission_mode: Some(PermissionMode::Auto),
-        disallowed_tools: settings.claude.disallowed_tools.clone(),
-        // No allowed_tools pre-approval at this layer. Each skill's
-        // own `allowed-tools` frontmatter (per Claude Code skills
-        // docs) handles tool gating when invoked.
-        tmux_session: "nucleus-reminders-fire".into(),
-        window_name: Some(format!("fire-{}", r.id)),
-        ready_timeout: Duration::from_secs(20),
-        agent_label: Some("reminders-fire".into()),
-        ..SpawnOptions::default()
+    // ADR-020: SessionProfile::one_shot_agentic carries the posture this
+    // path needs — Settings disallowed_tools, await_turn_complete (the model
+    // goes quiet between tool calls; quiescence alone tore the session down
+    // mid-task, the DSU skill-fire failures, 2026-05-26), 300s ceiling
+    // for Playwright-driven skills. Bounded by the per-tick file lock so we
+    // don't overlap. No allowed_tools pre-approval at this layer — each
+    // skill's own `allowed-tools` frontmatter handles tool gating.
+    let outcome = SessionProfile::one_shot_agentic(&ProfileContext {
+        workspace_root,
+        claude: &settings.claude,
+        tmux_session: "nucleus-reminders-fire",
+        agent_label: "reminders-fire",
     })
+    .system_prompt(persona)
+    .window_name(format!("fire-{}", r.id))
+    .run_one_shot(&ask_payload)
     .await
-    .with_context(|| format!("spawning fire session for reminder #{}", r.id))?;
+    .with_context(|| format!("fire session for reminder #{}", r.id))?;
 
-    // Generous timeout — Playwright-driven skills can take a few minutes.
-    // Bounded by the per-tick file lock so we don't overlap.
-    let raw = session
-        .ask(
-            &ask_payload,
-            AskOptions {
-                max_wait: Duration::from_secs(300),
-                quiescent_window: Duration::from_secs(5),
-                // Agentic, multi-step browser work: wait for the model to
-                // actually finish its turn (end_turn), never treat a pause
-                // between tool calls as "done". Without this, ask() tore the
-                // session down mid-task — one step before reading the live-doc
-                // dialog (DSU skill-fire failures, 2026-05-26).
-                await_turn_complete: true,
-            },
-        )
-        .await;
-    let session_id = session.session_id.clone();
-    // Capture before close(); the transcript file persists after the tmux
-    // window dies, so we can inspect how the session ended.
-    let transcript_path = session.transcript_path.clone();
-    let _ = session.close().await;
-    let reply = raw.with_context(|| format!("ask() for reminder #{}", r.id))?;
-
-    if reply.trim().is_empty() {
+    if outcome.reply.trim().is_empty() {
         bail!("session returned an empty reply (treated as failure)");
     }
 
@@ -786,7 +763,7 @@ async fn deliver_skill_fire(
     // the session ended on a clean assistant text turn; otherwise fail into
     // the ⚠️ alert path so the operator gets a "fire failed" notice, never
     // a leaked internal monologue.
-    if !nucleus_core::claude_session::transcript_ends_with_clean_reply(&transcript_path) {
+    if !outcome.ended_clean {
         bail!(
             "session ended mid-action (last assistant output was a tool call, not a \
              final reply) — suppressing forward to avoid leaking narration as the post"
@@ -797,13 +774,13 @@ async fn deliver_skill_fire(
         workspace_root,
         AGENT_NAME,
         "skill-fire",
-        &format!("reminder #{}: {}", r.id, truncate(&reply, 200)),
+        &format!("reminder #{}: {}", r.id, truncate(&outcome.reply, 200)),
         diary::Tag::Observation,
     );
 
     Ok(SkillFireResult {
-        msg_id: format!("skill-fire:{}", session_id),
-        reply,
+        msg_id: format!("skill-fire:{}", outcome.session_id),
+        reply: outcome.reply,
     })
 }
 
@@ -1006,47 +983,29 @@ After the tool succeeds, reply with ONLY the event id on its own line — no pro
     );
 
     // One-shot session — no SessionPool keying, the calendar channel doesn't
-    // need conversational continuity.
-    let mut session = Session::spawn(SpawnOptions {
-        workspace_root: workspace_root.to_path_buf(),
-        append_system_prompt: Some(persona),
-        permission_mode: Some(PermissionMode::Auto),
-        disallowed_tools: settings.claude.disallowed_tools.clone(),
-        // Pre-approve the create_event MCP call. Without this, the
-        // auto-mode classifier blocks invites sent to "external"
-        // addresses — but our entire design point is to send invites
-        // to NUCLEUS_PERSONAL_EMAIL. The persona already constrains
-        // who may be addressed; the classifier guard is redundant
-        // here and just makes calendar deliveries non-functional.
-        allowed_tools: vec![
-            "mcp__claude_ai_Google_Calendar__create_event".into(),
-        ],
-        // Venue-based identifier (Rule 7 / ADR-016) — shared with
-        // gmail-metabolism; JARVIS is the persona, not the code identity.
-        tmux_session: "nucleus-gmail".into(),
-        window_name: Some(format!("cal-{}", r.id)),
-        ready_timeout: Duration::from_secs(20),
-        agent_label: Some("calendar-fire".into()),
-        ..SpawnOptions::default()
-    })
+    // need conversational continuity. ADR-020: one_shot_mcp pre-approves the
+    // create_event MCP call as a constructor arg. Without it, the auto-mode
+    // classifier blocks invites sent to "external" addresses — but our
+    // entire design point is to send invites to NUCLEUS_PERSONAL_EMAIL; the
+    // persona already constrains who may be addressed. tmux session is the
+    // venue (Rule 7 / ADR-016) — shared with gmail-metabolism; JARVIS is the
+    // persona, not the code identity.
+    let outcome = SessionProfile::one_shot_mcp(
+        &ProfileContext {
+            workspace_root,
+            claude: &settings.claude,
+            tmux_session: "nucleus-gmail",
+            agent_label: "calendar-fire",
+        },
+        vec!["mcp__claude_ai_Google_Calendar__create_event".into()],
+    )
+    .system_prompt(persona)
+    .window_name(format!("cal-{}", r.id))
+    .max_wait(Duration::from_secs(60))
+    .run_one_shot(&prompt)
     .await
-    .context("spawning JARVIS session for calendar event")?;
-
-    let raw = session
-        .ask(
-            &prompt,
-            AskOptions {
-                max_wait: Duration::from_secs(60),
-                quiescent_window: Duration::from_secs(3),
-                // Agentic fire (JARVIS calls the calendar MCP tool then
-                // confirms). Same rationale as the skill-fire path: wait for
-                // end_turn, don't cut off mid-tool.
-                await_turn_complete: true,
-            },
-        )
-        .await;
-    let _ = session.close().await;
-    let raw = raw.context("JARVIS calendar create_event")?;
+    .context("JARVIS calendar create_event")?;
+    let raw = outcome.reply;
 
     // Validate the last non-empty line looks like a Google Calendar
     // event id (lowercase alphanumeric, ~26 chars). When the MCP call

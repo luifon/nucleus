@@ -7,10 +7,9 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 use nucleus_core::{
-    claude::PermissionMode,
-    claude_session::{AskOptions, Session, SpawnOptions},
     config::{self, Settings},
     diary, discord_sdk,
+    session_profile::{ProfileContext, SessionProfile},
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -78,16 +77,23 @@ pub async fn run(settings: &Settings, workspace_root: &Path) -> Result<()> {
         &settings.gmail.account,
     );
 
-    let mut session = Session::spawn(SpawnOptions {
-        workspace_root: workspace_root.to_path_buf(),
-        append_system_prompt: Some(persona),
-        permission_mode: Some(PermissionMode::Auto),
-        disallowed_tools: settings.claude.disallowed_tools.clone(),
-        // Pre-approve the Gmail MCP tools JARVIS needs to do the sweep
-        // without per-call classifier prompting. List + read + label
-        // ops are all expected; without this, the run stalls on the
-        // first mutation.
-        allowed_tools: vec![
+    // ADR-020: one_shot_mcp pre-approves the Gmail MCP tools JARVIS needs to
+    // do the sweep without per-call classifier prompting — list + read +
+    // label ops are all expected; without this the run stalls on the first
+    // mutation. Generous ceiling: bulk classification can run minutes;
+    // idempotent — on timeout the watermark stays put and the next 5am cron
+    // retries. This path also gains await_turn_complete (agentic multi-step
+    // classification; previously flagged as a candidate, now the profile
+    // default). tmux session is the venue (Rule 7 / ADR-016); JARVIS is the
+    // persona, resolved via NUCLEUS_PERSONA_GMAIL above.
+    let outcome = SessionProfile::one_shot_mcp(
+        &ProfileContext {
+            workspace_root,
+            claude: &settings.claude,
+            tmux_session: "nucleus-gmail",
+            agent_label: "gmail-metabolism",
+        },
+        vec![
             "mcp__claude_ai_Gmail__list_labels".into(),
             "mcp__claude_ai_Gmail__create_label".into(),
             "mcp__claude_ai_Gmail__search_threads".into(),
@@ -95,35 +101,14 @@ pub async fn run(settings: &Settings, workspace_root: &Path) -> Result<()> {
             "mcp__claude_ai_Gmail__label_thread".into(),
             "mcp__claude_ai_Gmail__unlabel_thread".into(),
         ],
-        // Venue-based identifier (Rule 7 / ADR-016); JARVIS is the persona,
-        // resolved via NUCLEUS_PERSONA_GMAIL above — not the code identity.
-        tmux_session: "nucleus-gmail".into(),
-        window_name: Some("metabolism".into()),
-        ready_timeout: Duration::from_secs(20),
-        agent_label: Some("gmail-metabolism".into()),
-        ..SpawnOptions::default()
-    })
+    )
+    .system_prompt(persona)
+    .window_name("metabolism")
+    .max_wait(Duration::from_secs(60 * 8))
+    .run_one_shot(&prompt)
     .await
-    .context("spawning JARVIS session for inbox metabolism")?;
-
-    let raw = session
-        .ask(
-            &prompt,
-            AskOptions {
-                // Bulk classification can run minutes; keep generous
-                // ceiling. Idempotent: if we time out, watermark stays
-                // put and the next 5am cron retries.
-                max_wait: Duration::from_secs(60 * 8),
-                quiescent_window: Duration::from_secs(5),
-                // Candidate for await_turn_complete: true (agentic, multi-step
-                // classification). Left legacy for now to scope this change to
-                // the dsu-prep fire fix.
-                await_turn_complete: false,
-            },
-        )
-        .await;
-    let _ = session.close().await;
-    let raw = raw.context("JARVIS metabolism turn")?;
+    .context("JARVIS metabolism turn")?;
+    let raw = outcome.reply;
 
     let tally = parse_tally(&raw).with_context(|| {
         format!("could not parse JARVIS tally from reply: {raw}")

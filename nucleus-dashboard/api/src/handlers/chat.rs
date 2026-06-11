@@ -8,9 +8,10 @@ use axum::{
 };
 use chrono::Utc;
 use nucleus_core::{
-    claude::PermissionMode,
-    claude_session::{AskOptions, Session, SessionPool, SpawnOptions},
+    claude_session::{AskOptions, SessionPool},
+    config::ClaudeConfig,
     diary,
+    session_profile::{ProfileContext, SessionProfile},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -24,6 +25,10 @@ pub struct ChatState {
     pub vault_path: PathBuf,
     pub workspace_root: PathBuf,
     pub sessions: SessionPool,
+    /// Profile-derived per-turn ask options (ADR-020).
+    pub ask_options: AskOptions,
+    /// Settings posture for the one-shot title generator.
+    pub claude: ClaudeConfig,
     pub persona_display_name: String,
 }
 
@@ -216,7 +221,7 @@ async fn send_message(
 
     let ask_result = s
         .sessions
-        .ask(&id, &prompt, chat.claude_session_id.clone(), AskOptions::default())
+        .ask(&id, &prompt, chat.claude_session_id.clone(), s.ask_options.clone())
         .await
         .map_err(|e| ChatError::Internal(e.to_string()))?;
 
@@ -266,7 +271,7 @@ async fn send_message(
     // main chat's context.
     let mut new_title = chat.title.clone();
     if chat.title.is_none() {
-        if let Ok(title) = generate_title(&s.workspace_root, &req.message, &ask_result.reply).await {
+        if let Ok(title) = generate_title(&s, &req.message, &ask_result.reply).await {
             sqlx::query("UPDATE obsidian_chats SET title = ?1 WHERE id = ?2")
                 .bind(&title)
                 .bind(&id)
@@ -310,7 +315,7 @@ async fn send_message(
     }))
 }
 
-async fn generate_title(cwd: &PathBuf, user: &str, assistant: &str) -> Result<String> {
+async fn generate_title(s: &ChatState, user: &str, assistant: &str) -> Result<String> {
     // Slice by chars, not bytes — byte slicing panics on multi-byte
     // UTF-8 boundaries (PT/ES/JP/CJK).
     let user_clip: String = user.chars().take(400).collect();
@@ -319,18 +324,16 @@ async fn generate_title(cwd: &PathBuf, user: &str, assistant: &str) -> Result<St
         "Generate a 3-6 word title for this chat. Output only the title, no quotes, no punctuation at end.\n\nUser: {}\n\nAssistant: {}",
         user_clip, asst_clip
     );
-    let mut session = Session::spawn(SpawnOptions {
-        workspace_root: cwd.clone(),
-        permission_mode: Some(PermissionMode::Auto),
-        tmux_session: "nucleus-chat-title".into(),
-        window_name: Some("title".into()),
-        agent_label: Some("chat".into()),
-        ..SpawnOptions::default()
+    let outcome = SessionProfile::one_shot_utility(&ProfileContext {
+        workspace_root: &s.workspace_root,
+        claude: &s.claude,
+        tmux_session: "nucleus-chat-title",
+        agent_label: "chat",
     })
+    .window_name("title")
+    .run_one_shot(&prompt)
     .await?;
-    let raw = session.ask(&prompt, AskOptions::default()).await?;
-    let _ = session.close().await;
-    let title = raw.trim().trim_matches('"').trim_matches('\'').to_string();
+    let title = outcome.reply.trim().trim_matches('"').trim_matches('\'').to_string();
     Ok(title.chars().take(80).collect())
 }
 

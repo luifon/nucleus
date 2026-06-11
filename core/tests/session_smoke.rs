@@ -6,10 +6,18 @@
 //! Marked `#[ignore]` so plain `cargo test` doesn't burn an interactive
 //! claude session. Requires `tmux` + the `claude` binary on PATH.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nucleus_core::claude::PermissionMode;
 use nucleus_core::claude_session::{AskOptions, Session, SpawnOptions};
+
+fn quiescent_ask() -> AskOptions {
+    AskOptions {
+        max_wait: Duration::from_secs(180),
+        quiescent_window: Duration::from_secs(3),
+        await_turn_complete: false,
+    }
+}
 
 #[tokio::test]
 #[ignore]
@@ -21,20 +29,28 @@ async fn spawn_ask_close_round_trip() {
         .to_path_buf();
 
     let spawn_t0 = Instant::now();
+    // Smoke test — full literals on purpose (Default is gone per ADR-020;
+    // real call sites go through session_profile).
     let mut session = Session::spawn(SpawnOptions {
         workspace_root,
+        append_system_prompt: None,
         permission_mode: Some(PermissionMode::Auto),
+        disallowed_tools: vec![],
+        allowed_tools: vec![],
+        add_dirs: vec![],
         tmux_session: "nucleus-test-smoke".into(),
         window_name: Some("smoke".into()),
-        ..SpawnOptions::default()
+        ready_timeout: Duration::from_secs(20),
+        resume_session_id: None,
+        agent_label: None,
     })
     .await
     .expect("spawn");
-    println!("[spawn] ready in {:.1}s — id {}", spawn_t0.elapsed().as_secs_f64(), session.session_id);
+    println!("[spawn] ready in {:.1}s — id {}", spawn_t0.elapsed().as_secs_f64(), session.session_id());
 
     let q1_t0 = Instant::now();
     let r1 = session
-        .ask("Reply with exactly: PONG", AskOptions::default())
+        .ask("Reply with exactly: PONG", quiescent_ask())
         .await
         .expect("ask 1");
     println!("[ask 1] {:.1}s → {:?}", q1_t0.elapsed().as_secs_f64(), r1);
@@ -44,7 +60,7 @@ async fn spawn_ask_close_round_trip() {
     let r2 = session
         .ask(
             "What word did I just ask you to reply with? Output only that word.",
-            AskOptions::default(),
+            quiescent_ask(),
         )
         .await
         .expect("ask 2");
