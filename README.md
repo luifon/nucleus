@@ -430,11 +430,23 @@ nucleus/
 - `docs/ADR-003-permissions.md` — Discord/WhatsApp bot security posture
 - `docs/ADR-004-diary-and-distillation.md` — journal pattern, promotion ops
 - `docs/ADR-005-second-brain.md` — T3 = PARA-organized Obsidian vault; multi-op brain-dump pipeline
+- `docs/ADR-005a-braindump-review.md` — brain-dump review-before-apply (WhatsApp, in-band)
+- `docs/ADR-005b-whatsapp-dm-mode.md` — WhatsApp DM mode: operator-only conversational channel
+- `docs/ADR-006-reminders.md` — reminders as the universal time-triggered notification primitive
+- `docs/ADR-007-gmail-calendar-via-mcp.md` — Gmail + Calendar via Claude.ai MCP (JARVIS persona)
 - `docs/ADR-008-skills.md` — procedural memory via Claude Code's native `SKILL.md` mechanism + the reminders `system_prompt` extension
 - `docs/ADR-009-persona-configurability.md` — venue→persona mapping via `NUCLEUS_PERSONA_<VENUE>`; venue names in code, persona names in config
+- `docs/ADR-010-setup-wizard.md` — guided one-shot Nucleus install (proposed)
+- `docs/ADR-011-perimeter-tailscale.md` — perimeter: Tailscale + Caddy, dashboard at its real hostname
+- `docs/ADR-012-canvas.md` — agent-rendered interactive components in dashboard chat (proposed)
+- `docs/ADR-013-vault-ingestion.md` — PDFs/Word/HTML → markdown in the PARA tree (deferred)
+- `docs/ADR-014-obsidian-vault-customization.md` — vault appearance/config for read-mostly operator use
 - `docs/ADR-015-nucleus-dashboard-unified-operator-app.md` — the single operator app + aesthetic guardrails
 - `docs/ADR-016-agent-registry-and-log-capture.md` — `agents.toml` registry, run-log capture, `/agents` front door, distiller consolidation
 - `docs/ADR-017-skill-gap-learner.md` — autonomous skill learner (on-the-fly review + periodic gap-detection/curator), the validation gate
+- `docs/ADR-018-whatsapp-media.md` — WhatsApp media + personal document library, encrypted Drive (proposed)
+- `docs/ADR-019-image-generation-surface.md` — local Bonsai image gen + dashboard gallery
+- `docs/ADR-020-architecture-hardening.md` — hardening pass: session profiles, migrations, DB ownership rule, ops pruning/rotation, typegen — and the rejected alternatives
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
