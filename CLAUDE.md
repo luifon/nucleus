@@ -407,6 +407,25 @@ Authoring discipline:
    posts. The persona at `chores/reminders/persona.md` enforces the
    ready-to-send-reply contract — don't undo it.
 
+## Rule 12 — Dashboard wire types are generated, not hand-written
+
+`nucleus-dashboard/web/src/lib/api/generated/` is ts-rs output derived
+from the Rust DTO structs (ADR-020). Never edit those files. When you
+change a `#[derive(ts_rs::TS)]` struct in the API (or the shared types in
+core / reminders), regenerate and commit the result:
+
+```bash
+cd nucleus-dashboard/web && npm run generate:api
+```
+
+`npm run check:api` is the drift gate (regenerate + `git diff
+--exit-code`) — run it before committing API-shape changes. Hand-written
+files under `lib/api/` keep only fetch functions and documented UI-layer
+narrowings (status unions etc.) layered over the generated wire types.
+New `i64`/`u64` DTO fields need `#[ts(type = "number")]` (or
+`"number | null"`) — ts-rs defaults them to `bigint`, which breaks
+JSON-parsed numbers.
+
 ## When in doubt
 
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit

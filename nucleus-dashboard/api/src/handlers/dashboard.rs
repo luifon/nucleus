@@ -43,14 +43,16 @@ pub fn router(state: Arc<DashboardState>) -> Router {
 
 // ─── health overview ────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct HealthCheck {
     name: &'static str,
     ok: bool,
     detail: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct HealthOverview {
     checks: Vec<HealthCheck>,
     ok_count: usize,
@@ -146,7 +148,8 @@ async fn check_tmux() -> HealthCheck {
 
 // ─── glances ────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct Glances {
     next_fire: Option<NextFireGlance>,
     latest_vault: Option<VaultGlance>,
@@ -155,29 +158,37 @@ struct Glances {
     latest_chat: Option<ChatGlance>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct NextFireGlance {
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     id: i64,
     title_or_body: String,
     next_fire_at: String,
     channels: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct VaultGlance {
     relpath: String,
     bucket: String,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     mtime_unix: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct DiaryGlance {
     agent: String,
     date: String,
     first_section: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct NewsGlance {
     title: String,
     source_name: String,
@@ -185,7 +196,8 @@ struct NewsGlance {
     notable_score: Option<f64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct ChatGlance {
     id: String,
     title: Option<String>,
@@ -375,7 +387,8 @@ fn truncate(s: &str, n: usize) -> String {
 
 // ─── docker ─────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct DockerContainer {
     id: String,
     names: Vec<String>,
@@ -384,7 +397,8 @@ struct DockerContainer {
     status: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct DockerResp {
     available: bool,
     error: Option<String>,
@@ -431,12 +445,14 @@ async fn docker() -> Json<DockerResp> {
 
 // ─── tunnel ─────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct TunnelResp {
     configured: bool,
     url: Option<String>,
     ok: bool,
     status_code: Option<u16>,
+    #[ts(type = "number | null")]
     elapsed_ms: Option<u128>,
     error: Option<String>,
 }

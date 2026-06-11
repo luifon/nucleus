@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 pub const MAX_ROWS_PER_AGENT: usize = 50;
 
 /// One agent execution. Serialized one-per-line in `runs.jsonl`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct RunRow {
     /// Unique per spawn (a fresh UUID, distinct from `session_id` so a
     /// resumed/rotated session that reuses an id still gets its own row).

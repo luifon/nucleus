@@ -47,7 +47,8 @@ pub fn router(state: Arc<RemindersState>) -> Router {
 
 // ─── DTOs ──────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct ReminderView {
     #[serde(flatten)]
     inner: store::Reminder,
@@ -87,17 +88,26 @@ async fn list(
 // `/list`, which the frontend sorts by next_fire. Only the fire-attempt audit
 // log was unique to /cron, so that's all that moves here.
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow, ts_rs::TS)]
+#[ts(export)]
 struct FireRow {
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     id: i64,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     reminder_id: i64,
     fired_at: String,
     channel: String,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     success: i64,
     msg_id: Option<String>,
     error: Option<String>,
     reminder_title: Option<String>,
     reminder_body: Option<String>,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     is_skill_fire: i64,
 }
 
@@ -127,21 +137,30 @@ async fn list_history(
 
 // ─── write actions ─────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
+#[ts(export)]
 struct IdReq {
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     id: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
+#[ts(export)]
 struct PauseReq {
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     id: i64,
     /// ISO-8601 (any reasonable offset; UTC if no offset). When set
     /// the ticker auto-resumes at that time per ADR-006.
     until: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
+#[ts(export)]
 struct SetTitleReq {
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     id: i64,
     /// Empty / null clears the title.
     title: Option<String>,

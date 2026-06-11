@@ -25,3 +25,4 @@ clap = { version = "4", features = ["derive"] }
 sqlx = { workspace = true }
 serde = { workspace = true }
 futures = { workspace = true }
+ts-rs = { workspace = true }

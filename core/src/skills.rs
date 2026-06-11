@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 pub const SKILL_FILE: &str = "SKILL.md";
 
 /// A parsed skill, ready for the dashboard API or the learner's library view.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct Skill {
     /// Frontmatter `name`, falling back to the directory name (CC convention).
     pub name: String,
@@ -34,6 +35,7 @@ pub struct Skill {
     pub mcp_needed: Option<Vec<String>>,
     pub last_used: Option<String>,
     pub last_failure: Option<String>,
+    #[ts(type = "number | null")]
     pub failure_count_30d: Option<i64>,
     pub notify_on_failure: Option<Vec<String>>,
     pub tags: Option<Vec<String>>,

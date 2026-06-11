@@ -43,7 +43,8 @@ pub fn router(state: Arc<DiaryState>) -> Router {
 
 // ─── agents ─────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct Agent {
     name: String,
     entry_count: usize,
@@ -138,7 +139,8 @@ struct RecentQ {
     limit: Option<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct Entry {
     agent: String,
     date: String,

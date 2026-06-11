@@ -22,7 +22,8 @@ use std::path::Path;
 /// Descriptive grouping for an agent. A *tag*, not a schema discriminator —
 /// every agent is the same `Agent` record regardless of class; this just
 /// drives how `/agents` groups tiles and frames liveness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentClass {
     /// Long-lived, operator-facing, hosts a Claude session pool (rotates).
@@ -39,7 +40,8 @@ pub enum AgentClass {
 }
 
 /// How an agent is launched — determines how liveness is probed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "kebab-case")]
 pub enum Launch {
     /// launchd KeepAlive daemon — liveness = PID present in `launchctl list`.
@@ -56,7 +58,8 @@ pub enum Launch {
 /// An optional behavior a fixed agent carries *internally* (Layer A in
 /// ADR-016 — capabilities live inside agents; maintenance *agents* are
 /// separate registry entries).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     /// Daily 04:00 session rotation (summarize → diary → respawn).

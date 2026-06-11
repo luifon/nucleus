@@ -1,19 +1,21 @@
 // Agents API — the ADR-016 front door. Mirrors
 // nucleus-dashboard/api/src/handlers/agents.rs.
+// Wire types are ts-rs-generated from the Rust structs (./generated/).
 
 import { jsonGet, qs } from "./client";
+import type { AgentView as AgentViewWire } from "./generated/AgentView";
+import type { RunRow } from "./generated/RunRow";
+import type { LogResponse as AgentLog } from "./generated/LogResponse";
 
-export type AgentClass =
-  | "conversational"
-  | "scheduled"
-  | "maintenance"
-  | "infra"
-  | "ephemeral";
+export type { AgentClass } from "./generated/AgentClass";
+export type { Launch } from "./generated/Launch";
+export type { Capability } from "./generated/Capability";
+export type { RunRow } from "./generated/RunRow";
+export type { LogResponse as AgentLog } from "./generated/LogResponse";
 
-export type Launch = "launchd-daemon" | "launchd-cron" | "in-process" | "on-demand";
-
-export type Capability = "rotates" | "skill_review";
-
+/** UI-layer refinement: the wire shape (generated AgentView) carries
+ *  `status: string`; this union narrows it to the values the handler
+ *  actually emits. Not a Rust enum, so it stays hand-written here. */
 export type AgentStatus =
   | "running"
   | "idle"
@@ -22,44 +24,9 @@ export type AgentStatus =
   | "stopped"
   | "unknown";
 
-export type AgentView = {
-  name: string;
-  class: AgentClass;
-  launch: Launch;
-  runtime: string | null;
-  schedule: string | null;
-  diary_key: string | null;
-  persona_venue: string | null;
-  persona_display_name: string | null;
-  capabilities: Capability[];
-  tmux_session: string | null;
-  launchd_label: string | null;
-
+/** Wire shape is generated; `status` narrowing is a UI-layer refinement. */
+export type AgentView = Omit<AgentViewWire, "status"> & {
   status: AgentStatus;
-  pid: number | null;
-  last_exit: number | null;
-  live_windows: number;
-  last_activity_unix: number | null;
-  last_run_started: string | null;
-  run_count: number;
-  attach_cmd: string | null;
-};
-
-export type RunRow = {
-  run_id: string;
-  agent: string;
-  session_id: string;
-  transcript_path: string;
-  tmux_target: string;
-  started_at: string;
-  ended_at: string | null;
-  ok: boolean | null;
-};
-
-export type AgentLog = {
-  agent: string;
-  path: string;
-  tail: string;
 };
 
 export const listAgents = () => jsonGet<AgentView[]>("/agents/api/list");
