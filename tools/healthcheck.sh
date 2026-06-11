@@ -5,9 +5,10 @@
 # depends on are intact. Built to be run after a reboot / OS update (which
 # tear down tmux + processes and frequently reset macOS TCC grants).
 #
-# Secret-free by design: labels come from the committed plists, paths are
-# derived from $HOME / nucleus.toml / .env at runtime. No JIDs, no literal
-# home paths baked in.
+# Secret-free by design: service labels derive from agents.toml (the
+# ADR-016 single source of truth), paths from $HOME / nucleus.toml / .env
+# at runtime. Operator-specific extra services come from the gitignored
+# .env (HEALTHCHECK_EXTRA_*) — never hardcoded here (Rule 1 / SECRETS.md).
 #
 # Usage:  ./tools/healthcheck.sh
 # Exit 0 if no FAILs, 1 otherwise. WARNs don't fail the run.
@@ -15,6 +16,10 @@
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
+
+# .env for NUCLEUS_LAUNCHD_PREFIX / NUCLEUS_BONSAI_DIR / HEALTHCHECK_EXTRA_*.
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+PREFIX="${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}"
 
 pass=0 warn=0 fail=0
 PASS(){ printf '  \033[32m✓ PASS\033[0m  %s\n' "$1"; pass=$((pass+1)); }
@@ -26,8 +31,31 @@ HEAD(){ printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 # KeepAlive bots must have a live PID; periodic jobs (StartInterval /
 # StartCalendarInterval) normally have no PID between fires — absence there
 # is fine, we only flag a nonzero last-exit status.
-PERSISTENT="dev.nucleus.discord dev.nucleus.whatsapp dev.nucleus.nucleus-dashboard dev.nucleus.bonsai tech.northmark.cloudflared tech.northmark.container-service"
-PERIODIC="dev.nucleus.reminders-tick dev.nucleus.news-fetcher dev.nucleus.distiller dev.nucleus.distiller-hourly dev.nucleus.distiller-weekly dev.nucleus.gmail-metabolism dev.nucleus.skill-gap-learner dev.nucleus.preference-learner"
+#
+# Lists derive from agents.toml (ADR-020): launch = "launchd-daemon" →
+# persistent, "launchd-cron" → periodic; in-process / on-demand agents are
+# skipped. Registry labels are canonical dev.nucleus.*; rewritten to the
+# operator's prefix when customized.
+labels_for() {  # $1 = launchd-daemon | launchd-cron
+  awk -v want="$1" '
+    function flush() { if (label != "" && kind == want) print label; label = ""; kind = "" }
+    /^\[\[agent\]\]/              { flush() }
+    /^launchd_label[[:space:]]*=/ { split($0, a, "\""); label = a[2] }
+    /^launch[[:space:]]*=/        { split($0, a, "\""); kind = a[2] }
+    END                           { flush() }
+  ' agents.toml | sed "s/^dev\.nucleus\./$PREFIX./"
+}
+PERSISTENT="$(labels_for launchd-daemon)"
+PERIODIC="$(labels_for launchd-cron)"
+
+# Bonsai (ADR-019) is an external image-gen backend, not an agents.toml
+# entry — checked iff the operator opted in (mirrors install.sh's gate).
+[ -n "${NUCLEUS_BONSAI_DIR:-}" ] && PERSISTENT="$PERSISTENT ${PREFIX}.bonsai"
+
+# Operator-specific extra services (tunnel daemons, sidecars) live in .env,
+# never in this committed file. Space-separated launchd labels.
+PERSISTENT="$PERSISTENT ${HEALTHCHECK_EXTRA_PERSISTENT:-}"
+PERIODIC="$PERIODIC ${HEALTHCHECK_EXTRA_PERIODIC:-}"
 
 svc_line(){ launchctl list 2>/dev/null | awk -v l="$1" '$3==l{print $1" "$2}'; }
 
@@ -56,7 +84,7 @@ if [ -x "$HOME/.local/bin/nucleus-dictate" ]; then PASS "nucleus-dictate present
 
 # --- cloudflared tunnels ------------------------------------------------
 HEAD "cloudflared tunnels"
-if pgrep -qf "cloudflared tunnel run"; then PASS "cloudflared tunnel process up"; else FAIL "no cloudflared tunnel running (northmark URLs down)"; fi
+if pgrep -qf "cloudflared tunnel run"; then PASS "cloudflared tunnel process up"; else FAIL "no cloudflared tunnel running (perimeter URLs down)"; fi
 
 # --- timezone (memory: launchd TZ pitfall) ------------------------------
 HEAD "timezone (launchd TZ pitfall)"
