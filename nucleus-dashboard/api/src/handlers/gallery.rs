@@ -121,13 +121,22 @@ pub fn router(state: Arc<GalleryState>) -> Router {
         .with_state(state)
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow, ts_rs::TS)]
+#[ts(export)]
 struct ImageRow {
     id: String,
     prompt: String,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     seed: i64,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     width: i64,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     height: i64,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     steps: i64,
     created_at: String,
     model: String,
@@ -135,13 +144,18 @@ struct ImageRow {
     error: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
+#[ts(export)]
 struct GenerateReq {
     prompt: String,
     model: Option<String>,
+    #[ts(type = "number | null")]
     seed: Option<i64>,
+    #[ts(type = "number | null")]
     steps: Option<i64>,
+    #[ts(type = "number | null")]
     width: Option<i64>,
+    #[ts(type = "number | null")]
     height: Option<i64>,
 }
 
@@ -306,13 +320,15 @@ async fn delete_image(
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct BackendStatus {
     name: String,
     reachable: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct StatusResp {
     backends: Vec<BackendStatus>,
     default_model: String,

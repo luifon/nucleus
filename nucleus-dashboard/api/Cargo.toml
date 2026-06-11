@@ -29,3 +29,4 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 bollard = { workspace = true }
 reqwest = { workspace = true }
+ts-rs = { workspace = true }

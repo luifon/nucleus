@@ -378,8 +378,11 @@ async fn backfill_pre_adr6(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct Reminder {
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     pub id: i64,
     /// ADR-015: short human-friendly name. When None, display layers
     /// fall back to `body` (if non-empty) or a derived label from
@@ -402,11 +405,16 @@ pub struct Reminder {
     pub system_prompt: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ChannelRow {
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     pub reminder_id: i64,
     pub channel: String,
     pub status: String,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     pub attempts: i64,
     pub last_error: Option<String>,
     pub last_attempt_at: Option<String>,

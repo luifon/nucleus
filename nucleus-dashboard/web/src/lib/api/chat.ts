@@ -1,37 +1,36 @@
+// Wire types are ts-rs-generated from the Rust structs (./generated/).
+
 import { jsonGet, jsonPost } from "./client";
+import type { MessageRow } from "./generated/MessageRow";
+import type { ChatDetail as ChatDetailWire } from "./generated/ChatDetail";
+import type { SendResp as SendRespWire } from "./generated/SendResp";
+import type { ChatRow as Chat } from "./generated/ChatRow";
+import type { CreatedChat } from "./generated/CreatedChat";
+import type { ChatInfo } from "./generated/ChatInfo";
 
-export type Chat = {
-  id: string;
-  title: string | null;
-  claude_session_id: string | null;
-  created_at: string;
-  last_active: string;
+export type { ChatRow as Chat } from "./generated/ChatRow";
+export type { CreatedChat } from "./generated/CreatedChat";
+export type { ChatInfo } from "./generated/ChatInfo";
+
+/** UI-layer refinement: the wire shape (generated MessageRow) carries
+ *  `role: string`; only these two values are ever written by the
+ *  handler, so the dashboard narrows it for rendering. */
+export type ChatRole = "user" | "assistant";
+
+/** Wire shape is generated; `role` narrowing is a UI-layer refinement. */
+export type ChatMessage = Omit<MessageRow, "role"> & {
+  role: ChatRole;
 };
 
-export type ChatMessage = {
-  id: number;
-  chat_id: string;
-  role: "user" | "assistant";
-  content: string;
-  ts: string;
-};
-
-export type ChatDetail = {
-  chat: Chat;
+/** Wire shape is generated; `messages` carry the UI-narrowed ChatMessage. */
+export type ChatDetail = Omit<ChatDetailWire, "messages"> & {
   messages: ChatMessage[];
 };
 
-export type CreatedChat = { id: string; created_at: string };
-
-export type SendResp = {
+/** Wire shape is generated; message fields carry the UI-narrowed ChatMessage. */
+export type SendResp = Omit<SendRespWire, "user_message" | "assistant_message"> & {
   user_message: ChatMessage;
   assistant_message: ChatMessage;
-  chat_title: string | null;
-  session_id: string;
-};
-
-export type ChatInfo = {
-  persona_name: string;
 };
 
 export const getChatInfo = () => jsonGet<ChatInfo>("/chat/api/info");

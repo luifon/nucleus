@@ -52,9 +52,12 @@ impl ListQ {
     }
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow, ts_rs::TS)]
+#[ts(export)]
 struct ItemDto {
     id: String,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     source_id: i64,
     source_name: String,
     url: String,
@@ -66,8 +69,12 @@ struct ItemDto {
     fetch_date: String,
     notable_score: Option<f64>,
     notable_reason: Option<String>,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     posted_to_discord: i64,
+    #[ts(type = "number | null")]
     upvotes: Option<i64>,
+    #[ts(type = "number | null")]
     downvotes: Option<i64>,
 }
 
@@ -131,11 +138,16 @@ async fn list_notable(
     Ok(Json(rows))
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow, ts_rs::TS)]
+#[ts(export)]
 struct SourceDto {
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     id: i64,
     name: String,
     url: String,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     enabled: i64,
     last_fetched_at: Option<String>,
     last_error: Option<String>,
@@ -150,13 +162,20 @@ async fn list_sources(State(s): State<Arc<NewsState>>) -> Result<Json<Vec<Source
     Ok(Json(rows))
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow, ts_rs::TS)]
+#[ts(export)]
 struct RunDto {
     run_id: String,
     started_at: String,
     finished_at: Option<String>,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     items_new: i64,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     items_notable: i64,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     ok: i64,
 }
 
@@ -169,7 +188,8 @@ async fn list_runs(State(s): State<Arc<NewsState>>) -> Result<Json<Vec<RunDto>>,
     Ok(Json(rows))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
+#[ts(export)]
 struct VoteReq {
     item_id: String,
     vote: i32,

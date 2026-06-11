@@ -41,7 +41,8 @@ pub fn router(state: Arc<ChatState>) -> Router {
         .with_state(state)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct ChatInfo {
     persona_name: String,
 }
@@ -83,7 +84,8 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow, ts_rs::TS)]
+#[ts(export)]
 pub struct ChatRow {
     pub id: String,
     pub title: Option<String>,
@@ -92,8 +94,11 @@ pub struct ChatRow {
     pub last_active: String,
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow, ts_rs::TS)]
+#[ts(export)]
 pub struct MessageRow {
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     pub id: i64,
     pub chat_id: String,
     pub role: String,
@@ -113,7 +118,8 @@ async fn list_chats(State(s): State<Arc<ChatState>>) -> Result<Json<Vec<ChatRow>
     Ok(Json(rows))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct CreatedChat {
     id: String,
     created_at: String,
@@ -130,7 +136,8 @@ async fn create_chat(State(s): State<Arc<ChatState>>) -> Result<Json<CreatedChat
     Ok(Json(CreatedChat { id, created_at: now }))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct ChatDetail {
     chat: ChatRow,
     messages: Vec<MessageRow>,
@@ -178,12 +185,14 @@ async fn delete_chat(
     Ok(Json(serde_json::json!({ "ok": true, "deleted": id })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
+#[ts(export)]
 struct SendReq {
     message: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct SendResp {
     user_message: MessageRow,
     assistant_message: MessageRow,

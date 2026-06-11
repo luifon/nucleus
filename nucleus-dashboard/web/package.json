@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "generate:api": "cd ../.. && TS_RS_EXPORT_DIR=\"$PWD/nucleus-dashboard/web/src/lib/api/generated\" cargo test -p nucleus-dashboard -p reminders -p nucleus-core export_bindings",
+    "check:api": "npm run generate:api && cd ../.. && git diff --exit-code nucleus-dashboard/web/src/lib/api/generated/"
   },
   "dependencies": {
     "lucide-react": "^0.460.0",

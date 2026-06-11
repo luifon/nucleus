@@ -1,79 +1,22 @@
+// Wire types are ts-rs-generated from the Rust structs (./generated/).
+
 import { jsonGet } from "./client";
+import type { HealthOverview } from "./generated/HealthOverview";
+import type { Glances } from "./generated/Glances";
+import type { DockerResp } from "./generated/DockerResp";
+import type { TunnelResp } from "./generated/TunnelResp";
 
-export type HealthCheck = {
-  name: string;
-  ok: boolean;
-  detail: string;
-};
-
-export type HealthOverview = {
-  checks: HealthCheck[];
-  ok_count: number;
-  total: number;
-};
-
-export type NextFireGlance = {
-  id: number;
-  title_or_body: string;
-  next_fire_at: string;
-  channels: string | null;
-};
-
-export type VaultGlance = {
-  relpath: string;
-  bucket: string;
-  mtime_unix: number;
-};
-
-export type DiaryGlance = {
-  agent: string;
-  date: string;
-  first_section: string | null;
-};
-
-export type NewsGlance = {
-  title: string;
-  source_name: string;
-  url: string;
-  notable_score: number | null;
-};
-
-export type ChatGlance = {
-  id: string;
-  title: string | null;
-  last_active: string;
-};
-
-export type Glances = {
-  next_fire: NextFireGlance | null;
-  latest_vault: VaultGlance | null;
-  latest_diary: DiaryGlance | null;
-  top_news: NewsGlance | null;
-  latest_chat: ChatGlance | null;
-};
-
-export type DockerContainer = {
-  id: string;
-  names: string[];
-  image: string;
-  state: string;
-  status: string;
-};
-
-export type DockerResp = {
-  available: boolean;
-  error: string | null;
-  containers: DockerContainer[];
-};
-
-export type TunnelResp = {
-  configured: boolean;
-  url: string | null;
-  ok: boolean;
-  status_code: number | null;
-  elapsed_ms: number | null;
-  error: string | null;
-};
+export type { HealthCheck } from "./generated/HealthCheck";
+export type { HealthOverview } from "./generated/HealthOverview";
+export type { NextFireGlance } from "./generated/NextFireGlance";
+export type { VaultGlance } from "./generated/VaultGlance";
+export type { DiaryGlance } from "./generated/DiaryGlance";
+export type { NewsGlance } from "./generated/NewsGlance";
+export type { ChatGlance } from "./generated/ChatGlance";
+export type { Glances } from "./generated/Glances";
+export type { DockerContainer } from "./generated/DockerContainer";
+export type { DockerResp } from "./generated/DockerResp";
+export type { TunnelResp } from "./generated/TunnelResp";
 
 export const getDashboardHealth = () => jsonGet<HealthOverview>("/api/dashboard/health");
 export const getDashboardGlances = () => jsonGet<Glances>("/api/dashboard/glances");

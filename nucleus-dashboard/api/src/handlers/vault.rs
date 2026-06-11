@@ -32,7 +32,8 @@ pub fn router(state: Arc<VaultState>) -> Router {
 
 // ─── buckets ────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct Bucket {
     /// Display name (e.g. `0-Inbox`).
     name: String,
@@ -107,14 +108,19 @@ struct RecentQ {
     limit: Option<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct VaultFile {
     /// Path relative to vault root (e.g. `3-Projects/Foo/index.md`).
     relpath: String,
     /// Top-level bucket name (e.g. `3-Projects`). Empty for root-level files.
     bucket: String,
     /// File mtime in unix epoch seconds.
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     mtime_unix: i64,
+    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
+    #[ts(type = "number")]
     bytes: u64,
     /// Absolute path. Used to fetch the file body separately.
     path: String,

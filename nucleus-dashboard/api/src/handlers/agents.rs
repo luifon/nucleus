@@ -50,7 +50,8 @@ pub fn router(state: Arc<AgentsState>) -> Router {
 
 // ─── list ─────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct AgentView {
     name: String,
     class: nucleus_core::agents::AgentClass,
@@ -75,6 +76,7 @@ struct AgentView {
     /// Live tmux windows matching this agent's session (prefix match).
     live_windows: usize,
     /// Most recent tmux window activity (epoch secs), if any live window.
+    #[ts(type = "number | null")]
     last_activity_unix: Option<i64>,
     /// `started_at` of the most recent run-log row (tmux agents).
     last_run_started: Option<String>,
@@ -232,7 +234,8 @@ struct LogQuery {
     agent: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 struct LogResponse {
     agent: String,
     path: String,

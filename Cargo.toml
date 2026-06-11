@@ -45,6 +45,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 futures = "0.3"
+ts-rs = { version = "12", features = ["serde-compat"] }
 
 nucleus-core = { path = "core" }
 reminders = { path = "chores/reminders" }

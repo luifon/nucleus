@@ -4,25 +4,14 @@
 // applies, so this surface answers "what files changed recently"
 // rather than "what the apply pipeline did" — close enough for the
 // operator's day-to-day "what did the bot write?" question.
+// Wire types are ts-rs-generated from the Rust structs (./generated/).
 
 import { jsonGet, qs } from "./client";
+import type { Bucket as VaultBucket } from "./generated/Bucket";
+import type { VaultFile } from "./generated/VaultFile";
 
-export type VaultBucket = {
-  name: string;
-  file_count: number;
-};
-
-export type VaultFile = {
-  /** Path relative to vault root, e.g. `3-Projects/Foo/index.md`. */
-  relpath: string;
-  /** Top-level PARA bucket name (e.g. `3-Projects`), or empty for
-   *  root-level files. */
-  bucket: string;
-  mtime_unix: number;
-  bytes: number;
-  /** Absolute path. Used by getVaultFile. */
-  path: string;
-};
+export type { Bucket as VaultBucket } from "./generated/Bucket";
+export type { VaultFile } from "./generated/VaultFile";
 
 export const listVaultBuckets = () => jsonGet<VaultBucket[]>("/vault/api/buckets");
 

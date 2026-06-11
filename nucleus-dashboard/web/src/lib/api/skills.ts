@@ -2,29 +2,19 @@
 // Mirrors `nucleus-dashboard/api/src/handlers/skills.rs`. Tiers per
 // ADR-008 storage convention: `personal` lives at ~/.claude/skills/,
 // `repo` lives at .claude/skills/ (committed).
+// Wire types are ts-rs-generated from the Rust structs (./generated/).
 
 import { jsonGet, qs } from "./client";
+import type { Skill as SkillWire } from "./generated/Skill";
 
+/** UI-layer refinement: the wire shape (generated Skill) carries
+ *  `tier: string`; this union narrows it to the two storage trees the
+ *  scanner actually emits. */
 export type SkillTier = "personal" | "repo";
 
-export type Skill = {
-  /** Display name. Frontmatter `name` if present, otherwise the
-   *  skill's directory name (Claude Code convention). */
-  name: string;
-  /** One-line summary from frontmatter. */
-  description: string;
+/** Wire shape is generated; `tier` narrowing is a UI-layer refinement. */
+export type Skill = Omit<SkillWire, "tier"> & {
   tier: SkillTier;
-  /** Absolute path to the SKILL.md. Useful for an "open in $EDITOR"
-   *  hint (operator can copy/paste the path). */
-  path: string;
-  flavor: string | null;
-  mcp_needed: string[] | null;
-  last_used: string | null;
-  last_failure: string | null;
-  failure_count_30d: number | null;
-  notify_on_failure: string[] | null;
-  tags: string[] | null;
-  trigger: string | null;
 };
 
 export const listSkills = () => jsonGet<Skill[]>("/skills/api/list");

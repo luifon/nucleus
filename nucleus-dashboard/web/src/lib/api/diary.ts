@@ -1,24 +1,14 @@
 // Diary API — per-agent dated entries from `memory/diaries/`.
 // Mirrors `nucleus-dashboard/api/src/handlers/diary.rs`. Conventions
 // per ADR-004.
+// Wire types are ts-rs-generated from the Rust structs (./generated/).
 
 import { jsonGet, qs } from "./client";
+import type { Agent as DiaryAgent } from "./generated/Agent";
+import type { Entry as DiaryEntry } from "./generated/Entry";
 
-export type DiaryAgent = {
-  name: string;
-  entry_count: number;
-  /** `YYYY-MM-DD` or null when the agent has no entries (shouldn't
-   *  happen since we only list agents with at least one folder). */
-  last_entry_date: string | null;
-};
-
-export type DiaryEntry = {
-  agent: string;
-  date: string;
-  path: string;
-  body: string;
-  bytes: number;
-};
+export type { Agent as DiaryAgent } from "./generated/Agent";
+export type { Entry as DiaryEntry } from "./generated/Entry";
 
 export const listDiaryAgents = () => jsonGet<DiaryAgent[]>("/diary/api/agents");
 
