@@ -1,4 +1,5 @@
 {
+  "enableAllProjectMcpServers": true,
   "enabledPlugins": {
     "skill-creator@claude-plugins-official": true
   },
