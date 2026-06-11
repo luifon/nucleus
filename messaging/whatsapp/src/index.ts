@@ -33,9 +33,19 @@ import {
   applyPlan,
   interpretResponse,
   formatRundown,
+  BRAINDUMP_TMUX_SESSION,
   type AppliedOp,
   type PlanForReview,
 } from "./braindump.js";
+
+// Every tmux session this process spawns claude windows into. Defined once
+// and reused for both pool construction and the boot-time orphan wipe, so
+// adding a pool can't forget the wipe again — nucleus-whatsapp-dm was
+// missing from a hand-maintained wipe list for 3 weeks (ADR-005b landed
+// without it), and the orphan it left turned into the 2026-06-11 DM outage.
+const GROUP_TMUX_SESSION = "nucleus-whatsapp";
+const DM_TMUX_SESSION = "nucleus-whatsapp-dm";
+const ALL_TMUX_SESSIONS = [GROUP_TMUX_SESSION, DM_TMUX_SESSION, BRAINDUMP_TMUX_SESSION];
 
 // Synchronous destination — no worker-thread buffering. Logs appear in stdout
 // as soon as they're emitted, which matters when tailing to debug what stage
@@ -176,10 +186,11 @@ async function main() {
   const plansStore = new PendingPlansStore(config.dbPath);
 
   // Tear down any leftover tmux sessions from a previous run before we own
-  // fresh windows. Both the conversational SessionPool (nucleus-whatsapp)
-  // and the brain-dump one-shot sessions (nucleus-whatsapp-braindump) get
-  // wiped — startup is the safe time to clean orphans from prior crashes.
-  for (const sessionName of ["nucleus-whatsapp", "nucleus-whatsapp-braindump"]) {
+  // fresh windows — startup is the safe time to clean orphans from prior
+  // crashes. The pools are in-memory, so any surviving window is an orphan
+  // by definition. ALL_TMUX_SESSIONS is derived from the same constants the
+  // pools are built with; never hand-list session names here.
+  for (const sessionName of ALL_TMUX_SESSIONS) {
     await new Promise<void>((resolve) => {
       const child = spawn("tmux", ["kill-session", "-t", sessionName], {
         stdio: "ignore",
@@ -194,7 +205,7 @@ async function main() {
     appendSystemPrompt: config.appendSystemPromptGroup,
     permissionMode: config.permissionMode,
     disallowedTools: config.disallowedTools,
-    tmuxSession: "nucleus-whatsapp",
+    tmuxSession: GROUP_TMUX_SESSION,
     idleTimeoutMs: 4 * 60 * 60 * 1000, // 4h
     agentLabel: "whatsapp",
     reviewNudgeInterval: config.skillNudgeInterval,
@@ -209,7 +220,7 @@ async function main() {
     appendSystemPrompt: config.appendSystemPromptDm,
     permissionMode: config.permissionMode,
     disallowedTools: config.disallowedTools,
-    tmuxSession: "nucleus-whatsapp-dm",
+    tmuxSession: DM_TMUX_SESSION,
     idleTimeoutMs: 4 * 60 * 60 * 1000, // 4h
     agentLabel: "whatsapp",
     reviewNudgeInterval: config.skillNudgeInterval,
