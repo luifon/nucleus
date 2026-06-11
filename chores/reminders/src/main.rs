@@ -825,17 +825,41 @@ struct SkillFireResult {
 /// be re-picked-up by the next tick (its channel rows are still
 /// 'pending') and a duplicate session would spawn.
 ///
-/// Stale-lock recovery: if the lockfile is older than 10 minutes we
+/// Stale-lock recovery: if the lockfile is older than `STALE_AFTER` we
 /// assume the prior process crashed (SIGKILL leaves the file behind
 /// because Drop didn't run) and reclaim it.
+///
+/// Heartbeat (ADR-020): a live holder rewrites the lockfile every
+/// `HEARTBEAT_EVERY`, refreshing its mtime — so staleness means *dead*,
+/// not *slow*. Before this, a fire that outlived the 10-minute window
+/// (Playwright-driven skills, anything past max_wait + spawn/close
+/// overhead) had its lock reclaimed by the next tick and the same
+/// reminder fired twice. If the heartbeat task panics or is starved,
+/// beats stop and we fail open to the pre-existing stale-reclaim path —
+/// never a deadlock.
 struct TickLock {
     path: std::path::PathBuf,
+    heartbeat: tokio::task::JoinHandle<()>,
 }
+
+/// Lockfile age past which a holder is presumed dead. ~9 missed beats
+/// of tolerance against system sleep / disk hiccups.
+const TICK_LOCK_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+const TICK_LOCK_HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
 
 impl TickLock {
     fn try_acquire(path: std::path::PathBuf) -> Result<Option<Self>> {
+        Self::try_acquire_with(path, TICK_LOCK_STALE_AFTER, TICK_LOCK_HEARTBEAT_EVERY)
+    }
+
+    fn try_acquire_with(
+        path: std::path::PathBuf,
+        stale_after: Duration,
+        heartbeat_every: Duration,
+    ) -> Result<Option<Self>> {
         use std::fs::{OpenOptions, metadata};
         use std::io::ErrorKind;
+        use std::io::Write;
         use std::time::SystemTime;
 
         if let Ok(meta) = metadata(&path) {
@@ -843,12 +867,13 @@ impl TickLock {
                 .modified()
                 .ok()
                 .and_then(|t| SystemTime::now().duration_since(t).ok())
-                .map(|d| d > Duration::from_secs(10 * 60))
+                .map(|d| d > stale_after)
                 .unwrap_or(false);
             if stale {
                 tracing::warn!(
                     path = %path.display(),
-                    "stale reminders-tick lockfile (>10min); reclaiming"
+                    "stale reminders-tick lockfile (no heartbeat for >{}s); reclaiming",
+                    stale_after.as_secs()
                 );
                 let _ = std::fs::remove_file(&path);
             }
@@ -859,7 +884,30 @@ impl TickLock {
             .create_new(true)
             .open(&path)
         {
-            Ok(_) => Ok(Some(TickLock { path })),
+            Ok(mut f) => {
+                // PID + timestamp for `cat memory/reminders-tick.lock`
+                // debuggability; content is informational only.
+                let _ = writeln!(f, "{} {}", std::process::id(), Utc::now().to_rfc3339());
+
+                let hb_path = path.clone();
+                let heartbeat = tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(heartbeat_every);
+                    tick.tick().await; // consume the immediate first tick
+                    loop {
+                        tick.tick().await;
+                        // Rewrite = mtime refresh. create(true), NOT
+                        // create_new: if the file vanished (operator rm),
+                        // recreating re-asserts the lock we still hold.
+                        let stamp =
+                            format!("{} {}\n", std::process::id(), Utc::now().to_rfc3339());
+                        if let Err(e) = std::fs::write(&hb_path, stamp) {
+                            tracing::warn!("tick-lock heartbeat write failed: {e}");
+                        }
+                    }
+                });
+
+                Ok(Some(TickLock { path, heartbeat }))
+            }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(None),
             Err(e) => Err(anyhow!(
                 "opening tick lockfile {}: {e}",
@@ -871,6 +919,9 @@ impl TickLock {
 
 impl Drop for TickLock {
     fn drop(&mut self) {
+        // Abort BEFORE removing so the heartbeat can't resurrect the file
+        // after release.
+        self.heartbeat.abort();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -1046,4 +1097,87 @@ fn first_csv_entry(env_var: &str) -> Option<String> {
         .next()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tick_lock_tests {
+    use super::*;
+
+    fn tmp_lock_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("nucleus-ticklock-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[tokio::test]
+    async fn second_acquire_is_refused_while_held() {
+        let path = tmp_lock_path("held.lock");
+        let lock = TickLock::try_acquire_with(
+            path.clone(),
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+        )
+        .unwrap()
+        .expect("first acquire succeeds");
+        assert!(
+            TickLock::try_acquire_with(path, Duration::from_secs(600), Duration::from_secs(3600))
+                .unwrap()
+                .is_none(),
+            "second acquire must be refused"
+        );
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_keeps_lock_fresh_past_stale_window() {
+        let path = tmp_lock_path("heartbeat.lock");
+        // Stale window 2s, heartbeat 300ms: without the heartbeat the lock
+        // would be reclaimable after 2s — the beats must prevent that.
+        let lock = TickLock::try_acquire_with(
+            path.clone(),
+            Duration::from_secs(2),
+            Duration::from_millis(300),
+        )
+        .unwrap()
+        .expect("first acquire succeeds");
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(
+            TickLock::try_acquire_with(
+                path,
+                Duration::from_secs(2),
+                Duration::from_secs(3600)
+            )
+            .unwrap()
+            .is_none(),
+            "live holder must not be reclaimed: heartbeat keeps mtime fresh"
+        );
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn dead_holder_is_reclaimed_after_stale_window() {
+        let path = tmp_lock_path("dead.lock");
+        let lock = TickLock::try_acquire_with(
+            path.clone(),
+            Duration::from_millis(800),
+            Duration::from_secs(3600), // no beats inside the window
+        )
+        .unwrap()
+        .expect("first acquire succeeds");
+        // Simulate SIGKILL: stop the heartbeat and skip Drop so the file
+        // stays behind with an aging mtime.
+        lock.heartbeat.abort();
+        std::mem::forget(lock);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let reclaimed = TickLock::try_acquire_with(
+            path.clone(),
+            Duration::from_millis(800),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        assert!(reclaimed.is_some(), "stale lock from a dead holder must be reclaimed");
+        drop(reclaimed);
+    }
 }
