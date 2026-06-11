@@ -33,6 +33,9 @@ export async function alertDiscordHome(body: string): Promise<void> {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ content: body, flags: SUPPRESS_EMBEDS }),
+        // This sits on exit paths (connection-rot, drain watchdog) — a
+        // hung Discord call must never block the respawn.
+        signal: AbortSignal.timeout(5_000),
       },
     );
     if (!res.ok) {
