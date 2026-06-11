@@ -6,10 +6,9 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use nucleus_core::{
-    claude::PermissionMode,
-    claude_session::{AskOptions, Session, SpawnOptions},
     config::Settings,
     db, diary, discord_sdk,
+    session_profile::{ProfileContext, SessionProfile},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -81,7 +80,7 @@ async fn main() -> Result<()> {
     // to items already in the DB for today, without re-fetching.
     match std::env::args().nth(1).as_deref() {
         Some("rescore-today") => {
-            return rescore_today(&pool, &workspace_root, &settings.identity.user_name).await;
+            return rescore_today(&pool, &workspace_root, &settings).await;
         }
         Some(other) => {
             anyhow::bail!("unknown subcommand: {other}");
@@ -121,7 +120,7 @@ async fn main() -> Result<()> {
                 // else (including the unscored 21..N) gets deleted by
                 // persist_top_n so the UI isn't drowned by a single source.
                 let to_score: &[ParsedItem] = &new[..new.len().min(PRE_SCORE_CAP)];
-                let scored = score_all(&workspace_root, to_score, &settings.identity.user_name).await?;
+                let scored = score_all(&workspace_root, to_score, &settings).await?;
                 let kept = persist_top_n(&pool, &new, &scored, POST_SCORE_CAP).await?;
                 notable_count += scored.iter().filter(|s| s.score >= 0.6 && kept.iter().any(|k| k.id == s.id)).count();
                 all_kept.extend(kept);
@@ -164,7 +163,7 @@ async fn main() -> Result<()> {
 /// One-off backfill: take today's items in-place, apply the new pipeline
 /// (HN/lobste.rs URL swap from summary, then score-everything-and-cap-to-N).
 /// Run via `news-fetcher rescore-today`. No network fetch happens.
-async fn rescore_today(pool: &SqlitePool, workspace_root: &PathBuf, user_name: &str) -> Result<()> {
+async fn rescore_today(pool: &SqlitePool, workspace_root: &PathBuf, settings: &Settings) -> Result<()> {
     let today = Utc::now().format("%Y-%m-%d").to_string();
     tracing::info!("rescore-today: target fetch_date = {}", today);
 
@@ -247,7 +246,7 @@ async fn rescore_today(pool: &SqlitePool, workspace_root: &PathBuf, user_name: &
             .collect();
         if !to_score.is_empty() {
             tracing::info!("rescore-today: {} -> scoring {} unscored items", src.name, to_score.len());
-            let scored = score_all(workspace_root, &to_score, user_name).await?;
+            let scored = score_all(workspace_root, &to_score, settings).await?;
             for s in &scored {
                 save_score(pool, &s.id, s.score, &s.reason).await?;
             }
@@ -631,10 +630,10 @@ const SCORE_BATCH_SIZE: usize = 20;
 
 /// Score every item in `items`, batching to keep each Claude call bounded.
 /// Returns one ScoredItem per input item (or fewer if Claude drops some).
-async fn score_all(workspace_root: &PathBuf, items: &[ParsedItem], user_name: &str) -> Result<Vec<ScoredItem>> {
+async fn score_all(workspace_root: &PathBuf, items: &[ParsedItem], settings: &Settings) -> Result<Vec<ScoredItem>> {
     let mut out: Vec<ScoredItem> = Vec::with_capacity(items.len());
     for chunk in items.chunks(SCORE_BATCH_SIZE) {
-        match score_notability(workspace_root, chunk, user_name).await {
+        match score_notability(workspace_root, chunk, settings).await {
             Ok(batch) => out.extend(batch),
             Err(e) => tracing::warn!("fetcher: score batch failed ({}): {}", chunk.len(), e),
         }
@@ -642,7 +641,7 @@ async fn score_all(workspace_root: &PathBuf, items: &[ParsedItem], user_name: &s
     Ok(out)
 }
 
-async fn score_notability(workspace_root: &PathBuf, items: &[ParsedItem], user_name: &str) -> Result<Vec<ScoredItem>> {
+async fn score_notability(workspace_root: &PathBuf, items: &[ParsedItem], settings: &Settings) -> Result<Vec<ScoredItem>> {
     if items.is_empty() {
         return Ok(vec![]);
     }
@@ -712,6 +711,7 @@ async fn score_notability(workspace_root: &PathBuf, items: &[ParsedItem], user_n
         )
     };
 
+    let user_name = &settings.identity.user_name;
     let prompt = format!(r#"You are scoring AI/tech news items for {user_name}, a senior software engineer.
 
 {base_rubric}{learned_block}
@@ -725,19 +725,17 @@ Items:
         items = serde_json::to_string_pretty(&payload)?,
     );
 
-    let mut session = Session::spawn(SpawnOptions {
-        workspace_root: workspace_root.clone(),
-        permission_mode: Some(PermissionMode::Auto),
-        tmux_session: "nucleus-news-fetcher".into(),
-        window_name: Some("score".into()),
-        agent_label: Some("news-fetcher".into()),
-        ..SpawnOptions::default()
+    let outcome = SessionProfile::one_shot_utility(&ProfileContext {
+        workspace_root,
+        claude: &settings.claude,
+        tmux_session: "nucleus-news-fetcher",
+        agent_label: "news-fetcher",
     })
+    .window_name("score")
+    .run_one_shot(&prompt)
     .await
-    .context("spawning claude session for scoring")?;
-
-    let raw = session.ask(&prompt, AskOptions::default()).await?;
-    let _ = session.close().await;
+    .context("scoring session")?;
+    let raw = outcome.reply;
 
     let cleaned = raw.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
     let scored: Vec<ScoredItem> = serde_json::from_str(cleaned)

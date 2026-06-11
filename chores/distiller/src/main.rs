@@ -13,10 +13,10 @@
 use anyhow::{Context, Result};
 use chrono::{Duration, Local, NaiveDate};
 use nucleus_core::{
-    claude::PermissionMode,
-    claude_session::{AskOptions, Session, SpawnOptions},
+    claude_session::Session,
     config::Settings,
     diary, memory,
+    session_profile::{ProfileContext, SessionProfile},
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
         .await;
 
     // One daily pass: extract fresh candidates, then judge + archive + prune.
-    metabolism(&workspace_root, &diary_root).await?;
+    metabolism(&workspace_root, &diary_root, &settings).await?;
     contemplation(&workspace_root, &diary_root, &settings).await?;
     Ok(())
 }
@@ -83,24 +83,27 @@ struct Candidate {
     confidence: f64,
 }
 
-async fn metabolism(workspace_root: &Path, diary_root: &Path) -> Result<()> {
+async fn metabolism(workspace_root: &Path, diary_root: &Path, settings: &Settings) -> Result<()> {
     let agents = list_agent_dirs(diary_root)?;
     if agents.is_empty() {
         tracing::info!("metabolism: no agent diaries found");
         return Ok(());
     }
     // One session reused across agents — pays the ~5s spawn cost once
-    // instead of per-agent.
-    let mut session = Session::spawn(SpawnOptions {
-        workspace_root: workspace_root.to_path_buf(),
-        permission_mode: Some(PermissionMode::Auto),
-        tmux_session: "nucleus-distiller".into(),
-        window_name: Some("metabolism".into()),
-        agent_label: Some("distiller".into()),
-        ..SpawnOptions::default()
+    // instead of per-agent; into_parts() keeps the manual lifecycle while
+    // the profile supplies the posture (ADR-020 — this path used to run
+    // without the Settings disallowed_tools).
+    let (spawn_opts, ask_opts) = SessionProfile::one_shot_utility(&ProfileContext {
+        workspace_root,
+        claude: &settings.claude,
+        tmux_session: "nucleus-distiller",
+        agent_label: "distiller",
     })
-    .await
-    .context("spawning claude session for metabolism")?;
+    .window_name("metabolism")
+    .into_parts();
+    let mut session = Session::spawn(spawn_opts)
+        .await
+        .context("spawning claude session for metabolism")?;
     // Daily pass — scan the last day's entries (was hourly).
     let since = Local::now() - Duration::days(1);
     let mut total_staged = 0usize;
@@ -128,7 +131,7 @@ Diary content:
 {body}
 ---"#);
 
-        let raw = session.ask(&prompt, AskOptions::default()).await?;
+        let raw = session.ask(&prompt, ask_opts.clone()).await?;
         let cleaned = strip_code_fence(&raw);
         let candidates: Vec<Candidate> = match serde_json::from_str(&cleaned) {
             Ok(v) => v,
@@ -203,17 +206,18 @@ async fn contemplation(workspace_root: &Path, diary_root: &Path, settings: &Sett
         return Ok(());
     }
     let vault_path = expand_home(&settings.obsidian.vault_path);
-    let mut session = Session::spawn(SpawnOptions {
-        workspace_root: workspace_root.to_path_buf(),
-        permission_mode: Some(PermissionMode::Auto),
-        add_dirs: vec![vault_path.clone()],
-        tmux_session: "nucleus-distiller".into(),
-        window_name: Some("contemplation".into()),
-        agent_label: Some("distiller".into()),
-        ..SpawnOptions::default()
+    let (spawn_opts, ask_opts) = SessionProfile::one_shot_utility(&ProfileContext {
+        workspace_root,
+        claude: &settings.claude,
+        tmux_session: "nucleus-distiller",
+        agent_label: "distiller",
     })
-    .await
-    .context("spawning claude session for contemplation")?;
+    .add_dirs(vec![vault_path.clone()])
+    .window_name("contemplation")
+    .into_parts();
+    let mut session = Session::spawn(spawn_opts)
+        .await
+        .context("spawning claude session for contemplation")?;
     let week_ago = Local::now() - Duration::days(settings.diary.retain_days as i64);
     let vault_summary = summarize_vault(&vault_path);
 
@@ -303,7 +307,7 @@ PENDING CANDIDATES:
             pending = pending,
         );
 
-        let raw = session.ask(&prompt, AskOptions::default()).await?;
+        let raw = session.ask(&prompt, ask_opts.clone()).await?;
         let cleaned = strip_code_fence(&raw);
         let decisions: Vec<Decision> = match serde_json::from_str(&cleaned) {
             Ok(v) => v,

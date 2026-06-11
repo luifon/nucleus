@@ -17,7 +17,7 @@ use axum::{
     routing::get,
     Router,
 };
-use nucleus_core::{claude::PermissionMode, claude_session, config::Settings, db};
+use nucleus_core::{claude_session, config::Settings, db, session_profile};
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -289,37 +289,29 @@ async fn init_chat(
     let pool = db::open(&chat_db).await?;
     handlers::chat::ensure_schema(&pool).await?;
 
-    let permission_mode = match PermissionMode::parse(&settings.claude.permission_mode) {
-        Some(m) => Some(m),
-        None => {
-            tracing::warn!(
-                mode = %settings.claude.permission_mode,
-                "chat: unknown claude permission_mode — using default"
-            );
-            None
-        }
-    };
-
     let persona = nucleus_core::config::resolve_persona(&settings.identity, "chat", None)
         .context("resolving chat persona")?;
     let persona_display_name = persona.display_name.clone();
 
-    let sessions = claude_session::SessionPool::new(claude_session::PoolConfig {
-        workspace_root: workspace_root.to_path_buf(),
-        append_system_prompt: Some(persona.body),
-        permission_mode,
-        disallowed_tools: settings.claude.disallowed_tools.clone(),
-        allowed_tools: vec![],
-        add_dirs: vec![vault_path.to_path_buf()],
-        tmux_session: "nucleus-chat".into(),
-        idle_timeout: std::time::Duration::from_secs(60 * 60 * 2),
-        agent_label: Some("chat".into()),
-        review_nudge_interval: if settings.skill_learner.enabled {
+    let (mut pool_config, ask_options) = session_profile::interactive_pool(
+        &session_profile::ProfileContext {
+            workspace_root,
+            claude: &settings.claude,
+            tmux_session: "nucleus-chat",
+            agent_label: "chat",
+        },
+        persona.body,
+        std::time::Duration::from_secs(60 * 60 * 2),
+        if settings.skill_learner.enabled {
             settings.skill_learner.nudge_interval
         } else {
             0
         },
-    });
+    );
+    // Vault answering needs --add-dir; pool fields are public for exactly
+    // this kind of per-venue extension.
+    pool_config.add_dirs = vec![vault_path.to_path_buf()];
+    let sessions = claude_session::SessionPool::new(pool_config);
 
     Ok(handlers::chat::ChatState {
         pool,
@@ -327,6 +319,8 @@ async fn init_chat(
         vault_path: vault_path.to_path_buf(),
         workspace_root: workspace_root.to_path_buf(),
         sessions,
+        ask_options,
+        claude: settings.claude.clone(),
     })
 }
 

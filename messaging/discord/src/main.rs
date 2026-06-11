@@ -8,10 +8,10 @@
 
 use anyhow::{Context, Result};
 use nucleus_core::{
-    claude::PermissionMode,
-    claude_session::{AskOptions, PoolConfig, SessionPool},
+    claude_session::{AskOptions, SessionPool},
     config::Settings,
     db, diary,
+    session_profile::{self, ProfileContext},
 };
 use serenity::all::{
     Channel, ChannelId, Command, CommandDataOptionValue, CommandInteraction,
@@ -42,6 +42,9 @@ struct Job {
 struct Handler {
     pool: SqlitePool,
     sessions: Arc<SessionPool>,
+    /// Profile-derived per-turn ask options (ADR-020) — interactive pool
+    /// semantics (quiescence-based doneness).
+    ask_options: AskOptions,
     settings: Settings,
     workspace_root: PathBuf,
     bot_user_id: tokio::sync::OnceCell<UserId>,
@@ -116,7 +119,7 @@ impl Handler {
 
         let result = self
             .sessions
-            .ask(&chat_key, &framed, resume.clone(), AskOptions::default())
+            .ask(&chat_key, &framed, resume.clone(), self.ask_options.clone())
             .await?;
 
         // Persist (or refresh) the session id so a bot restart can resume.
@@ -484,22 +487,22 @@ async fn main() -> Result<()> {
         .output()
         .await;
 
-    let sessions = Arc::new(SessionPool::new(PoolConfig {
-        workspace_root: workspace_root.clone(),
-        append_system_prompt: Some(persona.body),
-        permission_mode: PermissionMode::parse(&settings.claude.permission_mode),
-        disallowed_tools: settings.claude.disallowed_tools.clone(),
-        allowed_tools: vec![],
-        add_dirs: vec![],
-        tmux_session: "nucleus-discord".into(),
-        idle_timeout: std::time::Duration::from_secs(60 * 60 * 4),
-        agent_label: Some("discord".into()),
-        review_nudge_interval: if settings.skill_learner.enabled {
+    let (pool_config, ask_options) = session_profile::interactive_pool(
+        &ProfileContext {
+            workspace_root: &workspace_root,
+            claude: &settings.claude,
+            tmux_session: "nucleus-discord",
+            agent_label: "discord",
+        },
+        persona.body,
+        std::time::Duration::from_secs(60 * 60 * 4),
+        if settings.skill_learner.enabled {
             settings.skill_learner.nudge_interval
         } else {
             0
         },
-    }));
+    );
+    let sessions = Arc::new(SessionPool::new(pool_config));
 
     // Background task: reap idle sessions every 30 minutes.
     {
@@ -552,6 +555,7 @@ async fn main() -> Result<()> {
     let handler = Handler {
         pool,
         sessions,
+        ask_options,
         settings: settings.clone(),
         workspace_root,
         bot_user_id: tokio::sync::OnceCell::new(),

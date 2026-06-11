@@ -27,6 +27,7 @@ pub mod mem0;
 pub mod memory;
 pub mod migrate;
 pub mod runlog;
+pub mod session_profile;
 pub mod skills;
 
 pub fn init_tracing() {

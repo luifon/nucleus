@@ -63,12 +63,16 @@ pub async fn claude_version() -> Option<String> {
 }
 
 /// A live tmux-hosted claude session.
+///
+/// Fields are private (ADR-020): tmux targets and transcript paths are
+/// implementation details of this process model — callers go through the
+/// read-only accessors so a future backend change isn't a breaking change.
 pub struct Session {
-    pub session_id: String,
+    session_id: String,
     /// tmux target like `session:window`. Used as the `-t` value for every command.
-    pub tmux_target: String,
+    tmux_target: String,
     /// Path to the claude transcript file we tail.
-    pub transcript_path: PathBuf,
+    transcript_path: PathBuf,
     /// Byte offset into the transcript; we only read past this on each `ask`.
     cursor: u64,
     /// Run-log bookkeeping (ADR-016). Set when spawned with an `agent_label`;
@@ -113,25 +117,15 @@ pub struct SpawnOptions {
     pub agent_label: Option<String>,
 }
 
-impl Default for SpawnOptions {
-    fn default() -> Self {
-        Self {
-            workspace_root: PathBuf::from("."),
-            append_system_prompt: None,
-            permission_mode: None,
-            disallowed_tools: vec![],
-            allowed_tools: vec![],
-            add_dirs: vec![],
-            tmux_session: "nucleus".into(),
-            window_name: None,
-            ready_timeout: Duration::from_secs(20),
-            resume_session_id: None,
-            agent_label: None,
-        }
-    }
-}
+// NOTE (ADR-020): `Default` is deliberately NOT implemented for
+// `SpawnOptions` / `AskOptions`. Hand-rolled `..Default::default()` configs
+// were how the safety-critical knobs (await_turn_complete, the Settings
+// disallowed_tools posture) got silently dropped per-binary. Construct via
+// `crate::session_profile::SessionProfile` instead; core-internal code
+// writes full literals.
 
 /// Tunables for `Session::ask`.
+#[derive(Debug, Clone)]
 pub struct AskOptions {
     /// Hard ceiling on how long a single ask may take.
     pub max_wait: Duration,
@@ -148,13 +142,18 @@ pub struct AskOptions {
     pub await_turn_complete: bool,
 }
 
-impl Default for AskOptions {
-    fn default() -> Self {
-        Self {
-            max_wait: Duration::from_secs(180),
-            quiescent_window: Duration::from_secs(3),
-            await_turn_complete: false,
-        }
+impl Session {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// tmux `session:window` target — debugging/attach surface only.
+    pub fn tmux_target(&self) -> &str {
+        &self.tmux_target
+    }
+
+    pub fn transcript_path(&self) -> &Path {
+        &self.transcript_path
     }
 }
 
@@ -664,7 +663,7 @@ impl SessionPool {
         }
 
         let transcript_path = guard.session.transcript_path.clone();
-        let turns = last_n_turns(&transcript_path, 100);
+        let turns = last_n_turns_async(&transcript_path, 100).await;
         if turns.len() < 10 {
             return Ok(RotateOutcome::Skipped);
         }
@@ -1395,6 +1394,25 @@ pub fn transcript_ends_with_clean_reply(transcript_path: &Path) -> bool {
         last_has_tool_use = has_tool_use;
     }
     saw_assistant && last_has_text && !last_has_tool_use
+}
+
+/// Async wrapper for [`transcript_ends_with_clean_reply`] — transcripts can
+/// be tens of MB after a long day; reading them on a runtime thread stalls
+/// every other task (ADR-020).
+pub async fn transcript_ends_with_clean_reply_async(transcript_path: &Path) -> bool {
+    let path = transcript_path.to_path_buf();
+    tokio::task::spawn_blocking(move || transcript_ends_with_clean_reply(&path))
+        .await
+        .unwrap_or(false)
+}
+
+/// Async wrapper for [`last_n_turns`] — same rationale as
+/// [`transcript_ends_with_clean_reply_async`].
+pub async fn last_n_turns_async(transcript_path: &Path, n: usize) -> Vec<Turn> {
+    let path = transcript_path.to_path_buf();
+    tokio::task::spawn_blocking(move || last_n_turns(&path, n))
+        .await
+        .unwrap_or_default()
 }
 
 /// Role of a transcript turn. Used by [`last_n_turns`] to label what came
