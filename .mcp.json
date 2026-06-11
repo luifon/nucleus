@@ -5,7 +5,7 @@
       "args": [
         "@playwright/mcp@latest",
         "--user-data-dir",
-        "${NUCLEUS_PLAYWRIGHT_PROFILE:-${HOME}/.nucleus/playwright-profile}"
+        "${HOME}/.nucleus/playwright-profile"
       ]
     }
   }
