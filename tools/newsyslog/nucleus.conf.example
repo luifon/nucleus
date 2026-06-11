@@ -1,0 +1,21 @@
+# Nucleus log rotation (ADR-020) — rendered by tools/launchd/install.sh
+# (__WORKSPACE_ROOT__ / __USER__ substituted) into /etc/newsyslog.d/nucleus.conf.
+#
+# macOS runs newsyslog as root hourly at :30 (com.apple.newsyslog), so the
+# root-owned caddy.log rotates fine alongside the user-owned agent logs.
+#
+# Flags: G = logfilename is a glob; B = binary (no ASCII rotation banner —
+# these logs are tailed/grepped by healthcheck.sh and the dashboard); N =
+# no process to signal (don't HUP syslogd).
+#
+# Z (gzip) is DELIBERATELY omitted: KeepAlive daemons (discord, whatsapp,
+# nucleus-dashboard, bonsai, caddy) hold their launchd StandardOutPath fd
+# in append mode across rotation and keep writing into the renamed .0 file
+# until their next restart — gzip+unlink would silently destroy those
+# writes. Uncompressed archives preserve them, at a trivial disk cost
+# (1MB live + 5 archives ≈ 6MB cap per service).
+#
+# size is in KB: rotate past 1MB, keep 5 archives.
+#
+# logfilename                       [owner:group]   mode count size when flags
+__WORKSPACE_ROOT__/memory/*.log     __USER__:staff  644  5     1024 *    GBN
