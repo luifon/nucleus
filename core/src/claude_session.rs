@@ -415,11 +415,18 @@ impl Default for PoolConfig {
 /// window name.
 pub struct SessionPool {
     config: PoolConfig,
-    entries: Arc<RwLock<HashMap<String, Arc<Mutex<Entry>>>>>,
+    /// Two-phase slots (ADR-020): the map lock is only ever held briefly
+    /// (claim/fetch/unlink a slot) — NEVER across a `Session::spawn`. The
+    /// per-slot mutex is the per-key serializer; cold spawns happen under
+    /// it, so chat A's 5-60s boot can't block chat B. Lock ordering:
+    /// slot-then-map; the map lock is never held while acquiring a slot.
+    entries: Arc<RwLock<HashMap<String, Arc<Mutex<Slot>>>>>,
 }
 
-struct Entry {
-    session: Session,
+struct Slot {
+    /// None = slot claimed, session not (or no longer) live: a spawn is in
+    /// flight, failed, or the window died and a respawn-in-place is pending.
+    session: Option<Session>,
     last_active: Instant,
     /// Asks on this chat_key since the last on-the-fly review (ADR-017).
     turns_since_review: u32,
@@ -459,66 +466,95 @@ impl SessionPool {
         ask_opts: AskOptions,
     ) -> Result<AskResult> {
         let t0 = Instant::now();
-
-        // A pooled session whose tmux window has died (claude crash, binary
-        // upgrade, manual kill) must be dropped and respawned — asking into
-        // a dead window just burns the full ask timeout. Resume the same
-        // claude session id so the conversation continues where it left off.
         let mut resume_session_id = resume_session_id;
-        {
-            let existing = self.entries.read().await.get(chat_key).cloned();
-            if let Some(entry) = existing {
-                let alive = entry.lock().await.session.is_alive().await;
-                if !alive {
-                    let removed = self.entries.write().await.remove(chat_key);
-                    if let Some(entry) = removed {
-                        let guard = entry.lock().await;
-                        resume_session_id = Some(guard.session.session_id.clone());
-                    }
+        let mut was_cold = false;
+
+        // Phase 1 — claim/fetch this chat's slot (brief map write), then
+        // serialize on the slot's own mutex. Other chat keys proceed in
+        // parallel; pre-ADR-020 this held the map write lock across the
+        // whole cold spawn, freezing every other chat for 5-60s.
+        let (slot_arc, mut guard) = loop {
+            let slot_arc = {
+                let mut entries = self.entries.write().await;
+                entries
+                    .entry(chat_key.to_string())
+                    .or_insert_with(|| {
+                        Arc::new(Mutex::new(Slot {
+                            session: None,
+                            last_active: Instant::now(),
+                            turns_since_review: 0,
+                        }))
+                    })
+                    .clone()
+            };
+            let guard = slot_arc.clone().lock_owned().await;
+            // While we waited for the slot, the reaper/shutdown may have
+            // unlinked it from the map — spawning into an orphaned slot
+            // would leak a session the pool no longer tracks. Retry on the
+            // fresh slot.
+            let current = self.entries.read().await.get(chat_key).cloned();
+            match current {
+                Some(c) if Arc::ptr_eq(&c, &slot_arc) => break (slot_arc, guard),
+                _ => continue,
+            }
+        };
+
+        // Phase 2 — dead-window detection, under the slot lock (the old
+        // read-check-then-write-remove dance had a TOCTOU window). A pooled
+        // session whose tmux window died (claude crash, binary upgrade,
+        // manual kill) is respawned in place, resuming the same claude
+        // session id so the conversation continues where it left off.
+        if let Some(session) = &guard.session {
+            if !session.is_alive().await {
+                if let Some(dead) = guard.session.take() {
+                    resume_session_id = Some(dead.session_id().to_string());
                 }
             }
         }
 
-        // Get-or-create the per-chat entry. We hold the write lock briefly,
-        // then release before doing the actual work (which holds only the
-        // entry's own mutex).
-        let entry = {
-            let mut entries = self.entries.write().await;
-            if let Some(existing) = entries.get(chat_key).cloned() {
-                existing
-            } else {
-                let window_name = sanitize_window_name(chat_key);
-                let session = Session::spawn(SpawnOptions {
-                    workspace_root: self.config.workspace_root.clone(),
-                    append_system_prompt: self.config.append_system_prompt.clone(),
-                    permission_mode: self.config.permission_mode,
-                    disallowed_tools: self.config.disallowed_tools.clone(),
-                    allowed_tools: self.config.allowed_tools.clone(),
-                    add_dirs: self.config.add_dirs.clone(),
-                    tmux_session: self.config.tmux_session.clone(),
-                    window_name: Some(window_name),
-                    // 20s is too tight for a cold `claude` boot under load —
-                    // the same lesson the WhatsApp rotation path learned.
-                    ready_timeout: Duration::from_secs(60),
-                    resume_session_id,
-                    agent_label: self.config.agent_label.clone(),
-                })
-                .await?;
-                let entry = Arc::new(Mutex::new(Entry {
-                    session,
-                    last_active: Instant::now(),
-                    turns_since_review: 0,
-                }));
-                entries.insert(chat_key.to_string(), entry.clone());
-                entry
+        // Phase 3 — spawn if needed, holding ONLY the slot mutex.
+        if guard.session.is_none() {
+            let window_name = sanitize_window_name(chat_key);
+            let spawned = Session::spawn(SpawnOptions {
+                workspace_root: self.config.workspace_root.clone(),
+                append_system_prompt: self.config.append_system_prompt.clone(),
+                permission_mode: self.config.permission_mode,
+                disallowed_tools: self.config.disallowed_tools.clone(),
+                allowed_tools: self.config.allowed_tools.clone(),
+                add_dirs: self.config.add_dirs.clone(),
+                tmux_session: self.config.tmux_session.clone(),
+                window_name: Some(window_name),
+                // 20s is too tight for a cold `claude` boot under load —
+                // the same lesson the WhatsApp rotation path learned.
+                ready_timeout: Duration::from_secs(60),
+                resume_session_id: resume_session_id.clone(),
+                agent_label: self.config.agent_label.clone(),
+            })
+            .await;
+            match spawned {
+                Ok(s) => {
+                    guard.session = Some(s);
+                    was_cold = true;
+                }
+                Err(e) => {
+                    // Unlink the empty slot (only if the map still holds
+                    // THIS one) so the next ask retries a clean spawn.
+                    drop(guard);
+                    let mut entries = self.entries.write().await;
+                    if let Some(cur) = entries.get(chat_key) {
+                        if Arc::ptr_eq(cur, &slot_arc) {
+                            entries.remove(chat_key);
+                        }
+                    }
+                    return Err(e);
+                }
             }
-        };
+        }
 
-        let was_cold = t0.elapsed() > Duration::from_secs(2);
-        let mut guard = entry.lock().await;
-        let reply = guard.session.ask(message, ask_opts).await?;
-        let session_id = guard.session.session_id.clone();
-        let transcript_path = guard.session.transcript_path.to_string_lossy().into_owned();
+        let session = guard.session.as_mut().expect("session ensured above");
+        let reply = session.ask(message, ask_opts).await?;
+        let session_id = session.session_id().to_string();
+        let transcript_path = session.transcript_path().to_string_lossy().into_owned();
         guard.last_active = Instant::now();
 
         // On-the-fly skill-review nudge (ADR-017): count asks per chat_key; when
@@ -544,32 +580,40 @@ impl SessionPool {
 
     /// Drop sessions idle longer than `config.idle_timeout` and kill their
     /// tmux windows. Safe to call from a background task on a timer.
+    ///
+    /// Idleness is re-checked under each slot's lock (an ask may race in
+    /// between the scan and the close), and the slot is unlinked from the
+    /// map while its lock is held — an ask parked on the same mutex wakes
+    /// to a not-current slot and re-creates cleanly. The pre-ADR-020
+    /// `Arc::try_unwrap` dance silently leaked the session whenever an
+    /// in-flight ask still held a clone.
     pub async fn reap_idle(&self) -> Result<usize> {
-        let now = Instant::now();
         let idle_threshold = self.config.idle_timeout;
-        let mut to_close = Vec::new();
-        {
+        let candidates: Vec<(String, Arc<Mutex<Slot>>)> = {
             let entries = self.entries.read().await;
-            for (key, entry) in entries.iter() {
-                let guard = entry.lock().await;
-                if now.duration_since(guard.last_active) > idle_threshold {
-                    to_close.push(key.clone());
+            entries.iter().map(|(k, e)| (k.clone(), e.clone())).collect()
+        };
+        let mut reaped = 0usize;
+        for (key, slot_arc) in candidates {
+            let mut guard = slot_arc.clone().lock_owned().await;
+            if guard.last_active.elapsed() <= idle_threshold {
+                continue;
+            }
+            let session = guard.session.take();
+            {
+                let mut entries = self.entries.write().await;
+                if let Some(cur) = entries.get(&key) {
+                    if Arc::ptr_eq(cur, &slot_arc) {
+                        entries.remove(&key);
+                    }
                 }
             }
-        }
-        if to_close.is_empty() {
-            return Ok(0);
-        }
-        let mut entries = self.entries.write().await;
-        for key in &to_close {
-            if let Some(entry) = entries.remove(key) {
-                if let Ok(unwrapped) = Arc::try_unwrap(entry) {
-                    let inner = unwrapped.into_inner();
-                    let _ = inner.session.close().await;
-                }
+            if let Some(session) = session {
+                let _ = session.close().await;
+                reaped += 1;
             }
         }
-        Ok(to_close.len())
+        Ok(reaped)
     }
 
     /// Roll every active per-chat session forward by one day: ask each one
@@ -613,7 +657,7 @@ impl SessionPool {
         Fut: std::future::Future<Output = Result<()>>,
     {
         let mut stats = RotationStats::default();
-        let keys: Vec<(String, Arc<Mutex<Entry>>)> = {
+        let keys: Vec<(String, Arc<Mutex<Slot>>)> = {
             let entries = self.entries.read().await;
             entries
                 .iter()
@@ -646,7 +690,7 @@ impl SessionPool {
     async fn rotate_one<F, Fut>(
         &self,
         chat_key: &str,
-        entry_arc: &Arc<Mutex<Entry>>,
+        entry_arc: &Arc<Mutex<Slot>>,
         agent_name: &str,
         db_update_session_id: &mut F,
     ) -> Result<RotateOutcome>
@@ -657,12 +701,16 @@ impl SessionPool {
         let mut guard = entry_arc.lock().await;
 
         // Skip cold chats — the idle reaper will close them and there's no
-        // user continuity worth preserving.
+        // user continuity worth preserving. Empty slots (spawn pending or
+        // failed) have nothing to rotate.
         if guard.last_active.elapsed() > Duration::from_secs(24 * 60 * 60) {
             return Ok(RotateOutcome::Skipped);
         }
+        let Some(old_session) = guard.session.as_mut() else {
+            return Ok(RotateOutcome::Skipped);
+        };
 
-        let transcript_path = guard.session.transcript_path.clone();
+        let transcript_path = old_session.transcript_path().to_path_buf();
         let turns = last_n_turns_async(&transcript_path, 100).await;
         if turns.len() < 10 {
             return Ok(RotateOutcome::Skipped);
@@ -673,8 +721,7 @@ impl SessionPool {
         // — no user is waiting and the model needs to read the whole
         // transcript. If this triggers the picker, the existing auto-dismiss
         // path handles it.
-        let summary = guard
-            .session
+        let summary = old_session
             .ask(SUMMARY_PROMPT, AskOptions {
                 max_wait: Duration::from_secs(300),
                 quiescent_window: Duration::from_secs(5),
@@ -736,23 +783,25 @@ impl SessionPool {
         }
 
         // Step 6: swap in the new session, then close the old one.
-        let old_session = std::mem::replace(&mut guard.session, new_session);
-        let _ = old_session.close().await;
+        if let Some(old_session) = guard.session.replace(new_session) {
+            let _ = old_session.close().await;
+        }
         guard.last_active = Instant::now();
 
         Ok(RotateOutcome::Rotated)
     }
 
-    /// Close every session and tear down the tmux session.
+    /// Close every session and tear down the tmux session. Waits for any
+    /// in-flight asks (per-slot locks) so we never kill a window mid-turn.
     pub async fn shutdown(&self) -> Result<()> {
-        let mut entries = self.entries.write().await;
-        let keys: Vec<String> = entries.keys().cloned().collect();
-        for key in keys {
-            if let Some(entry) = entries.remove(&key) {
-                if let Ok(unwrapped) = Arc::try_unwrap(entry) {
-                    let inner = unwrapped.into_inner();
-                    let _ = inner.session.close().await;
-                }
+        let drained: Vec<(String, Arc<Mutex<Slot>>)> = {
+            let mut entries = self.entries.write().await;
+            entries.drain().collect()
+        };
+        for (_key, slot_arc) in drained {
+            let mut guard = slot_arc.lock().await;
+            if let Some(session) = guard.session.take() {
+                let _ = session.close().await;
             }
         }
         let _ = Command::new("tmux")
