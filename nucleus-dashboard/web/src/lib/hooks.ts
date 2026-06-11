@@ -17,9 +17,15 @@ export type FetchState<T> = {
 
 /** Run `fetcher` once on mount and again whenever `deps` change. Errors
  *  surface as strings (caller doesn't need to remember the error
- *  shape). Returns a `refetch` that's safe to wire to a button. */
+ *  shape). Returns a `refetch` that's safe to wire to a button.
+ *
+ *  The fetcher receives an `AbortSignal` (ADR-020) — pass it through to
+ *  the client helpers (`jsonGet(path, signal)`) and unmount/refetch
+ *  genuinely cancels the in-flight request instead of just discarding
+ *  the result. Existing closures that ignore the arg keep working; they
+ *  just don't get network-level cancellation. */
 export function useFetch<T>(
-  fetcher: () => Promise<T>,
+  fetcher: (signal?: AbortSignal) => Promise<T>,
   deps: ReadonlyArray<unknown> = [],
 ): FetchState<T> {
   const [data, setData] = useState<T | null>(null);
@@ -34,8 +40,9 @@ export function useFetch<T>(
 
   useEffect(() => {
     let cancelled = false;
+    const ctrl = new AbortController();
     fetcherRef
-      .current()
+      .current(ctrl.signal)
       .then((d) => {
         if (cancelled) return;
         setData(d);
@@ -43,6 +50,8 @@ export function useFetch<T>(
       })
       .catch((e) => {
         if (cancelled) return;
+        // Abort is cleanup, not an error state.
+        if ((e as Error)?.name === "AbortError") return;
         setError(String(e));
       })
       .finally(() => {
@@ -51,6 +60,7 @@ export function useFetch<T>(
       });
     return () => {
       cancelled = true;
+      ctrl.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick, ...deps]);

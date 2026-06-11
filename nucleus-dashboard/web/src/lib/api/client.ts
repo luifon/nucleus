@@ -33,19 +33,24 @@ async function readErrorMessage(res: Response, path: string): Promise<string> {
   return `${path} → ${res.status} ${res.statusText}`;
 }
 
-export async function jsonGet<T>(path: string): Promise<T> {
-  const res = await fetch(path);
+// All three helpers take an optional AbortSignal (ADR-020): `useFetch`
+// threads its per-effect controller through, so unmount/refetch actually
+// cancels the network request + JSON parse instead of just ignoring the
+// result. Domain fetchers adopt the trailing param incrementally.
+export async function jsonGet<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(path, { signal });
   if (!res.ok) {
     throw new ApiError(path, res.status, await readErrorMessage(res, path));
   }
   return res.json() as Promise<T>;
 }
 
-export async function jsonPost<T, B>(path: string, body: B): Promise<T> {
+export async function jsonPost<T, B>(path: string, body: B, signal?: AbortSignal): Promise<T> {
   const res = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
   if (!res.ok) {
     throw new ApiError(path, res.status, await readErrorMessage(res, path));
@@ -53,8 +58,8 @@ export async function jsonPost<T, B>(path: string, body: B): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-export async function jsonDelete<T>(path: string): Promise<T> {
-  const res = await fetch(path, { method: "DELETE" });
+export async function jsonDelete<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(path, { method: "DELETE", signal });
   if (!res.ok) {
     throw new ApiError(path, res.status, await readErrorMessage(res, path));
   }
