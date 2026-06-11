@@ -131,8 +131,28 @@ export class Session {
     const inner = `cd ${shellQuote(opts.workspaceRoot)} && claude ${args.map(shellQuote).join(" ")}`;
 
     await ensureTmuxSession(opts.tmuxSession);
-    const target = `${opts.tmuxSession}:${windowName}`;
-    await tmux(["new-window", "-t", opts.tmuxSession, "-n", windowName, inner]);
+    // Target the window by its server-unique id (`@N`), never by
+    // `session:name`. Window names aren't unique — a stale window left by
+    // a previous bot process (or a failed spawn) shares the chat-key name,
+    // and tmux refuses ambiguous name matches outright (`can't find
+    // window`). That made every capture/paste/kill fail and leaked one
+    // more duplicate per message (2026-06-11 DM outage). The name stays
+    // purely cosmetic, for `tmux attach` debuggability.
+    const { stdout: windowIdRaw } = await tmux([
+      "new-window",
+      "-t",
+      opts.tmuxSession,
+      "-n",
+      windowName,
+      "-P",
+      "-F",
+      "#{window_id}",
+      inner,
+    ]);
+    const target = windowIdRaw.trim();
+    if (!/^@\d+$/.test(target)) {
+      throw new Error(`tmux new-window returned unexpected window id: ${JSON.stringify(target)}`);
+    }
 
     try {
       await dismissTrustPrompt(target, 5_000);
@@ -214,6 +234,19 @@ export class Session {
     return reply;
   }
 
+  /** True while the underlying tmux window still exists. A window can die
+   *  without the pool noticing (claude crash, manual kill, `claude update`
+   *  swapping the binary, operator cleanup) — callers must check before
+   *  reusing a pooled session instead of timing out against a ghost. */
+  async isAlive(): Promise<boolean> {
+    try {
+      await tmux(["display-message", "-p", "-t", this.tmuxTarget, "ok"]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async close(): Promise<void> {
     // Finalize the run-log row (ok = closed cleanly; crashed runs leave
     // ended_at null). Best-effort. See the Rust counterpart in close().
@@ -244,6 +277,17 @@ export class SessionPool {
 
     let entry = this.entries.get(chatKey);
     let wasColdSpawn = false;
+    // A pooled session whose tmux window has died (claude crash, binary
+    // upgrade, manual kill) must be dropped and respawned — asking into a
+    // dead window just burns the full ask timeout. Resume the same claude
+    // session id so the conversation continues where it left off.
+    if (entry && !(await entry.session.isAlive())) {
+      this.entries.delete(chatKey);
+      const deadSessionId = entry.session.sessionId;
+      await entry.session.close().catch(() => {});
+      entry = undefined;
+      resumeSessionId = deadSessionId;
+    }
     if (!entry) {
       wasColdSpawn = true;
       const session = await Session.spawn({
@@ -254,6 +298,10 @@ export class SessionPool {
         addDirs: this.config.addDirs,
         tmuxSession: this.config.tmuxSession,
         windowName: sanitizeWindowName(chatKey),
+        // 20s (the SpawnOptions default) is too tight for a cold `claude`
+        // boot under load; the rotation path already learned this and uses
+        // 60s. Keep the two in lockstep.
+        readyTimeoutMs: 60_000,
         resumeSessionId,
         agentLabel: this.config.agentLabel,
       });
@@ -385,8 +433,9 @@ export class SessionPool {
         disallowedTools: this.config.disallowedTools,
         addDirs: this.config.addDirs,
         tmuxSession: this.config.tmuxSession,
-        // windowName left undefined → derives from the new session UUID,
-        // so it doesn't collide with the still-alive old window.
+        // windowName left undefined → derives from the new session UUID.
+        // (Cosmetic only — windows are addressed by unique id, so a name
+        // collision with the still-alive old window wouldn't matter.)
         readyTimeoutMs: 60_000,
         agentLabel: this.config.agentLabel,
       });

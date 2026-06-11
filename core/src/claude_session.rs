@@ -145,10 +145,27 @@ impl Session {
         );
 
         ensure_tmux_session(&opts.tmux_session).await?;
-        let target = format!("{}:{}", opts.tmux_session, window_name);
 
+        // Target the window by its server-unique id (`@N`), never by
+        // `session:name`. Window names aren't unique — a stale window left
+        // by a previous process (or a failed spawn) shares the chat-key
+        // name, and tmux refuses ambiguous name matches outright (`can't
+        // find window`). That made every capture/paste/kill fail and leaked
+        // one more duplicate per message (2026-06-11 WhatsApp DM outage,
+        // same design here). The name stays purely cosmetic, for
+        // `tmux attach` debuggability.
         let out = Command::new("tmux")
-            .args(["new-window", "-t", &opts.tmux_session, "-n", &window_name, &inner])
+            .args([
+                "new-window",
+                "-t",
+                &opts.tmux_session,
+                "-n",
+                &window_name,
+                "-P",
+                "-F",
+                "#{window_id}",
+                &inner,
+            ])
             .output()
             .await
             .context("tmux new-window")?;
@@ -157,6 +174,10 @@ impl Session {
                 "tmux new-window failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
+        }
+        let target = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !(target.starts_with('@') && target[1..].chars().all(|c| c.is_ascii_digit())) {
+            anyhow::bail!("tmux new-window returned unexpected window id: {target:?}");
         }
 
         let transcript_path = transcript_path_for(&opts.workspace_root, &session_id);
@@ -262,6 +283,19 @@ impl Session {
             .map(|m| m.len())
             .unwrap_or(self.cursor);
         Ok(reply)
+    }
+
+    /// True while the underlying tmux window still exists. A window can die
+    /// without the pool noticing (claude crash, manual kill, `claude update`
+    /// swapping the binary, operator cleanup) — callers must check before
+    /// reusing a pooled session instead of timing out against a ghost.
+    pub async fn is_alive(&self) -> bool {
+        Command::new("tmux")
+            .args(["display-message", "-p", "-t", &self.tmux_target, "ok"])
+            .output()
+            .await
+            .map(|out| out.status.success())
+            .unwrap_or(false)
     }
 
     /// Kill the tmux window (and the claude inside it).
@@ -388,6 +422,25 @@ impl SessionPool {
     ) -> Result<AskResult> {
         let t0 = Instant::now();
 
+        // A pooled session whose tmux window has died (claude crash, binary
+        // upgrade, manual kill) must be dropped and respawned — asking into
+        // a dead window just burns the full ask timeout. Resume the same
+        // claude session id so the conversation continues where it left off.
+        let mut resume_session_id = resume_session_id;
+        {
+            let existing = self.entries.read().await.get(chat_key).cloned();
+            if let Some(entry) = existing {
+                let alive = entry.lock().await.session.is_alive().await;
+                if !alive {
+                    let removed = self.entries.write().await.remove(chat_key);
+                    if let Some(entry) = removed {
+                        let guard = entry.lock().await;
+                        resume_session_id = Some(guard.session.session_id.clone());
+                    }
+                }
+            }
+        }
+
         // Get-or-create the per-chat entry. We hold the write lock briefly,
         // then release before doing the actual work (which holds only the
         // entry's own mutex).
@@ -406,7 +459,9 @@ impl SessionPool {
                     add_dirs: self.config.add_dirs.clone(),
                     tmux_session: self.config.tmux_session.clone(),
                     window_name: Some(window_name),
-                    ready_timeout: Duration::from_secs(20),
+                    // 20s is too tight for a cold `claude` boot under load —
+                    // the same lesson the WhatsApp rotation path learned.
+                    ready_timeout: Duration::from_secs(60),
                     resume_session_id,
                     agent_label: self.config.agent_label.clone(),
                 })

@@ -146,7 +146,10 @@ const NEEDS_DIRECTIVE_FOR_SUBFOLDER = new Set([
   "5-Resources",
 ]);
 
-const TMUX_SESSION = "nucleus-whatsapp-braindump";
+/** Exported so index.ts can include it in the boot-time orphan wipe — every
+ *  tmux session this process spawns windows into must be on that list. */
+export const BRAINDUMP_TMUX_SESSION = "nucleus-whatsapp-braindump";
+const TMUX_SESSION = BRAINDUMP_TMUX_SESSION;
 
 /** Today's date as YYYY-MM-DD in the operator's wall-clock zone (NUCLEUS_TZ,
  *  falling back to TZ then UTC) — NOT UTC unconditionally. Daily-note
