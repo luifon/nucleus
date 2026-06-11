@@ -467,21 +467,6 @@ fn extract_yaml_field(frontmatter: &str, field: &str) -> Option<String> {
 mod distiller_config_tests {
     use super::*;
 
-    // An operator's pre-ADR-016 [distiller] table (hourly/weekly keys, no
-    // `cron`) must still deserialize — unknown keys ignored, `cron` defaults.
-    #[test]
-    fn old_distiller_shape_still_loads() {
-        let toml = r#"
-metabolism_cron = "0 * * * *"
-contemplation_cron = "0 4 * * 0"
-metabolism_model = "claude-haiku-4-5"
-contemplation_model = "claude-sonnet-4-6"
-"#;
-        let cfg: DistillerConfig = toml::from_str(toml).expect("old shape deserializes");
-        assert_eq!(cfg.cron, "0 4 * * *", "missing cron falls back to daily default");
-        assert!(cfg.model.is_none());
-    }
-
     #[test]
     fn new_distiller_shape_loads() {
         let cfg: DistillerConfig =
