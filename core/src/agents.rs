@@ -183,10 +183,16 @@ mod tests {
     use super::*;
 
     fn write_tmp(contents: &str) -> std::path::PathBuf {
+        // A timestamp suffix alone is NOT collision-safe: two parallel tests
+        // can land on the same nanosecond (macOS clock resolution) and
+        // overwrite each other's fixture — observed as a flaky
+        // rejects_launchd_agent_without_label parsing another test's
+        // registry. The atomic counter disambiguates deterministically.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "nucleus-agents-{}-{}.toml",
+            "nucleus-agents-{}-{}-{}.toml",
             std::process::id(),
-            // monotonic-ish suffix so parallel tests don't collide
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
