@@ -25,6 +25,7 @@ pub mod discord_sdk;
 pub mod health;
 pub mod mem0;
 pub mod memory;
+pub mod migrate;
 pub mod runlog;
 pub mod skills;
 

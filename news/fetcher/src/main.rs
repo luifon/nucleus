@@ -69,7 +69,11 @@ async fn main() -> Result<()> {
         .output()
         .await;
 
-    ensure_schema(&pool).await?;
+    nucleus_core::migrate::migrate(&pool, MIGRATIONS)
+        .await
+        .context("migrating news.db")?;
+    // Data seeding (not schema) — stays outside migrations by design:
+    // INSERT OR IGNORE re-runs every boot so new defaults pick up.
     seed_default_sources(&pool).await?;
 
     // Subcommand dispatch. With no arg we do the normal twice-a-day fetch.
@@ -311,6 +315,19 @@ async fn persist_top_n(
     }
 
     Ok(keep.into_iter().map(|(_, (it, _, _))| it.clone()).collect())
+}
+
+/// Versioned migrations (ADR-020): v1 = the historical ensure_schema body
+/// verbatim (idempotent CREATEs + tolerated ALTERs + fetch_date backfill).
+/// New schema changes go in as v2+ and run exactly once.
+const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[nucleus_core::migrate::Migration {
+    version: 1,
+    name: "baseline-news",
+    step: nucleus_core::migrate::Step::Rust(baseline_v1),
+}];
+
+fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
+    Box::pin(ensure_schema(pool))
 }
 
 async fn ensure_schema(pool: &SqlitePool) -> Result<()> {

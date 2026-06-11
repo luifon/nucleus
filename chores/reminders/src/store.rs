@@ -73,8 +73,22 @@ pub fn nucleus_tz() -> Tz {
 
 pub async fn open(path: &Path) -> Result<SqlitePool> {
     let pool = nucleus_core::db::open(path).await?;
-    ensure_schema(&pool).await?;
+    nucleus_core::migrate::migrate(&pool, MIGRATIONS).await?;
     Ok(pool)
+}
+
+/// Versioned migrations (ADR-020). v1 is the historical `ensure_schema`
+/// body verbatim — intentionally idempotent so any pre-runner DB (full,
+/// partial, or pre-ADR-006) is healed once and recorded. Add new schema
+/// changes as v2+ `Step::Sql` entries; they run exactly once.
+const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[nucleus_core::migrate::Migration {
+    version: 1,
+    name: "baseline-adr006-008-015",
+    step: nucleus_core::migrate::Step::Rust(baseline_v1),
+}];
+
+fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
+    Box::pin(ensure_schema(pool))
 }
 
 /// Add ADR-006 columns + tables idempotently. Pre-ADR-006 columns
@@ -82,6 +96,11 @@ pub async fn open(path: &Path) -> Result<SqlitePool> {
 /// place but no longer written by the new code path; they survive as
 /// dead columns so the migration can replay safely on any historical
 /// snapshot.
+///
+/// Since ADR-020 this is migration v1 (run-once, recorded in
+/// `schema_migrations`) rather than an every-boot pass. Notably the
+/// channel-rename sweep at the bottom now runs once — correct going
+/// forward, since the legacy channel names can no longer be written.
 async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     // Base table — created fresh on new installs with the full ADR-006
     // shape. On existing DBs this is a no-op (table already exists) and

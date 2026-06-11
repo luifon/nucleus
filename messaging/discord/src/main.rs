@@ -376,8 +376,12 @@ async fn handle_forget(cmd: &CommandInteraction) -> Result<String> {
     }
 }
 
-async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
-    sqlx::query(
+/// Versioned migrations (ADR-020): v1 = the historical ensure_schema
+/// body. New schema changes go in as v2+ and run exactly once.
+const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[nucleus_core::migrate::Migration {
+    version: 1,
+    name: "baseline-channel-sessions",
+    step: nucleus_core::migrate::Step::Sql(
         r#"
         CREATE TABLE IF NOT EXISTS channel_sessions (
             channel_id TEXT PRIMARY KEY,
@@ -387,11 +391,8 @@ async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
             turns INTEGER NOT NULL DEFAULT 0
         )
         "#,
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
+    ),
+}];
 
 async fn lookup_session(pool: &SqlitePool, channel_id: u64) -> Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(
@@ -472,7 +473,9 @@ async fn main() -> Result<()> {
 
     let db_path = workspace_root.join(DB_PATH);
     let pool = db::open(&db_path).await.context("opening discord.db")?;
-    ensure_schema(&pool).await.context("ensure_schema")?;
+    nucleus_core::migrate::migrate(&pool, MIGRATIONS)
+        .await
+        .context("migrating discord.db")?;
 
     // Tear down any leftover tmux session from a previous crash before we
     // create fresh windows for live conversations.
