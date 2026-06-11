@@ -24,6 +24,7 @@ import AgentsPage from "./pages/AgentsPage";
 import VaultPage from "./pages/VaultPage";
 import ChatPage from "./pages/ChatPage";
 import GalleryPage from "./pages/GalleryPage";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 
 type RouteEntry = {
   path: string;
@@ -87,20 +88,24 @@ export default function App() {
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <TopBar onMenuToggle={() => setNavOpen((v) => !v)} navOpen={navOpen} />
         <div className="flex-1 overflow-auto">
-          <Routes>
-            <Route path="/" element={<HomePage />} />
-            <Route path="/news" element={<NewsPage />} />
-            <Route path="/skills" element={<SkillsPage />} />
-            <Route path="/diary" element={<DiaryPage />} />
-            <Route path="/reminders" element={<RemindersPage />} />
-            <Route path="/agents" element={<AgentsPage />} />
-            <Route path="/vault" element={<VaultPage />} />
-            <Route path="/chat" element={<ChatPage />} />
-            <Route path="/gallery" element={<GalleryPage />} />
-            {ROUTES.filter((r) => r.impl === "pending").map((r) => (
-              <Route key={r.path} path={r.path} element={<PendingPage label={r.label} Icon={r.icon} />} />
-            ))}
-          </Routes>
+          {/* Keyed by pathname so navigating away from a crashed page
+              auto-resets the boundary; sidebar/topbar stay alive. */}
+          <ErrorBoundary key={location.pathname}>
+            <Routes>
+              <Route path="/" element={<HomePage />} />
+              <Route path="/news" element={<NewsPage />} />
+              <Route path="/skills" element={<SkillsPage />} />
+              <Route path="/diary" element={<DiaryPage />} />
+              <Route path="/reminders" element={<RemindersPage />} />
+              <Route path="/agents" element={<AgentsPage />} />
+              <Route path="/vault" element={<VaultPage />} />
+              <Route path="/chat" element={<ChatPage />} />
+              <Route path="/gallery" element={<GalleryPage />} />
+              {ROUTES.filter((r) => r.impl === "pending").map((r) => (
+                <Route key={r.path} path={r.path} element={<PendingPage label={r.label} Icon={r.icon} />} />
+              ))}
+            </Routes>
+          </ErrorBoundary>
         </div>
       </main>
     </div>
