@@ -7,6 +7,7 @@ import {
   Browsers,
   DisconnectReason,
   type WAMessage,
+  type WASocket,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import pino from "pino";
@@ -27,6 +28,7 @@ import {
 } from "./db.js";
 import { record as recordDiary } from "./diary.js";
 import { alertDiscordHome } from "./discord_alert.js";
+import { formatReply as sharedFormatReply } from "./format.js";
 import { transcribe } from "./transcribe.js";
 import {
   planCapture,
@@ -141,6 +143,44 @@ let planExpirySweepTimer: NodeJS.Timeout | null = null;
 // clearInterval guard stopped reconnect-spawned parallel drains but not a
 // single timer overlapping itself.
 let outboundDraining = false;
+
+// Hang protection (ADR-020). The re-entrancy flag above is correct but
+// fail-closed: if sock.sendMessage HANGS (never settles — distinct from
+// rejecting), `outboundDraining` stays true forever and the queue silently
+// stops draining. Two layers:
+//  1. Per-send timeout — a send that hasn't settled in SEND_TIMEOUT_MS is
+//     treated as failed (retried, bounded by OUTBOUND_MAX_ATTEMPTS) and
+//     counts toward connection-rot; the tick aborts (a hung socket won't
+//     recover row-to-row). The original promise is kept: if it settles
+//     late with success we markSent, which suppresses the next tick's
+//     retry — closing most of the duplicate window retry-on-timeout opens.
+//  2. Drain watchdog — if outboundDraining has been true longer than
+//     DRAIN_WATCHDOG_MS (every await in the tick is timeout-bounded, so
+//     this means the boundedness assumption itself broke), alert + exit(1)
+//     for a launchd respawn. Force-resetting the flag instead would revive
+//     the 2026-05-28 overlapping-tick double-send if the zombie tick is
+//     still alive; exit matches the connection-rot precedent.
+const SEND_TIMEOUT_MS = 20_000;
+// Worst legitimate tick: 20 rows × just-under-timeout sends, plus margin.
+const DRAIN_WATCHDOG_MS = 20 * SEND_TIMEOUT_MS + 60_000; // 460s
+let drainTickStartedAt: number | null = null;
+
+class SendTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`sendMessage timed out after ${ms}ms (may still deliver late)`);
+    this.name = "SendTimeoutError";
+  }
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout;
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new SendTimeoutError(ms)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer!));
+}
 
 // ADR-005a: braindump plan timeout + sweep cadence.
 const PLAN_TIMEOUT_MS = 30 * 60 * 1000;
@@ -350,7 +390,7 @@ async function connect(
   });
 }
 
-async function resolveAllowlist(sock: any, config: Config): Promise<void> {
+async function resolveAllowlist(sock: WASocket, config: Config): Promise<void> {
   allowedJids.clear();
   groupNameToJid.clear();
 
@@ -369,7 +409,7 @@ async function resolveAllowlist(sock: any, config: Config): Promise<void> {
   try {
     const groups = await sock.groupFetchAllParticipating();
     const matches: Array<{ jid: string; name: string; role: ChatRole }> = [];
-    for (const [jid, meta] of Object.entries(groups) as [string, any][]) {
+    for (const [jid, meta] of Object.entries(groups)) {
       const name = (meta?.subject ?? "").trim();
       if (!name) continue;
       const lower = name.toLowerCase();
@@ -413,14 +453,28 @@ async function resolveAllowlist(sock: any, config: Config): Promise<void> {
  *
  *  Bounded batch size per tick to avoid hogging the event loop if a
  *  large backlog accumulates (it won't in normal use, but defense in depth). */
-function startOutboundDrain(sock: any, outbound: OutboundQueueStore, config: Config): void {
+function startOutboundDrain(sock: WASocket, outbound: OutboundQueueStore, config: Config): void {
   if (outboundDrainTimer) clearInterval(outboundDrainTimer);
   outboundDrainTimer = setInterval(async () => {
+    // Watchdog: a tick stuck past the bound means an await escaped the
+    // per-send timeouts — unknown hang, restart for a clean slate (see the
+    // hang-protection comment above).
+    if (
+      outboundDraining &&
+      drainTickStartedAt !== null &&
+      Date.now() - drainTickStartedAt > DRAIN_WATCHDOG_MS
+    ) {
+      const msg = `⚠️ WhatsApp outbound drain stuck >${Math.round(DRAIN_WATCHDOG_MS / 1000)}s — exiting for launchd respawn.`;
+      log.error({ stuckSince: new Date(drainTickStartedAt).toISOString() }, msg);
+      await withTimeout(alertDiscordHome(msg), 5_000).catch(() => {});
+      process.exit(1);
+    }
     // Skip this tick if the previous one is still draining — otherwise two
     // ticks grab the same not-yet-markSent row and double-send it. See the
     // outboundDraining comment above.
     if (outboundDraining) return;
     outboundDraining = true;
+    drainTickStartedAt = Date.now();
     try {
       let rows: OutboundRow[];
       try {
@@ -442,10 +496,45 @@ function startOutboundDrain(sock: any, outbound: OutboundQueueStore, config: Con
           if (process.env.NUCLEUS_WHATSAPP_FORCE_SEND_FAIL === "1") {
             throw new Error("Connection Closed (synthetic — NUCLEUS_WHATSAPP_FORCE_SEND_FAIL)");
           }
-          const sent = await sock.sendMessage(jid, { text: r.body });
-          outbound.markSent(r.id, sent?.key?.id ?? "");
-          consecutiveConnectionFailures = 0;
-          log.info({ id: r.id, target: r.target, jid }, "whatsapp: outbound sent");
+          // FORCE_SEND_HANG: never-settling promise so the timeout +
+          // watchdog paths are manually testable like the fail path is.
+          const sendPromise: Promise<WAMessage | undefined> =
+            process.env.NUCLEUS_WHATSAPP_FORCE_SEND_HANG === "1"
+              ? new Promise<never>(() => {})
+              : sock.sendMessage(jid, { text: r.body });
+          try {
+            const sent = await withTimeout(sendPromise, SEND_TIMEOUT_MS);
+            outbound.markSent(r.id, sent?.key?.id ?? "");
+            consecutiveConnectionFailures = 0;
+            log.info({ id: r.id, target: r.target, jid }, "whatsapp: outbound sent");
+          } catch (e) {
+            if (!(e instanceof SendTimeoutError)) throw e;
+            // Timeout: mark failed (retried next tick, bounded attempts) —
+            // this queue carries operator notifications; a rare duplicate
+            // beats a silently dropped reminder. Keep the original promise:
+            // a LATE success flips the row to sent before the retry tick
+            // re-picks it, suppressing the duplicate entirely.
+            outbound.markFailure(r.id, e.message, OUTBOUND_MAX_ATTEMPTS);
+            consecutiveConnectionFailures += 1; // a hang is rot-shaped
+            sendPromise.then(
+              (sent) => {
+                outbound.markSent(r.id, sent?.key?.id ?? "");
+                log.warn({ id: r.id }, "whatsapp: timed-out send completed late — marked sent to suppress retry");
+              },
+              () => { /* already markFailure'd at timeout */ },
+            );
+            log.warn(
+              { id: r.id, jid, consecutive: consecutiveConnectionFailures },
+              "whatsapp: outbound send timed out — aborting tick (hung socket won't recover row-to-row)",
+            );
+            if (consecutiveConnectionFailures >= CONNECTION_ROT_THRESHOLD) {
+              const alert = `⚠️ WhatsApp bot exiting: ${consecutiveConnectionFailures} consecutive failed/hung sendMessage calls — launchd will respawn.`;
+              log.error(alert);
+              await withTimeout(alertDiscordHome(alert), 5_000).catch(() => {});
+              process.exit(1);
+            }
+            break;
+          }
         } catch (e) {
           const err = (e as Error).message;
           outbound.markFailure(r.id, err, OUTBOUND_MAX_ATTEMPTS);
@@ -456,17 +545,18 @@ function startOutboundDrain(sock: any, outbound: OutboundQueueStore, config: Con
               { consecutive: consecutiveConnectionFailures, threshold: CONNECTION_ROT_THRESHOLD },
               "whatsapp: connection-rot counter incremented",
             );
-            if (consecutiveConnectionFailures >= CONNECTION_ROT_THRESHOLD) {
-              const alert = `⚠️ WhatsApp bot exiting: ${consecutiveConnectionFailures} consecutive "Connection Closed" sendMessage failures — launchd will respawn.`;
-              log.error(alert);
-              await alertDiscordHome(alert);
-              process.exit(1);
-            }
           }
+        }
+        if (consecutiveConnectionFailures >= CONNECTION_ROT_THRESHOLD) {
+          const alert = `⚠️ WhatsApp bot exiting: ${consecutiveConnectionFailures} consecutive failed/hung sendMessage calls — launchd will respawn.`;
+          log.error(alert);
+          await withTimeout(alertDiscordHome(alert), 5_000).catch(() => {});
+          process.exit(1);
         }
       }
     } finally {
       outboundDraining = false;
+      drainTickStartedAt = null;
     }
   }, OUTBOUND_DRAIN_INTERVAL_MS);
 }
@@ -511,7 +601,7 @@ function resolveOutboundTarget(target: string, config: Config): string | null {
  *  that case the user should put the LID directly in the env (it's
  *  surfaced in the "ignoring" log line). */
 async function isSenderAllowed(
-  sock: any,
+  sock: WASocket,
   participant: string,
   allowed: Set<string>,
 ): Promise<boolean> {
@@ -535,7 +625,7 @@ async function isSenderAllowed(
 }
 
 async function handleMessage(
-  sock: any,
+  sock: WASocket,
   msg: WAMessage,
   config: Config,
   store: ChatSessionStore,
@@ -662,7 +752,7 @@ async function handleMessage(
 }
 
 async function handleConversational(
-  sock: any,
+  sock: WASocket,
   chatId: string,
   text: string,
   inputKind: "text" | "voice",
@@ -747,7 +837,7 @@ function fireSkillReview(
  *  Each branch owns its own ack cadence.
  */
 async function handleBrainDump(
-  sock: any,
+  sock: WASocket,
   msg: WAMessage,
   chatId: string,
   config: Config,
@@ -800,7 +890,7 @@ async function handleBrainDump(
  *  persisted inside planCapture; the operator's reply will be handled by
  *  a subsequent inbound message → handlePlanResponse. */
 async function handleNewCapture(
-  sock: any,
+  sock: WASocket,
   chatId: string,
   text: string,
   inputKind: "text" | "voice",
@@ -864,7 +954,7 @@ async function handleNewCapture(
 
 /** Plan-response path: spawn response-interpreter, branch on action. */
 async function handlePlanResponse(
-  sock: any,
+  sock: WASocket,
   chatId: string,
   replyText: string,
   pending: ReturnType<PendingPlansStore["mostRecentPending"]> & {},
@@ -962,7 +1052,7 @@ async function handlePlanResponse(
  *  on voice-memo arrival (and as a defensive sweep before new captures)
  *  so a stale plan doesn't compete with the new one. */
 async function expireAnyPendingPlan(
-  sock: any,
+  sock: WASocket,
   chatId: string,
   plansStore: PendingPlansStore,
 ): Promise<void> {
@@ -978,7 +1068,7 @@ async function expireAnyPendingPlan(
 }
 
 /** Send a short status ack with the venue's signature applied. */
-async function sendBotAck(sock: any, chatId: string, body: string): Promise<void> {
+async function sendBotAck(sock: WASocket, chatId: string, body: string): Promise<void> {
   await sock.sendMessage(chatId, { text: formatReply(body) }).catch((e: Error) =>
     log.warn({ err: e.message }, "whatsapp: ack send failed"),
   );
@@ -987,7 +1077,7 @@ async function sendBotAck(sock: any, chatId: string, body: string): Promise<void
 /** Periodic sweep: expire `pending_plans` rows older than PLAN_TIMEOUT_MS
  *  and notify each affected chat. Handles the "operator walked away"
  *  case where no inbound traffic triggers the on-entry sweep. */
-function startPlanExpirySweep(sock: any, plansStore: PendingPlansStore): void {
+function startPlanExpirySweep(sock: WASocket, plansStore: PendingPlansStore): void {
   if (planExpirySweepTimer) clearInterval(planExpirySweepTimer);
   planExpirySweepTimer = setInterval(async () => {
     let rows: ReturnType<PendingPlansStore["sweepExpired"]>;
@@ -1064,15 +1154,10 @@ export function configurePersona(displayName: string): void {
 }
 
 /** Format every outbound message so it's distinguishable from the user's
- *  own typed messages in the same self-group: bold body + persona signature. */
+ *  own typed messages in the same self-group. Thin wrapper over the shared
+ *  implementation, bound to the boot-time persona. */
 function formatReply(body: string): string {
-  // WhatsApp bold uses single asterisks and DOES NOT cross newlines reliably.
-  // Wrap each non-empty line individually.
-  const bolded = body
-    .split("\n")
-    .map((line) => (line.trim() ? `*${line}*` : line))
-    .join("\n");
-  return `${bolded}\n\n*— ${personaDisplayName}*`;
+  return sharedFormatReply(body, personaDisplayName);
 }
 
 function extractText(msg: WAMessage): string {

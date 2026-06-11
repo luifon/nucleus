@@ -17,16 +17,7 @@
 import path from "node:path";
 import { loadConfig } from "./config.js";
 import { ChatSessionStore, OutboundQueueStore } from "./db.js";
-
-function formatReply(body: string, personaName: string): string {
-  // Match index.ts formatReply: WhatsApp bold uses single asterisks and
-  // doesn't cross newlines reliably, so wrap each non-empty line.
-  const bolded = body
-    .split("\n")
-    .map((line) => (line.trim() ? `*${line}*` : line))
-    .join("\n");
-  return `${bolded}\n\n*— ${personaName}*`;
-}
+import { formatReply } from "./format.js";
 
 function main(): void {
   const body = process.argv.slice(2).join(" ").trim();
