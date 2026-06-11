@@ -24,6 +24,7 @@ sqlx = { workspace = true }
 
 tracing = { workspace = true }
 anyhow = { workspace = true }
+futures = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 bollard = { workspace = true }

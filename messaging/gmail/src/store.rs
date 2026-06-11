@@ -20,12 +20,18 @@ pub const WATERMARK_KEY: &str = "last_run_at";
 
 pub async fn open(path: &Path) -> Result<SqlitePool> {
     let pool = nucleus_core::db::open(path).await?;
-    ensure_schema(&pool).await?;
+    nucleus_core::migrate::migrate(&pool, MIGRATIONS)
+        .await
+        .context("migrating gmail.db")?;
     Ok(pool)
 }
 
-async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
-    sqlx::query(
+/// Versioned migrations (ADR-020): v1 = the historical ensure_schema
+/// body. New schema changes go in as v2+ and run exactly once.
+const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[nucleus_core::migrate::Migration {
+    version: 1,
+    name: "baseline-adr007",
+    step: nucleus_core::migrate::Step::Sql(
         r#"
         CREATE TABLE IF NOT EXISTS killlist_senders (
             email      TEXT PRIMARY KEY,
@@ -33,36 +39,19 @@ async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
             reason     TEXT,
             added_by   TEXT
         );
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
         CREATE TABLE IF NOT EXISTS sender_hits (
             email       TEXT PRIMARY KEY,
             junk_hits   INTEGER NOT NULL DEFAULT 0,
             last_hit_at TEXT
         );
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
         CREATE TABLE IF NOT EXISTS watermark (
             key        TEXT PRIMARY KEY,
             value      TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        );
+        )
         "#,
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
+    ),
+}];
 
 pub async fn read_watermark(pool: &SqlitePool) -> Result<Option<DateTime<Utc>>> {
     let row: Option<(String,)> = sqlx::query_as(

@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = "0.10"
 async-trait = { workspace = true }
+futures = { workspace = true }
 figment = { workspace = true }
 dotenvy = { workspace = true }
 uuid = { workspace = true }

@@ -60,7 +60,25 @@ fn model_defaults(model: &str) -> (i64, i64, i64) {
     }
 }
 
+/// Versioned migrations (ADR-020): v1 = the historical ensure_schema body
+/// verbatim (idempotent CREATE + tolerated ALTERs). New schema changes go
+/// in as v2+ and run exactly once.
+const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[nucleus_core::migrate::Migration {
+    version: 1,
+    name: "baseline-adr019-gallery",
+    step: nucleus_core::migrate::Step::Rust(baseline_v1),
+}];
+
+fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
+    Box::pin(baseline_schema(pool))
+}
+
 pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
+    nucleus_core::migrate::migrate(pool, MIGRATIONS).await?;
+    Ok(())
+}
+
+async fn baseline_schema(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS generated_images (

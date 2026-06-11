@@ -47,8 +47,12 @@ async fn get_info(State(s): State<Arc<ChatState>>) -> Json<ChatInfo> {
     })
 }
 
-pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
-    sqlx::query(
+/// Versioned migrations (ADR-020): v1 = the historical ensure_schema
+/// body. New schema changes go in as v2+ and run exactly once.
+const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[nucleus_core::migrate::Migration {
+    version: 1,
+    name: "baseline-obsidian-chat",
+    step: nucleus_core::migrate::Step::Sql(
         r#"
         CREATE TABLE IF NOT EXISTS obsidian_chats (
           id TEXT PRIMARY KEY,
@@ -57,12 +61,6 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
           created_at TEXT NOT NULL,
           last_active TEXT NOT NULL
         );
-    "#,
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        r#"
         CREATE TABLE IF NOT EXISTS obsidian_messages (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           chat_id TEXT NOT NULL REFERENCES obsidian_chats(id),
@@ -70,13 +68,13 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
           content TEXT NOT NULL,
           ts TEXT NOT NULL
         );
-    "#,
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_obs_msgs_chat ON obsidian_messages(chat_id)")
-        .execute(pool)
-        .await?;
+        CREATE INDEX IF NOT EXISTS idx_obs_msgs_chat ON obsidian_messages(chat_id)
+        "#,
+    ),
+}];
+
+pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
+    nucleus_core::migrate::migrate(pool, MIGRATIONS).await?;
     Ok(())
 }
 
