@@ -14,6 +14,8 @@
     "discover": "tsx src/index.ts --discover",
     "send": "tsx src/send.ts",
     "ack": "tsx src/ack.ts",
+    "docs": "tsx src/docs.ts",
+    "enqueue-media": "tsx src/enqueue-media.ts",
     "list-groups": "tsx src/list-groups.ts",
     "build": "tsc -p .",
     "test": "tsx --test src/**/*.test.ts",
