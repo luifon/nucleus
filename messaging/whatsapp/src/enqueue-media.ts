@@ -24,6 +24,7 @@ import path from "node:path";
 import { loadConfig } from "./config.js";
 import { ChatSessionStore, OutboundQueueStore, type OutboundKind } from "./db.js";
 import { DocStore } from "./docstore.js";
+import { makeVaultManifestHook } from "./docstore_vault.js";
 
 function fail(msg: string): never {
   console.error(JSON.stringify({ error: msg }));
@@ -86,6 +87,7 @@ function main(): void {
     const docStore = new DocStore({
       dbPath: config.documentsDbPath,
       documentsDir: config.documentsDir,
+      onManifestChange: makeVaultManifestHook(config),
     });
     const doc = docStore.get(flags.get("doc")!);
     if (!doc) fail(`no active document matching ${flags.get("doc")}`);
