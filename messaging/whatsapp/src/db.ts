@@ -4,6 +4,24 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+/** Idempotent column additions via PRAGMA table_info detection — TS has no
+ *  migration runner, and ADR-020 called the tolerated-duplicate-error ALTER
+ *  pattern an accumulation smell. Checking the actual schema is exact. */
+function addColumnsIfMissing(
+  db: DatabaseSync,
+  table: string,
+  cols: Array<[name: string, ddl: string]>,
+): void {
+  const have = new Set(
+    (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+      (r) => r.name,
+    ),
+  );
+  for (const [name, ddl] of cols) {
+    if (!have.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  }
+}
+
 export class ChatSessionStore {
   private db: DatabaseSync;
 
@@ -50,6 +68,12 @@ export class ChatSessionStore {
       -- process) inserts here; Alfred drains every 5s. Target is
       -- either a group NAME (resolved via Alfred's allowlist map) or
       -- a JID (used directly when it matches the allowlist).
+      --
+      -- ADR-018 media extension: kind ∈ {text, image, document}; body
+      -- doubles as the caption for media rows. media_path MUST be a
+      -- drain-owned staged file under memory/outbound-staging/ — the
+      -- drain unlinks it at terminal state (sent or failed). Never point
+      -- it at a document-library original.
       CREATE TABLE IF NOT EXISTS outbound_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         target TEXT NOT NULL,
@@ -60,7 +84,11 @@ export class ChatSessionStore {
         attempts INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
         sent_at TEXT,
-        msg_id TEXT
+        msg_id TEXT,
+        kind TEXT NOT NULL DEFAULT 'text',
+        media_path TEXT,
+        mimetype TEXT,
+        filename TEXT
       );
 
       CREATE INDEX IF NOT EXISTS idx_outbound_status_enqueued
@@ -87,6 +115,14 @@ export class ChatSessionStore {
       CREATE INDEX IF NOT EXISTS idx_pending_plans_chat_status_time
         ON pending_plans(chat_id, status, captured_at DESC);
     `);
+    // ADR-018: heal pre-media DBs. Fresh installs get the full shape from
+    // the CREATE above; existing DBs gain the columns here.
+    addColumnsIfMissing(this.db, "outbound_queue", [
+      ["kind", "kind TEXT NOT NULL DEFAULT 'text'"],
+      ["media_path", "media_path TEXT"],
+      ["mimetype", "mimetype TEXT"],
+      ["filename", "filename TEXT"],
+    ]);
   }
 
   lookup(chatId: string): string | null {
@@ -272,13 +308,22 @@ export class PendingStore {
   }
 }
 
+export type OutboundKind = "text" | "image" | "document";
+
 export interface OutboundRow {
   id: number;
   target: string;
+  /** Message text; for media rows this is the caption (may be empty). */
   body: string;
   source: string;
   enqueuedAt: string;
   attempts: number;
+  kind: OutboundKind;
+  /** Drain-owned staged file (memory/outbound-staging/) — unlinked at
+   *  terminal state. NEVER a document-library original. Null for text. */
+  mediaPath: string | null;
+  mimetype: string | null;
+  filename: string | null;
 }
 
 /** Outbound WhatsApp send queue. The reminders binary (and anyone else
@@ -302,16 +347,36 @@ export class OutboundQueueStore {
 
   /** Insert a new pending row. Returns the auto-assigned id. `target` is
    *  either a group name (resolved via the bot's allowlist name→JID map)
-   *  or a raw JID; either way the drainer authorizes before sending. */
-  enqueue(input: { target: string; body: string; source: string }): number {
+   *  or a raw JID; either way the drainer authorizes before sending.
+   *  Media rows (kind image/document) must set mediaPath to a drain-owned
+   *  staged file — see the schema comment. */
+  enqueue(input: {
+    target: string;
+    body: string;
+    source: string;
+    kind?: OutboundKind;
+    mediaPath?: string;
+    mimetype?: string;
+    filename?: string;
+  }): number {
     const now = new Date().toISOString();
     const res = this.db
       .prepare(
         `INSERT INTO outbound_queue
-           (target, body, source, enqueued_at, status, attempts)
-         VALUES (?, ?, ?, ?, 'pending', 0)`,
+           (target, body, source, enqueued_at, status, attempts,
+            kind, media_path, mimetype, filename)
+         VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)`,
       )
-      .run(input.target, input.body, input.source, now);
+      .run(
+        input.target,
+        input.body,
+        input.source,
+        now,
+        input.kind ?? "text",
+        input.mediaPath ?? null,
+        input.mimetype ?? null,
+        input.filename ?? null,
+      );
     return Number(res.lastInsertRowid);
   }
 
@@ -319,7 +384,8 @@ export class OutboundQueueStore {
   pending(limit: number = 20): OutboundRow[] {
     const rows = this.db
       .prepare(
-        `SELECT id, target, body, source, enqueued_at, attempts
+        `SELECT id, target, body, source, enqueued_at, attempts,
+                kind, media_path, mimetype, filename
            FROM outbound_queue
           WHERE status = 'pending'
           ORDER BY enqueued_at ASC
@@ -332,6 +398,10 @@ export class OutboundQueueStore {
         source: string;
         enqueued_at: string;
         attempts: number;
+        kind: string;
+        media_path: string | null;
+        mimetype: string | null;
+        filename: string | null;
       }>;
     return rows.map((r) => ({
       id: r.id,
@@ -340,6 +410,10 @@ export class OutboundQueueStore {
       source: r.source,
       enqueuedAt: r.enqueued_at,
       attempts: r.attempts,
+      kind: (r.kind as OutboundKind) ?? "text",
+      mediaPath: r.media_path,
+      mimetype: r.mimetype,
+      filename: r.filename,
     }));
   }
 
@@ -354,15 +428,23 @@ export class OutboundQueueStore {
       .run(now, msgId, id);
   }
 
-  /** Record a delivery failure. After `maxAttempts` we stop retrying. */
-  markFailure(id: number, error: string, maxAttempts: number): void {
+  /** Record a delivery failure. After `maxAttempts` we stop retrying.
+   *  Returns the resulting status so the drain can gate filesystem
+   *  actions (staged-media unlink) on TERMINALITY — unlinking on a
+   *  non-terminal failure would strand the retry (ADR-018). */
+  markFailure(
+    id: number,
+    error: string,
+    maxAttempts: number,
+  ): { status: "pending" | "failed" } {
     const row = this.db
       .prepare(
         `SELECT attempts FROM outbound_queue WHERE id = ?`,
       )
       .get(id) as { attempts: number } | undefined;
     const attempts = (row?.attempts ?? 0) + 1;
-    const status = attempts >= maxAttempts ? "failed" : "pending";
+    const status: "pending" | "failed" =
+      attempts >= maxAttempts ? "failed" : "pending";
     this.db
       .prepare(
         `UPDATE outbound_queue
@@ -370,6 +452,31 @@ export class OutboundQueueStore {
           WHERE id = ?`,
       )
       .run(attempts, error, status, id);
+    return { status };
+  }
+
+  /** Terminal failure regardless of attempts — for non-retryable errors
+   *  (missing/oversized media file): retrying can never succeed. */
+  markFailedTerminal(id: number, error: string): void {
+    this.db
+      .prepare(
+        `UPDATE outbound_queue
+            SET attempts = attempts + 1, last_error = ?, status = 'failed'
+          WHERE id = ?`,
+      )
+      .run(error, id);
+  }
+
+  /** media_paths of all still-pending rows — the boot sweep keeps these
+   *  and deletes any other file in the staging dir. */
+  pendingMediaPaths(): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT media_path FROM outbound_queue
+          WHERE status = 'pending' AND media_path IS NOT NULL`,
+      )
+      .all() as Array<{ media_path: string }>;
+    return rows.map((r) => r.media_path);
   }
 }
 
