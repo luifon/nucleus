@@ -1,173 +1,209 @@
-# ADR-018 — WhatsApp media + personal document library (encrypted Drive)
+# ADR-018 — WhatsApp media + personal document library (local library)
 
-**Status:** Proposed (revised 2026-06-01 — supersedes the vault-binding draft)
-**Date:** 2026-06-01
+**Status:** Accepted (shipped 2026-06-12) — third revision; supersedes the
+encrypted-Drive draft (2026-06-01), which superseded the vault-binding draft.
+**Date:** 2026-06-12
 **Related:** ADR-005b (WhatsApp DM mode), ADR-006 (reminders / `outbound_queue`),
-ADR-007 (Gmail/Calendar via claude.ai MCP — trash account), ADR-008 (skills),
-ADR-019 (image-generation gallery — a producer for the outbound media path)
+ADR-011 (tailnet perimeter — the dashboard surface's access gate),
+ADR-015 (dashboard), ADR-019 (image-generation gallery — a producer for the
+outbound media path), ADR-020 (DB ownership rule, typegen, drain hang
+protection — all load-bearing here).
 
 ## Context
 
-WhatsApp is **text-only in both directions** today:
+WhatsApp was **text-only in both directions**:
 
-- **Inbound** (`messaging/whatsapp/src/index.ts`): `extractText()` reads only
-  `conversation` / `extendedTextMessage` / image|video `caption`; everything else
-  drops at `if (!text.trim()) return;`. Audio is the lone media type fetched
-  (`downloadMediaMessage` → Whisper) because it collapses to text.
+- **Inbound**: `extractText()` read only `conversation` / `extendedTextMessage`
+  / image|video `caption`; everything else dropped. Audio was the lone media
+  type fetched (`downloadMediaMessage` → Whisper) because it collapses to text.
 - **Outbound** (`outbound_queue` in `memory/whatsapp.db`, drained 1s): text-only
-  schema; the drain calls `sock.sendMessage(jid, { text })`. Baileys *does*
-  support `{ image }` / `{ document, mimetype, fileName }` — never called.
+  schema; the drain called `sock.sendMessage(jid, { text })`.
 
-The original trigger was delivering generated images. That's now **subsumed and
-sharpened**: the real goal is **WhatsApp as a working surface for documents**,
-and the headline is **on-demand retrieval of personal documents** — "send me my
-RG / CPF / passport" from the DM, and I deliver the file. Generated images
-(ADR-019's gallery) become just *one producer* feeding the same outbound path.
+The goal: **WhatsApp as a working surface for documents**, headlined by
+on-demand retrieval — "send me my RG / CPF / passport" from the DM, file
+delivered. Generated images (ADR-019) become one producer feeding the same
+outbound path.
 
-**This revision changes the storage model.** The prior draft bound media into the
-Obsidian vault via a new brain-dump `attach` op. That's dropped. Binary
-docs/media now live in **encrypted Google Drive**; the vault keeps only a
-**text manifest** (index + audit). Rationale below.
+**Revision history on the storage model** (the part that changed twice):
+
+1. *Vault-binding draft*: binaries inside the Obsidian vault → dropped
+   (binary churn, graph clutter, and the vault is `--add-dir`'d into LLM
+   sessions).
+2. *Encrypted-Drive draft*: client-side-encrypted binaries on the trash
+   account's Drive → dropped (this revision). Two reasons: implementation
+   reality and a better trade. Service accounts **cannot access a personal
+   Gmail's My Drive** (Workspace-only delegation), so the headless path
+   degraded to rclone+OAuth — and by the draft's own admission the Drive
+   plumbing was "where most of the build effort concentrates". All of it
+   bought a remote copy on a throwaway account that then *required*
+   client-side encryption (key management, Keychain, lost-key footgun) to
+   be tolerable.
+3. **This revision: local library.** Operator decision 2026-06-12. The
+   from-anywhere use case never needed Drive — WhatsApp delivery IS the
+   from-anywhere mechanism, and the bot runs on this Mac: if the Mac is
+   off, all of Nucleus is off, Drive or not.
 
 ## Decision — three planes + two cross-cutting rules
 
-- **Storage = encrypted Google Drive** (the trash account, `$NUCLEUS_GMAIL_ACCOUNT`),
-  client-side encrypted. Not the vault.
-- **Index/audit = Obsidian manifest** — text only: logical name, tags, Drive file
-  id, mimetype, direction, timestamp. Never the bytes, never decrypted content.
-- **Transport = WhatsApp** — inbound via `downloadMediaMessage`; outbound via the
-  `outbound_queue` extended for media.
+- **Storage = local library.** Bytes at `memory/documents/<id>.<ext>`,
+  metadata in `memory/documents.db` (`documents` + `doc_audit` tables).
+  The TS docstore (`messaging/whatsapp/src/docstore.ts`) owns ALL writes
+  (ADR-020 ownership — the bot process + its CLIs are one family; WAL +
+  busy_timeout absorb same-family concurrency). Everything else reads:
+  the dashboard opens read-only via `core::db::open_read_only()` (never
+  `db::open` — `create_if_missing` would conjure an empty foreign DB).
+- **Index/audit = Obsidian text layer** (`4-Areas/Documents/`) — never the
+  bytes. See below.
+- **Transport = WhatsApp** — inbound via `downloadMediaMessage`; outbound
+  via the media-extended `outbound_queue`.
 
-Cross-cutting:
-- **By-reference orchestration** (privacy-critical).
-- **Security model** (encryption + DM-lock + audit).
+Cross-cutting, carried from the prior drafts and still load-bearing:
 
-### Storage: encrypted Drive, not the vault
+- **By-reference orchestration** (privacy-critical). The model resolves
+  *which* file (name/tags → id via the docstore); the plumbing moves the
+  bytes disk → staging → Baileys. **Document bytes never enter model
+  context or session transcripts.** Inbound is symmetric: the model only
+  Reads an inbound file when the operator explicitly asks it to act on one.
+- **DM-lock** (misdelivery is the catastrophic failure mode). Three layers
+  make a wrong destination *inexpressible*: the retrieval skill forbids
+  naming a target → `enqueue-media.ts --doc` **parses no target flag at
+  all** (operator DM derived inside the CLI from `WHATSAPP_ALLOWED_DM_JIDS`)
+  → the drain's `resolveOutboundTarget` allowlist re-validates.
 
-- Binary docs/media live in the trash account's Drive, **client-side encrypted**
-  before upload. Operator's choice: it's the account Nucleus already has wired
-  (ADR-007), and encryption means a **trash-account compromise yields only
-  ciphertext**.
-- **Encryption:** symmetric, client-side (tool TBD — `age` preferred). The key
-  lives in the **macOS Keychain** (read on demand by the plumbing), with a backup
-  copy in the operator's password manager. *Lost key = unrecoverable docs* — the
-  backup is mandatory, not optional.
-- **Threat model:** protects against Drive / Google-account compromise. Does NOT
-  protect against a fully-compromised Mac — but the Mac already holds `.env`,
-  every bot token, and the WhatsApp session, so that's already game-over;
-  Keychain doesn't make it worse. (This is why we didn't pick passphrase-per-
-  retrieval: it would either ride through WhatsApp as plaintext or kill the
-  from-anywhere use case, for marginal gain against an already-lost Mac.)
+### Why not the vault (unchanged)
 
-### Index & audit: the Obsidian manifest
+Beyond churn/clutter: the vault is mounted into LLM sessions constantly
+(braindump, chat, distiller all get `--add-dir <vault>`). Identity documents
+inside it would be one `Read` away from any session — the by-reference rule
+dies. `memory/documents/` is deliberately NOT handed to sessions wholesale.
 
-- A text-only manifest in the vault records every stored item: logical name
-  (`passport`, `RG`, `CPF`, …) + tags, Drive file id, mimetype, direction
-  (in/out), source, timestamp. **No payload, no decrypted text.**
-- It serves double duty: the **lookup index** that resolves "send me my passport"
-  → a Drive file id, and the **audit log** of every store + retrieval.
-- Lives in its own area (e.g. `4-Areas/Documents/`), distinct from knowledge
-  brain-dumps. Text knowledge still flows to the vault as before; this is just a
-  registry of where the encrypted binaries are.
+### Why no encryption (new)
 
-### By-reference orchestration (privacy-critical)
+The encryption defended against compromise of a cloud account that no longer
+holds the documents. Locally, FileVault covers at-rest; a fully-compromised
+Mac was already game-over in the prior draft's own threat model (it holds
+`.env`, every token, the WhatsApp session). App-layer encryption here would
+add a key-management surface and a lost-key footgun for zero marginal
+protection.
 
-The model resolves *which* file (by name/tags from the manifest) — it never holds
-the document bytes. The plumbing does: download the ciphertext from Drive →
-decrypt locally to a temp path → hand that path to the outbound queue → Baileys
-sends → wipe the temp. **The bytes flow Drive → disk → WhatsApp, never into the
-model context or session transcripts.** Your passport never lands in an LLM log.
-(Inbound is symmetric: the model only *sees* an inbound doc when you explicitly
-ask it to act on one — see below; pure archival is by-reference too.)
+### Durability — consciously deferred
+
+Single-disk: Mac loss/disk death loses the library until the future mirror
+exists. Owned in writing, accepted by the operator (originals exist
+physically). Cheap interim mitigations: keep `memory/documents*` inside the
+Time Machine scope; the vault `audit.md` (append-only) survives a
+`documents.db` loss as a human-readable inventory trail.
+
+**Future mirror (replaces the Drive section):** `WHATSAPP_DOCUMENTS_DIR` is
+the seam — point it at a mounted external volume (or rsync nightly to a
+self-hosted box) and the library moves; the DB stays at
+`memory/documents.db`. If the mirror target ever leaves the machine,
+encrypt at mirror time (age). A restore drill is required before any mirror
+counts as durability. Out of S18 scope.
+
+## The pieces (as shipped)
+
+### Outbound queue — media extension
+
+`outbound_queue` gains `kind ∈ {text,image,document}` (body doubles as
+caption), `media_path`, `mimetype`, `filename`. TS heals existing DBs via
+`PRAGMA table_info` detection; the Rust co-creator
+(`chores/reminders/src/store.rs::open_whatsapp_db`) carries the full CREATE
+for fresh-install parity only — no Rust migrations on whatsapp.db (ADR-020).
+
+**Lifecycle contract:** `media_path` is a **drain-owned staged file** under
+`memory/outbound-staging/` — `enqueue-media` always COPIES into staging
+(pointing at a library original would let the drain delete your passport).
+The drain unlinks ONLY at terminal state: `markSent`, or a `markFailure`
+that *returns* `failed` (the return type exists for exactly this), or
+`markFailedTerminal` (missing/oversized file — retrying can never succeed).
+A retried row's file survives. Boot sweep collects staging orphans.
+
+Send budget: text 20s / media 90s timeouts, max 3 media sends per tick,
+`DRAIN_WATCHDOG_MS` derived from those constants (ADR-020's watchdog,
+now drift-proof). Size cap `WHATSAPP_MEDIA_MAX_BYTES` (default 64MB).
+Baileys `{url}` stream form — no multi-MB buffers in heap.
+
+### Document store
+
+`documents(id, logical_name, tags JSON, filename, ext, mimetype, bytes,
+sha256, source, added_at, last_retrieved_at, retrieve_count, status)` +
+`doc_audit(doc_id, action, channel, detail, at)`. Atomic add
+(tmp→fsync→rename→tx): no row ever points at a missing file. sha256 dedup
+(re-sending your passport doesn't double-store). Soft delete. Exact-first
+`find()` tiers: exact name → exact tag → substring → token fuzzy.
+
+**Stored-name contract (normative):** the on-disk file is
+`${id}.${lower(ext(filename))}` (mimetype-map fallback, then `bin`).
+`docstore.ts::storedName()` is the one implementation; the dashboard
+composes from the API's `ext` field. Don't fork the logic.
+
+### Vault text layer (`4-Areas/Documents/`)
+
+- `Documents-overview.md` — hub, written once if missing (operator-curated
+  afterwards).
+- `manifest.md` — a **regenerated view** of documents.db (full rewrite on
+  every mutation incl. retrievals; tmp+rename atomic; do-not-edit callout;
+  dataview inline fields). Regeneration makes rename/retag corruption
+  structurally impossible and the file self-healing.
+- `audit.md` — **append-only** (monthly headings). Survives DB loss.
+
+Written by direct deterministic fs writes (diary.ts precedent) — NOT the
+braindump review pipeline: fixed paths, DB-derived content, nothing for a
+model to decide. Don't "fix" this into the op pipeline. (Rule 9: the
+sub-folder creation is operator-directed via this ADR.)
 
 ### Inbound (operator → Nucleus)
 
-`handleMessage` gains an `imageMessage`/`documentMessage` branch
-(`downloadMediaMessage`, mirroring the audio path). Two outcomes by intent:
+Every inbound image/document **archives to the library** (dedup absorbs
+re-sends), in DM and braindump roles; ack carries the stored name + id.
+`documentWithCaptionMessage` is normalized (captioned docs silently drop
+otherwise). Caption heuristics (`caption.ts`): `name:`/`nome:` → archive
+with that name; `act:`/`faz:`/`!` → force act; ≤5 words with no sentence
+punctuation → it's a label; anything else **archives AND acts** (a false
+act wastes one turn; a false archive-only forces a re-ask that still
+works). The act path hands the session the **docstore path** to Read — no
+staging copy; the archived file is already local and under the workspace.
+Braindump role is capture-only (archive + ack, never a session ask).
 
-- **"act on this"** ("summarize this contract", "what's the total on this
-  receipt") → stage to a transient path and **instruct the session to `Read`
-  it** (Read renders images + PDF pages natively; robust through the tmux paste
-  path, unlike `@`-mentions). Respond, then sweep the temp.
-- **archive** → encrypt → upload to Drive → write a manifest entry. Per the scope
-  decision, **all inbound media is archived** to encrypted Drive; the model only
-  reads it when you ask it to act.
+### Outbound retrieval — the headline
 
-### Outbound (Nucleus → operator) — the headline
+DM: "send me my RG" → the `send-document` skill (repo-committed,
+`.claude/skills/send-document/`) → `docs.ts find` → 0/1/many handling (one
+disambiguation question max; never guess between identity documents) →
+`enqueue-media.ts --doc <id>` → drain delivers to the DM. Audited at every
+hop (retrieve_count + doc_audit + vault audit.md). The DM session pool
+pre-approves the two CLIs (`PoolConfig.allowedTools`) and carries a
+code-owned capability blurb on top of the operator-owned persona.
 
-"send me my passport" → resolve via the manifest → fetch + decrypt → enqueue a
-media row → the drain delivers to the DM. Mechanism = the extended
-`outbound_queue` (below). **DM-locked:** only the operator's JID
-(`resolveOutboundTarget` already gates the allowlist). Identity docs go to the
-operator's own DM and **never** a group/other contact — the catastrophic failure
-mode. Generated images (ADR-019) enqueue the same way: one delivery path, many
-producers.
+### Dashboard surface (`/documents`)
 
-### Outbound queue — media extension (carried from the prior draft, still valid)
-
-Extend `outbound_queue` (created identically in `messaging/whatsapp/src/db.ts`
-and `chores/reminders/src/store.rs`) with idempotent `ALTER TABLE … ADD COLUMN`
-(guard the duplicate-column error):
-
-```sql
-ALTER TABLE outbound_queue ADD COLUMN kind       TEXT NOT NULL DEFAULT 'text';
-ALTER TABLE outbound_queue ADD COLUMN media_path TEXT;   -- abs path to the decrypted temp
-ALTER TABLE outbound_queue ADD COLUMN mimetype   TEXT;
-ALTER TABLE outbound_queue ADD COLUMN filename   TEXT;   -- display name
-```
-
-`kind ∈ {text, image, document}`; `body` doubles as the caption. The drain
-branches: `{ image, caption }` / `{ document, mimetype, fileName, caption }` /
-`{ text }`. A venue-correct enqueue CLI (`messaging/whatsapp/src/enqueue-media.ts`)
-+ a thin skill let a session queue a file; **authorization is enforced at the
-drain** (allowlisted JID), not the enqueue.
-
-### Headless Drive access — the real implementation wrinkle
-
-The Google Drive access Nucleus has today is a **claude.ai connector
-(interactive auth)**. The WhatsApp bot runs as a **headless** tmux session and
-likely won't have it (cf. the memory: interactively-authed MCP servers are absent
-in headless runs). So store/retrieve needs a **non-interactive Drive path** — a
-Google **service account** (or an OAuth refresh token / `rclone`) with creds on
-the Mac (`.env` / Keychain). This is where most of the build effort concentrates,
-and it's independent of the WhatsApp + encryption work.
-
-## Rollout phases
-
-1. **Outbound media queue** — schema migration (both writers) + drain branch +
-   enqueue CLI/skill. The delivery substrate; also unblocks ADR-019 image
-   delivery. Validate with a static PNG to the DM; verify legacy `text` rows
-   unaffected.
-2. **Drive plumbing** — non-interactive Drive access (service account) + the
-   encrypt/decrypt helpers (Keychain key + backup) + temp-file hygiene.
-3. **Manifest** — the Obsidian text index/audit + resolve-by-name lookup.
-4. **Outbound retrieval** ("send me my X") — the headline skill, DM-locked,
-   by-reference, audited. This is the payoff.
-5. **Inbound capture** — the image/document branch → archive (encrypt→Drive→
-   manifest) + the act-on-this `Read` path.
-
-Phases 1–3 are independent; 4 needs 1+2+3; 5 needs 2+3.
+Read-only viewer (library grid + audit trail) over the TS-owned DB.
+File bytes served at `/documents/files/` with **`Cache-Control: no-store`**
+(identity bytes never persist in a browser cache) + `nosniff`, behind the
+ADR-011 tailnet perimeter. Dashboard views deliberately do NOT bump
+retrieve_count — "retrieved" means "delivered to the operator", not
+"looked at". Per-request auth was considered and rejected: at the tailnet
+trust level it's theater (an attacker who can reach the dashboard can read
+`memory/` through the chat surface anyway).
 
 ## Consequences
 
-- `outbound_queue` becomes the single media-delivery primitive (reminders,
-  gallery, doc retrieval) with one auth gate.
-- Storage is fully decoupled from the vault — the vault holds only the manifest.
-  No binary churn, no graph clutter; the prior draft's `_attachments`/`attach`-op
-  complexity disappears.
-- Encryption adds a key-management surface (Keychain + a mandatory backup) and a
-  lost-key footgun.
-- Headless Drive access (service account) is real, separable work.
-- Sensitive-document delivery is a high-consequence path: the DM JID-lock,
-  by-reference handling, and audit manifest are all load-bearing, not nice-to-have.
+- `outbound_queue` is the single media-delivery primitive (reminders,
+  gallery, doc retrieval) with one auth gate at the drain.
+- The library is one `cp -r` to back up; zero key management.
+- Durability risk is single-disk and owned in writing (mitigations above);
+  the future mirror has a named seam (`WHATSAPP_DOCUMENTS_DIR`).
+- The dashboard now serves identity files inside the tailnet perimeter
+  (no-store; env-gating the file route is a one-line follow-up if the
+  posture ever feels wrong).
+- Sensitive-document delivery remains a high-consequence path: the
+  three-layer DM-lock, by-reference handling, and the dual audit trail
+  are load-bearing, not nice-to-have.
 
 ## Open questions
 
-- Encryption tool + container format (`age` vs `gpg` vs `openssl enc`).
-- Manifest shape: one note + per-entry rows/tags, vs a small DB; where under
-  `4-Areas/Documents/`.
-- Name resolution: a tag/alias convention so "passport" / "RG" / "CPF" map
-  unambiguously to one file (and disambiguation when several match).
-- Office formats inbound (`.docx`/`.xlsx`): convert to render, or store-only.
-- Confirm-before-send for identity docs? (DM-to-self is pre-authorized; mis-
-  delivery is the real risk and the JID-lock already covers it — likely no.)
+- Office formats inbound (`.docx`/`.xlsx`): Read renders neither — store-only
+  for now; convert-on-act is a follow-up if it ever matters.
+- Mirror target (external volume vs self-hosted) — decided when the
+  durability deferral is revisited.
