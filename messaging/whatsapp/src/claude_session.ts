@@ -295,6 +295,7 @@ export class SessionPool {
         appendSystemPrompt: this.config.appendSystemPrompt,
         permissionMode: this.config.permissionMode,
         disallowedTools: this.config.disallowedTools,
+        allowedTools: this.config.allowedTools,
         addDirs: this.config.addDirs,
         tmuxSession: this.config.tmuxSession,
         windowName: sanitizeWindowName(chatKey),
@@ -431,6 +432,7 @@ export class SessionPool {
         appendSystemPrompt: this.config.appendSystemPrompt,
         permissionMode: this.config.permissionMode,
         disallowedTools: this.config.disallowedTools,
+        allowedTools: this.config.allowedTools,
         addDirs: this.config.addDirs,
         tmuxSession: this.config.tmuxSession,
         // windowName left undefined → derives from the new session UUID.
@@ -484,6 +486,9 @@ export interface PoolConfig {
   appendSystemPrompt?: string;
   permissionMode?: string;
   disallowedTools?: string[];
+  /** Tool patterns pre-approved past the auto-mode classifier (ADR-018:
+   *  the DM pool pre-approves the docs/enqueue-media CLIs). */
+  allowedTools?: string[];
   addDirs?: string[];
   tmuxSession: string;
   idleTimeoutMs: number;
