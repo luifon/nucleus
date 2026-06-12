@@ -37,6 +37,9 @@ import {
   sendTimeoutFor,
   sweepOutboundStaging,
 } from "./outbound.js";
+import { classifyCaption } from "./caption.js";
+import { DocStore } from "./docstore.js";
+import { makeVaultManifestHook } from "./docstore_vault.js";
 import { transcribe } from "./transcribe.js";
 import {
   planCapture,
@@ -194,6 +197,33 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 const PLAN_TIMEOUT_MS = 30 * 60 * 1000;
 const PLAN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
+// ── ADR-018: document library wiring ──────────────────────────────────────
+
+/** Bash patterns the DM pool pre-approves so the session can look up and
+ *  deliver documents without classifier prompting (ack.ts precedent). */
+const DOC_TOOL_ALLOWLIST = [
+  "Bash(npx --prefix messaging/whatsapp tsx messaging/whatsapp/src/docs.ts:*)",
+  "Bash(npx --prefix messaging/whatsapp tsx messaging/whatsapp/src/enqueue-media.ts:*)",
+];
+
+/** Code-owned capability blurb appended to the DM persona — the persona
+ *  file is operator-owned, so the mechanics live here, not there. */
+const DOCS_CAPABILITY_PROMPT = `## Document library (ADR-018)
+
+You can retrieve and manage the operator's local document library. All
+commands run from the workspace root via Bash and print JSON lines:
+
+- find:    npx --prefix messaging/whatsapp tsx messaging/whatsapp/src/docs.ts find <query…>
+- list:    npx --prefix messaging/whatsapp tsx messaging/whatsapp/src/docs.ts list [--tag t]
+- rename:  npx --prefix messaging/whatsapp tsx messaging/whatsapp/src/docs.ts rename <id> --name "…"
+- deliver: npx --prefix messaging/whatsapp tsx messaging/whatsapp/src/enqueue-media.ts --doc <id> [--caption "…"]
+
+Rules: deliveries go ONLY to the operator's own DM — enqueue-media's --doc
+mode has no target flag and refuses one; never try to send a document to a
+group or anyone else. Handle documents BY REFERENCE: use ids and metadata,
+never Read a library file unless the operator explicitly asks you to act
+on its contents. Files over 64MB can't be delivered.`;
+
 async function main() {
   const discover = process.argv.includes("--discover");
   const workspaceRoot =
@@ -236,6 +266,13 @@ async function main() {
   sweepOutboundStaging(config.outboundStagingDir, outbound.pendingMediaPaths());
   // ADR-005a: holds brain-dump plans pending operator review.
   const plansStore = new PendingPlansStore(config.dbPath);
+  // ADR-018: the document library (inbound media archives here; the DM
+  // session retrieves via the docs/enqueue-media CLIs).
+  const docStore = new DocStore({
+    dbPath: config.documentsDbPath,
+    documentsDir: config.documentsDir,
+    onManifestChange: makeVaultManifestHook(config),
+  });
 
   // Tear down any leftover tmux sessions from a previous run before we own
   // fresh windows — startup is the safe time to clean orphans from prior
@@ -267,11 +304,15 @@ async function main() {
   // `@g.us` and DM JIDs end `@s.whatsapp.net`, so the keys never collide
   // — we use chatId as the key in both pools, and the dispatch chooses
   // which pool to talk to based on chatType.
+  // ADR-018: the DM pool gets the document-library capability — the two
+  // CLIs pre-approved past the auto-mode classifier, and a code-owned
+  // capability blurb appended to the (operator-owned) persona.
   const sessionsDm = new SessionPool({
     workspaceRoot: config.workspaceRoot,
-    appendSystemPrompt: config.appendSystemPromptDm,
+    appendSystemPrompt: `${config.appendSystemPromptDm}\n\n${DOCS_CAPABILITY_PROMPT}`,
     permissionMode: config.permissionMode,
     disallowedTools: config.disallowedTools,
+    allowedTools: DOC_TOOL_ALLOWLIST,
     tmuxSession: DM_TMUX_SESSION,
     idleTimeoutMs: 4 * 60 * 60 * 1000, // 4h
     agentLabel: "whatsapp",
@@ -314,7 +355,7 @@ async function main() {
     }
   })();
 
-  await connect(config, store, sessions, sessionsDm, outbound, plansStore);
+  await connect(config, store, sessions, sessionsDm, outbound, plansStore, docStore);
 }
 
 async function connect(
@@ -324,6 +365,7 @@ async function connect(
   sessionsDm: SessionPool,
   outbound: OutboundQueueStore,
   plansStore: PendingPlansStore,
+  docStore: DocStore,
 ): Promise<void> {
   const authDir = path.join(config.workspaceRoot, "messaging/whatsapp/auth");
   fs.mkdirSync(authDir, { recursive: true });
@@ -385,7 +427,7 @@ async function connect(
       log.warn({ reason, shouldReconnect }, "whatsapp: connection closed");
       if (shouldReconnect) {
         const delay = reason === 405 ? 5000 : 2000;
-        setTimeout(() => connect(config, store, sessions, sessionsDm, outbound, plansStore).catch((e) => log.error(e, "reconnect failed")), delay);
+        setTimeout(() => connect(config, store, sessions, sessionsDm, outbound, plansStore, docStore).catch((e) => log.error(e, "reconnect failed")), delay);
       } else {
         log.error("whatsapp: logged out — delete auth/ and re-pair");
       }
@@ -395,7 +437,7 @@ async function connect(
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
     for (const msg of messages) {
-      await handleMessage(sock, msg, config, store, sessions, sessionsDm, plansStore).catch((e) => {
+      await handleMessage(sock, msg, config, store, sessions, sessionsDm, plansStore, docStore).catch((e) => {
         log.error({ err: e?.message }, "whatsapp: handler failed");
       });
     }
@@ -674,6 +716,7 @@ async function handleMessage(
   sessions: SessionPool,
   sessionsDm: SessionPool,
   plansStore: PendingPlansStore,
+  docStore: DocStore,
 ): Promise<void> {
   const chatId = msg.key.remoteJid;
   if (!chatId) return;
@@ -744,6 +787,21 @@ async function handleMessage(
     }
   }
   // ---- END FILTERS ----
+
+  // ADR-018: inbound media (images/documents) intercepts BEFORE the
+  // braindump dispatch — media archives to the document library in every
+  // role; only the DM role additionally gets the act-on-this path.
+  // documentWithCaptionMessage normalization matters: Baileys delivers
+  // captioned documents under that wrapper, and checking only
+  // documentMessage silently drops them.
+  const inboundDoc =
+    msg.message?.documentMessage ??
+    msg.message?.documentWithCaptionMessage?.message?.documentMessage;
+  const inboundImg = msg.message?.imageMessage;
+  if (inboundDoc || inboundImg) {
+    await handleInboundMedia(sock, msg, chatId, role, config, store, sessionsDm, docStore);
+    return;
+  }
 
   // Brain-dump dispatches before extraction — the role handler decides
   // whether this is a reply (skip transcription, treat text as response)
@@ -841,6 +899,127 @@ async function handleConversational(
     });
   } finally {
     await sock.sendPresenceUpdate("paused", chatId);
+  }
+}
+
+/** ADR-018 inbound media: archive EVERY image/document to the local
+ *  library (dedup absorbs re-sends), ack with the stored name, and — DM
+ *  role only, when the caption reads as an instruction — hand the
+ *  DOCSTORE PATH to the session to Read (no staging copy: the archived
+ *  file is already a local, session-readable path under the workspace;
+ *  one copy, one lifecycle). Braindump role is capture-only: archive +
+ *  ack, captions become names, never a session ask. */
+async function handleInboundMedia(
+  sock: WASocket,
+  msg: WAMessage,
+  chatId: string,
+  role: ChatRole,
+  config: Config,
+  store: ChatSessionStore,
+  sessionsDm: SessionPool,
+  docStore: DocStore,
+): Promise<void> {
+  const m = msg.message;
+  const docMsg = m?.documentMessage ?? m?.documentWithCaptionMessage?.message?.documentMessage;
+  const imgMsg = m?.imageMessage;
+  const media = docMsg ?? imgMsg;
+  if (!media) return;
+
+  const isImage = !docMsg;
+  const caption = (docMsg?.caption ?? imgMsg?.caption ?? "").trim();
+  const origName = docMsg?.fileName ?? null;
+  const mimetype = media.mimetype ?? (isImage ? "image/jpeg" : "application/octet-stream");
+
+  // Size pre-check before downloading — fileLength is advisory but honest.
+  const declared = Number(media.fileLength ?? 0);
+  if (declared > config.mediaMaxBytes) {
+    await sock.sendMessage(chatId, {
+      text: formatReply(
+        `that file is ~${Math.round(declared / 1024 / 1024)}MB — over the ${Math.round(config.mediaMaxBytes / 1024 / 1024)}MB library cap, not archiving it`,
+      ),
+    });
+    return;
+  }
+
+  let buffer: Buffer;
+  try {
+    buffer = (await downloadMediaMessage(msg, "buffer", {}, {
+      logger: baileysLogger as any,
+      reuploadRequest: sock.updateMediaMessage,
+    })) as Buffer;
+  } catch (e) {
+    log.error({ chatId, err: (e as Error).message }, "whatsapp: media download failed");
+    await sock.sendMessage(chatId, {
+      text: formatReply(`couldn't download that file — ${(e as Error).message}`),
+    });
+    return;
+  }
+
+  const decision = classifyCaption(caption);
+  const localToday = new Date().toISOString().slice(0, 10);
+  const logicalName =
+    decision.name ??
+    (origName ? origName.replace(/\.[a-z0-9]{1,8}$/i, "") : `unnamed-${localToday}`);
+  const filename = origName ?? `${logicalName}.${isImage ? "jpg" : "bin"}`;
+
+  let record;
+  let deduped = false;
+  try {
+    const res = docStore.add({
+      data: buffer,
+      logicalName,
+      filename,
+      mimetype,
+      source: role === "braindump" ? "inbound-braindump" : "inbound-dm",
+      channel: chatId,
+    });
+    record = res.record;
+    deduped = res.deduped;
+  } catch (e) {
+    log.error({ chatId, err: (e as Error).message }, "whatsapp: docstore add failed");
+    await sock.sendMessage(chatId, {
+      text: formatReply(`couldn't archive that file — ${(e as Error).message}`),
+    });
+    return;
+  }
+
+  log.info(
+    { chatId, role, id: record.id, name: record.logicalName, bytes: record.bytes, deduped },
+    "whatsapp: inbound media archived",
+  );
+  await sock.sendMessage(chatId, {
+    text: formatReply(
+      `📄 arquivado: ${record.logicalName} (id ${record.id.slice(0, 8)})${deduped ? " — já existia" : ""}`,
+    ),
+  });
+
+  // Act path: DM only, instruction-shaped caption.
+  if (role === "dm" && decision.mode === "act" && decision.instruction) {
+    const docPath = docStore.pathFor(record);
+    const framed = `[WhatsApp — chat ${chatId}]
+[attached ${isImage ? "image" : "document"} "${record.logicalName}" archived at ${docPath} — use the Read tool on it]
+
+${decision.instruction}`;
+    await sock.sendPresenceUpdate("composing", chatId);
+    try {
+      const resume = store.lookup(chatId) ?? undefined;
+      const result = await sessionsDm.ask(chatId, framed, resume);
+      store.save(chatId, result.sessionId, !resume);
+      const rawReply = result.reply.trim() || "(no response)";
+      await sock.sendMessage(chatId, { text: formatReply(rawReply) });
+      log.info(
+        { chatId, id: record.id, replyChars: rawReply.length, elapsedMs: result.elapsedMs },
+        "whatsapp: act-on-media reply sent",
+      );
+    } catch (e) {
+      const err = (e as Error).message;
+      log.error({ chatId, err }, "whatsapp: act-on-media session failed");
+      await sock.sendMessage(chatId, {
+        text: formatReply(`arquivei, mas não consegui processar o pedido:\n\`\`\`\n${err}\n\`\`\``),
+      });
+    } finally {
+      await sock.sendPresenceUpdate("paused", chatId);
+    }
   }
 }
 
