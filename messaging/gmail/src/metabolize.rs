@@ -71,11 +71,7 @@ pub async fn run(settings: &Settings, workspace_root: &Path) -> Result<()> {
     // ${USER_NAME}; per-venue placeholders remain venue-local.
     let persona = config::substitute_gmail(&persona.body, &settings.gmail);
 
-    let prompt = build_prompt(
-        &lookback_from.to_rfc3339(),
-        &killlist,
-        &settings.gmail.account,
-    );
+    let prompt = build_prompt(&lookback_from, &killlist, &settings.gmail.account);
 
     // ADR-020: one_shot_mcp pre-approves the Gmail MCP tools JARVIS needs to
     // do the sweep without per-call classifier prompting — list + read +
@@ -191,13 +187,20 @@ fn nucleus_tz() -> Tz {
     chrono_tz::America::Sao_Paulo
 }
 
-fn build_prompt(watermark_rfc3339: &str, killlist: &[String], account: &str) -> String {
+fn build_prompt(watermark: &DateTime<Utc>, killlist: &[String], account: &str) -> String {
     let killlist_json = serde_json::to_string(killlist).unwrap_or_else(|_| "[]".into());
+    // Gmail search has no timestamp form of `newer_than:` (it takes
+    // durations like `2d`); `after:` accepts epoch seconds, which keeps
+    // the watermark precise. Feeding the RFC3339 string made the search
+    // return empty and JARVIS improvise (observed 2026-06-11, surfaced by
+    // the ADR-020 monitors).
+    let epoch = watermark.timestamp();
     format!(
         r#"Run today's inbox metabolism on {account}.
 
 LOOKBACK
-  Walk every UNREAD thread newer than {watermark}.
+  Walk every UNREAD thread received after {watermark_human} — in Gmail
+  search terms: `after:{epoch}` (epoch seconds; Gmail accepts this form).
 
 LABEL TAXONOMY (pick exactly one per thread, create them if missing)
   nucleus/transactional       receipts, 2FA, order confirmations
@@ -214,7 +217,7 @@ WORKFLOW
   1. Use `mcp__claude_ai_Gmail__list_labels` to see what already exists; create
      any taxonomy labels that are missing via `mcp__claude_ai_Gmail__create_label`.
   2. Use `mcp__claude_ai_Gmail__search_threads` with query
-     `is:unread newer_than:{watermark}` to enumerate threads.
+     `is:unread after:{epoch}` to enumerate threads.
   3. For each thread, fetch its top-level details with
      `mcp__claude_ai_Gmail__get_thread`, classify into ONE label, and apply
      via `mcp__claude_ai_Gmail__label_thread`.
@@ -243,7 +246,8 @@ OUTPUT (REPLY WITH ONLY THIS JSON, NO PROSE, NO MARKDOWN FENCES)
 If zero unread threads matched, return all-zero counts. Do not invent counts.
 "#,
         account = account,
-        watermark = watermark_rfc3339,
+        watermark_human = watermark.to_rfc3339(),
+        epoch = epoch,
         killlist_json = killlist_json,
     )
 }
