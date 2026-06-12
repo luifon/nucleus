@@ -13,7 +13,7 @@ allowed-tools:
   - "Bash(npx --prefix messaging/whatsapp tsx messaging/whatsapp/src/docs.ts list:*)"
   - "Bash(npx --prefix messaging/whatsapp tsx messaging/whatsapp/src/enqueue-media.ts --doc:*)"
 mcp_needed: []
-last_used: null
+last_used: 2026-06-12
 last_failure: null
 failure_count_30d: 0
 notify_on_failure: []
