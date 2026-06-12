@@ -12,6 +12,7 @@
 //   docs.ts path <id-or-prefix>
 //   docs.ts rename <id-or-prefix> --name "new name"
 //   docs.ts retag <id-or-prefix> --tags a,b
+//   docs.ts remove <id-or-prefix>          (soft delete + unlink)
 
 import path from "node:path";
 import fs from "node:fs";
@@ -156,6 +157,15 @@ function main(): void {
       const list = tags.split(",").map((t) => t.trim()).filter(Boolean);
       store.retag(d.id, list, "cli");
       console.log(JSON.stringify({ id: d.id, tags: list }));
+      break;
+    }
+    case "remove": {
+      const id = positional[0];
+      if (!id) fail("remove needs an id");
+      const d = store.get(id);
+      if (!d) fail(`no active document matching ${id}`);
+      store.remove(d.id, "cli");
+      console.log(JSON.stringify({ id: d.id, removed: d.logicalName }));
       break;
     }
     default:
