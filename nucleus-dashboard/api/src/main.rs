@@ -22,7 +22,10 @@ use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tower_http::{services::ServeDir, trace::TraceLayer};
+use tower::ServiceBuilder;
+use tower_http::{
+    services::ServeDir, set_header::SetResponseHeaderLayer, trace::TraceLayer,
+};
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -213,6 +216,45 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Documents library viewer (ADR-018) — READ-ONLY over the TS-owned
+    // documents.db (db::open_read_only; never db::open, whose
+    // create_if_missing would conjure an empty foreign DB and mask "not
+    // initialized"). Tolerated-missing like the other surfaces.
+    let documents_files_dir = workspace_root.join("memory/documents");
+    let documents_db = workspace_root.join("memory/documents.db");
+    if documents_db.exists() {
+        match db::open_read_only(&documents_db).await {
+            Ok(pool) => {
+                // Probe the schema so a half-initialized DB disables the
+                // surface instead of 500ing every request.
+                match sqlx::query("SELECT 1 FROM documents LIMIT 1").fetch_optional(&pool).await {
+                    Ok(_) => {
+                        let documents_state =
+                            Arc::new(handlers::documents::DocumentsState { pool });
+                        app = app.nest(
+                            "/documents/api",
+                            handlers::documents::router(documents_state),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "nucleus-dashboard: documents.db schema probe failed: {} — /documents disabled",
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "nucleus-dashboard: documents.db not openable read-only: {} — /documents disabled",
+                    e
+                );
+            }
+        }
+    } else {
+        tracing::warn!("nucleus-dashboard: documents.db absent — /documents disabled");
+    }
+
     // SPA fallback — any path that ServeDir can't resolve (React Router
     // routes like /news, /chat) returns index.html with 200 so the
     // client-side router takes over. ServeDir's own not_found_service
@@ -230,6 +272,22 @@ async fn main() -> Result<()> {
     let app = app
         .nest_service("/assets", ServeDir::new(web_dist.join("assets")))
         .nest_service("/gallery/files", ServeDir::new(gallery_files_dir))
+        // ADR-018: identity-document bytes must never persist in a browser
+        // cache (no-store) and must not be sniffed into a renderable type
+        // (nosniff). The tailnet perimeter (ADR-011) is the access gate.
+        .nest_service(
+            "/documents/files",
+            ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    axum::http::header::CACHE_CONTROL,
+                    axum::http::HeaderValue::from_static("no-store"),
+                ))
+                .layer(SetResponseHeaderLayer::overriding(
+                    axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                    axum::http::HeaderValue::from_static("nosniff"),
+                ))
+                .service(ServeDir::new(documents_files_dir)),
+        )
         .fallback(move |uri: axum::http::Uri| {
             let path = index_html_path.clone();
             async move {

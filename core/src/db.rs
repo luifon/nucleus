@@ -25,3 +25,16 @@ pub async fn open(path: &Path) -> Result<SqlitePool> {
     let pool = SqlitePool::connect_with(opts).await?;
     Ok(pool)
 }
+
+/// Open an EXISTING SQLite DB read-only; errors if it's missing. For DBs
+/// owned by another process family (ADR-020 ownership — e.g. documents.db
+/// is TS-written): `open()`'s create_if_missing would silently create an
+/// empty foreign-owned DB and mask "not initialized". WAL reads from the
+/// same user work; busy_timeout absorbs the owner's writes.
+pub async fn open_read_only(path: &Path) -> Result<SqlitePool> {
+    let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
+        .read_only(true)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let pool = SqlitePool::connect_with(opts).await?;
+    Ok(pool)
+}
