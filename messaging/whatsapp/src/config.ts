@@ -175,6 +175,16 @@ export interface Config {
   dbPath: string;
   /** ADR-017: on-the-fly skill-review nudge interval (asks per chat). 0 = off. */
   skillNudgeInterval: number;
+  /** ADR-018: outbound media size cap (bytes). WHATSAPP_MEDIA_MAX_BYTES. */
+  mediaMaxBytes: number;
+  /** ADR-018: document-library binaries dir. WHATSAPP_DOCUMENTS_DIR override
+   *  is the future external-drive/self-hosted-mirror seam; default
+   *  <workspace>/memory/documents. */
+  documentsDir: string;
+  /** ADR-018: document-library metadata DB (fixed; TS-owned per ADR-020). */
+  documentsDbPath: string;
+  /** ADR-018: drain-owned staging dir for outbound media copies (fixed). */
+  outboundStagingDir: string;
 }
 
 export type { Config as default };
@@ -237,5 +247,12 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
     // ADR-017 on-the-fly skill review: 0 disables (enabled=false in toml).
     skillNudgeInterval:
       skillLearner.enabled === false ? 0 : Number(skillLearner.nudge_interval ?? 12),
+    // ADR-018 document library + outbound media.
+    mediaMaxBytes: Number(process.env.WHATSAPP_MEDIA_MAX_BYTES ?? 64 * 1024 * 1024),
+    documentsDir: process.env.WHATSAPP_DOCUMENTS_DIR
+      ? path.resolve(process.env.WHATSAPP_DOCUMENTS_DIR)
+      : path.join(workspaceRoot, "memory/documents"),
+    documentsDbPath: path.join(workspaceRoot, "memory/documents.db"),
+    outboundStagingDir: path.join(workspaceRoot, "memory/outbound-staging"),
   };
 }

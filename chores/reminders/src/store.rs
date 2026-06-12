@@ -1012,6 +1012,11 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
 
 pub async fn open_whatsapp_db(path: &Path) -> Result<SqlitePool> {
     let pool = nucleus_core::db::open(path).await?;
+    // Full ADR-018 shape (kind/media_path/mimetype/filename) for FRESH-
+    // INSTALL PARITY with the TS owner (messaging/whatsapp/src/db.ts)
+    // only — CREATE IF NOT EXISTS no-ops on existing DBs, and per ADR-020
+    // Rust runs NO migrations on whatsapp.db; the TS side heals pre-media
+    // DBs. The enqueue path below stays text-only (kind defaults 'text').
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS outbound_queue (
@@ -1024,7 +1029,11 @@ pub async fn open_whatsapp_db(path: &Path) -> Result<SqlitePool> {
             attempts     INTEGER NOT NULL DEFAULT 0,
             last_error   TEXT,
             sent_at      TEXT,
-            msg_id       TEXT
+            msg_id       TEXT,
+            kind         TEXT    NOT NULL DEFAULT 'text',
+            media_path   TEXT,
+            mimetype     TEXT,
+            filename     TEXT
         );
         "#,
     )

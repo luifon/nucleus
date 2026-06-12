@@ -29,6 +29,14 @@ import {
 import { record as recordDiary } from "./diary.js";
 import { alertDiscordHome } from "./discord_alert.js";
 import { formatReply as sharedFormatReply } from "./format.js";
+import {
+  buildOutboundContent,
+  cleanupMedia,
+  DRAIN_WATCHDOG_MS,
+  MAX_MEDIA_SENDS_PER_TICK,
+  sendTimeoutFor,
+  sweepOutboundStaging,
+} from "./outbound.js";
 import { transcribe } from "./transcribe.js";
 import {
   planCapture,
@@ -148,21 +156,21 @@ let outboundDraining = false;
 // fail-closed: if sock.sendMessage HANGS (never settles — distinct from
 // rejecting), `outboundDraining` stays true forever and the queue silently
 // stops draining. Two layers:
-//  1. Per-send timeout — a send that hasn't settled in SEND_TIMEOUT_MS is
-//     treated as failed (retried, bounded by OUTBOUND_MAX_ATTEMPTS) and
-//     counts toward connection-rot; the tick aborts (a hung socket won't
-//     recover row-to-row). The original promise is kept: if it settles
-//     late with success we markSent, which suppresses the next tick's
-//     retry — closing most of the duplicate window retry-on-timeout opens.
+//  1. Per-send timeout — a send that hasn't settled in its kind's timeout
+//     (text 20s, media 90s — ADR-018) is treated as failed (retried,
+//     bounded by OUTBOUND_MAX_ATTEMPTS) and counts toward connection-rot;
+//     the tick aborts (a hung socket won't recover row-to-row). The
+//     original promise is kept: if it settles late with success we
+//     markSent, which suppresses the next tick's retry — closing most of
+//     the duplicate window retry-on-timeout opens.
 //  2. Drain watchdog — if outboundDraining has been true longer than
 //     DRAIN_WATCHDOG_MS (every await in the tick is timeout-bounded, so
 //     this means the boundedness assumption itself broke), alert + exit(1)
 //     for a launchd respawn. Force-resetting the flag instead would revive
 //     the 2026-05-28 overlapping-tick double-send if the zombie tick is
 //     still alive; exit matches the connection-rot precedent.
-const SEND_TIMEOUT_MS = 20_000;
-// Worst legitimate tick: 20 rows × just-under-timeout sends, plus margin.
-const DRAIN_WATCHDOG_MS = 20 * SEND_TIMEOUT_MS + 60_000; // 460s
+// Constants + content building live in outbound.ts (DRAIN_WATCHDOG_MS is
+// DERIVED from the per-kind timeouts there, so the bound can't drift).
 let drainTickStartedAt: number | null = null;
 
 class SendTimeoutError extends Error {
@@ -222,6 +230,10 @@ async function main() {
   // doesn't use it — corrections happen via follow-up captures + move ops
   // (see CLAUDE.md Rule 9 + ADR-005).
   const outbound = new OutboundQueueStore(config.dbPath);
+  // ADR-018: collect staged media files orphaned by a crash between
+  // markSent and unlink, terminal rows whose unlink failed, or an
+  // enqueue-media crash between copy and INSERT.
+  sweepOutboundStaging(config.outboundStagingDir, outbound.pendingMediaPaths());
   // ADR-005a: holds brain-dump plans pending operator review.
   const plansStore = new PendingPlansStore(config.dbPath);
 
@@ -485,11 +497,33 @@ function startOutboundDrain(sock: WASocket, outbound: OutboundQueueStore, config
       }
       if (rows.length === 0) return;
       log.info({ count: rows.length }, "whatsapp: draining outbound queue");
+      // ADR-018: bound the media budget per tick so a batch of uploads
+      // can't monopolize the drain. Skipped media rows stay pending for
+      // the next tick (mildly breaks global FIFO; text ordering holds).
+      let mediaSentThisTick = 0;
       for (const r of rows) {
+        if (r.kind !== "text" && mediaSentThisTick >= MAX_MEDIA_SENDS_PER_TICK) {
+          continue;
+        }
         const jid = resolveOutboundTarget(r.target, config);
         if (!jid) {
-          outbound.markFailure(r.id, `unknown target: ${r.target}`, OUTBOUND_MAX_ATTEMPTS);
+          const { status } = outbound.markFailure(
+            r.id,
+            `unknown target: ${r.target}`,
+            OUTBOUND_MAX_ATTEMPTS,
+          );
+          if (status === "failed") cleanupMedia(r);
           log.warn({ id: r.id, target: r.target }, "whatsapp: outbound target not in allowlist — failed");
+          continue;
+        }
+        // Build content first: a media row whose file is missing or
+        // oversized can NEVER succeed — terminal-fail it instead of
+        // burning 5 retries.
+        const content = buildOutboundContent(r, config.mediaMaxBytes);
+        if ("error" in content) {
+          outbound.markFailedTerminal(r.id, content.error);
+          cleanupMedia(r);
+          log.warn({ id: r.id, err: content.error }, "whatsapp: outbound media row terminal-failed");
           continue;
         }
         try {
@@ -501,30 +535,37 @@ function startOutboundDrain(sock: WASocket, outbound: OutboundQueueStore, config
           const sendPromise: Promise<WAMessage | undefined> =
             process.env.NUCLEUS_WHATSAPP_FORCE_SEND_HANG === "1"
               ? new Promise<never>(() => {})
-              : sock.sendMessage(jid, { text: r.body });
+              : sock.sendMessage(jid, content);
           try {
-            const sent = await withTimeout(sendPromise, SEND_TIMEOUT_MS);
+            const sent = await withTimeout(sendPromise, sendTimeoutFor(r.kind));
             outbound.markSent(r.id, sent?.key?.id ?? "");
+            cleanupMedia(r);
+            if (r.kind !== "text") mediaSentThisTick += 1;
             consecutiveConnectionFailures = 0;
-            log.info({ id: r.id, target: r.target, jid }, "whatsapp: outbound sent");
+            log.info({ id: r.id, kind: r.kind, target: r.target, jid }, "whatsapp: outbound sent");
           } catch (e) {
             if (!(e instanceof SendTimeoutError)) throw e;
             // Timeout: mark failed (retried next tick, bounded attempts) —
             // this queue carries operator notifications; a rare duplicate
             // beats a silently dropped reminder. Keep the original promise:
             // a LATE success flips the row to sent before the retry tick
-            // re-picks it, suppressing the duplicate entirely.
-            outbound.markFailure(r.id, e.message, OUTBOUND_MAX_ATTEMPTS);
+            // re-picks it, suppressing the duplicate entirely. Staged media
+            // is unlinked ONLY at terminal state — a retried row needs it.
+            const { status } = outbound.markFailure(r.id, e.message, OUTBOUND_MAX_ATTEMPTS);
             consecutiveConnectionFailures += 1; // a hang is rot-shaped
             sendPromise.then(
               (sent) => {
                 outbound.markSent(r.id, sent?.key?.id ?? "");
+                // By the time the promise resolves Baileys has fully read
+                // the file — unlink is safe even on the late path.
+                cleanupMedia(r);
                 log.warn({ id: r.id }, "whatsapp: timed-out send completed late — marked sent to suppress retry");
               },
               () => { /* already markFailure'd at timeout */ },
             );
+            if (status === "failed") cleanupMedia(r);
             log.warn(
-              { id: r.id, jid, consecutive: consecutiveConnectionFailures },
+              { id: r.id, kind: r.kind, jid, consecutive: consecutiveConnectionFailures },
               "whatsapp: outbound send timed out — aborting tick (hung socket won't recover row-to-row)",
             );
             if (consecutiveConnectionFailures >= CONNECTION_ROT_THRESHOLD) {
@@ -537,7 +578,8 @@ function startOutboundDrain(sock: WASocket, outbound: OutboundQueueStore, config
           }
         } catch (e) {
           const err = (e as Error).message;
-          outbound.markFailure(r.id, err, OUTBOUND_MAX_ATTEMPTS);
+          const { status } = outbound.markFailure(r.id, err, OUTBOUND_MAX_ATTEMPTS);
+          if (status === "failed") cleanupMedia(r);
           log.warn({ id: r.id, err, attempts: r.attempts + 1 }, "whatsapp: outbound send failed");
           if (/connection closed/i.test(err)) {
             consecutiveConnectionFailures += 1;
