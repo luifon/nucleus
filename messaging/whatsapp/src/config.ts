@@ -185,6 +185,8 @@ export interface Config {
   documentsDbPath: string;
   /** ADR-018: drain-owned staging dir for outbound media copies (fixed). */
   outboundStagingDir: string;
+  /** ADR-013: jobs ledger DB (fixed; whatsapp-family-owned per ADR-020). */
+  jobsDbPath: string;
 }
 
 export type { Config as default };
@@ -254,5 +256,6 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
       : path.join(workspaceRoot, "memory/documents"),
     documentsDbPath: path.join(workspaceRoot, "memory/documents.db"),
     outboundStagingDir: path.join(workspaceRoot, "memory/outbound-staging"),
+    jobsDbPath: path.join(workspaceRoot, "memory/jobs.db"),
   };
 }

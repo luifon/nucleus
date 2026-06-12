@@ -38,6 +38,7 @@ import {
   sweepOutboundStaging,
 } from "./outbound.js";
 import { classifyCaption } from "./caption.js";
+import { JobStore, JOBS_TMUX_SESSION } from "./jobs.js";
 import { DocStore } from "./docstore.js";
 import { makeVaultManifestHook } from "./docstore_vault.js";
 import { transcribe } from "./transcribe.js";
@@ -58,7 +59,10 @@ import {
 // without it), and the orphan it left turned into the 2026-06-11 DM outage.
 const GROUP_TMUX_SESSION = "nucleus-whatsapp";
 const DM_TMUX_SESSION = "nucleus-whatsapp-dm";
-const ALL_TMUX_SESSIONS = [GROUP_TMUX_SESSION, DM_TMUX_SESSION, BRAINDUMP_TMUX_SESSION];
+// ADR-013: the jobs session is IN the wipe list on purpose — a restart
+// kills in-flight job windows, which is what makes "orphaned" mean dead
+// rather than maybe-still-running.
+const ALL_TMUX_SESSIONS = [GROUP_TMUX_SESSION, DM_TMUX_SESSION, BRAINDUMP_TMUX_SESSION, JOBS_TMUX_SESSION];
 
 // Synchronous destination — no worker-thread buffering. Logs appear in stdout
 // as soon as they're emitted, which matters when tailing to debug what stage
@@ -273,6 +277,26 @@ async function main() {
     documentsDir: config.documentsDir,
     onManifestChange: makeVaultManifestHook(config),
   });
+  // ADR-013: jobs ledger. Sweep rows orphaned by a restart BEFORE the
+  // drain starts so the interruption notes are first in the queue. Only
+  // kinds that promised the operator a reply get a note; enrich is a
+  // silent feature and stays silent in failure.
+  const jobStore = new JobStore({ dbPath: config.jobsDbPath });
+  for (const orphan of jobStore.sweepOrphans()) {
+    log.warn({ jobId: orphan.id, kind: orphan.kind }, "whatsapp: job orphaned by restart");
+    if (orphan.kind === "act" || orphan.kind === "vault-import") {
+      const digits = normalizeSenderId(orphan.chatId);
+      if (digits) {
+        outbound.enqueue({
+          target: digits,
+          source: "job-orphan",
+          body: formatReply(
+            `⚠️ tarefa interrompida pelo restart: ${orphan.instruction.slice(0, 80)} (job ${orphan.id.slice(0, 8)}) — reenvie se ainda quiser`,
+          ),
+        });
+      }
+    }
+  }
 
   // Tear down any leftover tmux sessions from a previous run before we own
   // fresh windows — startup is the safe time to clean orphans from prior
