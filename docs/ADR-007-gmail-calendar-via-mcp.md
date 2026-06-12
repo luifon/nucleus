@@ -1,6 +1,6 @@
 # ADR-007 — Gmail + Calendar via Claude.ai MCP (JARVIS persona)
 
-**Status:** Accepted (2026-05-15)
+**Status:** Accepted (2026-05-15) — Implemented (2026-05-16; stamped retroactively 2026-06-12)
 
 ## Context
 
