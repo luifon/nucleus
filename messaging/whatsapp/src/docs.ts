@@ -17,6 +17,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { loadConfig } from "./config.js";
 import { DocStore, type DocRecord } from "./docstore.js";
+import { makeVaultManifestHook } from "./docstore_vault.js";
 
 function fail(msg: string): never {
   console.error(JSON.stringify({ error: msg }));
@@ -86,6 +87,7 @@ function main(): void {
   const store = new DocStore({
     dbPath: config.documentsDbPath,
     documentsDir: config.documentsDir,
+    onManifestChange: makeVaultManifestHook(config),
   });
 
   const [flags, positional] = parseArgs(rest);
