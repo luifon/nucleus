@@ -115,56 +115,28 @@ export class Session {
     const sessionId = opts.resumeSessionId ?? randomUUID();
     const windowName = opts.windowName ?? sessionId.slice(0, 8);
 
-    const args: string[] = resuming
-      ? ["--resume", sessionId]
-      : ["--session-id", sessionId];
-    if (opts.permissionMode) args.push("--permission-mode", opts.permissionMode);
-    if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
-    for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
-    if (opts.disallowedTools?.length) {
-      args.push("--disallowed-tools", opts.disallowedTools.join(" "));
-    }
-    if (opts.allowedTools?.length) {
-      args.push("--allowed-tools", opts.allowedTools.join(" "));
-    }
-
-    const inner = `cd ${shellQuote(opts.workspaceRoot)} && claude ${args.map(shellQuote).join(" ")}`;
-
     await ensureTmuxSession(opts.tmuxSession);
-    // Target the window by its server-unique id (`@N`), never by
-    // `session:name`. Window names aren't unique — a stale window left by
-    // a previous bot process (or a failed spawn) shares the chat-key name,
-    // and tmux refuses ambiguous name matches outright (`can't find
-    // window`). That made every capture/paste/kill fail and leaked one
-    // more duplicate per message (2026-06-11 DM outage). The name stays
-    // purely cosmetic, for `tmux attach` debuggability.
-    const { stdout: windowIdRaw } = await tmux([
-      "new-window",
-      "-t",
-      opts.tmuxSession,
-      "-n",
-      windowName,
-      "-P",
-      "-F",
-      "#{window_id}",
-      inner,
-    ]);
-    const target = windowIdRaw.trim();
-    if (!/^@\d+$/.test(target)) {
-      throw new Error(`tmux new-window returned unexpected window id: ${JSON.stringify(target)}`);
-    }
 
-    try {
-      await dismissTrustPrompt(target, 5_000);
-      await waitForTuiReady(target, opts.readyTimeoutMs ?? 20_000);
-    } catch (e) {
-      // The window we just created is now stuck on whatever prompt
-      // we couldn't dismiss. Killing it here keeps the next retry
-      // from leaking another orphan into the tmux session.
-      await tmux(["kill-window", "-t", target]).catch(() => {});
-      throw e;
+    // Launch with the configured/default model first; if it boots into a
+    // fatal model-unavailable banner, retry ONCE with the fallback model
+    // (fable-5 incident 2026-06-13: a bad default left sessions hung at the
+    // error banner for the full timeout — the banner isn't an assistant
+    // turn, so transcript-tailing never sees it). Both attempts kill their
+    // window on any failure so retries can't leak windows.
+    const fb = fallbackModel();
+    let target = await launchWindow(opts, sessionId, resuming, windowName, undefined);
+    if (target === null) {
+      console.error(
+        `whatsapp: session spawn — configured/default model unavailable, retrying with fallback ${fb}`,
+      );
+      target = await launchWindow(opts, sessionId, resuming, windowName, fb);
+      if (target === null) {
+        throw new Error(
+          `session spawn: both the configured/default model and the fallback model ${fb} are ` +
+            `unavailable (set NUCLEUS_CLAUDE_FALLBACK_MODEL to a model you can use)`,
+        );
+      }
     }
-    await sleep(500);
 
     const transcriptPath = transcriptPathFor(opts.workspaceRoot, sessionId);
     // CRITICAL: when --resume'ing, the transcript file already has all the
@@ -515,6 +487,99 @@ async function ensureTmuxSession(name: string): Promise<void> {
     // not there
   }
   await execAsync(`tmux new-session -d -s ${shellQuote(name)}`);
+}
+
+/** Fallback model for spawned sessions when the configured/default model is
+ *  unavailable (fable-5 incident 2026-06-13). Mirrors core's fallback_model;
+ *  default is the stable Opus the error banner itself recommends. */
+function fallbackModel(): string {
+  const v = process.env.NUCLEUS_CLAUDE_FALLBACK_MODEL?.trim();
+  return v ? v : "claude-opus-4-8";
+}
+
+/** True if the pane shows a fatal model-unavailable banner — booted but
+ *  can't serve inference, so it would hang at ask time. Claude Code's own
+ *  error strings; checked only pre-first-ask so content can't false-trip. */
+export function paneShowsModelError(pane: string): boolean {
+  return (
+    pane.includes("is currently unavailable") ||
+    pane.includes("issue with the selected model") ||
+    pane.includes("you may not have access to it")
+  );
+}
+
+/** Create one tmux window running claude, dismiss the trust prompt, wait for
+ *  the TUI, and check for a fatal model-unavailable banner. Returns the
+ *  window target, or null if the model is unavailable (window killed so the
+ *  caller can retry with the fallback). Throws on hard spawn failure
+ *  (window killed). `modelOverride` passes --model; undefined uses the
+ *  configured/default model. */
+async function launchWindow(
+  opts: SpawnOptions,
+  sessionId: string,
+  resuming: boolean,
+  windowName: string,
+  modelOverride: string | undefined,
+): Promise<string | null> {
+  const args: string[] = resuming
+    ? ["--resume", sessionId]
+    : ["--session-id", sessionId];
+  // Fallback-model retry only: normal spawns pass no --model and inherit
+  // the operator's configured/default model.
+  if (modelOverride) args.push("--model", modelOverride);
+  if (opts.permissionMode) args.push("--permission-mode", opts.permissionMode);
+  if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
+  for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
+  if (opts.disallowedTools?.length) {
+    args.push("--disallowed-tools", opts.disallowedTools.join(" "));
+  }
+  if (opts.allowedTools?.length) {
+    args.push("--allowed-tools", opts.allowedTools.join(" "));
+  }
+
+  const inner = `cd ${shellQuote(opts.workspaceRoot)} && claude ${args.map(shellQuote).join(" ")}`;
+
+  // Target the window by its server-unique id (`@N`), never by
+  // `session:name` — stale windows share chat-key names and tmux refuses
+  // ambiguous matches (2026-06-11 DM outage). The name is cosmetic.
+  const { stdout: windowIdRaw } = await tmux([
+    "new-window",
+    "-t",
+    opts.tmuxSession,
+    "-n",
+    windowName,
+    "-P",
+    "-F",
+    "#{window_id}",
+    inner,
+  ]);
+  const target = windowIdRaw.trim();
+  if (!/^@\d+$/.test(target)) {
+    throw new Error(`tmux new-window returned unexpected window id: ${JSON.stringify(target)}`);
+  }
+
+  try {
+    await dismissTrustPrompt(target, 5_000);
+    await waitForTuiReady(target, opts.readyTimeoutMs ?? 20_000);
+  } catch (e) {
+    // Stuck on an undismissable prompt — kill so the next retry doesn't
+    // leak an orphan into the tmux session.
+    await tmux(["kill-window", "-t", target]).catch(() => {});
+    throw e;
+  }
+  // Extra beat for cursor positioning — also lets the model-unavailable
+  // banner finish rendering before we check.
+  await sleep(500);
+
+  const { stdout: pane } = await tmux(["capture-pane", "-t", target, "-p"]).catch(() => ({
+    stdout: "",
+    stderr: "",
+  }));
+  if (paneShowsModelError(pane)) {
+    await tmux(["kill-window", "-t", target]).catch(() => {});
+    return null;
+  }
+  return target;
 }
 
 async function tmux(args: string[]): Promise<{ stdout: string; stderr: string }> {

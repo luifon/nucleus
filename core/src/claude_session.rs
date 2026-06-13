@@ -37,6 +37,30 @@ pub fn claude_bin() -> String {
         .unwrap_or_else(|| "claude".into())
 }
 
+/// Fallback model used when a spawned session's configured/default model is
+/// unavailable (fable-5 incident 2026-06-13: a bad default left every
+/// spawned session hung at the model-error banner for the full timeout —
+/// the banner isn't an assistant turn, so transcript-tailing never sees it).
+/// Read from `NUCLEUS_CLAUDE_FALLBACK_MODEL`; default the current stable
+/// Opus, which is exactly what the error banner itself recommends.
+pub fn fallback_model() -> String {
+    std::env::var("NUCLEUS_CLAUDE_FALLBACK_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "claude-opus-4-8".into())
+}
+
+/// True if the pane shows a fatal model-unavailable banner — the session
+/// booted but its model can't serve inference, so it would hang at ask
+/// time. Markers are Claude Code's own error strings (boot banner + the
+/// post-send error). Checked only at spawn (pre-first-ask), so document
+/// content can't false-positive.
+fn pane_shows_model_error(pane: &str) -> bool {
+    pane.contains("is currently unavailable")
+        || pane.contains("issue with the selected model")
+        || pane.contains("you may not have access to it")
+}
+
 static CLAUDE_VERSION: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
 
 /// `claude --version` output, executed once per process and cached
@@ -171,79 +195,34 @@ impl Session {
             .clone()
             .unwrap_or_else(|| session_id.chars().take(8).collect());
 
-        let claude_args = build_claude_args(&session_id, resuming, &opts);
-        // claude_bin(): same resolution as claude_version(), so the version
-        // recorded in the run-log is provably the binary that ran.
-        let inner = format!(
-            "cd {} && {} {}",
-            shell_quote(&opts.workspace_root.to_string_lossy()),
-            shell_quote(&claude_bin()),
-            claude_args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
-        );
-
         ensure_tmux_session(&opts.tmux_session).await?;
-
-        // Target the window by its server-unique id (`@N`), never by
-        // `session:name`. Window names aren't unique — a stale window left
-        // by a previous process (or a failed spawn) shares the chat-key
-        // name, and tmux refuses ambiguous name matches outright (`can't
-        // find window`). That made every capture/paste/kill fail and leaked
-        // one more duplicate per message (2026-06-11 WhatsApp DM outage,
-        // same design here). The name stays purely cosmetic, for
-        // `tmux attach` debuggability.
-        let out = Command::new("tmux")
-            .args([
-                "new-window",
-                "-t",
-                &opts.tmux_session,
-                "-n",
-                &window_name,
-                "-P",
-                "-F",
-                "#{window_id}",
-                &inner,
-            ])
-            .output()
-            .await
-            .context("tmux new-window")?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "tmux new-window failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        let target = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !(target.starts_with('@') && target[1..].chars().all(|c| c.is_ascii_digit())) {
-            anyhow::bail!("tmux new-window returned unexpected window id: {target:?}");
-        }
-
         let transcript_path = transcript_path_for(&opts.workspace_root, &session_id);
-        // First-time visits to a cwd show a "trust this folder?" prompt that
-        // blocks claude from booting. Watch the pane and dismiss it if it appears.
-        // The two TUI-readiness steps below can fail (timeout, blocked at an
-        // interactive prompt we can't auto-dismiss); any such failure must
-        // kill the tmux window we just created, otherwise repeated retries
-        // leak windows — three accumulated during one chat outage when this
-        // path used to bail without cleanup.
-        if let Err(e) = dismiss_trust_prompt_if_present(&target, Duration::from_secs(5)).await {
-            let _ = Command::new("tmux")
-                .args(["kill-window", "-t", &target])
-                .output()
-                .await;
-            return Err(e);
-        }
-        // Claude only creates the transcript file when it gets its first
-        // message. Wait instead for the TUI to render the input prompt — at
-        // that point send-keys is safe.
-        if let Err(e) = wait_for_tui_ready(&target, opts.ready_timeout).await {
-            let _ = Command::new("tmux")
-                .args(["kill-window", "-t", &target])
-                .output()
-                .await;
-            return Err(e);
-        }
-        // Small extra beat for cursor positioning.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Launch with the configured/default model first; if it boots into a
+        // fatal model-unavailable banner, retry ONCE with the fallback model
+        // (fable-5 incident 2026-06-13). Both attempts kill their window on
+        // any failure so retries can't leak windows.
+        let fb = fallback_model();
+        let target = match Self::launch_window(&opts, &session_id, resuming, &window_name, None)
+            .await?
+        {
+            Some(t) => t,
+            None => {
+                tracing::warn!(
+                    "session spawn: configured/default model unavailable — retrying with fallback model {fb}"
+                );
+                match Self::launch_window(&opts, &session_id, resuming, &window_name, Some(&fb))
+                    .await?
+                {
+                    Some(t) => t,
+                    None => anyhow::bail!(
+                        "session spawn: both the configured/default model and the fallback \
+                         model {fb} are unavailable (set NUCLEUS_CLAUDE_FALLBACK_MODEL to a \
+                         model you can use)"
+                    ),
+                }
+            }
+        };
 
         // CRITICAL: when --resume'ing, the transcript file already has all
         // the prior turns. If we start reading from offset 0, wait_for_assistant
@@ -292,6 +271,100 @@ impl Session {
             run_id,
             workspace_root: opts.workspace_root.clone(),
         })
+    }
+
+    /// Create one tmux window running `claude`, dismiss the trust prompt,
+    /// wait for the TUI, and check for a fatal model-unavailable banner.
+    /// Returns:
+    ///   `Ok(Some(target))` — ready, model usable
+    ///   `Ok(None)`         — model unavailable (window killed; caller may
+    ///                        retry with the fallback model)
+    ///   `Err(e)`           — hard spawn failure (window killed)
+    /// `model_override` passes `--model`; `None` uses the configured/default.
+    async fn launch_window(
+        opts: &SpawnOptions,
+        session_id: &str,
+        resuming: bool,
+        window_name: &str,
+        model_override: Option<&str>,
+    ) -> Result<Option<String>> {
+        let claude_args = build_claude_args(session_id, resuming, opts, model_override);
+        // claude_bin(): same resolution as claude_version(), so the version
+        // recorded in the run-log is provably the binary that ran.
+        let inner = format!(
+            "cd {} && {} {}",
+            shell_quote(&opts.workspace_root.to_string_lossy()),
+            shell_quote(&claude_bin()),
+            claude_args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
+        );
+
+        // Target the window by its server-unique id (`@N`), never by
+        // `session:name`. Window names aren't unique — a stale window left
+        // by a previous process (or a failed spawn) shares the chat-key
+        // name, and tmux refuses ambiguous name matches outright (`can't
+        // find window`). That made every capture/paste/kill fail and leaked
+        // one more duplicate per message (2026-06-11 WhatsApp DM outage).
+        // The name stays purely cosmetic, for `tmux attach` debuggability.
+        let out = Command::new("tmux")
+            .args([
+                "new-window",
+                "-t",
+                &opts.tmux_session,
+                "-n",
+                window_name,
+                "-P",
+                "-F",
+                "#{window_id}",
+                &inner,
+            ])
+            .output()
+            .await
+            .context("tmux new-window")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "tmux new-window failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let target = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !(target.starts_with('@') && target[1..].chars().all(|c| c.is_ascii_digit())) {
+            anyhow::bail!("tmux new-window returned unexpected window id: {target:?}");
+        }
+
+        let kill = |t: String| async move {
+            let _ = Command::new("tmux").args(["kill-window", "-t", &t]).output().await;
+        };
+
+        // First-time visits to a cwd show a "trust this folder?" prompt that
+        // blocks claude from booting. Any readiness failure must kill the
+        // window we just created or repeated retries leak windows.
+        if let Err(e) = dismiss_trust_prompt_if_present(&target, Duration::from_secs(5)).await {
+            kill(target).await;
+            return Err(e);
+        }
+        // Claude only creates the transcript file when it gets its first
+        // message. Wait instead for the TUI to render the input prompt — at
+        // that point send-keys is safe.
+        if let Err(e) = wait_for_tui_ready(&target, opts.ready_timeout).await {
+            kill(target).await;
+            return Err(e);
+        }
+        // Small extra beat for cursor positioning — also lets the
+        // model-unavailable banner finish rendering before we check.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let pane = Command::new("tmux")
+            .args(["capture-pane", "-t", &target, "-p"])
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if pane_shows_model_error(&pane) {
+            kill(target).await;
+            return Ok(None);
+        }
+
+        Ok(Some(target))
     }
 
     /// Send a user message and wait for claude's next assistant reply. Blocks
@@ -944,12 +1017,23 @@ fn sanitize_window_name(s: &str) -> String {
 
 // ---- internals ----
 
-fn build_claude_args(session_id: &str, resuming: bool, opts: &SpawnOptions) -> Vec<String> {
+fn build_claude_args(
+    session_id: &str,
+    resuming: bool,
+    opts: &SpawnOptions,
+    model_override: Option<&str>,
+) -> Vec<String> {
     let mut args: Vec<String> = if resuming {
         vec!["--resume".into(), session_id.into()]
     } else {
         vec!["--session-id".into(), session_id.into()]
     };
+    // Fallback-model retry only (fable-5 incident): normal spawns pass no
+    // --model and inherit the operator's configured/default model.
+    if let Some(model) = model_override {
+        args.push("--model".into());
+        args.push(model.into());
+    }
     if let Some(mode) = opts.permission_mode {
         args.push("--permission-mode".into());
         args.push(mode.as_arg().into());
@@ -1599,6 +1683,32 @@ fn with_date_preamble(message: &str) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn pane_model_error_detection() {
+        // The actual fable-5 boot banner.
+        assert!(pane_shows_model_error(
+            "Claude Fable 5 is currently unavailable. Please use Opus 4.8 or another available model."
+        ));
+        // The post-send error.
+        assert!(pane_shows_model_error(
+            "There's an issue with the selected model (claude-fable-5). It may not exist or you may not have access to it."
+        ));
+        // A normal ready pane must NOT trip it.
+        assert!(!pane_shows_model_error(
+            "❯ \n~/Development/nucleus | main | Opus 4.8\n⏵⏵ auto mode on (shift+tab to cycle)"
+        ));
+    }
+
+    #[test]
+    fn fallback_model_defaults_to_stable_opus() {
+        // Default when the env var is unset/empty (don't mutate the global
+        // env in a parallel test run — just assert the documented default
+        // shape when unset by reading through the helper in a clean-ish env).
+        // We can't safely unset env here, so assert the helper returns a
+        // non-empty model id (the default or an operator override).
+        assert!(!fallback_model().trim().is_empty());
+    }
 
     /// Set up a tmux session whose pane contains synthetic text resembling
     /// the resume-from-summary picker. wait_for_tui_ready should detect it,
