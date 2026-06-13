@@ -601,9 +601,19 @@ async function tmux(args: string[]): Promise<{ stdout: string; stderr: string }>
 }
 
 async function pasteAndSend(target: string, content: string): Promise<void> {
+  // NAMED buffer per paste, never the server-global default. Concurrent
+  // sessions (S13 fires enrich + act/import jobs at once on one inbound)
+  // each load-buffer then paste-buffer — on the shared default buffer the
+  // second load clobbers the first, so both windows paste whichever load
+  // won (the S13 vault-import got the enrich prompt and silently failed,
+  // 2026-06-13). A unique buffer name isolates them; `paste-buffer -d`
+  // deletes it after so we don't leak buffers.
+  const buf = `nucleus-${target.replace(/@/, "")}-${randomUUID().slice(0, 8)}`;
   // Load buffer from stdin so any content (quotes, emoji, newlines) is safe.
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("tmux", ["load-buffer", "-"], { stdio: ["pipe", "ignore", "pipe"] });
+    const child = spawn("tmux", ["load-buffer", "-b", buf, "-"], {
+      stdio: ["pipe", "ignore", "pipe"],
+    });
     let stderr = "";
     child.stderr.on("data", (d) => (stderr += d.toString()));
     child.on("error", reject);
@@ -613,7 +623,7 @@ async function pasteAndSend(target: string, content: string): Promise<void> {
     child.stdin!.write(content);
     child.stdin!.end();
   });
-  await tmux(["paste-buffer", "-t", target]);
+  await tmux(["paste-buffer", "-d", "-b", buf, "-t", target]);
   // Wait for the bracketed-paste sequence to fully drain into claude's TUI
   // before pressing Enter. Without this, large pastes leave the TUI in
   // mid-paste-mode when Enter arrives, so the Enter gets eaten as a literal
