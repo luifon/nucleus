@@ -40,3 +40,23 @@ test("instruction-shaped captions act", () => {
   assert.equal(classifyCaption("summarize this contract for me please today").mode, "act"); // >5 words
   assert.equal(classifyCaption("read this.").mode, "act"); // punctuation
 });
+
+test("priv: prefix archives without enrichment", () => {
+  assert.deepEqual(classifyCaption("priv: RG novo"), {
+    mode: "archive",
+    name: "RG novo",
+    noEnrich: true,
+  });
+  assert.deepEqual(classifyCaption("priv:"), { mode: "archive", noEnrich: true });
+});
+
+test("vault:/import: prefix routes to vault-import with optional name", () => {
+  assert.deepEqual(classifyCaption("vault: contrato aluguel"), {
+    mode: "vault-import",
+    name: "contrato aluguel",
+  });
+  assert.deepEqual(classifyCaption("import:"), { mode: "vault-import" });
+  assert.deepEqual(classifyCaption("vault: please import this entire document now ok?"), {
+    mode: "vault-import",
+  });
+});

@@ -7,7 +7,7 @@ import path from "node:path";
 /** Idempotent column additions via PRAGMA table_info detection — TS has no
  *  migration runner, and ADR-020 called the tolerated-duplicate-error ALTER
  *  pattern an accumulation smell. Checking the actual schema is exact. */
-function addColumnsIfMissing(
+export function addColumnsIfMissing(
   db: DatabaseSync,
   table: string,
   cols: Array<[name: string, ddl: string]>,

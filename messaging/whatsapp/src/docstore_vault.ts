@@ -99,6 +99,9 @@ export function rewriteManifest(documentsDbPath: string, dir: string): void {
     added_at: string;
     last_retrieved_at: string | null;
     retrieve_count: number;
+    keywords: string | null;
+    summary: string | null;
+    imported_path: string | null;
   }
   const db = new DatabaseSync(documentsDbPath);
   let rows: ManifestRow[];
@@ -106,7 +109,8 @@ export function rewriteManifest(documentsDbPath: string, dir: string): void {
     rows = db
       .prepare(
         `SELECT id, logical_name, tags, filename, mimetype, bytes, added_at,
-                last_retrieved_at, retrieve_count
+                last_retrieved_at, retrieve_count, keywords, summary,
+                imported_path
            FROM documents WHERE status = 'active'
           ORDER BY logical_name COLLATE NOCASE ASC`,
       )
@@ -127,13 +131,29 @@ export function rewriteManifest(documentsDbPath: string, dir: string): void {
       r.retrieve_count > 0
         ? `${r.retrieve_count}× · last ${(r.last_retrieved_at ?? "").slice(0, 10)}`
         : "never";
+    let keywords: string[] = [];
+    try {
+      const parsed = JSON.parse(r.keywords ?? "[]");
+      if (Array.isArray(parsed)) keywords = parsed.map(String);
+    } catch {
+      /* tolerate */
+    }
+    const extra = [
+      r.summary ? `summary:: ${r.summary}` : null,
+      keywords.length ? `keywords:: ${keywords.join(", ")}` : null,
+      r.imported_path
+        ? `imported:: [[${(r.imported_path.split("/").pop() ?? "").replace(/\.md$/, "")}|imported note]]`
+        : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
     return `## ${r.logical_name}
 id:: ${r.id}
 tags:: ${tags.join(", ") || "—"}
 file:: ${r.filename} · ${r.mimetype} · ${humanBytes(r.bytes)}
 added:: ${r.added_at.slice(0, 10)}
 retrieved:: ${retrieved}
-`;
+${extra ? extra + "\n" : ""}`;
   });
 
   const body = `---

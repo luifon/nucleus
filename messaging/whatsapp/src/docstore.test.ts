@@ -185,3 +185,72 @@ test("remove soft-deletes, unlinks, and frees the sha for re-add", () => {
   });
   assert.equal(again.deduped, false, "deleted rows must not block re-add");
 });
+
+test("setEnrichment round-trips and find prefers tags over keywords over summary", () => {
+  const { store } = freshStore();
+  const tagged = store.add({
+    data: Buffer.from("tagged doc"),
+    logicalName: "Tagged",
+    tags: ["lease"],
+    filename: "t.txt",
+    mimetype: "text/plain",
+    source: "cli",
+    channel: "cli",
+  }).record;
+  const keyworded = store.add({
+    data: Buffer.from("keyworded doc"),
+    logicalName: "Keyworded",
+    filename: "k.txt",
+    mimetype: "text/plain",
+    source: "cli",
+    channel: "cli",
+  }).record;
+  const summarized = store.add({
+    data: Buffer.from("summarized doc"),
+    logicalName: "Summarized",
+    filename: "s.txt",
+    mimetype: "text/plain",
+    source: "cli",
+    channel: "cli",
+  }).record;
+  store.setEnrichment(keyworded.id, { keywords: ["lease", "contrato"], summary: null, status: "ok" }, "cli");
+  store.setEnrichment(summarized.id, { keywords: ["other"], summary: "about a lease agreement", status: "ok" }, "cli");
+
+  // Exact tag tier wins outright — keyword matches not consulted.
+  const byTag = store.find("lease");
+  assert.equal(byTag.length, 1);
+  assert.equal(byTag[0].logicalName, "Tagged");
+
+  // Exact keyword tier when no tag matches.
+  const byKeyword = store.find("contrato");
+  assert.equal(byKeyword.length, 1);
+  assert.equal(byKeyword[0].logicalName, "Keyworded");
+
+  // Summary substring is the weakest auto tier.
+  const bySummary = store.find("agreement");
+  assert.equal(bySummary.length, 1);
+  assert.equal(bySummary[0].logicalName, "Summarized");
+
+  // Round-trip fields.
+  const got = store.get(keyworded.id)!;
+  assert.deepEqual(got.keywords, ["lease", "contrato"]);
+  assert.equal(got.enrichStatus, "ok");
+  assert.ok(got.enrichedAt);
+
+  void tagged;
+});
+
+test("recordImport stores the pointer and audits", () => {
+  const { store } = freshStore();
+  const { record } = store.add({
+    data: Buffer.from("imp"),
+    logicalName: "Imp",
+    filename: "i.txt",
+    mimetype: "text/plain",
+    source: "cli",
+    channel: "cli",
+  });
+  store.recordImport(record.id, "5-Resources/Imported/2026-06-13-imp.md", "cli");
+  assert.equal(store.get(record.id)!.importedPath, "5-Resources/Imported/2026-06-13-imp.md");
+  assert.ok(store.auditRows().some((a) => a.action === "import"));
+});
