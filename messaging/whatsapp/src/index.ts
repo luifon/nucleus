@@ -39,7 +39,7 @@ import {
 } from "./outbound.js";
 import { classifyCaption } from "./caption.js";
 import { fireEnrichJob } from "./doc_jobs.js";
-import { JobStore, JOBS_TMUX_SESSION } from "./jobs.js";
+import { JobStore, JOBS_TMUX_SESSION, startJob, withQuickWindow } from "./jobs.js";
 import { DocStore } from "./docstore.js";
 import { makeVaultManifestHook } from "./docstore_vault.js";
 import { transcribe } from "./transcribe.js";
@@ -201,6 +201,23 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 // ADR-005a: braindump plan timeout + sweep cadence.
 const PLAN_TIMEOUT_MS = 30 * 60 * 1000;
 const PLAN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+// ── ADR-013: act-on-media job settings ─────────────────────────────────────
+
+/** Quick window before an act job promotes to deferred delivery. A cold
+ *  claude spawn alone is 5-20s, so most non-trivial asks WILL promote —
+ *  that's fine (ack at ~30s, answer follows). Raise to 60s if the
+ *  two-message dance grates; don't shrink below 30s. */
+const ACT_QUICK_WINDOW_MS = 30_000;
+
+/** Code-owned job persona — never the operator's DM persona; the persona
+ *  signature comes from formatReply at send time. */
+const JOB_ACT_SYSTEM_PROMPT = `You are answering exactly one instruction
+about one attached document on behalf of the operator. Read the file, do
+what was asked. Your final message IS the WhatsApp reply — answer directly,
+no preamble, no narration, match the instruction's language. You may search
+the document library for cross-references via the docs CLI (Bash); never
+deliver files, never use other tools.`;
 
 // ── ADR-018: document library wiring ──────────────────────────────────────
 
@@ -463,7 +480,7 @@ async function connect(
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
     for (const msg of messages) {
-      await handleMessage(sock, msg, config, store, sessions, sessionsDm, plansStore, docStore, jobStore).catch((e) => {
+      await handleMessage(sock, msg, config, store, sessions, sessionsDm, plansStore, docStore, jobStore, outbound).catch((e) => {
         log.error({ err: e?.message }, "whatsapp: handler failed");
       });
     }
@@ -744,6 +761,7 @@ async function handleMessage(
   plansStore: PendingPlansStore,
   docStore: DocStore,
   jobStore: JobStore,
+  outbound: OutboundQueueStore,
 ): Promise<void> {
   const chatId = msg.key.remoteJid;
   if (!chatId) return;
@@ -826,7 +844,7 @@ async function handleMessage(
     msg.message?.documentWithCaptionMessage?.message?.documentMessage;
   const inboundImg = msg.message?.imageMessage;
   if (inboundDoc || inboundImg) {
-    await handleInboundMedia(sock, msg, chatId, role, config, store, sessionsDm, docStore, jobStore);
+    await handleInboundMedia(sock, msg, chatId, role, config, docStore, jobStore, outbound);
     return;
   }
 
@@ -942,10 +960,9 @@ async function handleInboundMedia(
   chatId: string,
   role: ChatRole,
   config: Config,
-  store: ChatSessionStore,
-  sessionsDm: SessionPool,
   docStore: DocStore,
   jobStore: JobStore,
+  outbound: OutboundQueueStore,
 ): Promise<void> {
   const m = msg.message;
   const docMsg = m?.documentMessage ?? m?.documentWithCaptionMessage?.message?.documentMessage;
@@ -1028,27 +1045,82 @@ async function handleInboundMedia(
     ),
   });
 
-  // Act path: DM only, instruction-shaped caption.
+  // Act path: DM only, instruction-shaped caption. ADR-013: runs on a
+  // ONE-SHOT JOB SESSION (own tmux session) — the per-chat DM lock is
+  // never taken, so a 3-minute analysis can't block your next message.
+  // Timeout promotion: answer within ACT_QUICK_WINDOW_MS → single direct
+  // reply; else ack now, deliver the result via the outbound queue when
+  // the job finishes. Trade documented in ADR-013: act replies don't
+  // share the DM session's conversational memory (the doc + instruction
+  // are self-contained; the DM pool can docs.ts-find the doc for
+  // follow-ups).
   if (role === "dm" && decision.mode === "act" && decision.instruction) {
     const docPath = docStore.pathFor(record);
-    const framed = `[WhatsApp — chat ${chatId}]
-[attached ${isImage ? "image" : "document"} "${record.logicalName}" archived at ${docPath} — use the Read tool on it]
+    const framed = `[attached ${isImage ? "image" : "document"} "${record.logicalName}" archived at ${docPath} — use the Read tool on it]
 
 ${decision.instruction}`;
     await sock.sendPresenceUpdate("composing", chatId);
+    // Deferred-delivery target MUST be digits — raw @lid chatIds fail the
+    // drain's resolveOutboundTarget silently into failed rows.
+    const dmDigits = normalizeSenderId(chatId);
+    const { jobId, promise } = startJob({
+      store: jobStore,
+      config,
+      kind: "act",
+      chatId,
+      docId: record.id,
+      instruction: decision.instruction.slice(0, 200),
+      prompt: framed,
+      appendSystemPrompt: JOB_ACT_SYSTEM_PROMPT,
+      allowedTools: [
+        "Bash(npx --prefix messaging/whatsapp tsx messaging/whatsapp/src/docs.ts:*)",
+      ],
+    });
     try {
-      const resume = store.lookup(chatId) ?? undefined;
-      const result = await sessionsDm.ask(chatId, framed, resume);
-      store.save(chatId, result.sessionId, !resume);
-      const rawReply = result.reply.trim() || "(no response)";
-      await sock.sendMessage(chatId, { text: formatReply(rawReply) });
-      log.info(
-        { chatId, id: record.id, replyChars: rawReply.length, elapsedMs: result.elapsedMs },
-        "whatsapp: act-on-media reply sent",
-      );
+      const raced = await withQuickWindow(promise, ACT_QUICK_WINDOW_MS);
+      if (raced.settled) {
+        const rawReply = raced.value.reply.trim() || "(no response)";
+        await sock.sendMessage(chatId, { text: formatReply(rawReply) });
+        log.info(
+          { chatId, jobId, id: record.id, elapsedMs: raced.value.elapsedMs },
+          "whatsapp: act-on-media replied in-window",
+        );
+      } else {
+        jobStore.markPromoted(jobId);
+        await sock.sendMessage(chatId, {
+          text: formatReply("recebi, analisando — respondo já 📄"),
+        });
+        log.info({ chatId, jobId, id: record.id }, "whatsapp: act-on-media promoted to deferred job");
+        // Deferred path: result (or failure) arrives via the queue. The
+        // queue body is sent raw by the drain, so formatReply here.
+        promise.then(
+          (outcome) => {
+            if (dmDigits) {
+              outbound.enqueue({
+                target: dmDigits,
+                source: "job-act",
+                body: formatReply(`📄 ${record.logicalName}:\n${outcome.reply.trim()}`),
+              });
+            }
+          },
+          (e) => {
+            if (dmDigits) {
+              outbound.enqueue({
+                target: dmDigits,
+                source: "job-act",
+                body: formatReply(
+                  `📄 ${record.logicalName} — análise falhou:\n\`\`\`\n${(e as Error).message}\n\`\`\``,
+                ),
+              });
+            }
+          },
+        );
+      }
     } catch (e) {
+      // In-window failure: reply directly (the job row is already marked
+      // failed by the runner).
       const err = (e as Error).message;
-      log.error({ chatId, err }, "whatsapp: act-on-media session failed");
+      log.error({ chatId, jobId, err }, "whatsapp: act-on-media job failed in-window");
       await sock.sendMessage(chatId, {
         text: formatReply(`arquivei, mas não consegui processar o pedido:\n\`\`\`\n${err}\n\`\`\``),
       });
