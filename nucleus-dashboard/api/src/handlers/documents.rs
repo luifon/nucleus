@@ -56,6 +56,12 @@ struct DocumentRow {
     last_retrieved_at: Option<String>,
     #[ts(type = "number")]
     retrieve_count: i64,
+    /// ADR-013 enrichment (auto-generated; JSON array string like tags).
+    keywords: String,
+    summary: Option<String>,
+    enriched_at: Option<String>,
+    /// Vault-relative path of the imported 5-Resources note, when imported.
+    imported_path: Option<String>,
 }
 
 #[derive(Serialize, sqlx::FromRow, ts_rs::TS)]
@@ -76,7 +82,8 @@ async fn list(
 ) -> Result<Json<Vec<DocumentRow>>, DocumentsError> {
     let rows: Vec<DocumentRow> = sqlx::query_as(
         "SELECT id, logical_name, tags, filename, ext, mimetype, bytes,
-                source, added_at, last_retrieved_at, retrieve_count
+                source, added_at, last_retrieved_at, retrieve_count,
+                keywords, summary, enriched_at, imported_path
            FROM documents
           WHERE status = 'active'
           ORDER BY added_at DESC

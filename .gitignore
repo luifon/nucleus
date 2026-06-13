@@ -63,3 +63,10 @@ design-mocks/
 .playwright-mcp/
 *-news-*.png
 *-news-*.yml
+
+# ts-rs default export dirs — side effect of plain `cargo test` runs
+# without TS_RS_EXPORT_DIR; the real generated types live at
+# nucleus-dashboard/web/src/lib/api/generated/ (Rule 12).
+core/bindings/
+chores/reminders/bindings/
+nucleus-dashboard/api/bindings/
