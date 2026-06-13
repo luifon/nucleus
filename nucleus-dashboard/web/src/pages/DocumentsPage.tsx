@@ -25,6 +25,8 @@ const AUDIT_KIND: Record<string, StatusKind> = {
   retrieve: "warn",
   rename: "idle",
   retag: "idle",
+  enrich: "idle",
+  import: "ok",
   delete: "down",
 };
 
@@ -33,13 +35,16 @@ function matches(d: DocumentRow, q: string): boolean {
   return (
     d.logical_name.toLowerCase().includes(needle) ||
     d.filename.toLowerCase().includes(needle) ||
-    parseTags(d.tags).some((t) => t.toLowerCase().includes(needle))
+    parseTags(d.tags).some((t) => t.toLowerCase().includes(needle)) ||
+    parseTags(d.keywords).some((k) => k.toLowerCase().includes(needle)) ||
+    (d.summary ?? "").toLowerCase().includes(needle)
   );
 }
 
 function DocumentTile({ d }: { d: DocumentRow }) {
   const isImage = d.mimetype.startsWith("image/");
   const tags = parseTags(d.tags);
+  const keywords = parseTags(d.keywords);
   const retrieved =
     d.retrieve_count > 0
       ? `sent ${d.retrieve_count}× · last ${(d.last_retrieved_at ?? "").slice(0, 10)}`
@@ -67,6 +72,11 @@ function DocumentTile({ d }: { d: DocumentRow }) {
         <div className="truncate text-sm text-[var(--color-nucleus-accent)]">
           {d.logical_name}
         </div>
+        {d.summary && (
+          <div className="line-clamp-2 text-xs text-[var(--color-nucleus-faint)]">
+            {d.summary}
+          </div>
+        )}
         {tags.length > 0 && (
           <div className="flex flex-wrap gap-1">
             {tags.map((t) => (
@@ -75,6 +85,15 @@ function DocumentTile({ d }: { d: DocumentRow }) {
                 className="rounded border border-[var(--color-nucleus-border)] px-1.5 py-0.5 text-[10px] text-[var(--color-nucleus-faint)]"
               >
                 {t}
+              </span>
+            ))}
+          </div>
+        )}
+        {keywords.length > 0 && (
+          <div className="flex flex-wrap gap-1 opacity-60">
+            {keywords.slice(0, 6).map((k) => (
+              <span key={k} className="text-[10px] text-[var(--color-nucleus-faint)]">
+                #{k}
               </span>
             ))}
           </div>

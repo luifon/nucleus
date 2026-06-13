@@ -4,4 +4,12 @@ export type DocumentRow = { id: string, logical_name: string,
 /**
  * JSON array string as stored; the UI parses tolerantly.
  */
-tags: string, filename: string, ext: string, mimetype: string, bytes: number, source: string, added_at: string, last_retrieved_at: string | null, retrieve_count: number, };
+tags: string, filename: string, ext: string, mimetype: string, bytes: number, source: string, added_at: string, last_retrieved_at: string | null, retrieve_count: number, 
+/**
+ * ADR-013 enrichment (auto-generated; JSON array string like tags).
+ */
+keywords: string, summary: string | null, enriched_at: string | null, 
+/**
+ * Vault-relative path of the imported 5-Resources note, when imported.
+ */
+imported_path: string | null, };
