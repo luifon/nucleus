@@ -1091,9 +1091,20 @@ async fn ensure_tmux_session(name: &str) -> Result<()> {
 /// Send `content` into the target pane via paste-buffer (robust to quotes,
 /// newlines, emoji, etc.) and then press Enter.
 async fn paste_and_send(target: &str, content: &str) -> Result<()> {
-    // Load buffer from stdin.
+    // NAMED buffer per paste, never the server-global default. Concurrent
+    // sessions (ADR-020 parallel pool spawns; S13 concurrent jobs) each
+    // `load-buffer` then `paste-buffer` — on the shared default buffer the
+    // second load clobbers the first, so both windows paste whichever load
+    // won (cross-contaminated prompts; S13 vault-import got the enrich
+    // prompt, 2026-06-13). A unique buffer name isolates them; `paste-buffer
+    // -d` deletes it after so we don't leak buffers.
+    let buf = format!(
+        "nucleus-{}-{}",
+        target.trim_start_matches('@'),
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
     let mut child = Command::new("tmux")
-        .args(["load-buffer", "-"])
+        .args(["load-buffer", "-b", &buf, "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -1112,7 +1123,7 @@ async fn paste_and_send(target: &str, content: &str) -> Result<()> {
     }
 
     let p = Command::new("tmux")
-        .args(["paste-buffer", "-t", target])
+        .args(["paste-buffer", "-d", "-b", &buf, "-t", target])
         .output()
         .await?;
     if !p.status.success() {
