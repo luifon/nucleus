@@ -38,6 +38,7 @@ import {
   sweepOutboundStaging,
 } from "./outbound.js";
 import { classifyCaption } from "./caption.js";
+import { fireEnrichJob } from "./doc_jobs.js";
 import { JobStore, JOBS_TMUX_SESSION } from "./jobs.js";
 import { DocStore } from "./docstore.js";
 import { makeVaultManifestHook } from "./docstore_vault.js";
@@ -379,7 +380,7 @@ async function main() {
     }
   })();
 
-  await connect(config, store, sessions, sessionsDm, outbound, plansStore, docStore);
+  await connect(config, store, sessions, sessionsDm, outbound, plansStore, docStore, jobStore);
 }
 
 async function connect(
@@ -390,6 +391,7 @@ async function connect(
   outbound: OutboundQueueStore,
   plansStore: PendingPlansStore,
   docStore: DocStore,
+  jobStore: JobStore,
 ): Promise<void> {
   const authDir = path.join(config.workspaceRoot, "messaging/whatsapp/auth");
   fs.mkdirSync(authDir, { recursive: true });
@@ -451,7 +453,7 @@ async function connect(
       log.warn({ reason, shouldReconnect }, "whatsapp: connection closed");
       if (shouldReconnect) {
         const delay = reason === 405 ? 5000 : 2000;
-        setTimeout(() => connect(config, store, sessions, sessionsDm, outbound, plansStore, docStore).catch((e) => log.error(e, "reconnect failed")), delay);
+        setTimeout(() => connect(config, store, sessions, sessionsDm, outbound, plansStore, docStore, jobStore).catch((e) => log.error(e, "reconnect failed")), delay);
       } else {
         log.error("whatsapp: logged out — delete auth/ and re-pair");
       }
@@ -461,7 +463,7 @@ async function connect(
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
     for (const msg of messages) {
-      await handleMessage(sock, msg, config, store, sessions, sessionsDm, plansStore, docStore).catch((e) => {
+      await handleMessage(sock, msg, config, store, sessions, sessionsDm, plansStore, docStore, jobStore).catch((e) => {
         log.error({ err: e?.message }, "whatsapp: handler failed");
       });
     }
@@ -741,6 +743,7 @@ async function handleMessage(
   sessionsDm: SessionPool,
   plansStore: PendingPlansStore,
   docStore: DocStore,
+  jobStore: JobStore,
 ): Promise<void> {
   const chatId = msg.key.remoteJid;
   if (!chatId) return;
@@ -823,7 +826,7 @@ async function handleMessage(
     msg.message?.documentWithCaptionMessage?.message?.documentMessage;
   const inboundImg = msg.message?.imageMessage;
   if (inboundDoc || inboundImg) {
-    await handleInboundMedia(sock, msg, chatId, role, config, store, sessionsDm, docStore);
+    await handleInboundMedia(sock, msg, chatId, role, config, store, sessionsDm, docStore, jobStore);
     return;
   }
 
@@ -942,6 +945,7 @@ async function handleInboundMedia(
   store: ChatSessionStore,
   sessionsDm: SessionPool,
   docStore: DocStore,
+  jobStore: JobStore,
 ): Promise<void> {
   const m = msg.message;
   const docMsg = m?.documentMessage ?? m?.documentWithCaptionMessage?.message?.documentMessage;
@@ -1011,6 +1015,13 @@ async function handleInboundMedia(
     { chatId, role, id: record.id, name: record.logicalName, bytes: record.bytes, deduped },
     "whatsapp: inbound media archived",
   );
+
+  // ADR-013: auto-enrich every NON-deduped archive (silent; keywords +
+  // summary land in documents.db for find()). `priv:` opts out — those
+  // bytes never enter any session.
+  if (!deduped && !decision.noEnrich) {
+    void fireEnrichJob({ jobStore, docStore, config, record, chatId });
+  }
   await sock.sendMessage(chatId, {
     text: formatReply(
       `📄 arquivado: ${record.logicalName} (id ${record.id.slice(0, 8)})${deduped ? " — já existia" : ""}`,

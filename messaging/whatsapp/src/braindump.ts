@@ -702,7 +702,7 @@ ${capture}
  *  first ```json (or bare ```) fenced block; falls back to the substring
  *  between the first `{` and the last `}`. Tolerates prose before/after
  *  the JSON (Claude often prefaces with explanatory text). */
-function extractJsonBlock(raw: string): string {
+export function extractJsonBlock(raw: string): string {
   const trimmed = raw.trim();
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenced && fenced[1]) return fenced[1].trim();

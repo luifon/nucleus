@@ -15,11 +15,19 @@
 // never hands file contents to a model. Sessions get metadata + paths.
 
 import { DatabaseSync } from "node:sqlite";
+import { addColumnsIfMissing } from "./db.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-export type DocAction = "store" | "retrieve" | "rename" | "retag" | "delete";
+export type DocAction =
+  | "store"
+  | "retrieve"
+  | "rename"
+  | "retag"
+  | "delete"
+  | "enrich"
+  | "import";
 
 export interface DocRecord {
   id: string;
@@ -34,6 +42,15 @@ export interface DocRecord {
   addedAt: string;
   lastRetrievedAt: string | null;
   retrieveCount: number;
+  /** ADR-013 enrichment: auto-generated, search-only — operator-owned
+   *  `tags` always outrank these in find(). */
+  keywords: string[];
+  summary: string | null;
+  enrichedAt: string | null;
+  /** null = not attempted | ok | unsupported | failed */
+  enrichStatus: string | null;
+  /** Vault-relative path of the imported 5-Resources note, when imported. */
+  importedPath: string | null;
 }
 
 export interface ManifestEvent {
@@ -82,20 +99,18 @@ interface DocRow {
   added_at: string;
   last_retrieved_at: string | null;
   retrieve_count: number;
+  keywords: string;
+  summary: string | null;
+  enriched_at: string | null;
+  enrich_status: string | null;
+  imported_path: string | null;
 }
 
 function toRecord(r: DocRow): DocRecord {
-  let tags: string[] = [];
-  try {
-    const parsed = JSON.parse(r.tags);
-    if (Array.isArray(parsed)) tags = parsed.map(String);
-  } catch {
-    /* tolerate junk; empty tags */
-  }
   return {
     id: r.id,
     logicalName: r.logical_name,
-    tags,
+    tags: parseJsonArray(r.tags),
     filename: r.filename,
     ext: r.ext,
     mimetype: r.mimetype,
@@ -105,7 +120,23 @@ function toRecord(r: DocRow): DocRecord {
     addedAt: r.added_at,
     lastRetrievedAt: r.last_retrieved_at,
     retrieveCount: r.retrieve_count,
+    keywords: parseJsonArray(r.keywords),
+    summary: r.summary,
+    enrichedAt: r.enriched_at,
+    enrichStatus: r.enrich_status,
+    importedPath: r.imported_path,
   };
+}
+
+function parseJsonArray(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.map(String);
+  } catch {
+    /* tolerate junk */
+  }
+  return [];
 }
 
 export class DocStore {
@@ -156,6 +187,14 @@ export class DocStore {
       );
       CREATE INDEX IF NOT EXISTS idx_doc_audit_doc ON doc_audit(doc_id, at);
     `);
+    // ADR-013 enrichment columns — heal pre-enrichment DBs (S18 pattern).
+    addColumnsIfMissing(this.db, "documents", [
+      ["keywords", "keywords TEXT NOT NULL DEFAULT '[]'"],
+      ["summary", "summary TEXT"],
+      ["enriched_at", "enriched_at TEXT"],
+      ["enrich_status", "enrich_status TEXT"],
+      ["imported_path", "imported_path TEXT"],
+    ]);
     // Boot hygiene: clear .tmp-* leftovers from a crash mid-add. ONLY
     // .tmp-* — never unknown real files (safety over tidiness).
     for (const name of fs.readdirSync(this.documentsDir)) {
@@ -293,11 +332,15 @@ export class DocStore {
         .all() as unknown as DocRow[]
     ).map(toRecord);
 
+    // Tier order (ADR-013): operator-owned fields outrank auto-enrichment.
     const exact = all.filter((d) => d.logicalName.toLowerCase() === q);
     if (exact.length) return exact.slice(0, limit);
 
     const tagExact = all.filter((d) => d.tags.some((t) => t.toLowerCase() === q));
     if (tagExact.length) return tagExact.slice(0, limit);
+
+    const keywordExact = all.filter((d) => d.keywords.some((k) => k.toLowerCase() === q));
+    if (keywordExact.length) return keywordExact.slice(0, limit);
 
     const substr = all.filter(
       (d) =>
@@ -307,10 +350,19 @@ export class DocStore {
     );
     if (substr.length) return substr.slice(0, limit);
 
+    const autoSubstr = all.filter(
+      (d) =>
+        d.keywords.some((k) => k.toLowerCase().includes(q)) ||
+        (d.summary ?? "").toLowerCase().includes(q),
+    );
+    if (autoSubstr.length) return autoSubstr.slice(0, limit);
+
     const qTokens = q.split(/\s+/).filter(Boolean);
     const scored = all
       .map((d) => {
-        const hay = `${d.logicalName} ${d.tags.join(" ")} ${d.filename}`.toLowerCase();
+        // Summary deliberately excluded from fuzzy: long prose makes
+        // single-token overlap match everything.
+        const hay = `${d.logicalName} ${d.tags.join(" ")} ${d.keywords.join(" ")} ${d.filename}`.toLowerCase();
         const score = qTokens.filter((t) => hay.includes(t)).length;
         return { d, score };
       })
@@ -346,6 +398,51 @@ export class DocStore {
     const record = this.get(id);
     if (record) {
       this.fireManifest({ action: "retrieve", doc: record, channel, at: now });
+    }
+  }
+
+  /** ADR-013: store enrichment output (auto keywords + summary). Audited;
+   *  manifest regenerates so the vault view shows the new fields. */
+  setEnrichment(
+    id: string,
+    e: {
+      keywords: string[];
+      summary: string | null;
+      status: "ok" | "unsupported" | "failed";
+    },
+    channel: string,
+  ): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE documents
+            SET keywords = ?, summary = ?, enriched_at = ?, enrich_status = ?
+          WHERE id = ? AND status = 'active'`,
+      )
+      .run(JSON.stringify(e.keywords), e.summary, now, e.status, id);
+    this.audit(
+      id,
+      "enrich",
+      channel,
+      e.status === "ok" ? `${e.keywords.length} keywords` : e.status,
+    );
+    const record = this.get(id);
+    if (record) {
+      this.fireManifest({ action: "enrich", doc: record, channel, at: now });
+    }
+  }
+
+  /** ADR-013: record a vault import (full extracted markdown written by
+   *  the import job's TS writer; this stores the pointer + audit). */
+  recordImport(id: string, vaultRelPath: string, channel: string): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(`UPDATE documents SET imported_path = ? WHERE id = ? AND status = 'active'`)
+      .run(vaultRelPath, id);
+    this.audit(id, "import", channel, vaultRelPath);
+    const record = this.get(id);
+    if (record) {
+      this.fireManifest({ action: "import", doc: record, channel, detail: vaultRelPath, at: now });
     }
   }
 
