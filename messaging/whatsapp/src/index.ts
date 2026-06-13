@@ -38,7 +38,7 @@ import {
   sweepOutboundStaging,
 } from "./outbound.js";
 import { classifyCaption } from "./caption.js";
-import { fireEnrichJob } from "./doc_jobs.js";
+import { fireEnrichJob, runImportJob } from "./doc_jobs.js";
 import { JobStore, JOBS_TMUX_SESSION, startJob, withQuickWindow } from "./jobs.js";
 import { DocStore } from "./docstore.js";
 import { makeVaultManifestHook } from "./docstore_vault.js";
@@ -1044,6 +1044,57 @@ async function handleInboundMedia(
       `📄 arquivado: ${record.logicalName} (id ${record.id.slice(0, 8)})${deduped ? " — já existia" : ""}`,
     ),
   });
+
+  // Vault-import path (ADR-013, opt-in via vault:/import: caption, DM
+  // only): same promotion wrapper as act — extracting a long PDF easily
+  // outlives the quick window. runImportJob handles the identity-tag
+  // guard internally (returns the refusal line as the reply).
+  if (role === "dm" && decision.mode === "vault-import") {
+    await sock.sendPresenceUpdate("composing", chatId);
+    const dmDigits = normalizeSenderId(chatId);
+    const importPromise = runImportJob({ jobStore, docStore, config, record, chatId });
+    try {
+      const raced = await withQuickWindow(importPromise, ACT_QUICK_WINDOW_MS);
+      if (raced.settled) {
+        await sock.sendMessage(chatId, { text: formatReply(raced.value) });
+      } else {
+        await sock.sendMessage(chatId, {
+          text: formatReply("recebi, extraindo para o vault — aviso quando terminar 📥"),
+        });
+        importPromise.then(
+          (resultLine) => {
+            if (dmDigits) {
+              outbound.enqueue({
+                target: dmDigits,
+                source: "job-import",
+                body: formatReply(resultLine),
+              });
+            }
+          },
+          (e) => {
+            if (dmDigits) {
+              outbound.enqueue({
+                target: dmDigits,
+                source: "job-import",
+                body: formatReply(
+                  `📥 importação de "${record.logicalName}" falhou:\n\`\`\`\n${(e as Error).message}\n\`\`\``,
+                ),
+              });
+            }
+          },
+        );
+      }
+    } catch (e) {
+      await sock.sendMessage(chatId, {
+        text: formatReply(
+          `arquivei, mas a importação falhou:\n\`\`\`\n${(e as Error).message}\n\`\`\``,
+        ),
+      });
+    } finally {
+      await sock.sendPresenceUpdate("paused", chatId);
+    }
+    return;
+  }
 
   // Act path: DM only, instruction-shaped caption. ADR-013: runs on a
   // ONE-SHOT JOB SESSION (own tmux session) — the per-chat DM lock is
