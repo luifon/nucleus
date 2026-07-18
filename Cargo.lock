@@ -1539,6 +1539,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "chrono-tz",
+ "clap",
  "dotenvy",
  "figment",
  "futures",

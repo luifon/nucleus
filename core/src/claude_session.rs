@@ -380,7 +380,20 @@ impl Session {
             .await
             .unwrap_or(self.cursor);
         let payload = with_date_preamble(message);
-        paste_and_send(&self.tmux_target, &payload).await?;
+        if let Err(e) = paste_and_send(&self.tmux_target, &payload).await {
+            // A wedged TUI (submit verified to have NOT landed after the full
+            // recovery ladder) is unrecoverable from outside: kill the window
+            // so is_alive() fails and pool callers respawn with --resume,
+            // and fail THIS turn loudly instead of timing out against a
+            // black hole (operator DMs silently piling up, 2026-07-18).
+            if format!("{e:#}").contains("input wedged") {
+                let _ = Command::new("tmux")
+                    .args(["kill-window", "-t", &self.tmux_target])
+                    .output()
+                    .await;
+            }
+            return Err(e);
+        }
         let reply = wait_for_assistant(
             &self.transcript_path,
             from,
@@ -1090,14 +1103,16 @@ async fn ensure_tmux_session(name: &str) -> Result<()> {
 
 /// Send `content` into the target pane via paste-buffer (robust to quotes,
 /// newlines, emoji, etc.) and then press Enter.
-async fn paste_and_send(target: &str, content: &str) -> Result<()> {
-    // NAMED buffer per paste, never the server-global default. Concurrent
-    // sessions (ADR-020 parallel pool spawns; S13 concurrent jobs) each
-    // `load-buffer` then `paste-buffer` — on the shared default buffer the
-    // second load clobbers the first, so both windows paste whichever load
-    // won (cross-contaminated prompts; S13 vault-import got the enrich
-    // prompt, 2026-06-13). A unique buffer name isolates them; `paste-buffer
-    // -d` deletes it after so we don't leak buffers.
+/// Load `content` into a fresh NAMED tmux buffer and paste it into `target`.
+///
+/// NAMED buffer per paste, never the server-global default. Concurrent
+/// sessions (ADR-020 parallel pool spawns; S13 concurrent jobs) each
+/// `load-buffer` then `paste-buffer` — on the shared default buffer the
+/// second load clobbers the first, so both windows paste whichever load
+/// won (cross-contaminated prompts; S13 vault-import got the enrich
+/// prompt, 2026-06-13). A unique buffer name isolates them; `paste-buffer
+/// -d` deletes it after so we don't leak buffers.
+async fn paste_into(target: &str, content: &str) -> Result<()> {
     let buf = format!(
         "nucleus-{}-{}",
         target.trim_start_matches('@'),
@@ -1132,25 +1147,151 @@ async fn paste_and_send(target: &str, content: &str) -> Result<()> {
             String::from_utf8_lossy(&p.stderr).trim()
         );
     }
+    Ok(())
+}
 
-    // Wait for the bracketed-paste to fully drain into claude's TUI before
-    // pressing Enter. Without this, large pastes leave the TUI mid-paste-mode
-    // when Enter arrives, so the Enter gets eaten as a literal newline and
-    // the prompt sits queued unsent. Poll: pane is "settled" when consecutive
-    // captures match for 250ms.
-    wait_for_input_settled(target, Duration::from_millis(250), Duration::from_secs(10)).await?;
-
+async fn send_keys(target: &str, key: &str) -> Result<()> {
     let e = Command::new("tmux")
-        .args(["send-keys", "-t", target, "Enter"])
+        .args(["send-keys", "-t", target, key])
         .output()
         .await?;
     if !e.status.success() {
         anyhow::bail!(
-            "tmux send-keys Enter failed: {}",
+            "tmux send-keys {key} failed: {}",
             String::from_utf8_lossy(&e.stderr).trim()
         );
     }
     Ok(())
+}
+
+async fn send_keys_literal(target: &str, text: &str) -> Result<()> {
+    let e = Command::new("tmux")
+        .args(["send-keys", "-t", target, "-l", text])
+        .output()
+        .await?;
+    if !e.status.success() {
+        anyhow::bail!(
+            "tmux send-keys -l failed: {}",
+            String::from_utf8_lossy(&e.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Close-bracketed-paste escape sequence, sent as literal bytes. If a paste
+/// ever leaves the TUI mid-paste-mode, every later keystroke (including
+/// Enter) is swallowed as literal pasted text — this terminator snaps it out.
+pub(crate) const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
+
+/// Short recognizable prefix of the draft's first non-empty line, used to
+/// tell "our text is still sitting in the input" apart from every other
+/// ❯-prefixed row the TUI can show (permission pickers, placeholders).
+/// Matching on OUR text matters: a naive "input row not empty → press Enter
+/// again" would auto-accept the default option of a permission dialog.
+pub(crate) fn draft_fragment(content: &str) -> String {
+    content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(24)
+        .collect()
+}
+
+/// Text after the LAST ❯ glyph on screen (trimmed), or None when no ❯ row is
+/// visible. The last one is the live input row — submitted messages re-render
+/// in the scrollback with a ❯ prefix too, so anything above it is history,
+/// and treating history as "the draft is still there" made the verifier
+/// false-fail after every successful submit (E2E, 2026-07-18) — which would
+/// have re-pasted duplicate messages via the recovery ladder.
+pub(crate) fn last_prompt_row(pane: &str) -> Option<String> {
+    let mut row = None;
+    for line in pane.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix('❯') {
+            row = Some(rest.trim().to_string());
+        }
+    }
+    row
+}
+
+/// Poll until the LIVE INPUT ROW no longer carries the draft fragment — the
+/// submit landed (or the TUI moved to turn view). False on deadline: the
+/// draft is still sitting unsent in the input.
+async fn wait_for_draft_gone(target: &str, fragment: &str, deadline: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        if let Ok(out) = Command::new("tmux")
+            .args(["capture-pane", "-t", target, "-p"])
+            .output()
+            .await
+        {
+            let pane = String::from_utf8_lossy(&out.stdout);
+            // Multiline pastes can render as a "[Pasted text #N +K lines]"
+            // chip instead of the literal draft — the caller pasted into an
+            // empty input, so a lingering chip is equally "our draft unsent".
+            let stuck = last_prompt_row(&pane)
+                .map(|rest| {
+                    (!fragment.is_empty() && rest.starts_with(fragment))
+                        || rest.starts_with("[Pasted text")
+                })
+                .unwrap_or(false);
+            if !stuck {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    false
+}
+
+/// Paste `content` into `target` and submit it, VERIFYING the submit landed.
+///
+/// 2026-07-18: the settle-then-Enter heuristic passed, Enter was eaten
+/// anyway (TUI stuck in what looked like an open bracketed paste), and the
+/// operator's WhatsApp DMs piled up typed-but-unsent with zero signal.
+/// Ladder of increasingly forceful recoveries; every rung ends with Enter
+/// plus "did OUR draft leave the input row?". Exhausted ladder → an
+/// "input wedged" error the caller must treat as fatal for the window.
+pub(crate) async fn paste_and_submit_verified(target: &str, content: &str) -> Result<()> {
+    paste_into(target, content).await?;
+    // Wait for the bracketed-paste to fully drain into claude's TUI before
+    // pressing Enter; otherwise Enter gets eaten inside the paste and the
+    // prompt sits queued.
+    wait_for_input_settled(target, Duration::from_millis(250), Duration::from_secs(10)).await?;
+
+    let fragment = draft_fragment(content);
+    for rung in 0..3u8 {
+        match rung {
+            0 => {} // plain Enter
+            1 => {
+                // close a possibly-stuck bracketed paste, then Enter
+                let _ = send_keys_literal(target, BRACKETED_PASTE_END).await;
+            }
+            _ => {
+                // clear the draft entirely and re-paste from scratch
+                let _ = send_keys_literal(target, BRACKETED_PASTE_END).await;
+                send_keys(target, "C-u").await?;
+                paste_into(target, content).await?;
+                wait_for_input_settled(
+                    target,
+                    Duration::from_millis(250),
+                    Duration::from_secs(10),
+                )
+                .await?;
+            }
+        }
+        send_keys(target, "Enter").await?;
+        if wait_for_draft_gone(target, &fragment, Duration::from_millis(2500)).await {
+            return Ok(());
+        }
+        tracing::warn!(target, rung, "submit did not clear the input row — recovering");
+    }
+    anyhow::bail!("input wedged: submit did not clear after 3 recovery attempts (target {target})")
+}
+
+async fn paste_and_send(target: &str, content: &str) -> Result<()> {
+    paste_and_submit_verified(target, content).await
 }
 
 /// Poll the pane content; if claude's "trust this folder" prompt is showing,

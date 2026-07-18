@@ -15,6 +15,7 @@
 //! - [`runlog`] — per-agent run-log index over Claude transcripts (ADR-016).
 //! - [`skills`] — shared SKILL.md discovery/parse/validate (ADR-008/017).
 
+pub mod agent_msg;
 pub mod agents;
 pub mod claude;
 pub mod claude_session;

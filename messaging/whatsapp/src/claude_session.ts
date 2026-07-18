@@ -653,7 +653,7 @@ async function pasteInto(target: string, content: string): Promise<void> {
 /** Close-bracketed-paste escape, sent literally. If a paste ever leaves the
  *  TUI mid-paste-mode, every later keystroke (including Enter) is swallowed
  *  as literal pasted text — this terminator snaps it out. */
-const BRACKETED_PASTE_END = "[201~";
+const BRACKETED_PASTE_END = "\x1b[201~";
 
 async function pasteAndSend(target: string, content: string): Promise<void> {
   await pasteInto(target, content);
@@ -701,9 +701,23 @@ function draftFragment(content: string): string {
   return first.trim().slice(0, 24);
 }
 
-/** Poll until no ❯ row on screen still carries the draft fragment — submit
- *  landed (or the TUI moved to turn view). False on deadline: the draft is
- *  still sitting unsent in the input. */
+/** Text after the LAST ❯ glyph on screen (trimmed), or null when no ❯ row is
+ *  visible. The LAST one is the live input row — submitted messages re-render
+ *  in the scrollback with a ❯ prefix too, so anything above it is history;
+ *  treating history as "the draft is still there" false-fails after every
+ *  successful submit and would re-paste duplicates via the recovery ladder. */
+function lastPromptRow(pane: string): string | null {
+  let row: string | null = null;
+  for (const line of pane.split("\n")) {
+    const t = line.trimStart();
+    if (t.startsWith("❯")) row = t.slice(1).trim();
+  }
+  return row;
+}
+
+/** Poll until the LIVE INPUT ROW no longer carries the draft fragment —
+ *  submit landed (or the TUI moved to turn view). False on deadline: the
+ *  draft is still sitting unsent in the input. */
 async function waitForDraftGone(
   target: string,
   fragment: string,
@@ -716,10 +730,13 @@ async function waitForDraftGone(
       stderr: "",
     }));
     if (stdout) {
-      const stuck = stdout.split("\n").some((line) => {
-        const t = line.trimStart();
-        return t.startsWith("❯") && fragment.length > 0 && t.slice(1).trim().startsWith(fragment);
-      });
+      const row = lastPromptRow(stdout);
+      // Multiline pastes can render as a "[Pasted text #N +K lines]" chip
+      // instead of the literal draft — we pasted into this input, so a
+      // lingering chip is equally "our draft unsent".
+      const stuck =
+        row !== null &&
+        ((fragment.length > 0 && row.startsWith(fragment)) || row.startsWith("[Pasted text"));
       if (!stuck) return true;
     }
     await sleep(150);
