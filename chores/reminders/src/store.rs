@@ -955,30 +955,71 @@ pub async fn fire_history(
 /// is missing entirely, insert it.
 pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
     struct SeedRow {
+        /// Stable identity for title-matched seeds (skill-fires, whose
+        /// prompt wording may evolve). None → legacy body-matched seed.
+        title: Option<&'static str>,
         body: &'static str,
+        system_prompt: Option<&'static str>,
         cron: &'static str,
         one_shot: bool,
         channels: &'static [&'static str],
     }
-    let seeds: &[SeedRow] = &[SeedRow {
-        body: "⏰ End of day — time to log your hours.",
-        cron: "30 18 * * 1-5",
-        one_shot: false,
-        channels: &[CHANNEL_DISCORD_HOME],
-    }];
+    let seeds: &[SeedRow] = &[
+        SeedRow {
+            title: None,
+            body: "⏰ End of day — time to log your hours.",
+            system_prompt: None,
+            cron: "30 18 * * 1-5",
+            one_shot: false,
+            channels: &[CHANNEL_DISCORD_HOME],
+        },
+        // ADR-026 heartbeat: the standing "does anything need attention?"
+        // sweep. Reply contract: HEARTBEAT_OK → delivery suppressed by the
+        // worker. Prompt wording may evolve; identity is the title.
+        SeedRow {
+            title: Some("heartbeat"),
+            body: "",
+            system_prompt: Some(
+                "Heartbeat sweep (ADR-026). Read ~/Documents/Obsidian/4-Areas/Nucleus/HEARTBEAT.md \
+                 and check each item cheaply — file reads and read-only Bash only; no outbound \
+                 actions, no mutations. Before reporting, read today's reminders diary \
+                 (memory/diaries/reminders/) for what earlier heartbeats already flagged: report \
+                 each item at most once per day unless its state has CHANGED since. If something \
+                 genuinely needs the operator's attention, reply with a short plain report \
+                 (2-6 lines, lead with the item). If nothing does, reply exactly: HEARTBEAT_OK",
+            ),
+            cron: "*/30 9-23 * * *",
+            one_shot: false,
+            channels: &[CHANNEL_WHATSAPP_DM],
+        },
+    ];
 
     let tz = nucleus_tz();
     for seed in seeds {
-        // Body+system uniqueness — survives cancellation by leaving the
-        // cancelled row alone.
-        let existing: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM reminders
-              WHERE created_by = 'system' AND body = ?1
-              LIMIT 1",
-        )
-        .bind(seed.body)
-        .fetch_optional(pool)
-        .await?;
+        // Uniqueness survives cancellation by leaving the cancelled row
+        // alone: title match for titled seeds, body match for legacy ones.
+        let existing: Option<(i64,)> = match seed.title {
+            Some(title) => {
+                sqlx::query_as(
+                    "SELECT id FROM reminders
+                      WHERE created_by = 'system' AND title = ?1
+                      LIMIT 1",
+                )
+                .bind(title)
+                .fetch_optional(pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT id FROM reminders
+                      WHERE created_by = 'system' AND body = ?1
+                      LIMIT 1",
+                )
+                .bind(seed.body)
+                .fetch_optional(pool)
+                .await?
+            }
+        };
         if existing.is_some() {
             continue;
         }
@@ -987,17 +1028,21 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
         let channels: Vec<String> = seed.channels.iter().map(|s| s.to_string()).collect();
         let id = insert_with_channels(
             pool,
-            None, // title — system-seeded reminders use body as their display name
+            seed.title,
             seed.body,
             seed.cron,
             seed.one_shot,
             next,
             &channels,
             "system",
-            None,
+            seed.system_prompt,
         )
         .await?;
-        tracing::info!(id, body = seed.body, "reminders: seeded system reminder");
+        tracing::info!(
+            id,
+            title = seed.title.unwrap_or(seed.body),
+            "reminders: seeded system reminder"
+        );
     }
     Ok(())
 }

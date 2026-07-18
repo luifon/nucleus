@@ -1,0 +1,53 @@
+{
+  "_comment": "Shared test vectors for split_rotation_reply / splitRotationReply (ADR-025 memory flush folded into the rotation summary ask). Consumed by BOTH core/src/claude_session.rs tests and messaging/whatsapp/src/claude_session.test.ts — add cases here, never fork per-language copies. expect_durable: null means no durable section (whole reply is summary, or durable was 'none'/empty).",
+  "split_rotation_reply": [
+    {
+      "name": "both sections present",
+      "reply": "SUMMARY:\n- task A ongoing\n- decided X\n\nDURABLE:\n- user prefers terse replies\n- correction: use bootout not unload",
+      "expect_summary": "- task A ongoing\n- decided X",
+      "expect_durable": "- user prefers terse replies\n- correction: use bootout not unload"
+    },
+    {
+      "name": "durable none is dropped",
+      "reply": "SUMMARY:\n- quiet day, small talk only\n\nDURABLE:\nnone",
+      "expect_summary": "- quiet day, small talk only",
+      "expect_durable": null
+    },
+    {
+      "name": "durable none with period and case",
+      "reply": "SUMMARY:\n- bullets here\n\nDurable:\nNone.",
+      "expect_summary": "- bullets here",
+      "expect_durable": null
+    },
+    {
+      "name": "no headers at all degrades to summary-only",
+      "reply": "- old-style reply\n- just bullets",
+      "expect_summary": "- old-style reply\n- just bullets",
+      "expect_durable": null
+    },
+    {
+      "name": "empty durable body is dropped",
+      "reply": "SUMMARY:\n- a bullet\n\nDURABLE:\n",
+      "expect_summary": "- a bullet",
+      "expect_durable": null
+    },
+    {
+      "name": "durable mentioned mid-bullet is not a header",
+      "reply": "SUMMARY:\n- discussed DURABLE: goods pricing\n- decided Y\n\nDURABLE:\n- user buys appliances in July",
+      "expect_summary": "- discussed DURABLE: goods pricing\n- decided Y",
+      "expect_durable": "- user buys appliances in July"
+    },
+    {
+      "name": "preamble before summary header is tolerated",
+      "reply": "Here is the summary.\nSUMMARY:\n- bullet one\nDURABLE:\n- fact one",
+      "expect_summary": "- bullet one",
+      "expect_durable": "- fact one"
+    },
+    {
+      "name": "content on the header lines is kept",
+      "reply": "SUMMARY: - inline bullet\nDURABLE: - inline fact",
+      "expect_summary": "- inline bullet",
+      "expect_durable": "- inline fact"
+    }
+  ]
+}

@@ -17,6 +17,7 @@ import {
   draftFragment,
   draftStuck,
   waitForDraftGone,
+  splitRotationReply,
   Turn,
 } from "./claude_session.js";
 
@@ -312,5 +313,26 @@ test("waitForDraftGone detects a stuck draft, then a cleared live row", async ()
     assert.equal(gone, true, "cleared live row must report gone");
   } finally {
     await tmuxKill(session);
+  }
+});
+
+// Mirror of core's rotation_reply_vectors_split (ADR-025). Shared vector
+// file — add cases there, never fork per-language expectations.
+const ROTATION_VECTORS = JSON.parse(
+  readFileSync(
+    path.join(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../../core/testdata/rotation_reply_vectors.json",
+    ),
+    "utf8",
+  ),
+);
+
+test("splitRotationReply matches the shared rotation-reply vectors", () => {
+  assert.ok(ROTATION_VECTORS.split_rotation_reply.length > 0);
+  for (const c of ROTATION_VECTORS.split_rotation_reply) {
+    const { summary, durable } = splitRotationReply(c.reply);
+    assert.equal(summary, c.expect_summary, `summary vector: ${c.name}`);
+    assert.equal(durable, c.expect_durable, `durable vector: ${c.name}`);
   }
 });
