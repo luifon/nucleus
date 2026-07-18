@@ -148,6 +148,10 @@ cp nucleus.toml.example nucleus.toml
 cargo build --release
 (cd messaging/whatsapp && npm install)
 (cd nucleus-dashboard/web && npm install && npm run build)
+(cd tools/playwright-auth && npm install && node playwright-auth.mjs init)
+# init creates the (empty) browser-auth snapshot the Playwright MCP
+# server seeds isolated sessions from (ADR-022). To carry real logins:
+#   node playwright-auth.mjs login --url <site>   # log in, close window
 ```
 
 ### 3. Cloudflare tunnel (skip if running localhost-only)
@@ -447,6 +451,8 @@ nucleus/
 - `docs/ADR-018-whatsapp-media.md` — WhatsApp media + personal document library, encrypted Drive (proposed)
 - `docs/ADR-019-image-generation-surface.md` — local Bonsai image gen + dashboard gallery
 - `docs/ADR-020-architecture-hardening.md` — hardening pass: session profiles, migrations, DB ownership rule, ops pruning/rotation, typegen — and the rejected alternatives
+- `docs/ADR-021-agent-session-messaging.md` — `session-send`: the one sanctioned agent-to-agent session injection primitive (attributed, idle-gated, logged)
+- `docs/ADR-022-concurrent-browser-automation.md` — Playwright MCP isolated contexts + shared storage state; `tools/playwright-auth/` owns logins
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
