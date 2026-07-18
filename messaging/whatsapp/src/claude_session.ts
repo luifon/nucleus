@@ -189,7 +189,19 @@ export class Session {
   async ask(message: string, opts: AskOptions = {}): Promise<string> {
     const ask = { ...DEFAULT_ASK, ...opts };
     const fromOffset = this.cursor;
-    await pasteAndSend(this.tmuxTarget, withDatePreamble(message));
+    try {
+      await pasteAndSend(this.tmuxTarget, withDatePreamble(message));
+    } catch (e) {
+      if (e instanceof WedgedInputError) {
+        // The TUI stopped accepting submits (2026-07-18: operator DMs piled
+        // up typed-but-unsent, invisibly). A wedged window is unrecoverable
+        // from outside — kill it so isAlive() fails and the pool respawns
+        // with --resume, and rethrow so the caller knows THIS turn was lost
+        // instead of timing out against a black hole.
+        await this.close().catch(() => {});
+      }
+      throw e;
+    }
     const reply = await waitForAssistant(
       this.transcriptPath,
       fromOffset,
@@ -600,7 +612,19 @@ async function tmux(args: string[]): Promise<{ stdout: string; stderr: string }>
   });
 }
 
-async function pasteAndSend(target: string, content: string): Promise<void> {
+/** The TUI stopped accepting submits — Enter is being eaten and typed input
+ *  accumulates unsent. Callers should kill the window and respawn. */
+export class WedgedInputError extends Error {
+  constructor(target: string, attempts: number) {
+    super(
+      `input wedged: submit did not clear after ${attempts} recovery attempts (target ${target})`,
+    );
+    this.name = "WedgedInputError";
+  }
+}
+
+/** Load `content` into a fresh NAMED tmux buffer and paste it into `target`. */
+async function pasteInto(target: string, content: string): Promise<void> {
   // NAMED buffer per paste, never the server-global default. Concurrent
   // sessions (S13 fires enrich + act/import jobs at once on one inbound)
   // each load-buffer then paste-buffer — on the shared default buffer the
@@ -624,13 +648,83 @@ async function pasteAndSend(target: string, content: string): Promise<void> {
     child.stdin!.end();
   });
   await tmux(["paste-buffer", "-d", "-b", buf, "-t", target]);
+}
+
+/** Close-bracketed-paste escape, sent literally. If a paste ever leaves the
+ *  TUI mid-paste-mode, every later keystroke (including Enter) is swallowed
+ *  as literal pasted text — this terminator snaps it out. */
+const BRACKETED_PASTE_END = "[201~";
+
+async function pasteAndSend(target: string, content: string): Promise<void> {
+  await pasteInto(target, content);
   // Wait for the bracketed-paste sequence to fully drain into claude's TUI
   // before pressing Enter. Without this, large pastes leave the TUI in
   // mid-paste-mode when Enter arrives, so the Enter gets eaten as a literal
   // newline and the prompt sits queued unsent. Same fix as the Rust side
   // (core/src/claude_session.rs::wait_for_input_settled).
   await waitForInputSettled(target, 250, 10_000);
-  await tmux(["send-keys", "-t", target, "Enter"]);
+
+  // Submit is VERIFIED, not fire-and-forget: on 2026-07-18 the settle
+  // heuristic passed, Enter was eaten anyway, and the operator's DMs piled
+  // up typed-but-unsent with zero signal. Ladder of increasingly forceful
+  // recoveries; every rung ends with Enter + "did the input row clear?".
+  const recoveries: (() => Promise<void>)[] = [
+    async () => {}, // rung 0: plain Enter
+    async () => {
+      // rung 1: close a possibly-stuck bracketed paste, then Enter
+      await tmux(["send-keys", "-t", target, "-l", BRACKETED_PASTE_END]);
+    },
+    async () => {
+      // rung 2: clear the draft entirely and re-paste from scratch
+      await tmux(["send-keys", "-t", target, "-l", BRACKETED_PASTE_END]).catch(() => {});
+      await tmux(["send-keys", "-t", target, "C-u"]);
+      await pasteInto(target, content);
+      await waitForInputSettled(target, 250, 10_000);
+    },
+  ];
+  const fragment = draftFragment(content);
+  for (const recover of recoveries) {
+    await recover();
+    await tmux(["send-keys", "-t", target, "Enter"]);
+    if (await waitForDraftGone(target, fragment, 2_500)) return;
+  }
+  throw new WedgedInputError(target, recoveries.length);
+}
+
+/** Short recognizable prefix of the draft's first line, used to tell "our
+ *  text is still sitting in the input" apart from every other ❯-prefixed row
+ *  the TUI can show (permission pickers, placeholders). Matching on OUR text
+ *  matters: a naive "input row not empty → press Enter again" would auto-
+ *  accept the default option of a permission dialog. */
+function draftFragment(content: string): string {
+  const first = content.split("\n").find((l) => l.trim().length > 0) ?? "";
+  return first.trim().slice(0, 24);
+}
+
+/** Poll until no ❯ row on screen still carries the draft fragment — submit
+ *  landed (or the TUI moved to turn view). False on deadline: the draft is
+ *  still sitting unsent in the input. */
+async function waitForDraftGone(
+  target: string,
+  fragment: string,
+  deadlineMs: number,
+): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < deadlineMs) {
+    const { stdout } = await tmux(["capture-pane", "-t", target, "-p"]).catch(() => ({
+      stdout: "",
+      stderr: "",
+    }));
+    if (stdout) {
+      const stuck = stdout.split("\n").some((line) => {
+        const t = line.trimStart();
+        return t.startsWith("❯") && fragment.length > 0 && t.slice(1).trim().startsWith(fragment);
+      });
+      if (!stuck) return true;
+    }
+    await sleep(150);
+  }
+  return false;
 }
 
 /** Poll the pane until consecutive captures stay identical for `settleMs`,
