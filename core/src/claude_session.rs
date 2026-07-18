@@ -815,13 +815,26 @@ impl SessionPool {
             })
             .await
             .context("daily_rotate: summary ask failed")?;
+        // ADR-025 memory flush: the same ask carries a DURABLE section for
+        // observations not yet recorded anywhere; a format-ignoring reply
+        // degrades to summary-only (pre-flush behavior).
+        let (summary, durable) = split_rotation_reply(&summary);
 
-        // Step 2: append the summary to today's diary.
+        // Step 2: append the summary to today's diary, plus a distinct
+        // flush entry when the session surfaced durable observations —
+        // labeled so the distiller sees it as promotion-grade input.
         let entry = crate::diary::Entry::now(
             format!("daily_rotate {}", chat_key),
             format!("Session rotated. Yesterday's summary:\n\n{}", summary.trim()),
         );
         let _ = crate::diary::append(&self.config.workspace_root, agent_name, &entry);
+        if let Some(durable) = &durable {
+            let entry = crate::diary::Entry::now(
+                format!("memory_flush {}", chat_key),
+                format!("Durable observations flushed at rotation:\n\n{}", durable),
+            );
+            let _ = crate::diary::append(&self.config.workspace_root, agent_name, &entry);
+        }
 
         // Step 3: spawn a brand-new session (no --resume, fresh UUID).
         // Window name derived from the new UUID so it doesn't collide with
@@ -915,13 +928,69 @@ pub struct RotationStats {
 }
 
 /// The deterministic prompt the old session is given before being closed.
-/// Phrased so the reply is the bullets directly, with no surrounding
-/// preamble we'd then have to strip before writing to the diary.
+/// Two labeled sections (ADR-025): SUMMARY feeds tomorrow's priming as
+/// before; DURABLE is the memory flush — observations worth keeping beyond
+/// tomorrow that never made it into the diary. Split by
+/// [`split_rotation_reply`]; a reply that ignores the format degrades to
+/// summary-only, which is exactly the pre-ADR-025 behavior.
 const SUMMARY_PROMPT: &str =
-    "Summarize this conversation in 5-10 bullets for tomorrow's session. \
-     Focus on ongoing tasks, decisions made, key facts about the user, \
-     and anything a fresh assistant would need to know. \
-     Reply with only the bullets.";
+    "This session rotates now. Reply with exactly two sections and no other text:\n\
+     SUMMARY:\n\
+     5-10 bullets for tomorrow's session — ongoing tasks, decisions made, \
+     key facts about the user, anything a fresh assistant would need to know.\n\
+     DURABLE:\n\
+     Bullets for observations worth keeping beyond tomorrow that are NOT yet \
+     recorded anywhere: decisions, corrections, recurring user preferences, \
+     unresolved threads. Write none if everything durable is already recorded.";
+
+/// Split the rotation reply into (summary, durable). The DURABLE header is
+/// matched line-anchored (last occurrence wins); a missing header, an empty
+/// body, or a literal "none" yields no durable section. Mirrored in
+/// messaging/whatsapp `splitRotationReply`; shared vectors in
+/// `core/testdata/rotation_reply_vectors.json`.
+pub(crate) fn split_rotation_reply(reply: &str) -> (String, Option<String>) {
+    fn header_rest<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+        let t = line.trim();
+        // byte-safe: get() returns None off a char boundary (e.g. a line
+        // starting with a multibyte glyph), which is correctly "no header"
+        let head = t.get(..name.len())?;
+        if head.eq_ignore_ascii_case(name) {
+            t.get(name.len()..)?.strip_prefix(':')
+        } else {
+            None
+        }
+    }
+    let lines: Vec<&str> = reply.lines().collect();
+    let Some(durable_idx) = (0..lines.len()).rev().find(|&i| header_rest(lines[i], "DURABLE").is_some())
+    else {
+        return (reply.trim().to_string(), None);
+    };
+
+    let mut durable_parts: Vec<&str> = Vec::new();
+    if let Some(rest) = header_rest(lines[durable_idx], "DURABLE") {
+        durable_parts.push(rest);
+    }
+    durable_parts.extend(&lines[durable_idx + 1..]);
+    let durable = durable_parts.join("\n").trim().to_string();
+    let durable = match durable.trim_end_matches('.').to_ascii_lowercase().as_str() {
+        "" | "none" => None,
+        _ => Some(durable),
+    };
+
+    let head = &lines[..durable_idx];
+    let summary = match (0..head.len()).find(|&i| header_rest(head[i], "SUMMARY").is_some()) {
+        Some(i) => {
+            let mut parts: Vec<&str> = Vec::new();
+            if let Some(rest) = header_rest(head[i], "SUMMARY") {
+                parts.push(rest);
+            }
+            parts.extend(&head[i + 1..]);
+            parts.join("\n").trim().to_string()
+        }
+        None => head.join("\n").trim().to_string(),
+    };
+    (summary, durable)
+}
 
 /// Build the first message a freshly-rotated session sees: yesterday's
 /// summary on top, then the last N turns replayed in plain "USER:"/
@@ -2298,6 +2367,27 @@ mod tests {
             let fragment = case["fragment"].as_str().unwrap();
             let expect = case["expect"].as_bool().unwrap();
             assert_eq!(draft_stuck(pane, fragment), expect, "vector: {name}");
+        }
+    }
+
+    /// Shared vectors for the ADR-025 rotation-reply split; the SAME file
+    /// drives the TS mirror's tests.
+    const ROTATION_REPLY_VECTORS: &str = include_str!("../testdata/rotation_reply_vectors.json");
+
+    #[test]
+    fn rotation_reply_vectors_split() {
+        let v: serde_json::Value = serde_json::from_str(ROTATION_REPLY_VECTORS).unwrap();
+        let cases = v["split_rotation_reply"].as_array().expect("vector array");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let (summary, durable) = split_rotation_reply(case["reply"].as_str().unwrap());
+            assert_eq!(summary, case["expect_summary"].as_str().unwrap(), "summary vector: {name}");
+            assert_eq!(
+                durable.as_deref(),
+                case["expect_durable"].as_str(),
+                "durable vector: {name}"
+            );
         }
     }
 

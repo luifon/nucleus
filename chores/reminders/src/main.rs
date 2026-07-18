@@ -504,6 +504,39 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
             // session has no built-in posting tool, so the reminders
             // worker is the bridge (see persona.md for the contract).
             match deliver_skill_fire(settings, workspace_root, &reminder, &channels).await {
+                Ok(SkillFireResult { msg_id, reply }) if is_silent_reply(&reply) => {
+                    // Reply-gated delivery (ADR-026): the session judged
+                    // there is nothing worth the operator's attention.
+                    // Record a successful fire on every channel, deliver
+                    // nothing anywhere.
+                    tracing::info!(
+                        id = reminder.id,
+                        msg = %msg_id,
+                        "skill-fire ok — silent reply, delivery suppressed"
+                    );
+                    let silent_msg_id = format!("{}|silent", msg_id);
+                    for ch in &channels {
+                        store::record_channel_fire(
+                            &pool,
+                            reminder.id,
+                            &ch.channel,
+                            fired_at,
+                            store::FireOutcome {
+                                success: true,
+                                msg_id: Some(&silent_msg_id),
+                                error: None,
+                            },
+                        )
+                        .await?;
+                    }
+                    let _ = diary::record_observation(
+                        workspace_root,
+                        AGENT_NAME,
+                        "fired",
+                        &format!("reminder #{} skill-fire → silent (HEARTBEAT_OK)", reminder.id),
+                        diary::Tag::Observation,
+                    );
+                }
                 Ok(SkillFireResult { msg_id, reply }) => {
                     tracing::info!(
                         id = reminder.id,
@@ -1105,6 +1138,15 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Reply-gated delivery (ADR-026): a skill-fire session that has nothing
+/// worth the operator's attention replies exactly `HEARTBEAT_OK` (after
+/// marker-strip) and the worker suppresses delivery on every channel while
+/// still recording a successful fire. Strict equality modulo surrounding
+/// whitespace — a report that merely *mentions* the token must deliver.
+fn is_silent_reply(reply: &str) -> bool {
+    reply.trim() == "HEARTBEAT_OK"
+}
+
 /// A skill-fire failure alerts a channel only when it exhausts that
 /// channel's retry budget — with attempts left, next tick re-spawns the
 /// fire, and a ⚠ followed minutes later by the successful retry's
@@ -1124,6 +1166,28 @@ fn first_csv_entry(env_var: &str) -> Option<String> {
         .next()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod silent_reply_tests {
+    use super::is_silent_reply;
+
+    #[test]
+    fn exact_token_is_silent_modulo_whitespace() {
+        assert!(is_silent_reply("HEARTBEAT_OK"));
+        assert!(is_silent_reply("  HEARTBEAT_OK\n"));
+    }
+
+    /// Anything beyond the bare token must deliver — a report that merely
+    /// mentions the token, wrong case, or an empty reply (empty is an
+    /// error shape, not a silence request).
+    #[test]
+    fn non_bare_replies_deliver() {
+        assert!(!is_silent_reply("HEARTBEAT_OK — but disk is low"));
+        assert!(!is_silent_reply("All quiet.\nHEARTBEAT_OK"));
+        assert!(!is_silent_reply("heartbeat_ok"));
+        assert!(!is_silent_reply(""));
+    }
 }
 
 #[cfg(test)]

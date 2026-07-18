@@ -1,7 +1,13 @@
 # ADR-026 — Heartbeat: a standing "does anything need attention?" turn
 
 Date: 2026-07-18
-Status: proposed
+Status: accepted + built (2026-07-18)
+
+> As-built: `is_silent_reply` gate in the reminders worker (unit-tested;
+> suppression records `<msg_id>|silent` fires), heartbeat seeded as the
+> system reminder titled `heartbeat` (title-matched seeding so prompt
+> wording can evolve; cancellation stays sticky), checklist at
+> `4-Areas/Nucleus/HEARTBEAT.md` in the vault.
 
 ## Context
 

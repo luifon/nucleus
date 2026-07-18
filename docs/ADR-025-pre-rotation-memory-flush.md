@@ -1,7 +1,23 @@
 # ADR-025 — Pre-rotation memory flush: persist before the 4 am recycle
 
 Date: 2026-07-18
-Status: proposed
+Status: accepted + built (2026-07-18)
+
+> **As-built deviation.** Implementation revealed the rotation already
+> asks the dying session for a continuity summary at exactly the right
+> moment — so the flush is FOLDED INTO that ask instead of being a
+> separate `FLUSH_OK` turn. The rotation prompt now requests two labeled
+> sections: `SUMMARY:` (priming + diary, as before) and `DURABLE:`
+> (observations not yet recorded anywhere; `none` when empty). The
+> runtime splits the reply (`split_rotation_reply` /
+> `splitRotationReply`, shared vectors in
+> `core/testdata/rotation_reply_vectors.json`); a DURABLE section becomes
+> a distinct `memory_flush <chat>` diary entry for the distiller. A reply
+> that ignores the format degrades to summary-only — exactly the
+> pre-flush behavior, so the failure mode is "no worse than before" by
+> construction. The separate-turn design below is retained for context;
+> its skip-when-idle and cannot-block-rotation properties hold trivially
+> in the folded form (the summary ask already has both).
 
 ## Context
 

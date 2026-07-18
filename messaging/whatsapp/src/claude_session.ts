@@ -398,17 +398,28 @@ export class SessionPool {
 
       // Step 1: ask for the summary. Generous timeout — no user is
       // waiting and the model may have to consume a large transcript.
-      const summary = await entry.session.ask(SUMMARY_PROMPT, {
+      const reply = await entry.session.ask(SUMMARY_PROMPT, {
         maxWaitMs: 300_000,
         quiescentMs: 5_000,
       });
+      // ADR-025 memory flush: the same ask carries a DURABLE section; a
+      // format-ignoring reply degrades to summary-only.
+      const { summary, durable } = splitRotationReply(reply);
 
-      // Step 2: append to today's diary.
+      // Step 2: append to today's diary — plus a distinct flush entry when
+      // the session surfaced durable observations (distiller input).
       diaryAppendEntry(
         diaryRoot,
         `daily_rotate ${chatKey}`,
         `Session rotated. Yesterday's summary:\n\n${summary.trim()}`,
       );
+      if (durable !== null) {
+        diaryAppendEntry(
+          diaryRoot,
+          `memory_flush ${chatKey}`,
+          `Durable observations flushed at rotation:\n\n${durable}`,
+        );
+      }
 
       // Step 3: spawn a fresh session (no resume, new UUID, new window).
       const newSession = await Session.spawn({
@@ -957,11 +968,55 @@ export interface RotationStats {
   failed: number;
 }
 
+/** Two labeled sections (ADR-025): SUMMARY feeds tomorrow's priming as
+ *  before; DURABLE is the memory flush — observations worth keeping beyond
+ *  tomorrow that never made it into the diary. Split by splitRotationReply;
+ *  a reply that ignores the format degrades to summary-only (pre-ADR-025
+ *  behavior). Mirror of core/src/claude_session.rs::SUMMARY_PROMPT. */
 const SUMMARY_PROMPT =
-  "Summarize this conversation in 5-10 bullets for tomorrow's session. " +
-  "Focus on ongoing tasks, decisions made, key facts about the user, " +
-  "and anything a fresh assistant would need to know. " +
-  "Reply with only the bullets.";
+  "This session rotates now. Reply with exactly two sections and no other text:\n" +
+  "SUMMARY:\n" +
+  "5-10 bullets for tomorrow's session — ongoing tasks, decisions made, " +
+  "key facts about the user, anything a fresh assistant would need to know.\n" +
+  "DURABLE:\n" +
+  "Bullets for observations worth keeping beyond tomorrow that are NOT yet " +
+  "recorded anywhere: decisions, corrections, recurring user preferences, " +
+  "unresolved threads. Write none if everything durable is already recorded.";
+
+/** Split the rotation reply into summary + durable. The DURABLE header is
+ *  matched line-anchored (last occurrence wins); a missing header, empty
+ *  body, or literal "none" yields durable: null. Mirror of
+ *  core/src/claude_session.rs::split_rotation_reply; shared vectors in
+ *  core/testdata/rotation_reply_vectors.json. */
+export function splitRotationReply(reply: string): { summary: string; durable: string | null } {
+  const headerRest = (line: string, name: string): string | null => {
+    const t = line.trim();
+    if (t.length < name.length + 1) return null;
+    if (t.slice(0, name.length).toUpperCase() !== name) return null;
+    return t[name.length] === ":" ? t.slice(name.length + 1) : null;
+  };
+  const lines = reply.split("\n");
+  let durableIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (headerRest(lines[i], "DURABLE") !== null) {
+      durableIdx = i;
+      break;
+    }
+  }
+  if (durableIdx < 0) return { summary: reply.trim(), durable: null };
+
+  const durableParts = [headerRest(lines[durableIdx], "DURABLE") ?? "", ...lines.slice(durableIdx + 1)];
+  let durable: string | null = durableParts.join("\n").trim();
+  if (durable.replace(/\.+$/, "").toLowerCase() === "none" || durable === "") durable = null;
+
+  const head = lines.slice(0, durableIdx);
+  const summaryIdx = head.findIndex((l) => headerRest(l, "SUMMARY") !== null);
+  const summary =
+    summaryIdx >= 0
+      ? [headerRest(head[summaryIdx], "SUMMARY") ?? "", ...head.slice(summaryIdx + 1)].join("\n").trim()
+      : head.join("\n").trim();
+  return { summary, durable };
+}
 
 const SYSTEM_INJECTED_PREFIXES = [
   "<ide_opened_file>",
