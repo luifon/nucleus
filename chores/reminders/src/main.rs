@@ -540,7 +540,10 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                         let (recorded_msg_id, forward_err) = match forward {
                             Ok(fw_msg) => (format!("{}|fwd:{}", msg_id, fw_msg), None),
                             Err(e) => {
-                                let err_str = e.to_string();
+                                // {:#} keeps the whole anyhow chain — the
+                                // outer context alone ("deliver to …") is
+                                // useless for triage.
+                                let err_str = format!("{e:#}");
                                 tracing::warn!(
                                     id = reminder.id,
                                     channel = %ch.channel,
@@ -583,34 +586,44 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                     );
                 }
                 Err(e) => {
-                    let err = e.to_string();
+                    // {:#} keeps the whole anyhow chain — persisting only
+                    // the outer context ("fire session for reminder #N")
+                    // made 2026-07-18's failure untriageable after the fact.
+                    let err = format!("{e:#}");
                     tracing::warn!(
                         id = reminder.id,
                         err = %err,
-                        "skill-fire failed; alerting channels"
+                        "skill-fire failed"
                     );
-                    // Outer-error alert (ADR-008 failure handling layer 2):
-                    // post a heads-up to each channel best-effort, then
-                    // record the channel-fire as Err so per-channel retry
-                    // budget governs whether we re-spawn next tick.
-                    let alert_body = format!(
-                        "⚠️ Reminder #{} fire failed: {}",
-                        reminder.id,
-                        truncate(&err, 200)
-                    );
-                    let alert_reminder = store::Reminder {
-                        body: alert_body,
-                        ..reminder.clone()
-                    };
+                    // Outer-error alert (ADR-008 failure handling layer 2),
+                    // but retry-aware: a channel with budget left re-spawns
+                    // the fire next tick, so alerting on a non-final attempt
+                    // is noise — the operator gets a ⚠ followed minutes
+                    // later by the successful retry's deliverable (observed
+                    // with #47, 2026-07-18). Alert only the channels this
+                    // failure exhausts; record every failure regardless.
                     for ch in &channels {
-                        let _ = deliver(
-                            settings,
-                            workspace_root,
-                            &mention,
-                            &alert_reminder,
-                            &ch.channel,
-                        )
-                        .await;
+                        let attempt = ch.attempts + 1;
+                        if alert_on_this_attempt(ch.attempts) {
+                            let alert_reminder = store::Reminder {
+                                body: format!(
+                                    "⚠️ Reminder #{} fire failed (attempt {}/{}, giving up): {}",
+                                    reminder.id,
+                                    attempt,
+                                    store::MAX_ATTEMPTS,
+                                    truncate(&err, 200)
+                                ),
+                                ..reminder.clone()
+                            };
+                            let _ = deliver(
+                                settings,
+                                workspace_root,
+                                &mention,
+                                &alert_reminder,
+                                &ch.channel,
+                            )
+                            .await;
+                        }
                         store::record_channel_fire(
                             &pool,
                             reminder.id,
@@ -663,7 +676,8 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                         );
                     }
                     Err(e) => {
-                        let err = e.to_string();
+                        // {:#} keeps the whole anyhow chain for triage.
+                        let err = format!("{e:#}");
                         store::record_channel_fire(
                             &pool,
                             reminder.id,
@@ -1091,6 +1105,15 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// A skill-fire failure alerts a channel only when it exhausts that
+/// channel's retry budget — with attempts left, next tick re-spawns the
+/// fire, and a ⚠ followed minutes later by the successful retry's
+/// deliverable is pure noise (observed with #47, 2026-07-18). Takes the
+/// channel's attempt count BEFORE this failure is recorded.
+fn alert_on_this_attempt(prior_attempts: i64) -> bool {
+    prior_attempts + 1 >= store::MAX_ATTEMPTS
+}
+
 /// First non-empty entry from a comma-separated env var. Used to pick
 /// the default delivery target for WhatsApp channels — the first listed
 /// group name (whatsapp-group/braindump) or the first listed DM JID.
@@ -1101,6 +1124,29 @@ fn first_csv_entry(env_var: &str) -> Option<String> {
         .next()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod alert_gating_tests {
+    use super::alert_on_this_attempt;
+    use super::store::MAX_ATTEMPTS;
+
+    /// Attempts 1..MAX-1 stay silent (retry will re-spawn); the attempt
+    /// that exhausts the budget alerts. Pinned to MAX_ATTEMPTS so a
+    /// budget change can't silently open an alert gap.
+    #[test]
+    fn alerts_only_on_the_budget_exhausting_attempt() {
+        for prior in 0..MAX_ATTEMPTS - 1 {
+            assert!(
+                !alert_on_this_attempt(prior),
+                "attempt {} of {MAX_ATTEMPTS} must be silent",
+                prior + 1
+            );
+        }
+        assert!(alert_on_this_attempt(MAX_ATTEMPTS - 1));
+        // Defensive: attempts beyond the budget (shouldn't occur) still alert.
+        assert!(alert_on_this_attempt(MAX_ATTEMPTS + 3));
+    }
 }
 
 #[cfg(test)]
