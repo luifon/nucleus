@@ -263,6 +263,20 @@ known set. Default is `discord-home`. Examples:
 - `--channels whatsapp-dm`
 - `--channels discord-home,whatsapp-dm` (delivers to both, per-channel retry)
 
+**Condition watchers (ADR-024).** `--condition "<shell cmd>"` gates the
+fire: at each due tick the command runs (`sh -c`, 5s timeout) and only
+exit 0 lets the reminder fire. Gated cron ticks skip to the next match;
+gated one-shots keep watching every tick ("fire as soon as X" — e.g.
+`--at now --condition "test -f /tmp/done"` watches until a marker
+appears). `--condition-mode change` fires only on a false→true
+transition (a persistently-true condition alerts once, not every
+match). Truthy stdout of the form `{"context":"..."}` is appended to
+the fire payload as evidence. Use this instead of scheduling a
+skill-fire that spawns a session just to discover there's nothing to
+do — the check costs a subprocess, the session only spawns on change.
+A broken watcher (timeout/spawn failure) is recorded as a failure;
+one-shots auto-pause on it, fix the script and `reminders resume`.
+
 Other subcommands:
 - `reminders list` — active/pending reminders with next fire time and
   channels. Add `--include-fired` / `--include-cancelled` to broaden.
