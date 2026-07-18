@@ -1,0 +1,12 @@
+{
+  "name": "playwright-auth",
+  "private": true,
+  "type": "module",
+  "description": "Capture/refresh the shared Playwright storage state (ADR-022) from the persistent auth profile.",
+  "bin": {
+    "playwright-auth": "./playwright-auth.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.55.0"
+  }
+}

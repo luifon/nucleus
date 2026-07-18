@@ -4,8 +4,9 @@
       "command": "npx",
       "args": [
         "@playwright/mcp@latest",
-        "--user-data-dir",
-        "${HOME}/.nucleus/playwright-profile"
+        "--isolated",
+        "--storage-state",
+        "${HOME}/.nucleus/playwright-storage.json"
       ]
     }
   }
