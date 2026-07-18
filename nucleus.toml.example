@@ -15,6 +15,10 @@ disallowed_tools = [
   "Bash(shutdown *)",
   "Bash(reboot *)",
   "Bash(launchctl *)",
+  # claude-in-chrome pops an interactive "install extension?" dialog — in a
+  # headless bot/fire session that wedges the session forever (2026-07-18,
+  # WhatsApp bot stuck on it after ML blocked its fetches).
+  "Skill(claude-in-chrome)",
 ]
 
 [discord]
