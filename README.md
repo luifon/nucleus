@@ -16,9 +16,8 @@ brain is your existing Claude subscription — no separate API billing.
 | **WhatsApp bot** (Alfred) | Self-only group, voice memos transcribed locally via whisper.cpp, brain-dump classified and routed (TODOs → tasks, facts → memory, etc.). Iron-tight allowlist scoping. |
 | **News pipeline** | Daily 9am RSS pull (HN, arXiv cs.AI, Simon Willison, Pragmatic Engineer, Latent Space, …) → Claude scores notability against your learned preferences → top items posted to Discord → full feed at `news.<your-domain>`. Upvote/downvote teaches the scorer. |
 | **nucleus-dashboard** | Single operator app subsuming dashboard widgets, chat against your PARA vault, the public news API, and every admin surface (agents, skills, diary, reminders, vault writes) at `nucleus.<your-domain>`. See ADR-015/016. |
-| **Distiller** | Hourly + weekly passes that promote diary observations to long-term memory (PROMOTE / MERGE / ARCHIVE / DROP, Mem0-style ops). |
-| **Preference learner** | Weekly pass that reads news votes and rewrites a preferences file the next news fetch reads back. |
-| **Reminders** | Ask either bot "remind me at 16:45 about dentist" → Claude schedules via the `reminders` CLI. Once-per-minute polling delivers to one or more channels (Discord home, Alfred / Brain Dump WhatsApp groups via the Alfred-drained outbound queue). Supports `--at` (one-shot) and `--cron` (recurring) with pause/resume + per-channel retry; daily timesheet nudge is seeded as a recurring system reminder. |
+| **Distiller** | Single daily 4am pass (consolidated per ADR-016; absorbed the old preference learner) that promotes diary observations to long-term memory (PROMOTE / MERGE / ARCHIVE / DROP, Mem0-style ops). |
+| **Reminders** | Ask either bot "remind me at 16:45 about dentist" → Claude schedules via the `reminders` CLI. Once-per-minute polling delivers to one or more channels (`discord-home`, `whatsapp-dm` via the bot-drained outbound queue, `calendar`). Supports `--at` (one-shot) and `--cron` (recurring) with pause/resume + per-channel retry; daily timesheet nudge is seeded as a recurring system reminder. |
 
 ## Architecture at a glance
 
@@ -338,9 +337,10 @@ Four tiers, each with a clear lifetime:
 | **T3** Second brain | `~/Documents/Obsidian/{0-Inbox, 1-Main-Notes, 2-Daily-Notes, 3-Projects, 4-Areas, 5-Resources, 6-Slipbox, 7-Archives}/` | Forever | User browses; bots read via `--add-dir` and write via the multi-op brain-dump pipeline (see ADR-005) |
 | **T4** mem0 vector | `tools/mem0/docker-compose.yaml` (kept idle) | Deferred indefinitely | mem0 needs embedding + LLM provider, neither covered by Claude Max — T3 covers the role |
 
-Distillation pipeline (`chores/distiller`) runs hourly (cheap extraction
-into a `_pending.md` queue) and weekly (heavy judge that emits PROMOTE /
-MERGE / ARCHIVE / DROP operations against T2 / T3).
+Distillation pipeline (`chores/distiller`) runs as one daily 4am pass
+(extract → judge, emitting PROMOTE / MERGE / ARCHIVE / DROP operations
+against T2 / T3; consolidated from the old hourly + weekly split per
+ADR-016).
 
 Full design: `docs/ADR-002-memory.md` and `docs/ADR-004-diary-and-distillation.md`.
 
@@ -516,7 +516,7 @@ cd messaging/whatsapp && npm run send -- <phone-or-jid> "<message>"
 
 # Re-pair WhatsApp (e.g. moving to a new number)
 rm -rf messaging/whatsapp/auth
-launchctl unload ~/Library/LaunchAgents/"${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}".whatsapp.plist
+launchctl bootout gui/$(id -u)/"${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}".whatsapp
 cd messaging/whatsapp && npm run discover
 # scan QR, update .env if the group changed, then re-install via install.sh
 ```
