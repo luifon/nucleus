@@ -1,7 +1,30 @@
 # ADR-024 — Condition watchers: gate reminder fires on cheap local checks
 
 Date: 2026-07-18
-Status: proposed
+Status: accepted + built (2026-07-18)
+
+> **As-built deviations from the text below:**
+>
+> 1. Gated ticks are NOT recorded as `reminder_fires` rows — a `*/5`
+>    watcher would write 288 audit rows/day of pure noise. Instead the
+>    last evaluation is stored in place on the reminder
+>    (`condition_state` + `condition_checked_at`, shown by
+>    `reminders show`); fires rows appear only for actual fires and for
+>    broken watches (`channel='condition'`, success=0).
+> 2. Gated CRON ticks advance to the next cron match (the missed
+>    occurrence is skipped, not fire-late'd); gated ONE-SHOTS stay due
+>    and re-evaluate every tick — "fire as soon as X", which subsumes
+>    the on-exit use case.
+> 3. Broken-watch policy (spawn failure / 5s timeout): recorded as a
+>    failure; cron advances to its next match, a one-shot is PAUSED so
+>    it can't re-fail every minute forever — the operator fixes the
+>    script and resumes.
+>
+> Verified live through the launchd tick (2026-07-18): a flag-file
+> watcher evaluated false (state recorded, zero fires, one-shot kept
+> watching), fired exactly one tick after the flag appeared, and the
+> delivered message carried the watcher's `{"context": …}` evidence.
+> Decision + eval logic unit-tested (modes × states × timeout).
 
 ## Context
 

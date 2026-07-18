@@ -14,4 +14,17 @@ title: string | null, body: string, cron: string, one_shot: boolean, status: str
  * --append-system-prompt). XOR with `body`: exactly one is
  * non-empty, enforced at CLI insert time.
  */
-system_prompt: string | null, };
+system_prompt: string | null, 
+/**
+ * ADR-024: shell command gating fires (exit 0 = fire). None = ungated.
+ */
+condition_cmd: string | null, 
+/**
+ * ADR-024: 'while-true' (default when None) or 'change'.
+ */
+condition_mode: string | null, 
+/**
+ * ADR-024: last condition evaluation (true = fired-eligible), None =
+ * never evaluated.
+ */
+condition_state: boolean | null, condition_checked_at: string | null, };

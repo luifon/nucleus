@@ -81,11 +81,31 @@ pub async fn open(path: &Path) -> Result<SqlitePool> {
 /// body verbatim — intentionally idempotent so any pre-runner DB (full,
 /// partial, or pre-ADR-006) is healed once and recorded. Add new schema
 /// changes as v2+ `Step::Sql` entries; they run exactly once.
-const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[nucleus_core::migrate::Migration {
-    version: 1,
-    name: "baseline-adr006-008-015",
-    step: nucleus_core::migrate::Step::Rust(baseline_v1),
-}];
+const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[
+    nucleus_core::migrate::Migration {
+        version: 1,
+        name: "baseline-adr006-008-015",
+        step: nucleus_core::migrate::Step::Rust(baseline_v1),
+    },
+    // ADR-024: condition watcher. When condition_cmd is set, a due tick
+    // runs it (sh -c, 5s timeout) and only exit 0 lets the reminder
+    // fire; a gated tick advances the schedule silently. condition_mode:
+    // 'while-true' (default) fires on every truthy evaluation, 'change'
+    // only on a false→true transition. condition_state /
+    // condition_checked_at record the last evaluation in place —
+    // deliberately NOT one audit row per gated tick (a */5 watcher
+    // would write 288 rows/day of noise).
+    nucleus_core::migrate::Migration {
+        version: 2,
+        name: "adr024-condition-watchers",
+        step: nucleus_core::migrate::Step::Sql(
+            "ALTER TABLE reminders ADD COLUMN condition_cmd TEXT;
+             ALTER TABLE reminders ADD COLUMN condition_mode TEXT;
+             ALTER TABLE reminders ADD COLUMN condition_state INTEGER;
+             ALTER TABLE reminders ADD COLUMN condition_checked_at TEXT",
+        ),
+    },
+];
 
 fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
     Box::pin(ensure_schema(pool))
@@ -403,6 +423,14 @@ pub struct Reminder {
     /// --append-system-prompt). XOR with `body`: exactly one is
     /// non-empty, enforced at CLI insert time.
     pub system_prompt: Option<String>,
+    /// ADR-024: shell command gating fires (exit 0 = fire). None = ungated.
+    pub condition_cmd: Option<String>,
+    /// ADR-024: 'while-true' (default when None) or 'change'.
+    pub condition_mode: Option<String>,
+    /// ADR-024: last condition evaluation (true = fired-eligible), None =
+    /// never evaluated.
+    pub condition_state: Option<bool>,
+    pub condition_checked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
@@ -424,7 +452,8 @@ async fn load_reminder(pool: &SqlitePool, id: i64) -> Result<Option<Reminder>> {
     let row = sqlx::query(
         "SELECT id, title, body, cron, one_shot, status, next_fire_at,
                 last_fired_at, paused_until, created_at, created_by,
-                system_prompt
+                system_prompt, condition_cmd, condition_mode,
+                condition_state, condition_checked_at
            FROM reminders WHERE id = ?1",
     )
     .bind(id)
@@ -447,6 +476,14 @@ fn row_to_reminder(r: sqlx::sqlite::SqliteRow) -> Reminder {
         created_at: r.get("created_at"),
         created_by: r.try_get::<Option<String>, _>("created_by").ok().flatten().unwrap_or_else(|| "user".into()),
         system_prompt: r.try_get::<Option<String>, _>("system_prompt").ok().flatten(),
+        condition_cmd: r.try_get::<Option<String>, _>("condition_cmd").ok().flatten(),
+        condition_mode: r.try_get::<Option<String>, _>("condition_mode").ok().flatten(),
+        condition_state: r
+            .try_get::<Option<i64>, _>("condition_state")
+            .ok()
+            .flatten()
+            .map(|v| v != 0),
+        condition_checked_at: r.try_get::<Option<String>, _>("condition_checked_at").ok().flatten(),
     }
 }
 
@@ -503,6 +540,7 @@ pub async fn insert_with_channels(
     channels: &[String],
     created_by: &str,
     system_prompt: Option<&str>,
+    condition: Option<(&str, &str)>,
 ) -> Result<i64> {
     if channels.is_empty() {
         bail!("at least one channel is required");
@@ -522,8 +560,9 @@ pub async fn insert_with_channels(
     let mut tx = pool.begin().await?;
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO reminders
-            (title, body, cron, one_shot, status, next_fire_at, created_at, created_by, system_prompt)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            (title, body, cron, one_shot, status, next_fire_at, created_at, created_by, system_prompt,
+             condition_cmd, condition_mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          RETURNING id",
     )
     .bind(title)
@@ -535,6 +574,8 @@ pub async fn insert_with_channels(
     .bind(&now)
     .bind(created_by)
     .bind(system_prompt)
+    .bind(condition.map(|(cmd, _)| cmd))
+    .bind(condition.map(|(_, mode)| mode))
     .fetch_one(&mut *tx)
     .await
     .context("insert reminder")?;
@@ -564,7 +605,8 @@ pub async fn list_all(
     let mut q = String::from(
         "SELECT id, title, body, cron, one_shot, status, next_fire_at,
                 last_fired_at, paused_until, created_at, created_by,
-                system_prompt
+                system_prompt, condition_cmd, condition_mode,
+                condition_state, condition_checked_at
            FROM reminders WHERE 1=1",
     );
     if !include_fired {
@@ -617,7 +659,8 @@ pub async fn pending_due_with_channels(
     let rems = sqlx::query(
         "SELECT id, body, cron, one_shot, status, next_fire_at,
                 last_fired_at, paused_until, created_at, created_by,
-                system_prompt
+                system_prompt, title, condition_cmd, condition_mode,
+                condition_state, condition_checked_at
            FROM reminders
           WHERE status IN ('active', 'pending')
             AND next_fire_at IS NOT NULL
@@ -760,6 +803,43 @@ pub async fn record_channel_fire(
 ///
 /// Wrapped in a single transaction so the channel-reset is atomic with
 /// the next_fire_at advance.
+/// Record a condition evaluation (ADR-024) in place on the reminder row.
+pub async fn record_condition_eval(pool: &SqlitePool, reminder_id: i64, state: bool) -> Result<()> {
+    sqlx::query(
+        "UPDATE reminders
+            SET condition_state = ?1, condition_checked_at = ?2
+          WHERE id = ?3",
+    )
+    .bind(state as i64)
+    .bind(Utc::now().to_rfc3339())
+    .bind(reminder_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Advance the schedule after a GATED tick (ADR-024: condition said
+/// don't fire). Recurring reminders move to the next cron match — the
+/// missed occurrence is skipped by design, not fire-late'd. One-shots
+/// stay due: they re-evaluate every tick until the condition turns true
+/// ("fire as soon as X", the watch-a-command use case) or are cancelled.
+pub async fn advance_after_gate(pool: &SqlitePool, reminder_id: i64) -> Result<()> {
+    let reminder = load_reminder(pool, reminder_id)
+        .await?
+        .ok_or_else(|| anyhow!("reminder {reminder_id} vanished mid-gate"))?;
+    if reminder.one_shot {
+        return Ok(());
+    }
+    let tz = nucleus_tz();
+    let next = next_match_utc(&reminder.cron, Utc::now(), tz)?;
+    sqlx::query("UPDATE reminders SET next_fire_at = ?1 WHERE id = ?2")
+        .bind(next.to_rfc3339())
+        .bind(reminder_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn advance_after_fire(pool: &SqlitePool, reminder_id: i64) -> Result<()> {
     let reminder = load_reminder(pool, reminder_id)
         .await?
@@ -1036,6 +1116,7 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
             &channels,
             "system",
             seed.system_prompt,
+            None,
         )
         .await?;
         tracing::info!(

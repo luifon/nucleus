@@ -68,6 +68,16 @@ enum Cmd {
         /// back to discord-home if unset).
         #[arg(long, value_delimiter = ',')]
         channels: Vec<String>,
+        /// ADR-024 condition watcher: shell command run (sh -c, 5s timeout)
+        /// at each due tick. Exit 0 = fire; non-zero = skip silently and
+        /// advance (cron) or keep watching every tick (one-shot). Optional
+        /// stdout JSON {"context": "..."} is appended to the fire payload.
+        #[arg(long)]
+        condition: Option<String>,
+        /// 'while-true' (default): fire on every truthy evaluation.
+        /// 'change': fire only on a false→true transition.
+        #[arg(long = "condition-mode", requires = "condition")]
+        condition_mode: Option<String>,
     },
     /// Set (or clear with empty string) the title on an existing reminder.
     SetTitle {
@@ -126,7 +136,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Add { title, at, cron, body, system_prompt, channels } => {
+        Cmd::Add { title, at, cron, body, system_prompt, channels, condition, condition_mode } => {
             add(
                 &settings,
                 &workspace_root,
@@ -136,6 +146,8 @@ async fn main() -> Result<()> {
                 body.as_deref(),
                 system_prompt.as_deref(),
                 channels,
+                condition.as_deref(),
+                condition_mode.as_deref(),
             )
             .await
         }
@@ -172,7 +184,24 @@ async fn add(
     body: Option<&str>,
     system_prompt: Option<&str>,
     channels: Vec<String>,
+    condition: Option<&str>,
+    condition_mode: Option<&str>,
 ) -> Result<()> {
+    // ADR-024: validate the watcher args before touching the DB.
+    let condition = match (condition, condition_mode) {
+        (None, _) => None,
+        (Some(cmd), mode) => {
+            if cmd.trim().is_empty() {
+                bail!("--condition cannot be empty");
+            }
+            let mode = mode.unwrap_or("while-true");
+            if !matches!(mode, "while-true" | "change") {
+                bail!("--condition-mode must be 'while-true' or 'change', got {mode:?}");
+            }
+            Some((cmd, mode))
+        }
+    };
+
     // Resolve the body/system_prompt XOR. clap's `conflicts_with` already
     // rejects the (Some,Some) case at parse time; we still need the
     // (None,None) guard because we dropped the body default.
@@ -235,6 +264,7 @@ async fn add(
         &channels,
         "user",
         system_prompt_stored.as_deref(),
+        condition,
     )
     .await?;
     let local = next_fire_at.with_timezone(&Local);
@@ -326,6 +356,19 @@ async fn show(workspace_root: &Path, id: i64) -> Result<()> {
         None => println!("  body: {}", r.body),
     }
     println!("  cron: {}", r.cron);
+    if let Some(cmd) = r.condition_cmd.as_deref() {
+        println!(
+            "  ⛩ condition [{}]: {}  (last eval: {} at {})",
+            r.condition_mode.as_deref().unwrap_or("while-true"),
+            cmd,
+            match r.condition_state {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "never",
+            },
+            r.condition_checked_at.as_deref().unwrap_or("—"),
+        );
+    }
     println!("  next_fire: {}  (utc: {})",
         local_next,
         r.next_fire_at.as_deref().unwrap_or("—"));
@@ -498,6 +541,64 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
 
     for (reminder, channels) in work {
         let fired_at = Utc::now();
+
+        // ADR-024 condition gate: a watcher command decides whether this
+        // due tick actually fires. Gated ticks are success-neutral (no
+        // channel fires, no retry burn); the evaluation is recorded in
+        // place on the reminder row.
+        let mut reminder = reminder;
+        if let Some(cmd) = reminder.condition_cmd.clone() {
+            match eval_condition(&cmd).await {
+                Ok(eval) => {
+                    let prev = reminder.condition_state;
+                    store::record_condition_eval(&pool, reminder.id, eval.truthy).await?;
+                    if !condition_should_fire(reminder.condition_mode.as_deref(), eval.truthy, prev)
+                    {
+                        tracing::debug!(
+                            id = reminder.id,
+                            truthy = eval.truthy,
+                            "condition gated; not firing"
+                        );
+                        if let Err(e) = store::advance_after_gate(&pool, reminder.id).await {
+                            tracing::warn!(id = reminder.id, err = %e, "advance_after_gate failed");
+                        }
+                        continue;
+                    }
+                    if let Some(ctx) = eval.context {
+                        // Hand the watcher's evidence to the fire so the
+                        // session doesn't re-derive it.
+                        let suffix = format!("\n\n[condition context] {ctx}");
+                        match reminder.system_prompt.as_mut() {
+                            Some(sp) => sp.push_str(&suffix),
+                            None => reminder.body.push_str(&suffix),
+                        }
+                    }
+                }
+                Err(e) => {
+                    // A broken watch IS a failure (unlike a gated tick):
+                    // record it, then stop the bleeding — cron advances to
+                    // its next match; a one-shot would re-fail every tick
+                    // forever, so it gets paused for the operator to fix.
+                    let err = format!("condition failed: {e:#}");
+                    tracing::warn!(id = reminder.id, err = %err, "condition watcher broken");
+                    store::record_channel_fire(
+                        &pool,
+                        reminder.id,
+                        "condition",
+                        fired_at,
+                        store::FireOutcome { success: false, msg_id: None, error: Some(&err) },
+                    )
+                    .await?;
+                    if reminder.one_shot {
+                        let _ = store::pause(&pool, reminder.id, None).await;
+                    } else if let Err(e) = store::advance_after_gate(&pool, reminder.id).await {
+                        tracing::warn!(id = reminder.id, err = %e, "advance_after_gate failed");
+                    }
+                    continue;
+                }
+            }
+        }
+
         if reminder.system_prompt.is_some() {
             // Skill-fire: spawn one session, then forward its reply to
             // each channel as the actual user-visible output. The
@@ -1138,6 +1239,56 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Outcome of one ADR-024 condition evaluation.
+struct CondEval {
+    truthy: bool,
+    /// Parsed from stdout JSON {"context": "..."} on a truthy exit —
+    /// evidence handed to the fire payload. Non-JSON stdout is ignored.
+    context: Option<String>,
+}
+
+/// Run a condition watcher command (sh -c, hard 5s timeout). Exit 0 =
+/// truthy. Spawn failure or timeout is an Err — a broken watch, distinct
+/// from a false condition.
+async fn eval_condition(cmd: &str) -> Result<CondEval> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out after 5s"))?
+    .context("spawn failed")?;
+    let truthy = out.status.success();
+    let context = if truthy {
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .ok()
+            .and_then(|v| v.get("context").and_then(|c| c.as_str()).map(str::to_string))
+    } else {
+        None
+    };
+    Ok(CondEval { truthy, context })
+}
+
+/// The ADR-024 fire decision. `while-true` (the default when mode is
+/// None/unknown) fires on every truthy evaluation; `change` only on a
+/// false→true transition — a persistently-true condition alerts once.
+/// `prev` is the state recorded BEFORE this evaluation (None = never
+/// evaluated, which counts as "was false" so a first truthy eval fires).
+fn condition_should_fire(mode: Option<&str>, truthy: bool, prev: Option<bool>) -> bool {
+    if !truthy {
+        return false;
+    }
+    match mode {
+        Some("change") => prev != Some(true),
+        _ => true,
+    }
+}
+
 /// Reply-gated delivery (ADR-026): a skill-fire session that has nothing
 /// worth the operator's attention replies exactly `HEARTBEAT_OK` (after
 /// marker-strip) and the worker suppresses delivery on every channel while
@@ -1166,6 +1317,54 @@ fn first_csv_entry(env_var: &str) -> Option<String> {
         .next()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod condition_tests {
+    use super::{condition_should_fire, eval_condition};
+
+    /// A false condition never fires, in any mode, whatever the history.
+    #[test]
+    fn false_never_fires() {
+        for mode in [None, Some("while-true"), Some("change")] {
+            for prev in [None, Some(false), Some(true)] {
+                assert!(!condition_should_fire(mode, false, prev));
+            }
+        }
+    }
+
+    /// while-true (and unknown modes, defensively) fire on every truthy
+    /// evaluation regardless of the previous state.
+    #[test]
+    fn while_true_fires_on_every_truthy_eval() {
+        for mode in [None, Some("while-true"), Some("garbage")] {
+            for prev in [None, Some(false), Some(true)] {
+                assert!(condition_should_fire(mode, true, prev));
+            }
+        }
+    }
+
+    /// change fires only on the false→true transition; never-evaluated
+    /// counts as false so the first truthy eval fires.
+    #[test]
+    fn change_fires_only_on_transition() {
+        assert!(condition_should_fire(Some("change"), true, None));
+        assert!(condition_should_fire(Some("change"), true, Some(false)));
+        assert!(!condition_should_fire(Some("change"), true, Some(true)));
+    }
+
+    #[tokio::test]
+    async fn eval_condition_truthiness_and_context() {
+        assert!(eval_condition("true").await.unwrap().truthy);
+        assert!(!eval_condition("false").await.unwrap().truthy);
+        // context comes only from valid JSON stdout on truthy exits
+        let e = eval_condition(r#"echo '{"context":"queue depth 14"}'"#).await.unwrap();
+        assert_eq!(e.context.as_deref(), Some("queue depth 14"));
+        let e = eval_condition("echo not-json").await.unwrap();
+        assert!(e.truthy && e.context.is_none());
+        // a hung watcher is an Err (broken watch), not a false condition
+        assert!(eval_condition("sleep 10").await.is_err());
+    }
 }
 
 #[cfg(test)]
