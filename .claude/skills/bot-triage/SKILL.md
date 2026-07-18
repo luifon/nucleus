@@ -10,6 +10,10 @@ description: >
 flavor: recipe
 trigger: model
 mcp_needed: []
+last_used: null
+last_failure: null
+failure_count_30d: 0
+notify_on_failure: []
 ---
 
 # bot-triage — why is the bot silent?

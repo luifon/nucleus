@@ -1,6 +1,12 @@
 ---
 name: obsidian-tweaks
 description: Modify the operator's Obsidian vault appearance, filtering, and plugin config. Triggered when the user asks to style/color/hide/configure things in Obsidian — file-explorer folder colors + icons, graph view color groups, "Excluded files" patterns, tab accents, callout/tag styling, plugin data, the Home dashboard. Covers CSS snippets (Style Settings-annotated), `graph.json`, `app.json`/`appearance.json`, the committed plugin set, and the Home.md dashboard. Encodes the Nucleus deep-PARA palette + depth-tier conventions + the read-mostly use model from ADR-014 so iterations stay consistent across sessions.
+flavor: recipe
+mcp_needed: []
+last_used: null
+last_failure: null
+failure_count_30d: 0
+notify_on_failure: []
 ---
 
 # Obsidian vault tweaks
