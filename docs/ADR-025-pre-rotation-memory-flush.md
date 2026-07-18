@@ -18,6 +18,12 @@ Status: accepted + built (2026-07-18)
 > construction. The separate-turn design below is retained for context;
 > its skip-when-idle and cannot-block-rotation properties hold trivially
 > in the folded form (the summary ask already has both).
+>
+> Verification: splitter covered by the shared vector suite on both
+> sides (21 Rust / 14 TS tests green); degradation path guarantees
+> pre-flush behavior on format-ignoring replies. First live proof is
+> the next 4 am rotation — look for `memory_flush <chat>` entries in
+> the whatsapp/discord diaries of 2026-07-19.
 
 ## Context
 
