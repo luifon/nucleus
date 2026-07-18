@@ -8,6 +8,18 @@ Status: accepted + built (2026-07-18)
 > system reminder titled `heartbeat` (title-matched seeding so prompt
 > wording can evolve; cancellation stays sticky), checklist at
 > `4-Areas/Nucleus/HEARTBEAT.md` in the vault.
+>
+> **Live verification (2026-07-18 evening):** first two fires wedged on a
+> transient tool-execution stall (coincided with a Claude Code
+> plugin-update window; every component — Bash, vault Read, parallel
+> batches, the full sweep — passed isolated probes minutes later). The
+> retry machinery absorbed it exactly as designed: full error chains
+> persisted, silent retries, zero operator noise. Third attempt ran the
+> full sweep (2 file reads, 9 read-only commands, ~2 min) and correctly
+> DELIVERED a one-time report of the day's genuinely-failed fires — the
+> report path is verified end-to-end. The `HEARTBEAT_OK` suppression
+> path is unit-tested; first live observation expected on the next
+> quiet fire.
 
 ## Context
 
