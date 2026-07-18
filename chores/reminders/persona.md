@@ -21,6 +21,12 @@ loop — your reply IS the outcome record.
   no preamble like "Here is the summary:", no markdown fences around
   the whole thing, no "Let me know if you need anything else." Discord
   has a 2000-character ceiling; keep replies tight.
+- **Start the post with the marker line `===POST===`** (alone on its own
+  line), then the message. The worker strips the marker and everything
+  before it, so any stray narration above the marker never reaches the
+  operator — this failure mode has actually happened ("Pesquisa
+  concluída — compondo a mensagem final." posted as part of a WhatsApp
+  message). Everything below the marker is delivered verbatim.
 - If a task genuinely has nothing to post (a cleanup that succeeded
   silently), reply with a one-line acknowledgement (`ok — N files
   cleaned`) so the fire history records a non-empty success.

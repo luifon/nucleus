@@ -770,18 +770,63 @@ async fn deliver_skill_fire(
         );
     }
 
+    // Second half of the narration guard: even a clean final text block can
+    // carry thinking-out-loud ABOVE the deliverable ("Pesquisa concluída —
+    // compondo a mensagem final." posted to WhatsApp, 2026-07-18). The persona
+    // requires the post to start at a `===POST===` marker line; strip the
+    // marker and anything before it. No marker → forward as-is (the contract
+    // is belt, this is suspenders — never fail a fire over formatting).
+    let reply = strip_post_marker(&outcome.reply);
+    if reply.len() != outcome.reply.trim().len() {
+        tracing::info!(
+            reminder_id = r.id,
+            stripped_chars = outcome.reply.trim().len().saturating_sub(reply.len()),
+            "stripped pre-marker narration from skill-fire reply"
+        );
+    }
+
     let _ = diary::record_observation(
         workspace_root,
         AGENT_NAME,
         "skill-fire",
-        &format!("reminder #{}: {}", r.id, truncate(&outcome.reply, 200)),
+        &format!("reminder #{}: {}", r.id, truncate(&reply, 200)),
         diary::Tag::Observation,
     );
 
     Ok(SkillFireResult {
         msg_id: format!("skill-fire:{}", outcome.session_id),
-        reply: outcome.reply,
+        reply,
     })
+}
+
+/// Marker the fire persona puts at the start of the ready-to-send post.
+const POST_MARKER: &str = "===POST===";
+
+/// Return everything after the first line that IS the marker (trimmed line
+/// equality, so narration merely *mentioning* the marker inline doesn't
+/// truncate the post). Without a marker, the trimmed reply passes through
+/// unchanged.
+fn strip_post_marker(reply: &str) -> String {
+    let mut before = true;
+    let mut out: Vec<&str> = Vec::new();
+    for line in reply.lines() {
+        if before && line.trim() == POST_MARKER {
+            before = false;
+            continue;
+        }
+        if !before {
+            out.push(line);
+        }
+    }
+    let body = out.join("\n");
+    let body = body.trim();
+    // Marker missing OR marker with an empty body → pass the trimmed original
+    // through; a fire must never be emptied by formatting.
+    if body.is_empty() {
+        reply.trim().to_string()
+    } else {
+        body.to_string()
+    }
 }
 
 /// Discord's hard limit is 2000; cap below that to leave room for the
@@ -1056,6 +1101,44 @@ fn first_csv_entry(env_var: &str) -> Option<String> {
         .next()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod strip_post_marker_tests {
+    use super::strip_post_marker;
+
+    #[test]
+    fn strips_narration_before_marker() {
+        let r = "Pesquisa concluída — compondo a mensagem final.\n\n===POST===\n**Servidor caseiro — 4 opções:**\n1. Beelink";
+        assert_eq!(strip_post_marker(r), "**Servidor caseiro — 4 opções:**\n1. Beelink");
+    }
+
+    #[test]
+    fn no_marker_passes_through_trimmed() {
+        assert_eq!(strip_post_marker("  plain reply\nline 2  \n"), "plain reply\nline 2");
+    }
+
+    #[test]
+    fn marker_with_surrounding_whitespace_matches() {
+        assert_eq!(strip_post_marker("noise\n  ===POST===  \npost body"), "post body");
+    }
+
+    #[test]
+    fn inline_mention_does_not_truncate() {
+        let r = "o marcador ===POST=== é usado assim\nconteúdo";
+        assert_eq!(strip_post_marker(r), r.trim());
+    }
+
+    #[test]
+    fn marker_first_line_keeps_everything_after() {
+        assert_eq!(strip_post_marker("===POST===\nbody"), "body");
+    }
+
+    #[test]
+    fn marker_with_empty_body_falls_back_to_original() {
+        let r = "narration\n===POST===\n\n";
+        assert_eq!(strip_post_marker(r), r.trim());
+    }
 }
 
 #[cfg(test)]
