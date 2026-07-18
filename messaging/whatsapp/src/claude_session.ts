@@ -696,7 +696,7 @@ async function pasteAndSend(target: string, content: string): Promise<void> {
  *  the TUI can show (permission pickers, placeholders). Matching on OUR text
  *  matters: a naive "input row not empty → press Enter again" would auto-
  *  accept the default option of a permission dialog. */
-function draftFragment(content: string): string {
+export function draftFragment(content: string): string {
   const first = content.split("\n").find((l) => l.trim().length > 0) ?? "";
   return first.trim().slice(0, 24);
 }
@@ -706,7 +706,7 @@ function draftFragment(content: string): string {
  *  in the scrollback with a ❯ prefix too, so anything above it is history;
  *  treating history as "the draft is still there" false-fails after every
  *  successful submit and would re-paste duplicates via the recovery ladder. */
-function lastPromptRow(pane: string): string | null {
+export function lastPromptRow(pane: string): string | null {
   let row: string | null = null;
   for (const line of pane.split("\n")) {
     const t = line.trimStart();
@@ -715,10 +715,26 @@ function lastPromptRow(pane: string): string | null {
   return row;
 }
 
+/** Pure predicate behind waitForDraftGone: does the pane's live input row
+ *  still carry OUR draft? Multiline pastes can render as a
+ *  "[Pasted text #N +K lines]" chip instead of the literal draft — we pasted
+ *  into this input, so a lingering chip is equally "our draft unsent".
+ *  Matching on our fragment (never mere non-emptiness) is what keeps the
+ *  recovery ladder from pressing Enter into a permission picker. Mirror of
+ *  core/src/claude_session.rs::draft_stuck; shared vectors in
+ *  core/testdata/submit_verify_vectors.json. */
+export function draftStuck(pane: string, fragment: string): boolean {
+  const row = lastPromptRow(pane);
+  return (
+    row !== null &&
+    ((fragment.length > 0 && row.startsWith(fragment)) || row.startsWith("[Pasted text"))
+  );
+}
+
 /** Poll until the LIVE INPUT ROW no longer carries the draft fragment —
  *  submit landed (or the TUI moved to turn view). False on deadline: the
  *  draft is still sitting unsent in the input. */
-async function waitForDraftGone(
+export async function waitForDraftGone(
   target: string,
   fragment: string,
   deadlineMs: number,
@@ -729,16 +745,7 @@ async function waitForDraftGone(
       stdout: "",
       stderr: "",
     }));
-    if (stdout) {
-      const row = lastPromptRow(stdout);
-      // Multiline pastes can render as a "[Pasted text #N +K lines]" chip
-      // instead of the literal draft — we pasted into this input, so a
-      // lingering chip is equally "our draft unsent".
-      const stuck =
-        row !== null &&
-        ((fragment.length > 0 && row.startsWith(fragment)) || row.startsWith("[Pasted text"));
-      if (!stuck) return true;
-    }
+    if (stdout && !draftStuck(stdout, fragment)) return true;
     await sleep(150);
   }
   return false;

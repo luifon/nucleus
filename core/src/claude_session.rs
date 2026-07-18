@@ -1215,6 +1215,23 @@ pub(crate) fn last_prompt_row(pane: &str) -> Option<String> {
     row
 }
 
+/// Pure predicate behind [`wait_for_draft_gone`]: does the pane's live input
+/// row still carry OUR draft? Multiline pastes can render as a
+/// "[Pasted text #N +K lines]" chip instead of the literal draft — the
+/// caller pasted into an empty input, so a lingering chip is equally "our
+/// draft unsent". Matching on our fragment (never mere non-emptiness) is
+/// what keeps the recovery ladder from pressing Enter into a permission
+/// picker. Mirrored in messaging/whatsapp `draftStuck`; shared vectors in
+/// `core/testdata/submit_verify_vectors.json`.
+pub(crate) fn draft_stuck(pane: &str, fragment: &str) -> bool {
+    last_prompt_row(pane)
+        .map(|rest| {
+            (!fragment.is_empty() && rest.starts_with(fragment))
+                || rest.starts_with("[Pasted text")
+        })
+        .unwrap_or(false)
+}
+
 /// Poll until the LIVE INPUT ROW no longer carries the draft fragment — the
 /// submit landed (or the TUI moved to turn view). False on deadline: the
 /// draft is still sitting unsent in the input.
@@ -1227,16 +1244,7 @@ async fn wait_for_draft_gone(target: &str, fragment: &str, deadline: Duration) -
             .await
         {
             let pane = String::from_utf8_lossy(&out.stdout);
-            // Multiline pastes can render as a "[Pasted text #N +K lines]"
-            // chip instead of the literal draft — the caller pasted into an
-            // empty input, so a lingering chip is equally "our draft unsent".
-            let stuck = last_prompt_row(&pane)
-                .map(|rest| {
-                    (!fragment.is_empty() && rest.starts_with(fragment))
-                        || rest.starts_with("[Pasted text")
-                })
-                .unwrap_or(false);
-            if !stuck {
+            if !draft_stuck(&pane, fragment) {
                 return true;
             }
         }
@@ -2245,5 +2253,99 @@ mod tests {
         // No assistant message at all → None (fall back to quiescent).
         let none = r#"{"type":"user","message":{"role":"user","content":"hi"}}"#;
         assert_eq!(last_assistant_stop_reason(none), None);
+    }
+
+    /// Shared vectors for the verified-submit helpers (ADR-021/-022 era).
+    /// The SAME file drives the TS mirror's tests in
+    /// messaging/whatsapp/src/claude_session.test.ts — add cases there,
+    /// never fork per-language expectations.
+    const SUBMIT_VERIFY_VECTORS: &str = include_str!("../testdata/submit_verify_vectors.json");
+
+    #[test]
+    fn submit_verify_vectors_last_prompt_row() {
+        let v: serde_json::Value = serde_json::from_str(SUBMIT_VERIFY_VECTORS).unwrap();
+        let cases = v["last_prompt_row"].as_array().expect("vector array");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let pane = case["pane"].as_str().unwrap();
+            let expect = case["expect"].as_str().map(str::to_string);
+            assert_eq!(last_prompt_row(pane), expect, "vector: {name}");
+        }
+    }
+
+    #[test]
+    fn submit_verify_vectors_draft_fragment() {
+        let v: serde_json::Value = serde_json::from_str(SUBMIT_VERIFY_VECTORS).unwrap();
+        let cases = v["draft_fragment"].as_array().expect("vector array");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let content = case["content"].as_str().unwrap();
+            let expect = case["expect"].as_str().unwrap();
+            assert_eq!(draft_fragment(content), expect, "vector: {name}");
+        }
+    }
+
+    #[test]
+    fn submit_verify_vectors_draft_stuck() {
+        let v: serde_json::Value = serde_json::from_str(SUBMIT_VERIFY_VECTORS).unwrap();
+        let cases = v["draft_stuck"].as_array().expect("vector array");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let pane = case["pane"].as_str().unwrap();
+            let fragment = case["fragment"].as_str().unwrap();
+            let expect = case["expect"].as_bool().unwrap();
+            assert_eq!(draft_stuck(pane, fragment), expect, "vector: {name}");
+        }
+    }
+
+    /// wait_for_draft_gone against a real tmux pane: a pane still showing
+    /// our draft on the live ❯ row must return false at the deadline (the
+    /// 2026-07-18 eaten-Enter shape), and must flip to true as soon as the
+    /// live row clears.
+    #[tokio::test]
+    async fn wait_for_draft_gone_detects_stuck_then_cleared() {
+        let session = "nucleus-draft-gone-test";
+        tmux_kill(session).await;
+        let out = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session, "cat"])
+            .output()
+            .await
+            .expect("tmux new-session");
+        assert!(out.status.success(), "tmux new-session failed");
+        let target = format!("{session}:0");
+
+        // Seed the pane with a stuck draft on the live input row. `cat`
+        // echoes typed keys, so send-keys paints the pane for capture-pane.
+        let _ = Command::new("tmux")
+            .args(["send-keys", "-t", &target, "-l", "❯ remind me tomorrow at 9am"])
+            .output()
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stuck_result =
+            wait_for_draft_gone(&target, "remind me tomorrow at 9", Duration::from_millis(900))
+                .await;
+        assert!(!stuck_result, "draft on the live row must report NOT gone");
+
+        // Repaint an empty prompt row on a FRESH line (cat echoes keystrokes
+        // onto the current line, so the new ❯ must not append to the stuck
+        // one). The old draft line stays visible above as history — exactly
+        // the post-submit pane shape, and what last_prompt_row must skip.
+        let _ = Command::new("tmux")
+            .args(["send-keys", "-t", &target, "Enter"])
+            .output()
+            .await;
+        let _ = Command::new("tmux")
+            .args(["send-keys", "-t", &target, "-l", "❯ "])
+            .output()
+            .await;
+        let gone_result =
+            wait_for_draft_gone(&target, "remind me tomorrow at 9", Duration::from_secs(5)).await;
+        assert!(gone_result, "cleared live row must report gone");
+
+        tmux_kill(session).await;
     }
 }

@@ -3,15 +3,20 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { exec } from "node:child_process";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { writeFileSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   waitForTuiReady,
   lastNTurns,
   buildPrimingPreamble,
   msUntilNext4am,
   extractLastAssistantText,
+  lastPromptRow,
+  draftFragment,
+  draftStuck,
+  waitForDraftGone,
   Turn,
 } from "./claude_session.js";
 
@@ -245,4 +250,67 @@ test("extractLastAssistantText(requireEndTurn) returns null until the turn actua
   // keeps waiting (bounded by maxWaitMs) instead of returning the narration.
   const partial = NARRATION_THEN_JSON.split("\n").slice(0, 3).join("\n");
   assert.equal(extractLastAssistantText(partial, true), null);
+});
+
+// ---------------------------------------------------------------------------
+// Verified-submit helpers (mirror of core/src/claude_session.rs). The vector
+// file is SHARED with the Rust tests — add cases there, never fork
+// per-language expectations.
+// ---------------------------------------------------------------------------
+
+const VECTORS = JSON.parse(
+  readFileSync(
+    path.join(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../../core/testdata/submit_verify_vectors.json",
+    ),
+    "utf8",
+  ),
+);
+
+test("lastPromptRow matches the shared submit-verify vectors", () => {
+  assert.ok(VECTORS.last_prompt_row.length > 0);
+  for (const c of VECTORS.last_prompt_row) {
+    assert.equal(lastPromptRow(c.pane), c.expect, `vector: ${c.name}`);
+  }
+});
+
+test("draftFragment matches the shared submit-verify vectors", () => {
+  assert.ok(VECTORS.draft_fragment.length > 0);
+  for (const c of VECTORS.draft_fragment) {
+    assert.equal(draftFragment(c.content), c.expect, `vector: ${c.name}`);
+  }
+});
+
+test("draftStuck matches the shared submit-verify vectors", () => {
+  assert.ok(VECTORS.draft_stuck.length > 0);
+  for (const c of VECTORS.draft_stuck) {
+    assert.equal(draftStuck(c.pane, c.fragment), c.expect, `vector: ${c.name}`);
+  }
+});
+
+// Mirror of core's wait_for_draft_gone_detects_stuck_then_cleared: a real
+// tmux pane still showing our draft on the live ❯ row must report NOT gone
+// at the deadline (the 2026-07-18 eaten-Enter shape), then flip to gone once
+// an empty prompt row appears on a fresh line (the old draft stays above as
+// history — exactly the post-submit pane shape lastPromptRow must skip).
+test("waitForDraftGone detects a stuck draft, then a cleared live row", async () => {
+  const session = "nucleus-ts-draft-gone-test";
+  await tmuxKill(session);
+  await tmux(["new-session", "-d", "-s", session, "cat"]);
+  const target = `${session}:0`;
+  try {
+    await tmux(["send-keys", "-t", target, "-l", "❯ remind me tomorrow at 9am"]);
+    await new Promise((r) => setTimeout(r, 200));
+
+    const stuck = await waitForDraftGone(target, "remind me tomorrow at 9", 900);
+    assert.equal(stuck, false, "draft on the live row must report NOT gone");
+
+    await tmux(["send-keys", "-t", target, "Enter"]);
+    await tmux(["send-keys", "-t", target, "-l", "❯ "]);
+    const gone = await waitForDraftGone(target, "remind me tomorrow at 9", 5000);
+    assert.equal(gone, true, "cleared live row must report gone");
+  } finally {
+    await tmuxKill(session);
+  }
 });

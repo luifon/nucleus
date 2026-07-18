@@ -1,0 +1,32 @@
+{
+  "_comment": "Shared test vectors for the ADR-021/verified-submit helpers. Consumed by BOTH core/src/claude_session.rs tests and messaging/whatsapp/src/claude_session.test.ts — the TS ladder is a line-for-line mirror of the Rust one, and this file is what keeps the mirror honest. Add cases here, never fork per-language copies.",
+  "last_prompt_row": [
+    { "name": "empty pane", "pane": "", "expect": null },
+    { "name": "no prompt glyph", "pane": "some output\nno prompt here", "expect": null },
+    { "name": "single live prompt with draft", "pane": "banner text\n❯ hello world", "expect": "hello world" },
+    { "name": "history rows above live row win nothing — LAST ❯ is live", "pane": "❯ old submitted msg\nassistant reply text\n❯ current draft", "expect": "current draft" },
+    { "name": "submitted then cleared live row", "pane": "❯ my message\nthinking…\n❯ ", "expect": "" },
+    { "name": "indented prompt row is trimmed", "pane": "   ❯ padded draft", "expect": "padded draft" },
+    { "name": "permission picker renders as prompt row", "pane": "Allow Bash?\n❯ 1. Yes, allow\n  2. No, deny", "expect": "1. Yes, allow" },
+    { "name": "pasted-text chip", "pane": "❯ [Pasted text #1 +12 lines]", "expect": "[Pasted text #1 +12 lines]" }
+  ],
+  "draft_fragment": [
+    { "name": "short single line", "content": "hello", "expect": "hello" },
+    { "name": "truncates to 24 chars", "content": "0123456789012345678901234567", "expect": "012345678901234567890123" },
+    { "name": "skips leading blank lines and trims", "content": "\n\n  actual first line  ", "expect": "actual first line" },
+    { "name": "empty content", "content": "", "expect": "" },
+    { "name": "whitespace-only content", "content": "  \n \n", "expect": "" },
+    { "name": "multiline takes first non-empty line", "content": "first line\nsecond line", "expect": "first line" }
+  ],
+  "draft_stuck": [
+    { "name": "live row still carries our fragment", "pane": "❯ remind me tomorrow at 9", "fragment": "remind me tomorrow at 9", "expect": true },
+    { "name": "live row carries fragment as prefix of longer draft", "pane": "❯ remind me tomorrow at 9am about the dentist", "fragment": "remind me tomorrow at 9", "expect": true },
+    { "name": "pasted-text chip is our unsent draft", "pane": "❯ [Pasted text #2 +40 lines]", "fragment": "remind me tomorrow at 9", "expect": true },
+    { "name": "cleared live row means submit landed", "pane": "❯ remind me tomorrow at 9\nthinking…\n❯ ", "fragment": "remind me tomorrow at 9", "expect": false },
+    { "name": "fragment only in HISTORY row must not re-trigger (2026-07-18 duplicate-repaste bug)", "pane": "❯ remind me tomorrow at 9\nassistant: done!\n❯ next draft", "fragment": "remind me tomorrow at 9", "expect": false },
+    { "name": "permission picker row is NOT our draft — never Enter into a dialog", "pane": "Allow Bash?\n❯ 1. Yes, allow\n  2. No, deny", "fragment": "remind me tomorrow at 9", "expect": false },
+    { "name": "empty fragment never matches arbitrary rows", "pane": "❯ some other text", "fragment": "", "expect": false },
+    { "name": "empty fragment still detects the paste chip", "pane": "❯ [Pasted text #1 +3 lines]", "fragment": "", "expect": true },
+    { "name": "no prompt row at all", "pane": "plain output, no glyph", "fragment": "remind me", "expect": false }
+  ]
+}
