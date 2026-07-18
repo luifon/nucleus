@@ -244,6 +244,61 @@ Enforcement model: a *policy*, not a runtime gate. The Q persona prompt carries 
 - **ADR-011 (perimeter)** — drafted at implementation kickoff. Tailscale ACLs, cloudflared adjustments, verifying that news stays public while dashboard + chat are private.
 - **Brain-dump rundown on WhatsApp** — addendum to ADR-005. Separate from canvas; documented here only to record the decision that it does *not* belong on canvas.
 
+## Field notes from OpenClaw's shipped canvas (added 2026-07-18)
+
+OpenClaw has since shipped its canvas/A2UI stack to production; a review of
+their implementation (docs.openclaw.ai/platforms/mac/canvas + the A2UI
+protocol) yields the following for whenever S12 unparks:
+
+**Validations (our design matches what survived contact with reality):**
+
+- The core shape is identical: agent emits structured blocks → client
+  renders native widgets → user actions post back as structured messages
+  the agent's next turn reads. No richer paradigm emerged; the protocol
+  shape in this ADR is the settled industry shape.
+- Constraining canvas to ONE surface was right — they gate it to their
+  own clients and never attempt canvas-over-text-transports; text
+  fallback everywhere else, same as our Discord/WhatsApp stance.
+- User responses arriving as structured tool-call-like messages (our
+  `<canvas-response>`) is exactly their action-flow mechanism.
+
+**Lessons to adopt:**
+
+1. **Version the block format from day one.** A2UI broke mid-flight
+   (their client supports protocol v0.8 but not v0.9's `createSurface`),
+   and the mismatch is a canvas support wart for them. Our inline blocks
+   carry a `v` attribute from the first release; the frontend renders
+   unknown-version blocks as a plain "unsupported canvas block (vN)"
+   box with the raw payload collapsed under it, never as breakage.
+2. **Declarative update ops beat re-emission.** A2UI models
+   `beginRendering` / `surfaceUpdate` / `dataModelUpdate` /
+   `deleteSurface` — the agent can update a rendered widget (e.g. tick a
+   progress list) without re-emitting the whole block. V1 of S12 stays
+   emit-once (simpler), but block IDs are mandatory in the syntax from
+   v1 so update ops can be added later without a format break.
+3. **Push-while-hidden is worth having**: their `a2ui push` updates
+   canvas content even when the panel isn't visible; users see fresh
+   state on next open. For us canvas state lives in the chat transcript
+   (re-render on scroll-back), so we get this for free — but only if
+   blocks are re-renderable from stored state, i.e. the frontend must
+   parse-and-render from history identically to live stream. Make that
+   an explicit test case.
+4. **Skip the separate panel.** Their WKWebView side-panel (separate
+   window, `present`/`navigate`/`eval` commands) adds a second surface
+   with its own lifecycle; the inline chat widgets are the load-bearing
+   part and the panel is macOS-app garnish. Inline-in-chat (our plan) is
+   confirmed sufficient — do not grow a panel.
+5. **Deep links are cheap leverage later**: `openclaw://agent` URLs
+   trigger agent runs from anywhere in the OS. A `nucleus://` handler is
+   out of S12 scope, but the canvas-response POST endpoint should be
+   shaped so a future deep-link handler can reuse it (one generic
+   "structured message in" route, not a canvas-only one).
+
+**Explicitly not adopting:** their full A2UI JSON protocol. It solves
+multi-client native rendering (macOS/iOS/Android); we have exactly one
+web frontend, and the inline XML-ish block + regex parse from this ADR
+remains the right complexity level.
+
 ## References
 
 - ADR-002 — tiered memory; explains why canvas spec lives in the chat venue, not T2
