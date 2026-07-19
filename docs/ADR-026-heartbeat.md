@@ -19,7 +19,9 @@ Status: accepted + built (2026-07-18)
 > DELIVERED a one-time report of the day's genuinely-failed fires — the
 > report path is verified end-to-end. The `HEARTBEAT_OK` suppression
 > path is unit-tested; first live observation expected on the next
-> quiet fire.
+> quiet fire. — Confirmed same evening: the 21:00 fire recorded
+> `…|silent` and delivered nothing. All three paths (report, silent,
+> retry absorption) verified live on day one.
 
 ## Context
 

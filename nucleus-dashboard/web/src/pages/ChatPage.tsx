@@ -11,6 +11,7 @@ import {
   type ChatMessage,
 } from "@/lib/api";
 import { useFetch } from "@/lib/hooks";
+import { answeredIds } from "@/lib/canvas";
 import ChatListItem from "@/components/chat/ChatListItem";
 import MessageBubble from "@/components/chat/MessageBubble";
 
@@ -78,10 +79,10 @@ export default function ChatPage() {
     }
   };
 
-  const onSend = async () => {
-    if (!activeId || !draft.trim() || sending) return;
-    const message = draft.trim();
-    setDraft("");
+  // Shared send path: typed drafts and canvas submissions both go through
+  // here — a canvas response IS a normal user message (ADR-012).
+  const sendText = async (message: string) => {
+    if (!activeId || !message.trim() || sending) return;
     setSending(true);
     setError(null);
 
@@ -114,12 +115,21 @@ export default function ChatPage() {
       await chats.refetch();
     } catch (e) {
       setError(String(e));
-      // Restore the draft so the operator can edit and retry.
+      // Restore the draft so the operator can edit and retry. (For a
+      // canvas submission this puts the raw response text in the box —
+      // visible, editable, and re-sendable, which beats losing it.)
       setDetail((d) => d && { ...d, messages: d.messages.filter((m) => m.id !== OPTIMISTIC_ID) });
       setDraft(message);
     } finally {
       setSending(false);
     }
+  };
+
+  const onSend = async () => {
+    const message = draft.trim();
+    if (!message) return;
+    setDraft("");
+    await sendText(message);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -132,6 +142,13 @@ export default function ChatPage() {
   const activeChat = useMemo(
     () => chats.data?.find((c) => c.id === activeId),
     [chats.data, activeId],
+  );
+
+  // Canvas blocks already answered in this chat — derived from the message
+  // list alone, so history re-render and live render agree (ADR-012).
+  const answered = useMemo(
+    () => answeredIds(detail?.messages ?? []),
+    [detail?.messages],
   );
 
   return (
@@ -229,7 +246,13 @@ export default function ChatPage() {
                 <ul className="space-y-3">
                   {detail?.messages.map((m, i) => (
                     <li key={m.id === OPTIMISTIC_ID ? `opt-${i}` : m.id}>
-                      <MessageBubble message={m} personaName={personaName} />
+                      <MessageBubble
+                        message={m}
+                        personaName={personaName}
+                        answeredIds={answered}
+                        sending={sending}
+                        onCanvasSubmit={(msg) => void sendText(msg)}
+                      />
                     </li>
                   ))}
                   {sending && (
