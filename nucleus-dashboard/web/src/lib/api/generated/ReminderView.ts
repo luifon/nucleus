@@ -28,4 +28,9 @@ condition_mode: string | null,
  * ADR-024: last condition evaluation (true = fired-eligible), None =
  * never evaluated.
  */
-condition_state: boolean | null, condition_checked_at: string | null, };
+condition_state: boolean | null, condition_checked_at: string | null, 
+/**
+ * Last time an outer-error ⚠ alert was delivered for this reminder
+ * (alert-cooldown dedup; not part of the fire audit trail).
+ */
+last_alerted_at: string | null, };
