@@ -453,10 +453,10 @@ nucleus/
 - `docs/ADR-020-architecture-hardening.md` — hardening pass: session profiles, migrations, DB ownership rule, ops pruning/rotation, typegen — and the rejected alternatives
 - `docs/ADR-021-agent-session-messaging.md` — `session-send`: the one sanctioned agent-to-agent session injection primitive (attributed, idle-gated, logged)
 - `docs/ADR-022-concurrent-browser-automation.md` — Playwright MCP isolated contexts + shared storage state; `tools/playwright-auth/` owns logins
-- `docs/ADR-023-session-search.md` — FTS5 transcript retrieval between T1 and T2, junk-session gate + pruning (proposed)
-- `docs/ADR-024-reminder-condition-watchers.md` — cheap script gates on reminder fires; model only on state change (proposed)
-- `docs/ADR-025-pre-rotation-memory-flush.md` — persist-before-recycle turn for long-lived venue sessions (proposed)
-- `docs/ADR-026-heartbeat.md` — HEARTBEAT.md checklist sweep + reply-gated silent fires (proposed)
+- `docs/ADR-023-session-search.md` — FTS5 transcript retrieval between T1 and T2, junk-session gate + pruning (`session-search` CLI)
+- `docs/ADR-024-reminder-condition-watchers.md` — cheap script gates on reminder fires; model only on state change (`--condition`)
+- `docs/ADR-025-pre-rotation-memory-flush.md` — persist-before-recycle DURABLE section in the rotation ask
+- `docs/ADR-026-heartbeat.md` — HEARTBEAT.md checklist sweep + reply-gated silent fires
 - `docs/ADR-027-adapter-circuit-breaker.md` — WhatsApp connection supervisor: close-reason taxonomy, backoff ladder, open-circuit alerts (proposed)
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
@@ -514,6 +514,10 @@ tmux kill-window -t nucleus-discord:<window-prefix>
   --channels discord-home
 
 ./target/release/reminders list   # see pending
+
+# Search past session transcripts (ADR-023; index refreshes on every run)
+./target/release/session-search "what did we decide about X" --days 30
+./target/release/session-search --prune            # junk-transcript report (dry-run)
 ./target/release/reminders cancel <id>
 
 # One-shot WhatsApp send (uses the paired session)

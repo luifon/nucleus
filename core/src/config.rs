@@ -25,6 +25,7 @@ pub struct Settings {
     pub news: NewsConfig,
     pub gmail: GmailConfig,
     pub reminders: RemindersConfig,
+    pub session_search: SessionSearchConfig,
     pub ports: PortsConfig,
 }
 
@@ -201,6 +202,28 @@ impl Default for RemindersConfig {
     }
 }
 
+/// ADR-023 session-search maintenance knobs. `prune_apply` arms the junk
+/// transcript deletion the distiller runs daily — false ships as the
+/// default so a fresh install (and the first production week) only
+/// reports what WOULD be deleted.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SessionSearchConfig {
+    #[serde(default)]
+    pub prune_apply: bool,
+    #[serde(default = "default_prune_max_age_days")]
+    pub prune_max_age_days: i64,
+}
+
+fn default_prune_max_age_days() -> i64 {
+    14
+}
+
+impl Default for SessionSearchConfig {
+    fn default() -> Self {
+        Self { prune_apply: false, prune_max_age_days: default_prune_max_age_days() }
+    }
+}
+
 fn default_reminder_channels() -> Vec<String> {
     vec!["discord-home".to_string()]
 }
@@ -233,6 +256,8 @@ struct TomlConfig {
     gmail: GmailConfig,
     #[serde(default)]
     reminders: RemindersConfig,
+    #[serde(default)]
+    session_search: SessionSearchConfig,
     ports: PortsConfig,
 }
 
@@ -292,6 +317,7 @@ impl Settings {
             news: toml.news,
             gmail,
             reminders: toml.reminders,
+            session_search: toml.session_search,
             ports: toml.ports,
         })
     }

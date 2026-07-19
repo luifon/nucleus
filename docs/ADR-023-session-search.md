@@ -1,7 +1,33 @@
 # ADR-023 — Session search: transcript retrieval between T1 and T2
 
 Date: 2026-07-18
-Status: proposed
+Status: accepted + built (2026-07-19)
+
+> **As-built** (`core/src/session_index.rs` + `session-search` bin;
+> maintenance folded into the distiller daily pass; `[session_search]`
+> toml knobs, `prune_apply=false` shipped default):
+>
+> 1. The junk premise was overstated: first real index = 380 transcripts,
+>    **377 eligible, 3 junk**. Most one-shot spawns (fires) carry a real
+>    user payload + assistant deliverable and are legitimately
+>    searchable; true junk is wedged/no-op sessions only. The gate
+>    (≥1 real user + ≥1 assistant turn post-filtering, synthetic-agent
+>    prefix exclusion) identified exactly those 3 — including the two
+>    wedged heartbeat attempts of 2026-07-18.
+> 2. Turn timestamps are session-level (file mtime), not per-turn — the
+>    `--days` filter needs no finer grain.
+> 3. Agent attribution joins runs.jsonl (ADR-016), which rotates (~50
+>    rows/agent), so older sessions show agent `?` — searchable, just
+>    unlabeled. Accepted; labels are advisory.
+> 4. No cross-language fixture file for the gate — it has no TS mirror;
+>    inline table-driven tests cover it (+ a tempdir FTS round-trip test
+>    exercising index → porter-stemmed search → dry-run → real prune
+>    with the path-safety rails).
+>
+> Verified on the live corpus: "consórcio adm" and "wedged submit
+> verify" both recalled the right sessions with usable snippets;
+> incremental re-index skips unchanged files; dry-run prune reports 1
+> candidate and deletes nothing.
 
 ## Context
 
