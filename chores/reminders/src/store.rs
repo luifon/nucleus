@@ -105,6 +105,17 @@ const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[
              ALTER TABLE reminders ADD COLUMN condition_checked_at TEXT",
         ),
     },
+    // Per-reminder ⚠-alert cooldown: three identical alerts in 90 minutes
+    // for one wedged heartbeat window (2026-07-19) showed that exhausted
+    // occurrences of the SAME reminder need dedup, not just retry-aware
+    // gating within one occurrence.
+    nucleus_core::migrate::Migration {
+        version: 3,
+        name: "alert-cooldown",
+        step: nucleus_core::migrate::Step::Sql(
+            "ALTER TABLE reminders ADD COLUMN last_alerted_at TEXT",
+        ),
+    },
 ];
 
 fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
@@ -431,6 +442,9 @@ pub struct Reminder {
     /// never evaluated.
     pub condition_state: Option<bool>,
     pub condition_checked_at: Option<String>,
+    /// Last time an outer-error ⚠ alert was delivered for this reminder
+    /// (alert-cooldown dedup; not part of the fire audit trail).
+    pub last_alerted_at: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
@@ -453,7 +467,7 @@ async fn load_reminder(pool: &SqlitePool, id: i64) -> Result<Option<Reminder>> {
         "SELECT id, title, body, cron, one_shot, status, next_fire_at,
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, condition_cmd, condition_mode,
-                condition_state, condition_checked_at
+                condition_state, condition_checked_at, last_alerted_at
            FROM reminders WHERE id = ?1",
     )
     .bind(id)
@@ -484,6 +498,7 @@ fn row_to_reminder(r: sqlx::sqlite::SqliteRow) -> Reminder {
             .flatten()
             .map(|v| v != 0),
         condition_checked_at: r.try_get::<Option<String>, _>("condition_checked_at").ok().flatten(),
+        last_alerted_at: r.try_get::<Option<String>, _>("last_alerted_at").ok().flatten(),
     }
 }
 
@@ -606,7 +621,7 @@ pub async fn list_all(
         "SELECT id, title, body, cron, one_shot, status, next_fire_at,
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, condition_cmd, condition_mode,
-                condition_state, condition_checked_at
+                condition_state, condition_checked_at, last_alerted_at
            FROM reminders WHERE 1=1",
     );
     if !include_fired {
@@ -660,7 +675,7 @@ pub async fn pending_due_with_channels(
         "SELECT id, body, cron, one_shot, status, next_fire_at,
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, title, condition_cmd, condition_mode,
-                condition_state, condition_checked_at
+                condition_state, condition_checked_at, last_alerted_at
            FROM reminders
           WHERE status IN ('active', 'pending')
             AND next_fire_at IS NOT NULL
@@ -803,6 +818,16 @@ pub async fn record_channel_fire(
 ///
 /// Wrapped in a single transaction so the channel-reset is atomic with
 /// the next_fire_at advance.
+/// Stamp the alert-cooldown clock after delivering an outer-error ⚠.
+pub async fn record_alerted(pool: &SqlitePool, reminder_id: i64) -> Result<()> {
+    sqlx::query("UPDATE reminders SET last_alerted_at = ?1 WHERE id = ?2")
+        .bind(Utc::now().to_rfc3339())
+        .bind(reminder_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Record a condition evaluation (ADR-024) in place on the reminder row.
 pub async fn record_condition_eval(pool: &SqlitePool, reminder_id: i64, state: bool) -> Result<()> {
     sqlx::query(

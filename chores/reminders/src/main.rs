@@ -736,9 +736,11 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                     // later by the successful retry's deliverable (observed
                     // with #47, 2026-07-18). Alert only the channels this
                     // failure exhausts; record every failure regardless.
+                    let cooled = alert_cooldown_active(reminder.last_alerted_at.as_deref(), fired_at);
+                    let mut alerted = false;
                     for ch in &channels {
                         let attempt = ch.attempts + 1;
-                        if alert_on_this_attempt(ch.attempts) {
+                        if alert_on_this_attempt(ch.attempts) && !cooled {
                             let alert_reminder = store::Reminder {
                                 body: format!(
                                     "⚠️ Reminder #{} fire failed (attempt {}/{}, giving up): {}",
@@ -757,6 +759,7 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                                 &ch.channel,
                             )
                             .await;
+                            alerted = true;
                         }
                         store::record_channel_fire(
                             &pool,
@@ -770,6 +773,9 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                             },
                         )
                         .await?;
+                    }
+                    if alerted {
+                        let _ = store::record_alerted(&pool, reminder.id).await;
                     }
                 }
             }
@@ -1307,6 +1313,20 @@ fn alert_on_this_attempt(prior_attempts: i64) -> bool {
     prior_attempts + 1 >= store::MAX_ATTEMPTS
 }
 
+/// Per-reminder alert cooldown: consecutive OCCURRENCES of the same
+/// recurring reminder each exhaust their own retry budget, so a wedged
+/// window produced three identical ⚠s in 90 minutes (heartbeat,
+/// 2026-07-19). One alert per reminder per cooldown window; the failures
+/// are all still recorded in reminder_fires either way.
+const ALERT_COOLDOWN_SECS: i64 = 2 * 60 * 60;
+
+fn alert_cooldown_active(last_alerted_at: Option<&str>, now: DateTime<Utc>) -> bool {
+    let Some(prev) = last_alerted_at.and_then(|s| DateTime::parse_from_rfc3339(s).ok()) else {
+        return false;
+    };
+    (now - prev.with_timezone(&Utc)).num_seconds() < ALERT_COOLDOWN_SECS
+}
+
 /// First non-empty entry from a comma-separated env var. Used to pick
 /// the default delivery target for WhatsApp channels — the first listed
 /// group name (whatsapp-group/braindump) or the first listed DM JID.
@@ -1317,6 +1337,27 @@ fn first_csv_entry(env_var: &str) -> Option<String> {
         .next()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod alert_cooldown_tests {
+    use super::{ALERT_COOLDOWN_SECS, alert_cooldown_active};
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn never_alerted_is_not_cooled() {
+        assert!(!alert_cooldown_active(None, Utc::now()));
+        assert!(!alert_cooldown_active(Some("not-a-date"), Utc::now()));
+    }
+
+    #[test]
+    fn recent_alert_cools_reruns_and_expires() {
+        let now = Utc::now();
+        let recent = (now - Duration::seconds(ALERT_COOLDOWN_SECS - 60)).to_rfc3339();
+        assert!(alert_cooldown_active(Some(&recent), now));
+        let stale = (now - Duration::seconds(ALERT_COOLDOWN_SECS + 60)).to_rfc3339();
+        assert!(!alert_cooldown_active(Some(&stale), now));
+    }
 }
 
 #[cfg(test)]
