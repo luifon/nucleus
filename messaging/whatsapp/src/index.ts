@@ -27,6 +27,31 @@ import {
   type OutboundRow,
 } from "./db.js";
 import { record as recordDiary } from "./diary.js";
+import { ConnectionSupervisor, DEFAULT_BREAKER } from "./breaker.js";
+
+// ADR-027: one supervisor for the process lifetime — reconnects re-enter
+// connect(), so breaker state must live outside it. Configured in main()
+// from [whatsapp.breaker]; the default covers early references.
+let supervisor = new ConnectionSupervisor(DEFAULT_BREAKER);
+
+/** One-shot operator alert on the INDEPENDENT channel (discord-home) —
+ *  alerting through the broken WhatsApp link would be a design error.
+ *  Best-effort: missing env or a failed POST only logs. */
+async function discordAlert(body: string): Promise<void> {
+  const token = process.env.DISCORD_BOT_TOKEN;
+  const channel = process.env.DISCORD_HOME_CHANNEL_ID;
+  if (!token || !channel) return;
+  try {
+    const resp = await fetch(`https://discord.com/api/v10/channels/${channel}/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bot ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ content: body }),
+    });
+    if (!resp.ok) throw new Error(`discord ${resp.status}`);
+  } catch (e) {
+    console.error("whatsapp: discord alert failed:", (e as Error).message);
+  }
+}
 import { alertDiscordHome } from "./discord_alert.js";
 import { formatReply as sharedFormatReply } from "./format.js";
 import {
@@ -252,6 +277,7 @@ async function main() {
     process.env.NUCLEUS_WORKSPACE_ROOT ??
     path.resolve(import.meta.dirname, "..", "..", "..");
   const config = loadConfig(workspaceRoot, discover);
+  supervisor = new ConnectionSupervisor(config.breaker);
   configurePersona(config.personaDisplayName);
 
   log.info(
@@ -452,6 +478,21 @@ async function connect(
     }
     if (connection === "open") {
       log.info({ user: sock.user?.id }, "whatsapp: connected");
+      // ADR-027: closing an open circuit is worth a diary line; a long
+      // outage additionally tells the operator it's over.
+      const opened = supervisor.onOpen();
+      if (opened.recovered) {
+        const mins = Math.round(opened.outageMs / 60_000);
+        recordDiary(
+          config.diaryRoot,
+          "breaker",
+          `Circuit closed after ${mins}m outage; queued messages flushing.`,
+          "OBSERVATION",
+        );
+        if (opened.outageMs >= config.breaker.alertAfterOutageMs) {
+          void discordAlert(`✅ WhatsApp link recovered after ${mins}m; queued messages flushing.`);
+        }
+      }
       // Resolve the allowlist asynchronously so handler is ready before any
       // unexpected event fires. Then start the outbound drain — the
       // drainer needs the allowlist to authorize each target.
@@ -466,13 +507,60 @@ async function connect(
       recordDiary(config.diaryRoot, "boot", `Connected as ${sock.user?.id ?? "unknown"}`, "OBSERVATION");
     } else if (connection === "close") {
       const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const shouldReconnect = reason !== DisconnectReason.loggedOut;
-      log.warn({ reason, shouldReconnect }, "whatsapp: connection closed");
-      if (shouldReconnect) {
-        const delay = reason === 405 ? 5000 : 2000;
-        setTimeout(() => connect(config, store, sessions, sessionsDm, outbound, plansStore, docStore, jobStore).catch((e) => log.error(e, "reconnect failed")), delay);
-      } else {
-        log.error("whatsapp: logged out — delete auth/ and re-pair");
+      // ADR-027: classify, record, and let the breaker pick the response.
+      // The breaker never touches auth state and never exits the process —
+      // launchd stays the outer supervision layer for crashes only.
+      const outcome = supervisor.onClose(reason);
+      try {
+        store.recordConnectionEvent(outcome.cls, reason, outcome.uptimeMs);
+      } catch (e) {
+        log.warn({ err: (e as Error).message }, "whatsapp: connection_events write failed");
+      }
+      log.warn(
+        { reason, cls: outcome.cls, uptimeMs: outcome.uptimeMs, decision: outcome.decision.action },
+        "whatsapp: connection closed",
+      );
+      const reconnect = () =>
+        connect(config, store, sessions, sessionsDm, outbound, plansStore, docStore, jobStore).catch(
+          (e) => {
+            log.error(e, "reconnect failed");
+            // A connect() that throws never reaches connection.update —
+            // feed it back so the breaker keeps counting.
+            const again = supervisor.onClose(undefined);
+            const delayMs =
+              again.decision.action === "reconnect"
+                ? again.decision.delayMs
+                : again.decision.action === "open-circuit"
+                  ? again.decision.probeMs
+                  : null;
+            if (delayMs !== null) setTimeout(reconnect, delayMs);
+          },
+        );
+      switch (outcome.decision.action) {
+        case "reconnect":
+          setTimeout(reconnect, outcome.decision.delayMs);
+          break;
+        case "open-circuit": {
+          if (outcome.decision.justOpened) {
+            recordDiary(
+              config.diaryRoot,
+              "breaker",
+              `Circuit OPEN (${outcome.cls}): reconnect storm; probing every ${Math.round(outcome.decision.probeMs / 60_000)}m. Outbound queue holds.`,
+              "OBSERVATION",
+            );
+            void discordAlert(
+              `⚠️ WhatsApp link circuit OPEN (${outcome.cls} storm) — holding reconnects, probing every ${Math.round(outcome.decision.probeMs / 60_000)}m. Queued messages are safe and will flush on recovery.`,
+            );
+          }
+          setTimeout(reconnect, outcome.decision.probeMs);
+          break;
+        }
+        case "hold":
+          log.error("whatsapp: logged out — device unlinked; operator must re-pair (Rule 8: never automated)");
+          void discordAlert(
+            "🚨 WhatsApp device UNLINKED (loggedOut) — bot is holding. Re-pair manually: delete messaging/whatsapp/auth/ and scan the QR.",
+          );
+          break;
       }
     }
   });

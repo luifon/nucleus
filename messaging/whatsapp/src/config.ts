@@ -1,3 +1,4 @@
+import { DEFAULT_BREAKER } from "./breaker.js";
 import fs from "node:fs";
 import path from "node:path";
 import { resolvePersona } from "./persona.js";
@@ -187,6 +188,8 @@ export interface Config {
   outboundStagingDir: string;
   /** ADR-013: jobs ledger DB (fixed; whatsapp-family-owned per ADR-020). */
   jobsDbPath: string;
+  /** ADR-027 connection breaker knobs ([whatsapp.breaker] in nucleus.toml). */
+  breaker: import("./breaker.js").BreakerConfig;
 }
 
 export type { Config as default };
@@ -257,5 +260,23 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
     documentsDbPath: path.join(workspaceRoot, "memory/documents.db"),
     outboundStagingDir: path.join(workspaceRoot, "memory/outbound-staging"),
     jobsDbPath: path.join(workspaceRoot, "memory/jobs.db"),
+    breaker: breakerConfig(parsed.whatsapp?.breaker ?? {}),
+  };
+}
+
+/** ADR-027: [whatsapp.breaker] overrides layered over the defaults. */
+function breakerConfig(t: Record<string, unknown>): import("./breaker.js").BreakerConfig {
+  const d = DEFAULT_BREAKER;
+  const num = (v: unknown, fallback: number) =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : fallback;
+  return {
+    ladderMs: Array.isArray(t.ladder_ms) && t.ladder_ms.every((x) => typeof x === "number")
+      ? (t.ladder_ms as number[])
+      : d.ladderMs,
+    stableMs: num(t.stable_ms, d.stableMs),
+    openThreshold: num(t.open_threshold, d.openThreshold),
+    windowMs: num(t.window_ms, d.windowMs),
+    probeMs: num(t.probe_ms, d.probeMs),
+    alertAfterOutageMs: num(t.alert_after_outage_ms, d.alertAfterOutageMs),
   };
 }
