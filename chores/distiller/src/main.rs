@@ -38,7 +38,52 @@ async fn main() -> Result<()> {
     // One daily pass: extract fresh candidates, then judge + archive + prune.
     metabolism(&workspace_root, &diary_root, &settings).await?;
     contemplation(&workspace_root, &diary_root, &settings).await?;
+    session_index_maintenance(&workspace_root, &settings).await;
     Ok(())
+}
+
+/// ADR-023 daily catch-up: refresh the session-search index and prune
+/// junk transcripts. Best-effort — index maintenance must never fail the
+/// distillation pass. Prune stays dry-run until
+/// `[session_search] prune_apply = true` in nucleus.toml; counts go to
+/// the diary either way (no silent caps, ADR-020).
+async fn session_index_maintenance(workspace_root: &Path, settings: &Settings) {
+    use nucleus_core::session_index;
+    let result = async {
+        let pool = session_index::open(workspace_root).await?;
+        let idx = session_index::update_index(&pool, workspace_root).await?;
+        let prune = session_index::prune_junk(
+            &pool,
+            workspace_root,
+            settings.session_search.prune_apply,
+            settings.session_search.prune_max_age_days,
+        )
+        .await?;
+        anyhow::Ok((idx, prune))
+    }
+    .await;
+    match result {
+        Ok((idx, prune)) => {
+            let _ = nucleus_core::diary::record_observation(
+                workspace_root,
+                "distiller",
+                "session-index",
+                &format!(
+                    "session-search index: {} (re)indexed, {} ineligible, {} unchanged; prune{}: {} junk candidate(s), {} deleted",
+                    idx.indexed,
+                    idx.ineligible,
+                    idx.skipped_unchanged,
+                    if prune.dry_run { " (dry-run)" } else { "" },
+                    prune.candidates,
+                    prune.deleted,
+                ),
+                nucleus_core::diary::Tag::Observation,
+            );
+        }
+        Err(e) => {
+            tracing::warn!(err = %format!("{e:#}"), "session-index maintenance failed");
+        }
+    }
 }
 
 fn list_agent_dirs(diary_root: &Path) -> Result<Vec<(String, PathBuf)>> {

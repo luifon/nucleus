@@ -81,3 +81,11 @@ nucleus_dashboard = 8092
 # Bonsai image-generation FastAPI backend (loopback only). The /gallery surface
 # proxies generation requests here (ADR-019). Set NUCLEUS_BONSAI_DIR in .env.
 bonsai = 8093
+
+# ADR-023 session-search maintenance (distiller daily pass). prune_apply
+# arms real deletion of junk transcripts (no substantive exchange, older
+# than prune_max_age_days); false = dry-run reporting only. Flip to true
+# after a week of clean dry-run counts in the distiller diary.
+[session_search]
+prune_apply = false
+prune_max_age_days = 14
