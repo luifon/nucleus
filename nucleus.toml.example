@@ -89,3 +89,15 @@ bonsai = 8093
 [session_search]
 prune_apply = false
 prune_max_age_days = 14
+
+# ADR-027 WhatsApp connection circuit breaker. Defaults are sane; every
+# value is optional. ladder_ms = reconnect backoff per consecutive quick
+# failure; open_threshold failures within window_ms open the circuit
+# (stop reconnecting, alert once on discord-home, probe every probe_ms).
+# [whatsapp.breaker]
+# ladder_ms = [1000, 2000, 5000, 15000, 60000, 300000]
+# stable_ms = 120000
+# open_threshold = 10
+# window_ms = 900000
+# probe_ms = 300000
+# alert_after_outage_ms = 1800000

@@ -94,6 +94,16 @@ export class ChatSessionStore {
       CREATE INDEX IF NOT EXISTS idx_outbound_status_enqueued
         ON outbound_queue(status, enqueued_at);
 
+      -- ADR-027: every connection close, classified. The churn-diagnosis
+      -- dataset, populated passively by the breaker in index.ts.
+      CREATE TABLE IF NOT EXISTS connection_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        class TEXT NOT NULL,
+        code INTEGER,
+        uptime_ms INTEGER
+      );
+
       -- ADR-005a: brain-dump review-before-apply. Each capture produces
       -- a plan that's held here until the operator approves (or rejects,
       -- or times out). One pending plan per chat at a time; new captures
@@ -130,6 +140,13 @@ export class ChatSessionStore {
       .prepare("SELECT session_id FROM chat_sessions WHERE chat_id = ?")
       .get(chatId) as { session_id: string } | undefined;
     return row?.session_id ?? null;
+  }
+
+  /** ADR-027: record one classified connection close. */
+  recordConnectionEvent(cls: string, code: number | undefined, uptimeMs: number | null): void {
+    this.db
+      .prepare(`INSERT INTO connection_events (ts, class, code, uptime_ms) VALUES (?, ?, ?, ?)`)
+      .run(new Date().toISOString(), cls, code ?? null, uptimeMs ?? null);
   }
 
   save(chatId: string, sessionId: string, isNew: boolean): void {

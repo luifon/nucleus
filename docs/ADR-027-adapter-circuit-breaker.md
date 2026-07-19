@@ -1,7 +1,28 @@
 # ADR-027 — Channel adapter circuit breaker (WhatsApp first)
 
 Date: 2026-07-18
-Status: proposed
+Status: accepted + built (2026-07-19)
+
+> **As-built** (`messaging/whatsapp/src/breaker.ts` + `connection_events`
+> in whatsapp.db + `[whatsapp.breaker]` toml knobs over defaults):
+>
+> - Pure clock-injected state machine, 9 unit tests. Ladder
+>   1s→2s→5s→15s→60s→300s per consecutive quick failure; a ≥2 min
+>   stable connection resets it; 10 failures in 15 min open the circuit
+>   (single Discord alert, 5 min half-open probes); recovery clears the
+>   failure window but keeps the ladder rung (a probe that dies in
+>   seconds backs off long instead of re-alerting), and only a stable
+>   stretch resets the rung — a subtlety the first test draft caught.
+> - One deviation from the sketch below: `loggedOut` HOLDS instead of
+>   exiting — exiting would make launchd crash-loop a state only the
+>   operator can fix (re-pair). The bot stays alive, queue durable,
+>   single 🚨 alert.
+> - `connect()` failures that never reach a connection event are fed
+>   back into the breaker so silent spawn failures still count.
+> - Every close records (ts, class, code, uptime) — the churn-diagnosis
+>   dataset, passive from day one. Deployed 2026-07-19; a monitor is
+>   watching for the first natural churn event (baseline 6–9/day) to
+>   confirm classification in production.
 
 ## Context
 
