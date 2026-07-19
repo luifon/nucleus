@@ -1,6 +1,32 @@
 # ADR-012 — Canvas: agent-rendered interactive components in the dashboard chat
 
-**Status:** Proposed (2026-05-16)
+**Status:** Accepted + built (2026-07-18; proposed 2026-05-16)
+
+> **As-built (S12, 2026-07-18).** Shipped inside `nucleus-dashboard`
+> per the ADR-015 reframing, incorporating the OpenClaw field notes
+> below: versioned inline blocks (`v="1"`, mandatory unique `id`),
+> five types (`decision`, `multi-select`, `confirm`, `form`,
+> `review`), JSON payload bodies, malformed-block fallback that never
+> breaks the transcript. Parser/serializer + answered-state derivation
+> are pure functions in `web/src/lib/canvas.ts` (vitest suite — the
+> repo's first web test infra); rendering in
+> `web/src/components/chat/CanvasBlock.tsx` + `MessageBubble.tsx`
+> (interleaved `<pre>` text + widgets; no markdown pipeline exists in
+> the dashboard chat, contrary to this ADR's original assumption).
+> Responses ride the existing message POST as `<canvas-response>`
+> user messages, rendered as compact chips; answered-ness derives
+> solely from message history, which makes history-re-render parity
+> hold by construction (verified: reloaded transcript identical).
+> The canvas spec is injected venue-side
+> (`api/src/canvas_spec.md` appended to the resolved chat persona in
+> `init_chat`) — Rule 7: capability belongs to the venue, character to
+> the persona; no "Q" persona was introduced, `NUCLEUS_PERSONA_CHAT`
+> stands. No parallel chat-v2 binary (that rollout plan died with the
+> standalone crate; the feature shipped directly, burn-in is live use).
+> E2E-verified through the real dashboard + a live session: model
+> emitted a valid decision block unprompted-of-format, click → chip →
+> structured payload parsed by the model, block disabled after answer,
+> parity after reload.
 
 > **Post-ADR-015 reframing (2026-05-24).** Two things in the body
 > below are no longer accurate:

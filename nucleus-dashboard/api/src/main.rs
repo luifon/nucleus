@@ -2,7 +2,7 @@
 //!
 //! Single axum binary subsuming the standalone `dashboard/`, `chat/`,
 //! and `news/api/` crates. Serves the React SPA shell + every operator
-//! API surface + the chat WebSocket + the public news API at one origin.
+//! API surface + the chat API + the public news API at one origin.
 //!
 //! Routes are path-scoped; see ADR-015 §"Routes (axum)". The frontend
 //! lives at `nucleus-dashboard/web/` (React + Vite + Tailwind v4),
@@ -350,6 +350,10 @@ async fn init_chat(
     let persona = nucleus_core::config::resolve_persona(&settings.identity, "chat", None)
         .context("resolving chat persona")?;
     let persona_display_name = persona.display_name.clone();
+    // ADR-012: the canvas spec is a VENUE capability, not part of the
+    // persona character — appended here so only chat-hosted sessions ever
+    // learn the block format (Discord/WhatsApp/Gmail stay text-only).
+    let persona_body = format!("{}\n\n{}", persona.body, include_str!("canvas_spec.md"));
 
     let (mut pool_config, ask_options) = session_profile::interactive_pool(
         &session_profile::ProfileContext {
@@ -358,7 +362,7 @@ async fn init_chat(
             tmux_session: "nucleus-chat",
             agent_label: "chat",
         },
-        persona.body,
+        persona_body,
         std::time::Duration::from_secs(60 * 60 * 2),
         if settings.skill_learner.enabled {
             settings.skill_learner.nudge_interval

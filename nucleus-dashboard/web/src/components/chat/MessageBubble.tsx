@@ -1,11 +1,21 @@
 import { type ChatMessage } from "@/lib/api";
+import { describeResponse, parseMessage, parseResponses } from "@/lib/canvas";
+import CanvasBlock, { CanvasFallback } from "./CanvasBlock";
 
 export default function MessageBubble({
   message,
   personaName,
+  answeredIds,
+  sending,
+  onCanvasSubmit,
 }: {
   message: ChatMessage;
   personaName: string;
+  /** ids of canvas blocks already answered anywhere in this chat. */
+  answeredIds: Set<string>;
+  /** a send is in flight — canvas widgets must not double-submit. */
+  sending: boolean;
+  onCanvasSubmit: (message: string) => void;
 }) {
   const isUser = message.role === "user";
   return (
@@ -23,10 +33,79 @@ export default function MessageBubble({
           <span>·</span>
           <span>{shortTime(message.ts)}</span>
         </div>
-        <pre className="whitespace-pre-wrap font-[inherit] text-sm">{message.content}</pre>
+        {isUser ? (
+          <UserContent content={message.content} />
+        ) : (
+          <AssistantContent
+            content={message.content}
+            answeredIds={answeredIds}
+            sending={sending}
+            onCanvasSubmit={onCanvasSubmit}
+          />
+        )}
       </div>
     </div>
   );
+}
+
+/** Assistant text renders as interleaved plain-text + canvas segments. */
+function AssistantContent({
+  content,
+  answeredIds,
+  sending,
+  onCanvasSubmit,
+}: {
+  content: string;
+  answeredIds: Set<string>;
+  sending: boolean;
+  onCanvasSubmit: (message: string) => void;
+}) {
+  const segments = parseMessage(content);
+  return (
+    <>
+      {segments.map((seg, i) => {
+        if (seg.kind === "text") {
+          return (
+            <pre key={i} className="whitespace-pre-wrap font-[inherit] text-sm">
+              {seg.text}
+            </pre>
+          );
+        }
+        if (seg.kind === "canvas-fallback") {
+          return <CanvasFallback key={i} reason={seg.reason} raw={seg.raw} />;
+        }
+        return (
+          <CanvasBlock
+            key={seg.block.id}
+            block={seg.block}
+            answered={answeredIds.has(seg.block.id)}
+            disabled={sending}
+            onSubmit={onCanvasSubmit}
+          />
+        );
+      })}
+    </>
+  );
+}
+
+/** User messages that are canvas responses render as compact chips; the
+ *  raw XML-ish text stays in the transcript for the model only. */
+function UserContent({ content }: { content: string }) {
+  if (content.includes("<canvas-response")) {
+    const responses = parseResponses(content);
+    if (responses.length > 0) {
+      return (
+        <div className="flex flex-col gap-1">
+          {responses.map((r, i) => (
+            <span key={i} className="text-sm">
+              ✔ {describeResponse(r)}
+            </span>
+          ))}
+        </div>
+      );
+    }
+  }
+  return <pre className="whitespace-pre-wrap font-[inherit] text-sm">{content}</pre>;
 }
 
 function shortTime(iso: string): string {
