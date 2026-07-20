@@ -116,10 +116,49 @@ switch (cmd) {
     const ctx = await openProfile({ headless: false });
     const page = ctx.pages()[0] ?? (await ctx.newPage());
     await page.goto(args.url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    console.log('Log in in the opened window, then close it. State is captured on close.');
-    await new Promise((resolve) => ctx.on('close', resolve));
-    // the closed context can't export state — reopen headless and capture
-    await capture([originOf(args.url), ...(args.origins ?? '').split(',').filter(Boolean)]);
+    console.log(
+      'Log in in the opened window. Login is detected automatically — the\n' +
+        'window closes itself once the session is captured. (Closing it\n' +
+        'manually also works.)',
+    );
+    // Two exit signals, whichever comes first:
+    //  1. auto-detect: an open page sits on the target origin, off any
+    //     login/signin path, stable across two consecutive polls — then a
+    //     grace period for token writes;
+    //  2. the operator closes the window (context 'close') — works where
+    //     the platform ends the browser with its last window. On macOS
+    //     Chromium OUTLIVES its windows, so the pre-fix wait-for-close
+    //     never fired and a manual kill could nuke the just-created
+    //     session before it flushed (lost a login, 2026-07-20).
+    const target = originOf(args.url);
+    const looksLoggedIn = () =>
+      ctx.pages().some((pg) => {
+        try {
+          const u = new URL(pg.url());
+          return u.origin === target && !/login|signin|sign-in|auth/i.test(u.pathname);
+        } catch {
+          return false;
+        }
+      });
+    let closed = false;
+    ctx.on('close', () => {
+      closed = true;
+    });
+    const deadline = Date.now() + 10 * 60_000;
+    let stable = 0;
+    while (!closed && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 3_000));
+      stable = looksLoggedIn() ? stable + 1 : 0;
+      if (stable >= 2) {
+        console.log('login detected — capturing in 8s…');
+        await new Promise((r) => setTimeout(r, 8_000)); // let token writes settle
+        break;
+      }
+    }
+    if (!closed) {
+      await ctx.close(); // clean shutdown flushes cookies/localStorage
+    }
+    await capture([target, ...(args.origins ?? '').split(',').filter(Boolean)]);
     break;
   }
 
