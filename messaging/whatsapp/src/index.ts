@@ -33,6 +33,7 @@ import { ConnectionSupervisor, DEFAULT_BREAKER } from "./breaker.js";
 // connect(), so breaker state must live outside it. Configured in main()
 // from [whatsapp.breaker]; the default covers early references.
 let supervisor = new ConnectionSupervisor(DEFAULT_BREAKER);
+let hasConnectedOnce = false;
 
 /** One-shot operator alert on the INDEPENDENT channel (discord-home) —
  *  alerting through the broken WhatsApp link would be a design error.
@@ -504,7 +505,16 @@ async function connect(
         .catch((e) =>
           log.error({ err: e?.message }, "whatsapp: allowlist resolve failed"),
         );
-      recordDiary(config.diaryRoot, "boot", `Connected as ${sock.user?.id ?? "unknown"}`, "OBSERVATION");
+      // ADR-027: only the first open of this process is a boot; later opens
+      // are in-process reconnects — label them so diary churn accounting
+      // distinguishes process restarts from socket recycles.
+      recordDiary(
+        config.diaryRoot,
+        hasConnectedOnce ? "reconnect" : "boot",
+        `Connected as ${sock.user?.id ?? "unknown"}`,
+        "OBSERVATION",
+      );
+      hasConnectedOnce = true;
     } else if (connection === "close") {
       const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
       // ADR-027: classify, record, and let the breaker pick the response.
