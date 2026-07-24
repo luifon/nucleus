@@ -50,6 +50,7 @@ __pycache__/
 
 # personal Claude Code overrides (hooks + permissions for this operator only)
 .claude/settings.local.json
+.claude/secret-strings
 
 # personal project state — see docs/SECRETS.md
 docs/ROADMAP.md
