@@ -238,7 +238,7 @@ export function startJob(o: StartJobOpts): { jobId: string; promise: Promise<Job
         const reply = await session.ask(o.prompt, {
           maxWaitMs: o.maxWaitMs ?? JOB_MAX_WAIT_MS[o.kind],
           // Non-negotiable for agentic jobs: quiescence alone tears the
-          // session down mid-tool (the dsu-prep failure class).
+          // session down mid-tool (the skill-fire failure class).
           awaitTurnComplete: true,
         });
         o.store.markDone(jobId, reply);

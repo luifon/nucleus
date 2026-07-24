@@ -5,7 +5,7 @@ invoked skill's SKILL.md frontmatter.
 Why this exists: the dashboard's Skills page and the skill-gap-learner read
 `last_used` straight from frontmatter, but the ONLY writer of that field was
 the skill-gap-learner when it *patches* a skill. A skill that merely *runs*
-(dsu-prep firing every weekday, say) never bumped `last_used`, so it showed
+(a skill firing every weekday, say) never bumped `last_used`, so it showed
 as "never fired" forever. This hook closes that gap deterministically: it
 fires on every `Skill` invocation, in every Nucleus surface, because all
 bot/fire sessions `cd` into the repo and load `.claude/settings.json`.

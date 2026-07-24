@@ -63,7 +63,7 @@ Split the two concerns the profile was conflating:
 - Auth expiry changes shape: instead of a lock error, an expired snapshot
   surfaces as a logged-out page in an otherwise healthy browser. Recovery is
   `playwright-auth login` (or `capture` after the operator re-authed), not
-  file surgery. The lock-recovery ladder in `automation-triage` is replaced
+  file surgery. The lock-recovery ladder in the triage recovery skill is replaced
   accordingly.
 - Logins no longer accrete implicitly. A session that logs in somewhere does
   not persist it — deliberate: credentials flow through one auditable,

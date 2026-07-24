@@ -17,7 +17,17 @@ into committed files — is the reason this rule has teeth, not just text.
 - Absolute paths under `/Users/<your-user>/` or `/home/<your-user>/`
 - Public hostnames you control
 - Anyone's name (use `${USER_NAME}` substitution)
-- Anything that would be regrettable in public `git blame`
+- **Personal information of any kind** — anything identifying a person,
+  account, contact, or external party
+- **Operator-personal-skill content** — anything belonging to a skill in
+  `~/.claude/skills/` (not the repo-wired `.claude/skills/`)
+- Anything that would be regrettable in public `git blame` (this repo is
+  public)
+
+The specific real literals that aren't `.env` values (so the value-scan
+can't infer them) go in the gitignored `.claude/secret-strings` denylist —
+one per line, whole-word matched. Never put a real value in the committed
+`.claude/secret-strings.example`.
 
 ## How to route it
 
@@ -26,14 +36,19 @@ into committed files — is the reason this rule has teeth, not just text.
 | Code that needs an identifier | Read from env (e.g., `settings.gmail.account`) |
 | Persona / prompt template | Use `${USER_NAME}` / `${GMAIL_ACCOUNT}` placeholder, substituted at load via `nucleus_core::config::substitute*()` |
 | `.env.example` | Obviously-fake placeholders (`5511999999999`, `you@example.com`), never real values |
-| ADR / docs | Refer by role ("the trash account", `$NUCLEUS_PERSONAL_EMAIL`), never the literal |
+| ADR / docs | Refer by role ("the trash account", `$NUCLEUS_PERSONAL_EMAIL`), never the literal — including any external party (name them by role, not literally) |
 | Test data | Synthetic values, not redacted real values |
+| A tool/skill that integrates a specific external product | It's operator-personal → `~/.claude/skills/` + `.env`, never committed under `tools/`/`core/`/`chores/` |
+| A sensitive literal that isn't an `.env` value | Add it to the gitignored `.claude/secret-strings` denylist so the guard catches it |
 
 ## Enforcement layers
 
-All three call `tools/check-secrets.sh`, which **auto-derives the
-blocklist from your live `.env` values**. Add a new env var → all three
-layers cover it without code changes.
+All three call `tools/check-secrets.sh`, which scans for **four** things:
+`.env` values (substring), the gitignored `.claude/secret-strings` denylist
+(whole-word), generic PII heuristics (emails / JIDs / phones / home paths),
+and operator-personal-skill names (`~/.claude/skills/` minus the repo-wired
+`.claude/skills/`). Add an env var or a denylist line → all three call sites
+cover it without code changes.
 
 | Layer | Where | Fires on |
 |---|---|---|

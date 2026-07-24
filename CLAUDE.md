@@ -14,18 +14,30 @@ and route through `.env` instead:
 - Any Discord/WhatsApp user, channel, or group ID
 - Any specific public hostname (route via `NUCLEUS_*_PUBLIC_URL` env vars)
 - Any absolute path containing a user's home dir
+- **Personal information of any kind** — anything identifying a person,
+  account, contact, or external party
+- **Operator-personal-skill content** — anything belonging to a skill in the
+  `~/.claude/skills/` tree (as opposed to the repo-wired `.claude/skills/`).
+  That tooling and everything it names lives in the personal tree, never in
+  a tracked file.
 
-If the value should be identical for everyone who clones the repo (cron
-schedules, ports, denylists, behavior toggles), it goes in `nucleus.toml`.
-If it identifies a specific operator's setup, it goes in `.env`.
+**This repo is public.** Nothing above may appear in tracked source, docs,
+comments, or test fixtures. If the value should be identical for everyone
+who clones the repo (cron schedules, ports, denylists, behavior toggles), it
+goes in `nucleus.toml`. If it identifies a specific operator's setup, it goes
+in `.env`. The specific real literals a value-scan can't infer (names that
+aren't env values) go in the gitignored `.claude/secret-strings` denylist.
 
-Pre-commit audit:
+**Placement rule:** anything that integrates or names a specific external
+product/service is operator-personal → `~/.claude/skills/` + `.env`, never
+under `tools/`, `core/`, `chores/`, or `docs/` (those are venue/
+infrastructure code that refers to any external party by role, not name).
 
-```bash
-git ls-files | xargs grep -l "$NUCLEUS_USER_NAME\|$DISCORD_HOME_CHANNEL_ID" 2>/dev/null
-```
-
-Zero matches = clean. Full policy in `docs/SECRETS.md`.
+`tools/check-secrets.sh` (wired into Write/Edit, `git commit`, and the git
+pre-commit hook) enforces this: it scans for `.env` values, the
+`.claude/secret-strings` denylist, generic PII (emails/JIDs/phones/home
+paths), and operator-personal-skill names. Bypass intentionally only with
+`git commit --no-verify`. Full policy in `docs/SECRETS.md`.
 
 ## Rule 2 — Personal project state stays gitignored
 

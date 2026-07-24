@@ -1,8 +1,14 @@
 # Secrets, identifiers, and what goes where
 
 **Hard rule:** anything that personally identifies a specific human, machine,
-account, channel, or path lives in `.env` (gitignored). Nothing committed to
-the repo should let a reader figure out who runs Nucleus or where.
+account, channel, path, or external party lives in `.env` (gitignored) — and
+**this repo is public**, so personal information of any kind, and any content
+belonging to an operator-personal skill (`~/.claude/skills/`, as opposed to
+the repo-wired `.claude/skills/`), must never appear in a tracked file.
+Sensitive literals that aren't `.env` values go in the gitignored
+`.claude/secret-strings` denylist. `tools/check-secrets.sh` enforces all of
+this (see `.claude/rules/secrets.md`). Nothing committed to the repo should
+let a reader figure out who runs Nucleus, where, or for whom.
 
 **Second hard rule:** personal project state (roadmaps, todo lists, sprint
 plans, "things I'm currently postponing", references to specific contracts

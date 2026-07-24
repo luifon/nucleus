@@ -45,7 +45,7 @@ Extend the reminders primitive (ADR-006/008) with an optional gate:
 ```
 reminders add --cron "*/5 * * * *" \
   --condition "tools/checks/outbound-stuck.sh" \
-  --system-prompt "Outbound queue is stuck; diagnose per automation-triage." \
+  --system-prompt "Outbound queue is stuck; diagnose per the triage runbook." \
   --channels discord-home
 ```
 
