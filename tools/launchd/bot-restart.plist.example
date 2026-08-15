@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LAUNCHD_PREFIX__.bot-restart</string>
+    <!-- Daily recycle of the resident bots at 04:00 local. Resident workers
+         accumulate in-process state (wedged handlers, stale session-pool
+         entries, spawn-day date anchor); periodic jobs are excluded by the
+         script since they already spawn fresh per fire. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec __USER_HOME__/Development/nucleus/tools/restart-bots.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__USER_HOME__/Development/nucleus</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TZ</key>
+        <string>__TZ__</string>
+        <key>NUCLEUS_WORKSPACE_ROOT</key>
+        <string>__USER_HOME__/Development/nucleus</string>
+        <key>PATH</key>
+        <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <!-- One-shot per fire: never RunAtLoad (installing must not bounce every
+         bot mid-day) and never KeepAlive (the script exits by design). -->
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/bot-restart.log</string>
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/bot-restart.log</string>
+</dict>
+</plist>
