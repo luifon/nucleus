@@ -65,6 +65,23 @@ design-mocks/
 *-news-*.png
 *-news-*.yml
 
+# Sibling-project artifacts that land HERE by accident.
+# Lastro (~/Development/lastro) and Tessera (~/Development/tessera) are
+# separate repos, but screenshots/dumps taken while working on them get
+# written to the CWD — which is usually this repo — and then sit untracked
+# in the root until someone `git add -A`s them in. Nothing belonging to
+# another project may be committed here, so ignore the shapes outright.
+lastro-*
+lastro*.png
+tessera-*
+tessera*.png
+
+# Scratch captures from ad-hoc work (dumps, previews, page grabs).
+*_dump.txt
+*-dump.txt
+*-preview.png
+*-b64.txt
+
 # ts-rs default export dirs — side effect of plain `cargo test` runs
 # without TS_RS_EXPORT_DIR; the real generated types live at
 # nucleus-dashboard/web/src/lib/api/generated/ (Rule 12).
