@@ -194,25 +194,39 @@ export class Session {
 
   async ask(message: string, opts: AskOptions = {}): Promise<string> {
     const reply = await this.askOnce(message, opts);
-    if (!replyIsModelError(reply)) return reply;
-    // The session booted clean and died at INFERENCE time — the model is a
-    // valid menu entry this account can't actually run, so launchWindow's
-    // boot-pane check saw nothing wrong. Without this branch the banner
-    // becomes the deliverable: on 2026-08-24 a heartbeat fire posted
-    // "issue with the selected model (claude-fable-5)" to WhatsApp and the
-    // report it was supposed to send was lost.
-    const fb = fallbackModel();
-    console.error(
-      `whatsapp: session model failed at inference time — relaunching on fallback ${fb} and re-asking once`,
-    );
-    await this.respawnOnFallback(fb);
+    const kind = classifyInfraReply(reply);
+    if (kind === null) return reply;
+    // The session booted clean and died at INFERENCE time, so launchWindow's
+    // boot-pane check saw nothing wrong and the banner arrived as the turn's
+    // reply. Callers then posted it as content: on 2026-08-24 one fire sent
+    // "issue with the selected model (claude-fable-5)" and another sent an
+    // ENOTFOUND, each in place of the report it owed the operator.
+    //
+    // Fix what can be fixed, re-ask once, and never return the banner.
+    const what = INFRA_ERROR_DESCRIPTION[kind];
+    if (kind === "not-logged-in") {
+      // Retrying can't mint credentials. Fail now so the caller alerts
+      // instead of burning a second turn.
+      throw new Error(`ask: ${what} — no reply was produced (log the CLI back in)`);
+    }
+    if (kind === "model-unavailable") {
+      const fb = fallbackModel();
+      console.error(`whatsapp: ${what} — relaunching on fallback ${fb} and re-asking once`);
+      await this.respawnOnFallback(fb);
+    } else {
+      // Transient. The window is fine — wait for the far side to recover and
+      // re-ask in place.
+      console.error(`whatsapp: ${what} — waiting ${API_ERROR_RETRY_DELAY_MS}ms and re-asking once`);
+      await new Promise((r) => setTimeout(r, API_ERROR_RETRY_DELAY_MS));
+    }
     const retry = await this.askOnce(message, opts);
-    if (replyIsModelError(retry)) {
+    const again = classifyInfraReply(retry);
+    if (again !== null) {
       // Never return the banner as content. A thrown error routes the caller
       // into its ⚠️ alert path, which says something useful.
       throw new Error(
-        `ask: neither the configured/default model nor the fallback model ${fb} can serve ` +
-          `inference (set NUCLEUS_CLAUDE_FALLBACK_MODEL to a model you can use)`,
+        `ask: ${INFRA_ERROR_DESCRIPTION[again]} — still failing after one retry, so this turn ` +
+          `produced no content`,
       );
     }
     return retry;
@@ -597,22 +611,44 @@ export function paneShowsModelError(pane: string): boolean {
   );
 }
 
-/** Upper bound on a reply that `replyIsModelError` will judge. The banners
+/** Upper bound on a reply that `classifyInfraReply` will judge. The banners
  *  are one or two sentences; a longer reply is a real answer that happens to
- *  discuss models, so it must not read as a failure. */
-export const MODEL_ERROR_REPLY_MAX_LEN = 400;
+ *  discuss models or API errors, so it must not read as a failure. */
+export const INFRA_ERROR_REPLY_MAX_LEN = 400;
 
-/** True if an `ask` reply IS the model-unavailable banner rather than an
- *  answer. The spawn-time pane check can't catch this: a model the account
- *  can't use still boots into a normal TUI and only fails when it has to
- *  serve inference, so the banner arrives as the turn's "reply" and gets
- *  delivered as content (2026-08-24: a heartbeat fire posted exactly this to
- *  the operator's WhatsApp and the real report was lost). Mirrors core's
- *  reply_is_model_error — deliberately narrow, so a session explaining the
- *  incident can't respawn itself. */
-export function replyIsModelError(reply: string): boolean {
+/** How long to wait before re-asking after an API error. 529 Overloaded and
+ *  the DNS failures clear on their own, but not instantly. */
+const API_ERROR_RETRY_DELAY_MS = 10_000;
+
+/** An `ask` reply that is infrastructure failing, not an answer. */
+export type InfraError = "model-unavailable" | "api" | "not-logged-in";
+
+const INFRA_ERROR_DESCRIPTION: Record<InfraError, string> = {
+  "model-unavailable": "the model cannot serve inference",
+  api: "the API is unreachable or overloaded",
+  "not-logged-in": "the claude CLI is not logged in",
+};
+
+/** Classify an `ask` reply that is infrastructure failing rather than an
+ *  answer, or null when it's real content.
+ *
+ *  The spawn-time pane check can't catch any of these: the session boots into
+ *  a normal TUI and only fails when it has to serve inference, so the banner
+ *  arrives as the turn's "reply" and gets delivered as content. Three fires
+ *  did exactly that on 2026-08-24 — a fable-5 model banner and an ENOTFOUND
+ *  both reached the operator's WhatsApp in place of the report they owed.
+ *
+ *  Mirrors core's classify_infra_reply — deliberately narrow, so a session
+ *  explaining the incident can't retry itself. */
+export function classifyInfraReply(reply: string): InfraError | null {
   const trimmed = reply.trim();
-  return trimmed.length <= MODEL_ERROR_REPLY_MAX_LEN && paneShowsModelError(trimmed);
+  if (trimmed.length > INFRA_ERROR_REPLY_MAX_LEN) return null;
+  // Order matters: an expired login is fatal, so it must not be mistaken for
+  // a transient API error and retried.
+  if (trimmed.includes("Please run /login")) return "not-logged-in";
+  if (paneShowsModelError(trimmed)) return "model-unavailable";
+  if (trimmed.includes("API Error")) return "api";
+  return null;
 }
 
 /** Create one tmux window running claude, dismiss the trust prompt, wait for

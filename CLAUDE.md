@@ -276,7 +276,8 @@ known set. Default is `discord-home`. Examples:
 - `--channels discord-home,whatsapp-dm` (delivers to both, per-channel retry)
 
 **Condition watchers (ADR-024).** `--condition "<shell cmd>"` gates the
-fire: at each due tick the command runs (`sh -c`, 5s timeout) and only
+fire: at each due tick the command runs (`sh -c`, 15s timeout by default —
+`--condition-timeout <secs>` raises it per reminder, max 55) and only
 exit 0 lets the reminder fire. Gated cron ticks skip to the next match;
 gated one-shots keep watching every tick ("fire as soon as X" — e.g.
 `--at now --condition "test -f /tmp/done"` watches until a marker

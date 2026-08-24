@@ -61,24 +61,69 @@ fn pane_shows_model_error(pane: &str) -> bool {
         || pane.contains("you may not have access to it")
 }
 
-/// Upper bound on a reply that `reply_is_model_error` will judge. The real
+/// Upper bound on a reply that `classify_infra_reply` will judge. The real
 /// banners are one or two sentences; anything longer is a genuine answer
-/// that happens to discuss models, so it must not be treated as a failure.
-const MODEL_ERROR_REPLY_MAX_LEN: usize = 400;
+/// that happens to discuss models or API errors, so it must not read as a
+/// failure.
+const INFRA_ERROR_REPLY_MAX_LEN: usize = 400;
 
-/// True if an `ask` reply IS the model-unavailable banner rather than an
-/// answer. The spawn-time pane check can't catch this case: a model the
-/// account can't use still boots into a normal TUI and only fails when it
-/// has to serve inference, so the banner arrives as the turn's "reply" and
-/// gets delivered as if it were content (the 2026-08-24 fable-5 fire posted
-/// exactly this to the operator's WhatsApp, and the real report was lost).
+/// How long to wait before re-asking after an API error. 529 Overloaded and
+/// the DNS failures clear on their own, but not instantly.
+const API_ERROR_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// An `ask` reply that is infrastructure failing, not an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InfraError {
+    /// The model booted but can't serve inference for this account.
+    /// Relaunching on the fallback model fixes it.
+    ModelUnavailable,
+    /// The API refused or was unreachable (529 Overloaded, ENOTFOUND).
+    /// Usually transient — waiting and re-asking fixes it.
+    Api,
+    /// The CLI's credentials expired. No retry helps; only the operator can.
+    NotLoggedIn,
+}
+
+impl InfraError {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::ModelUnavailable => "the model cannot serve inference",
+            Self::Api => "the API is unreachable or overloaded",
+            Self::NotLoggedIn => "the claude CLI is not logged in",
+        }
+    }
+}
+
+/// Classify an `ask` reply that is infrastructure failing rather than an
+/// answer, or `None` when it's real content.
 ///
-/// Deliberately narrow — same markers as the pane check, but the whole reply
-/// must be short. A session explaining this incident writes far more than
-/// 400 chars, so it can't false-positive itself into a respawn.
-fn reply_is_model_error(reply: &str) -> bool {
+/// The spawn-time pane check can't catch any of these: the session boots
+/// into a normal TUI and only fails when it has to serve inference, so the
+/// banner arrives as the turn's "reply" and gets delivered as content. Three
+/// separate fires did exactly that on 2026-08-24 — a fable-5 model banner
+/// and an ENOTFOUND both reached the operator's WhatsApp in place of the
+/// report they were supposed to send.
+///
+/// Deliberately narrow: known markers AND a short whole reply. A session
+/// explaining any of these incidents writes far more than 400 chars, so it
+/// can't false-positive itself into a retry.
+fn classify_infra_reply(reply: &str) -> Option<InfraError> {
     let reply = reply.trim();
-    reply.len() <= MODEL_ERROR_REPLY_MAX_LEN && pane_shows_model_error(reply)
+    if reply.len() > INFRA_ERROR_REPLY_MAX_LEN {
+        return None;
+    }
+    // Order matters: an expired login is fatal, so it must not be mistaken
+    // for a transient API error and retried.
+    if reply.contains("Please run /login") {
+        return Some(InfraError::NotLoggedIn);
+    }
+    if pane_shows_model_error(reply) {
+        return Some(InfraError::ModelUnavailable);
+    }
+    if reply.contains("API Error") {
+        return Some(InfraError::Api);
+    }
+    None
 }
 
 static CLAUDE_VERSION: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
@@ -400,34 +445,55 @@ impl Session {
     /// for at most `opts.max_wait`.
     pub async fn ask(&mut self, message: &str, opts: AskOptions) -> Result<String> {
         let reply = self.ask_once(message, &opts).await?;
-        if !reply_is_model_error(&reply) {
+        let Some(kind) = classify_infra_reply(&reply) else {
             return Ok(reply);
-        }
-        // The session booted clean and died at INFERENCE time — the model is
-        // a valid menu entry this account can't actually run. `launch_window`
-        // only reads the boot pane, so it saw nothing wrong. Without this
-        // branch the banner becomes the deliverable: on 2026-08-24 a heartbeat
-        // fire posted "issue with the selected model (claude-fable-5)" to
-        // WhatsApp and the report it was supposed to send was lost.
+        };
+        // The session booted clean and died at INFERENCE time, so
+        // `launch_window`'s boot-pane check saw nothing wrong and the banner
+        // arrived as the turn's reply. Callers then posted it as content: on
+        // 2026-08-24 one fire sent "issue with the selected model
+        // (claude-fable-5)" and another sent an ENOTFOUND, each in place of
+        // the report it owed the operator.
         //
-        // Relaunch on the fallback model and re-ask once, so the content
-        // survives an operator-side model change instead of the error
-        // replacing it.
-        let fb = fallback_model();
-        tracing::warn!(
-            "ask: the session's model failed at inference time — relaunching on fallback model {fb} and re-asking once"
-        );
-        self.respawn_on_fallback(&fb).await?;
-        let reply = self.ask_once(message, &opts).await?;
-        if reply_is_model_error(&reply) {
+        // Fix what can be fixed, re-ask once, and never return the banner.
+        match kind {
+            InfraError::NotLoggedIn => {
+                // Retrying can't mint credentials. Fail now so the caller
+                // alerts instead of burning a second turn.
+                anyhow::bail!(
+                    "ask: {} — no reply was produced (log the CLI back in)",
+                    kind.describe()
+                );
+            }
+            InfraError::ModelUnavailable => {
+                let fb = fallback_model();
+                tracing::warn!(
+                    "ask: {} — relaunching on fallback model {fb} and re-asking once",
+                    kind.describe()
+                );
+                self.respawn_on_fallback(&fb).await?;
+            }
+            InfraError::Api => {
+                // Transient. The window is fine — wait for the far side to
+                // recover and re-ask in place.
+                tracing::warn!(
+                    "ask: {} — waiting {:?} and re-asking once",
+                    kind.describe(),
+                    API_ERROR_RETRY_DELAY
+                );
+                tokio::time::sleep(API_ERROR_RETRY_DELAY).await;
+            }
+        }
+        let retry = self.ask_once(message, &opts).await?;
+        match classify_infra_reply(&retry) {
             // Never return the banner as content. A loud error routes the
             // caller into its ⚠️ alert path, which says something useful.
-            anyhow::bail!(
-                "ask: neither the configured/default model nor the fallback model {fb} can \
-                 serve inference (set NUCLEUS_CLAUDE_FALLBACK_MODEL to a model you can use)"
-            );
+            Some(again) => anyhow::bail!(
+                "ask: {} — still failing after one retry, so this turn produced no content",
+                again.describe()
+            ),
+            None => Ok(retry),
         }
-        Ok(reply)
     }
 
     /// Kill this session's window and relaunch it on `model`, resuming the
@@ -2030,30 +2096,63 @@ mod tests {
     }
 
     #[test]
-    fn reply_model_error_detection() {
-        // The exact text the 2026-08-24 heartbeat fire posted to WhatsApp as
-        // if it were the deliverable.
-        assert!(reply_is_model_error(
-            "There's an issue with the selected model (claude-fable-5). It may not exist or you may not have access to it. Run /model to pick a different model."
-        ));
+    fn classify_infra_reply_catches_the_banners_that_got_posted() {
+        // The exact text the 2026-08-24 13:01 fire posted to WhatsApp as if
+        // it were the deliverable.
+        assert_eq!(
+            classify_infra_reply(
+                "There's an issue with the selected model (claude-fable-5). It may not exist or you may not have access to it. Run /model to pick a different model."
+            ),
+            Some(InfraError::ModelUnavailable)
+        );
         // Leading/trailing whitespace from the transcript must not hide it.
-        assert!(reply_is_model_error(
-            "\n  Claude Fable 5 is currently unavailable. Please use Opus 4.8 or another available model.  \n"
-        ));
-        // A real answer must never trip it, however model-ish it reads.
-        assert!(!reply_is_model_error(
-            "Switched the default to Opus. Nothing else pins a model."
-        ));
-        // A long answer that quotes the banner is content, not a failure —
-        // this is what a session explaining the incident writes.
+        assert_eq!(
+            classify_infra_reply(
+                "\n  Claude Fable 5 is currently unavailable. Please use Opus 4.8 or another available model.  \n"
+            ),
+            Some(InfraError::ModelUnavailable)
+        );
+        // The 09:03 fire, which then died in the outbound queue.
+        assert_eq!(
+            classify_infra_reply(
+                "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"
+            ),
+            Some(InfraError::Api)
+        );
+        assert_eq!(
+            classify_infra_reply("API Error: 529 Overloaded"),
+            Some(InfraError::Api)
+        );
+        // Expired credentials are fatal, never a retryable API error.
+        assert_eq!(
+            classify_infra_reply("Not logged in · Please run /login"),
+            Some(InfraError::NotLoggedIn)
+        );
+    }
+
+    #[test]
+    fn classify_infra_reply_leaves_real_answers_alone() {
+        assert_eq!(
+            classify_infra_reply("Switched the default to Opus. Nothing else pins a model."),
+            None
+        );
+        // A long answer quoting the banner is content, not a failure — this
+        // is what a session explaining the incident writes.
         let quoting = format!(
             "The fire failed because the pane said \"There's an issue with the selected model \
              (claude-fable-5). It may not exist or you may not have access to it.\" and the \
              spawn-time check never saw it. {}",
             "Detail follows. ".repeat(20)
         );
-        assert!(quoting.len() > MODEL_ERROR_REPLY_MAX_LEN);
-        assert!(!reply_is_model_error(&quoting));
+        assert!(quoting.len() > INFRA_ERROR_REPLY_MAX_LEN);
+        assert_eq!(classify_infra_reply(&quoting), None);
+        // Same for a report that mentions an API error it recovered from.
+        let recovered = format!(
+            "The 09:03 fire hit \"API Error: Can't reach the API server\" and retried clean. {}",
+            "Detail follows. ".repeat(30)
+        );
+        assert!(recovered.len() > INFRA_ERROR_REPLY_MAX_LEN);
+        assert_eq!(classify_infra_reply(&recovered), None);
     }
 
     #[test]
