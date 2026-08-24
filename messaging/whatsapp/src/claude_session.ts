@@ -101,13 +101,18 @@ function withDatePreamble(message: string): string {
 export class Session {
   constructor(
     public readonly sessionId: string,
-    public readonly tmuxTarget: string,
+    // Not readonly: `respawnOnFallback` relaunches the window and repoints
+    // this at the new one.
+    public tmuxTarget: string,
     public readonly transcriptPath: string,
     private cursor: number,
     // Run-log bookkeeping (ADR-016); set when spawned with an agentLabel.
     private readonly workspaceRoot: string = "",
     private readonly agentLabel?: string,
     private readonly runId: string = "",
+    // The config this session was spawned with, kept so `ask` can relaunch
+    // on the fallback model without the caller's help.
+    private readonly spawnOpts?: SpawnOptions,
   ) {}
 
   static async spawn(opts: SpawnOptions): Promise<Session> {
@@ -183,10 +188,71 @@ export class Session {
       opts.workspaceRoot,
       opts.agentLabel,
       runId,
+      opts,
     );
   }
 
   async ask(message: string, opts: AskOptions = {}): Promise<string> {
+    const reply = await this.askOnce(message, opts);
+    if (!replyIsModelError(reply)) return reply;
+    // The session booted clean and died at INFERENCE time — the model is a
+    // valid menu entry this account can't actually run, so launchWindow's
+    // boot-pane check saw nothing wrong. Without this branch the banner
+    // becomes the deliverable: on 2026-08-24 a heartbeat fire posted
+    // "issue with the selected model (claude-fable-5)" to WhatsApp and the
+    // report it was supposed to send was lost.
+    const fb = fallbackModel();
+    console.error(
+      `whatsapp: session model failed at inference time — relaunching on fallback ${fb} and re-asking once`,
+    );
+    await this.respawnOnFallback(fb);
+    const retry = await this.askOnce(message, opts);
+    if (replyIsModelError(retry)) {
+      // Never return the banner as content. A thrown error routes the caller
+      // into its ⚠️ alert path, which says something useful.
+      throw new Error(
+        `ask: neither the configured/default model nor the fallback model ${fb} can serve ` +
+          `inference (set NUCLEUS_CLAUDE_FALLBACK_MODEL to a model you can use)`,
+      );
+    }
+    return retry;
+  }
+
+  /** Kill this session's window and relaunch it on `model`, resuming the same
+   *  session id so the chat keeps its history. Only `ask`'s model-failure
+   *  path calls this. Mirrors core's respawn_on_fallback. */
+  private async respawnOnFallback(model: string): Promise<void> {
+    if (!this.spawnOpts) {
+      throw new Error("respawn: session has no spawn options (constructed directly?)");
+    }
+    await tmux(["kill-window", "-t", this.tmuxTarget]).catch(() => {});
+    const windowName = this.spawnOpts.windowName ?? this.sessionId.slice(0, 8);
+    // --resume on the same id: the transcript already holds the
+    // conversation, including the turn that just failed.
+    const target = await launchWindow(
+      this.spawnOpts,
+      this.sessionId,
+      true,
+      windowName,
+      model,
+    );
+    if (target === null) {
+      throw new Error(`respawn: fallback model ${model} is unavailable at boot too`);
+    }
+    this.tmuxTarget = target;
+    // Same reason as spawn's resuming branch — pin past the existing
+    // transcript so the retry can't read the failed turn back as its reply.
+    try {
+      const stat = await fs.stat(this.transcriptPath);
+      this.cursor = stat.size;
+    } catch {
+      // best-effort; cursor stays
+    }
+  }
+
+  /** One send-and-wait round trip. `ask` wraps this with the model-failure
+   *  retry; nothing else should call it. */
+  private async askOnce(message: string, opts: AskOptions = {}): Promise<string> {
     const ask = { ...DEFAULT_ASK, ...opts };
     const fromOffset = this.cursor;
     try {
@@ -529,6 +595,24 @@ export function paneShowsModelError(pane: string): boolean {
     pane.includes("issue with the selected model") ||
     pane.includes("you may not have access to it")
   );
+}
+
+/** Upper bound on a reply that `replyIsModelError` will judge. The banners
+ *  are one or two sentences; a longer reply is a real answer that happens to
+ *  discuss models, so it must not read as a failure. */
+export const MODEL_ERROR_REPLY_MAX_LEN = 400;
+
+/** True if an `ask` reply IS the model-unavailable banner rather than an
+ *  answer. The spawn-time pane check can't catch this: a model the account
+ *  can't use still boots into a normal TUI and only fails when it has to
+ *  serve inference, so the banner arrives as the turn's "reply" and gets
+ *  delivered as content (2026-08-24: a heartbeat fire posted exactly this to
+ *  the operator's WhatsApp and the real report was lost). Mirrors core's
+ *  reply_is_model_error — deliberately narrow, so a session explaining the
+ *  incident can't respawn itself. */
+export function replyIsModelError(reply: string): boolean {
+  const trimmed = reply.trim();
+  return trimmed.length <= MODEL_ERROR_REPLY_MAX_LEN && paneShowsModelError(trimmed);
 }
 
 /** Create one tmux window running claude, dismiss the trust prompt, wait for

@@ -61,6 +61,26 @@ fn pane_shows_model_error(pane: &str) -> bool {
         || pane.contains("you may not have access to it")
 }
 
+/// Upper bound on a reply that `reply_is_model_error` will judge. The real
+/// banners are one or two sentences; anything longer is a genuine answer
+/// that happens to discuss models, so it must not be treated as a failure.
+const MODEL_ERROR_REPLY_MAX_LEN: usize = 400;
+
+/// True if an `ask` reply IS the model-unavailable banner rather than an
+/// answer. The spawn-time pane check can't catch this case: a model the
+/// account can't use still boots into a normal TUI and only fails when it
+/// has to serve inference, so the banner arrives as the turn's "reply" and
+/// gets delivered as if it were content (the 2026-08-24 fable-5 fire posted
+/// exactly this to the operator's WhatsApp, and the real report was lost).
+///
+/// Deliberately narrow — same markers as the pane check, but the whole reply
+/// must be short. A session explaining this incident writes far more than
+/// 400 chars, so it can't false-positive itself into a respawn.
+fn reply_is_model_error(reply: &str) -> bool {
+    let reply = reply.trim();
+    reply.len() <= MODEL_ERROR_REPLY_MAX_LEN && pane_shows_model_error(reply)
+}
+
 static CLAUDE_VERSION: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
 
 /// `claude --version` output, executed once per process and cached
@@ -106,9 +126,17 @@ pub struct Session {
     run_id: String,
     /// Workspace root, needed to resolve the `memory/logs/<agent>/` path.
     workspace_root: PathBuf,
+    /// The config this session was spawned with, kept so `ask` can relaunch
+    /// the window on the fallback model without the caller's help.
+    spawn_opts: SpawnOptions,
 }
 
 /// Options for spawning a new claude session in tmux.
+///
+/// `Clone` so a `Session` can keep its own spawn config and relaunch itself
+/// on the fallback model when the configured one dies mid-conversation
+/// (see `Session::respawn_on_fallback`).
+#[derive(Clone)]
 pub struct SpawnOptions {
     /// CWD that claude is launched from. Determines auto-memory + .claude/ resolution.
     pub workspace_root: PathBuf,
@@ -270,6 +298,7 @@ impl Session {
             agent_label: opts.agent_label.clone(),
             run_id,
             workspace_root: opts.workspace_root.clone(),
+            spawn_opts: opts,
         })
     }
 
@@ -370,6 +399,77 @@ impl Session {
     /// Send a user message and wait for claude's next assistant reply. Blocks
     /// for at most `opts.max_wait`.
     pub async fn ask(&mut self, message: &str, opts: AskOptions) -> Result<String> {
+        let reply = self.ask_once(message, &opts).await?;
+        if !reply_is_model_error(&reply) {
+            return Ok(reply);
+        }
+        // The session booted clean and died at INFERENCE time — the model is
+        // a valid menu entry this account can't actually run. `launch_window`
+        // only reads the boot pane, so it saw nothing wrong. Without this
+        // branch the banner becomes the deliverable: on 2026-08-24 a heartbeat
+        // fire posted "issue with the selected model (claude-fable-5)" to
+        // WhatsApp and the report it was supposed to send was lost.
+        //
+        // Relaunch on the fallback model and re-ask once, so the content
+        // survives an operator-side model change instead of the error
+        // replacing it.
+        let fb = fallback_model();
+        tracing::warn!(
+            "ask: the session's model failed at inference time — relaunching on fallback model {fb} and re-asking once"
+        );
+        self.respawn_on_fallback(&fb).await?;
+        let reply = self.ask_once(message, &opts).await?;
+        if reply_is_model_error(&reply) {
+            // Never return the banner as content. A loud error routes the
+            // caller into its ⚠️ alert path, which says something useful.
+            anyhow::bail!(
+                "ask: neither the configured/default model nor the fallback model {fb} can \
+                 serve inference (set NUCLEUS_CLAUDE_FALLBACK_MODEL to a model you can use)"
+            );
+        }
+        Ok(reply)
+    }
+
+    /// Kill this session's window and relaunch it on `model`, resuming the
+    /// same session id so a pooled chat keeps its history. Only `ask`'s
+    /// model-failure path calls this.
+    async fn respawn_on_fallback(&mut self, model: &str) -> Result<()> {
+        let _ = Command::new("tmux")
+            .args(["kill-window", "-t", &self.tmux_target])
+            .output()
+            .await;
+        let window_name = self
+            .spawn_opts
+            .window_name
+            .clone()
+            .unwrap_or_else(|| self.session_id.chars().take(8).collect());
+        // `--resume` on the same id: the transcript already holds the
+        // conversation, including the turn that just failed.
+        let target = Self::launch_window(
+            &self.spawn_opts,
+            &self.session_id,
+            true,
+            &window_name,
+            Some(model),
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("respawn: fallback model {model} is unavailable at boot too")
+        })?;
+        self.tmux_target = target;
+        // Same reason as spawn's resuming branch — pin past the existing
+        // transcript so the retry can't read the failed turn back as its own
+        // reply.
+        self.cursor = tokio::fs::metadata(&self.transcript_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(self.cursor);
+        Ok(())
+    }
+
+    /// One send-and-wait round trip. `ask` wraps this with the model-failure
+    /// retry; nothing else should call it.
+    async fn ask_once(&mut self, message: &str, opts: &AskOptions) -> Result<String> {
         // Wait for the transcript to be quiet for `quiescent_window` before
         // snapshotting the cursor. Claude can keep writing after the
         // previous `wait_for_assistant` returned (late tool outputs,
@@ -1927,6 +2027,33 @@ mod tests {
         assert!(!pane_shows_model_error(
             "❯ \n~/Development/nucleus | main | Opus 4.8\n⏵⏵ auto mode on (shift+tab to cycle)"
         ));
+    }
+
+    #[test]
+    fn reply_model_error_detection() {
+        // The exact text the 2026-08-24 heartbeat fire posted to WhatsApp as
+        // if it were the deliverable.
+        assert!(reply_is_model_error(
+            "There's an issue with the selected model (claude-fable-5). It may not exist or you may not have access to it. Run /model to pick a different model."
+        ));
+        // Leading/trailing whitespace from the transcript must not hide it.
+        assert!(reply_is_model_error(
+            "\n  Claude Fable 5 is currently unavailable. Please use Opus 4.8 or another available model.  \n"
+        ));
+        // A real answer must never trip it, however model-ish it reads.
+        assert!(!reply_is_model_error(
+            "Switched the default to Opus. Nothing else pins a model."
+        ));
+        // A long answer that quotes the banner is content, not a failure —
+        // this is what a session explaining the incident writes.
+        let quoting = format!(
+            "The fire failed because the pane said \"There's an issue with the selected model \
+             (claude-fable-5). It may not exist or you may not have access to it.\" and the \
+             spawn-time check never saw it. {}",
+            "Detail follows. ".repeat(20)
+        );
+        assert!(quoting.len() > MODEL_ERROR_REPLY_MAX_LEN);
+        assert!(!reply_is_model_error(&quoting));
     }
 
     #[test]
