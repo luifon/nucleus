@@ -116,6 +116,19 @@ const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[
             "ALTER TABLE reminders ADD COLUMN last_alerted_at TEXT",
         ),
     },
+    // Per-reminder watcher timeout. The original hard 5s killed a watcher
+    // that reads the vault: on 2026-08-24 one such watcher (~3.3s warm)
+    // blew past it on one tick and that day's fire was lost, because a
+    // broken watcher advances the cron. NULL = the DEFAULT_CONDITION_TIMEOUT
+    // in main.rs, which is generous enough for a watcher that only shells
+    // out; a watcher that reads files sets its own.
+    nucleus_core::migrate::Migration {
+        version: 4,
+        name: "condition-timeout",
+        step: nucleus_core::migrate::Step::Sql(
+            "ALTER TABLE reminders ADD COLUMN condition_timeout_secs INTEGER",
+        ),
+    },
 ];
 
 fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
@@ -442,6 +455,10 @@ pub struct Reminder {
     /// never evaluated.
     pub condition_state: Option<bool>,
     pub condition_checked_at: Option<String>,
+    /// ADR-024: seconds this reminder's watcher may run before it counts as
+    /// broken. None = the built-in default.
+    #[ts(type = "number | null")]
+    pub condition_timeout_secs: Option<i64>,
     /// Last time an outer-error ⚠ alert was delivered for this reminder
     /// (alert-cooldown dedup; not part of the fire audit trail).
     pub last_alerted_at: Option<String>,
@@ -467,7 +484,8 @@ async fn load_reminder(pool: &SqlitePool, id: i64) -> Result<Option<Reminder>> {
         "SELECT id, title, body, cron, one_shot, status, next_fire_at,
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, condition_cmd, condition_mode,
-                condition_state, condition_checked_at, last_alerted_at
+                condition_state, condition_checked_at, condition_timeout_secs,
+                last_alerted_at
            FROM reminders WHERE id = ?1",
     )
     .bind(id)
@@ -498,6 +516,7 @@ fn row_to_reminder(r: sqlx::sqlite::SqliteRow) -> Reminder {
             .flatten()
             .map(|v| v != 0),
         condition_checked_at: r.try_get::<Option<String>, _>("condition_checked_at").ok().flatten(),
+        condition_timeout_secs: r.try_get::<Option<i64>, _>("condition_timeout_secs").ok().flatten(),
         last_alerted_at: r.try_get::<Option<String>, _>("last_alerted_at").ok().flatten(),
     }
 }
@@ -556,6 +575,8 @@ pub async fn insert_with_channels(
     created_by: &str,
     system_prompt: Option<&str>,
     condition: Option<(&str, &str)>,
+    // Seconds the watcher may run. None = the built-in default.
+    condition_timeout_secs: Option<i64>,
 ) -> Result<i64> {
     if channels.is_empty() {
         bail!("at least one channel is required");
@@ -576,8 +597,8 @@ pub async fn insert_with_channels(
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO reminders
             (title, body, cron, one_shot, status, next_fire_at, created_at, created_by, system_prompt,
-             condition_cmd, condition_mode)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             condition_cmd, condition_mode, condition_timeout_secs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          RETURNING id",
     )
     .bind(title)
@@ -591,6 +612,7 @@ pub async fn insert_with_channels(
     .bind(system_prompt)
     .bind(condition.map(|(cmd, _)| cmd))
     .bind(condition.map(|(_, mode)| mode))
+    .bind(condition_timeout_secs)
     .fetch_one(&mut *tx)
     .await
     .context("insert reminder")?;
@@ -621,7 +643,8 @@ pub async fn list_all(
         "SELECT id, title, body, cron, one_shot, status, next_fire_at,
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, condition_cmd, condition_mode,
-                condition_state, condition_checked_at, last_alerted_at
+                condition_state, condition_checked_at, condition_timeout_secs,
+                last_alerted_at
            FROM reminders WHERE 1=1",
     );
     if !include_fired {
@@ -675,7 +698,8 @@ pub async fn pending_due_with_channels(
         "SELECT id, body, cron, one_shot, status, next_fire_at,
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, title, condition_cmd, condition_mode,
-                condition_state, condition_checked_at, last_alerted_at
+                condition_state, condition_checked_at, condition_timeout_secs,
+                last_alerted_at
            FROM reminders
           WHERE status IN ('active', 'pending')
             AND next_fire_at IS NOT NULL
@@ -1141,6 +1165,7 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
             &channels,
             "system",
             seed.system_prompt,
+            None,
             None,
         )
         .await?;

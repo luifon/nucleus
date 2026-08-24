@@ -15,10 +15,10 @@ Status: accepted + built (2026-07-18)
 >    occurrence is skipped, not fire-late'd); gated ONE-SHOTS stay due
 >    and re-evaluate every tick — "fire as soon as X", which subsumes
 >    the on-exit use case.
-> 3. Broken-watch policy (spawn failure / 5s timeout): recorded as a
->    failure; cron advances to its next match, a one-shot is PAUSED so
->    it can't re-fail every minute forever — the operator fixes the
->    script and resumes.
+> 3. Broken-watch policy (spawn failure / timeout): retried once, then
+>    recorded as a failure; cron advances to its next match, a one-shot
+>    is PAUSED so it can't re-fail every minute forever — the operator
+>    fixes the script and resumes.
 >
 > Verified live through the launchd tick (2026-07-18): a flag-file
 > watcher evaluated false (state recorded, zero fires, one-shot kept
@@ -51,8 +51,9 @@ reminders add --cron "*/5 * * * *" \
 
 Semantics:
 
-- The condition runs at each matching tick, under a hard timeout (5 s) and
-  the tick's file lock. It is a plain executable: **exit 0 = fire**,
+- The condition runs at each matching tick, under a hard timeout (15 s by
+  default, `--condition-timeout` per reminder, 55 s ceiling) and the tick's
+  file lock. It is a plain executable: **exit 0 = fire**,
   non-zero = skip silently (recorded in `reminder_fires` as a `gated` row,
   success-neutral — gating is not failure and must not consume retry
   budget or trigger ⚠ alerts).
@@ -81,8 +82,10 @@ the use case without a new schedule type in the model.
 - `reminder_fires` gains the `gated` outcome; `reminders history` and the
   dashboard DTOs learn to render it (ts-rs regen per Rule 12).
 - New failure mode: a hung condition script must not stall the tick — the
-  5 s timeout kills it and records `condition-timeout` as an error (that
-  one DOES count as a failure, since the watch is broken).
+  timeout kills it and records `condition-timeout` as an error (that one
+  DOES count as a failure, since the watch is broken). A failed evaluation
+  is retried once before that verdict: a cron reminder whose watcher breaks
+  skips the whole occurrence, so one slow tick must not cost a day's fire.
 - The 60 s tick grain bounds condition frequency; that is accepted — this
   is a scheduler refinement, not an event bus (no inotify, no webhooks;
   those stay out per ADR-021's non-goals posture).

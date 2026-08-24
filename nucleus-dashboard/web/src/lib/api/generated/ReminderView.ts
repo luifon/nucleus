@@ -30,6 +30,11 @@ condition_mode: string | null,
  */
 condition_state: boolean | null, condition_checked_at: string | null, 
 /**
+ * ADR-024: seconds this reminder's watcher may run before it counts as
+ * broken. None = the built-in default.
+ */
+condition_timeout_secs: number | null, 
+/**
  * Last time an outer-error ⚠ alert was delivered for this reminder
  * (alert-cooldown dedup; not part of the fire audit trail).
  */

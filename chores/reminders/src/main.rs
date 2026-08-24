@@ -68,16 +68,21 @@ enum Cmd {
         /// back to discord-home if unset).
         #[arg(long, value_delimiter = ',')]
         channels: Vec<String>,
-        /// ADR-024 condition watcher: shell command run (sh -c, 5s timeout)
-        /// at each due tick. Exit 0 = fire; non-zero = skip silently and
-        /// advance (cron) or keep watching every tick (one-shot). Optional
-        /// stdout JSON {"context": "..."} is appended to the fire payload.
+        /// ADR-024 condition watcher: shell command run (sh -c) at each due
+        /// tick. Exit 0 = fire; non-zero = skip silently and advance (cron)
+        /// or keep watching every tick (one-shot). Optional stdout JSON
+        /// {"context": "..."} is appended to the fire payload.
         #[arg(long)]
         condition: Option<String>,
         /// 'while-true' (default): fire on every truthy evaluation.
         /// 'change': fire only on a false→true transition.
         #[arg(long = "condition-mode", requires = "condition")]
         condition_mode: Option<String>,
+        /// Seconds the watcher may run before it counts as broken
+        /// (default: 15). Raise it for a watcher that reads the vault or
+        /// hits the network; leave it alone for one that only shells out.
+        #[arg(long = "condition-timeout", requires = "condition")]
+        condition_timeout: Option<u64>,
     },
     /// Set (or clear with empty string) the title on an existing reminder.
     SetTitle {
@@ -136,7 +141,17 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Add { title, at, cron, body, system_prompt, channels, condition, condition_mode } => {
+        Cmd::Add {
+            title,
+            at,
+            cron,
+            body,
+            system_prompt,
+            channels,
+            condition,
+            condition_mode,
+            condition_timeout,
+        } => {
             add(
                 &settings,
                 &workspace_root,
@@ -148,6 +163,7 @@ async fn main() -> Result<()> {
                 channels,
                 condition.as_deref(),
                 condition_mode.as_deref(),
+                condition_timeout,
             )
             .await
         }
@@ -186,6 +202,7 @@ async fn add(
     channels: Vec<String>,
     condition: Option<&str>,
     condition_mode: Option<&str>,
+    condition_timeout: Option<u64>,
 ) -> Result<()> {
     // ADR-024: validate the watcher args before touching the DB.
     let condition = match (condition, condition_mode) {
@@ -197,6 +214,13 @@ async fn add(
             let mode = mode.unwrap_or("while-true");
             if !matches!(mode, "while-true" | "change") {
                 bail!("--condition-mode must be 'while-true' or 'change', got {mode:?}");
+            }
+            if let Some(t) = condition_timeout {
+                // A tick runs every minute, so a watcher that can outlive one
+                // would stack against the next tick's lock.
+                if t == 0 || t > 55 {
+                    bail!("--condition-timeout must be between 1 and 55 seconds, got {t}");
+                }
             }
             Some((cmd, mode))
         }
@@ -265,6 +289,7 @@ async fn add(
         "user",
         system_prompt_stored.as_deref(),
         condition,
+        condition_timeout.map(|t| t as i64),
     )
     .await?;
     let local = next_fire_at.with_timezone(&Local);
@@ -367,6 +392,11 @@ async fn show(workspace_root: &Path, id: i64) -> Result<()> {
                 None => "never",
             },
             r.condition_checked_at.as_deref().unwrap_or("—"),
+        );
+        println!(
+            "     timeout: {}s{}",
+            r.condition_timeout_secs.unwrap_or(DEFAULT_CONDITION_TIMEOUT_SECS as i64),
+            if r.condition_timeout_secs.is_some() { "" } else { " (default)" },
         );
     }
     println!("  next_fire: {}  (utc: {})",
@@ -548,7 +578,26 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
         // place on the reminder row.
         let mut reminder = reminder;
         if let Some(cmd) = reminder.condition_cmd.clone() {
-            match eval_condition(&cmd).await {
+            let timeout_secs = reminder
+                .condition_timeout_secs
+                .and_then(|s| u64::try_from(s).ok())
+                .filter(|s| *s > 0)
+                .unwrap_or(DEFAULT_CONDITION_TIMEOUT_SECS);
+            // Retry once before writing the watch off. A cron reminder whose
+            // watcher breaks advances to its next match, so a single slow
+            // tick costs a whole day's fire — that is how a 2026-08-24 daily
+            // nudge went missing. A watcher is a cheap subprocess; running it
+            // twice is far cheaper than losing the delivery.
+            let mut eval = eval_condition(&cmd, timeout_secs).await;
+            if let Err(e) = &eval {
+                tracing::warn!(
+                    id = reminder.id,
+                    err = %format!("{e:#}"),
+                    "condition watcher failed; retrying once"
+                );
+                eval = eval_condition(&cmd, timeout_secs).await;
+            }
+            match eval {
                 Ok(eval) => {
                     let prev = reminder.condition_state;
                     store::record_condition_eval(&pool, reminder.id, eval.truthy).await?;
@@ -1253,12 +1302,18 @@ struct CondEval {
     context: Option<String>,
 }
 
-/// Run a condition watcher command (sh -c, hard 5s timeout). Exit 0 =
-/// truthy. Spawn failure or timeout is an Err — a broken watch, distinct
-/// from a false condition.
-async fn eval_condition(cmd: &str) -> Result<CondEval> {
+/// Seconds a condition watcher may run when the reminder doesn't set its
+/// own. The original 5s was tuned for `test -f`-shaped checks and killed
+/// anything that reads real state: on 2026-08-24 a watcher that reads the
+/// vault (~3.3s warm) overran it on one tick and that day's fire was lost.
+const DEFAULT_CONDITION_TIMEOUT_SECS: u64 = 15;
+
+/// Run a condition watcher command (sh -c, hard timeout). Exit 0 = truthy.
+/// Spawn failure or timeout is an Err — a broken watch, distinct from a
+/// false condition.
+async fn eval_condition(cmd: &str, timeout_secs: u64) -> Result<CondEval> {
     let out = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(timeout_secs),
         tokio::process::Command::new("sh")
             .arg("-c")
             .arg(cmd)
@@ -1267,7 +1322,7 @@ async fn eval_condition(cmd: &str) -> Result<CondEval> {
             .output(),
     )
     .await
-    .map_err(|_| anyhow!("timed out after 5s"))?
+    .map_err(|_| anyhow!("timed out after {timeout_secs}s"))?
     .context("spawn failed")?;
     let truthy = out.status.success();
     let context = if truthy {
@@ -1362,7 +1417,7 @@ mod alert_cooldown_tests {
 
 #[cfg(test)]
 mod condition_tests {
-    use super::{condition_should_fire, eval_condition};
+    use super::{DEFAULT_CONDITION_TIMEOUT_SECS, condition_should_fire, eval_condition};
 
     /// A false condition never fires, in any mode, whatever the history.
     #[test]
@@ -1396,15 +1451,30 @@ mod condition_tests {
 
     #[tokio::test]
     async fn eval_condition_truthiness_and_context() {
-        assert!(eval_condition("true").await.unwrap().truthy);
-        assert!(!eval_condition("false").await.unwrap().truthy);
+        let t = DEFAULT_CONDITION_TIMEOUT_SECS;
+        assert!(eval_condition("true", t).await.unwrap().truthy);
+        assert!(!eval_condition("false", t).await.unwrap().truthy);
         // context comes only from valid JSON stdout on truthy exits
-        let e = eval_condition(r#"echo '{"context":"queue depth 14"}'"#).await.unwrap();
+        let e = eval_condition(r#"echo '{"context":"queue depth 14"}'"#, t).await.unwrap();
         assert_eq!(e.context.as_deref(), Some("queue depth 14"));
-        let e = eval_condition("echo not-json").await.unwrap();
+        let e = eval_condition("echo not-json", t).await.unwrap();
         assert!(e.truthy && e.context.is_none());
         // a hung watcher is an Err (broken watch), not a false condition
-        assert!(eval_condition("sleep 10").await.is_err());
+        assert!(eval_condition("sleep 10", 1).await.is_err());
+    }
+
+    /// The 2026-08-24 regression: a watcher that reads real state took ~3.3s
+    /// warm and the hard 5s ceiling killed it on one tick, losing that day's
+    /// fire. The default has to clear a watcher of that shape comfortably.
+    #[tokio::test]
+    async fn default_condition_timeout_clears_a_slow_watcher() {
+        assert!(DEFAULT_CONDITION_TIMEOUT_SECS >= 15);
+        assert!(
+            eval_condition("sleep 4 && true", DEFAULT_CONDITION_TIMEOUT_SECS)
+                .await
+                .unwrap()
+                .truthy
+        );
     }
 }
 
