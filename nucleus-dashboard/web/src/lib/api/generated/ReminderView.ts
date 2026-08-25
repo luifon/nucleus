@@ -38,4 +38,9 @@ condition_timeout_secs: number | null,
  * Last time an outer-error ⚠ alert was delivered for this reminder
  * (alert-cooldown dedup; not part of the fire audit trail).
  */
-last_alerted_at: string | null, };
+last_alerted_at: string | null, 
+/**
+ * Consecutive failed occurrences, reset to 0 on any success. Drives
+ * the escalating alert gate so a long outage can't go quiet.
+ */
+consecutive_failures: number, };

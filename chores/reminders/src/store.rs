@@ -129,6 +129,19 @@ const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[
             "ALTER TABLE reminders ADD COLUMN condition_timeout_secs INTEGER",
         ),
     },
+    // Failure-streak counter behind the escalating alert gate. The v3
+    // cooldown dedups by TIME alone, so a reminder that keeps failing goes
+    // quiet after its first ⚠: on 2026-08-24 twelve consecutive heartbeat
+    // failures produced one message and then 85 minutes of silence, while
+    // the reminder whose job is to report trouble was the broken one.
+    // Counts consecutive failed occurrences; reset to 0 on any success.
+    nucleus_core::migrate::Migration {
+        version: 5,
+        name: "failure-streak",
+        step: nucleus_core::migrate::Step::Sql(
+            "ALTER TABLE reminders ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+        ),
+    },
 ];
 
 fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
@@ -462,6 +475,10 @@ pub struct Reminder {
     /// Last time an outer-error ⚠ alert was delivered for this reminder
     /// (alert-cooldown dedup; not part of the fire audit trail).
     pub last_alerted_at: Option<String>,
+    /// Consecutive failed occurrences, reset to 0 on any success. Drives
+    /// the escalating alert gate so a long outage can't go quiet.
+    #[ts(type = "number")]
+    pub consecutive_failures: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
@@ -485,7 +502,7 @@ async fn load_reminder(pool: &SqlitePool, id: i64) -> Result<Option<Reminder>> {
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, condition_cmd, condition_mode,
                 condition_state, condition_checked_at, condition_timeout_secs,
-                last_alerted_at
+                last_alerted_at, consecutive_failures
            FROM reminders WHERE id = ?1",
     )
     .bind(id)
@@ -518,6 +535,7 @@ fn row_to_reminder(r: sqlx::sqlite::SqliteRow) -> Reminder {
         condition_checked_at: r.try_get::<Option<String>, _>("condition_checked_at").ok().flatten(),
         condition_timeout_secs: r.try_get::<Option<i64>, _>("condition_timeout_secs").ok().flatten(),
         last_alerted_at: r.try_get::<Option<String>, _>("last_alerted_at").ok().flatten(),
+        consecutive_failures: r.try_get::<i64, _>("consecutive_failures").unwrap_or(0),
     }
 }
 
@@ -644,7 +662,7 @@ pub async fn list_all(
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, condition_cmd, condition_mode,
                 condition_state, condition_checked_at, condition_timeout_secs,
-                last_alerted_at
+                last_alerted_at, consecutive_failures
            FROM reminders WHERE 1=1",
     );
     if !include_fired {
@@ -699,7 +717,7 @@ pub async fn pending_due_with_channels(
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, title, condition_cmd, condition_mode,
                 condition_state, condition_checked_at, condition_timeout_secs,
-                last_alerted_at
+                last_alerted_at, consecutive_failures
            FROM reminders
           WHERE status IN ('active', 'pending')
             AND next_fire_at IS NOT NULL
@@ -846,6 +864,31 @@ pub async fn record_channel_fire(
 pub async fn record_alerted(pool: &SqlitePool, reminder_id: i64) -> Result<()> {
     sqlx::query("UPDATE reminders SET last_alerted_at = ?1 WHERE id = ?2")
         .bind(Utc::now().to_rfc3339())
+        .bind(reminder_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Count this occurrence as a failure and return the new streak length.
+/// Called once per failed fire, not once per channel.
+pub async fn bump_failure_streak(pool: &SqlitePool, reminder_id: i64) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "UPDATE reminders
+            SET consecutive_failures = consecutive_failures + 1
+          WHERE id = ?1
+      RETURNING consecutive_failures",
+    )
+    .bind(reminder_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Clear the streak after a successful fire, so the next outage starts
+/// its alert ladder from the top.
+pub async fn clear_failure_streak(pool: &SqlitePool, reminder_id: i64) -> Result<()> {
+    sqlx::query("UPDATE reminders SET consecutive_failures = 0 WHERE id = ?1")
         .bind(reminder_id)
         .execute(pool)
         .await?;

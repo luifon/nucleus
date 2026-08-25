@@ -679,6 +679,7 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                         )
                         .await?;
                     }
+                    let _ = store::clear_failure_streak(&pool, reminder.id).await;
                     let _ = diary::record_observation(
                         workspace_root,
                         AGENT_NAME,
@@ -752,6 +753,7 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                         )
                         .await?;
                     }
+                    let _ = store::clear_failure_streak(&pool, reminder.id).await;
                     let _ = diary::record_observation(
                         workspace_root,
                         AGENT_NAME,
@@ -786,16 +788,27 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                     // with #47, 2026-07-18). Alert only the channels this
                     // failure exhausts; record every failure regardless.
                     let cooled = alert_cooldown_active(reminder.last_alerted_at.as_deref(), fired_at);
+                    // Count the occurrence once, before the per-channel loop.
+                    let streak = store::bump_failure_streak(&pool, reminder.id)
+                        .await
+                        .unwrap_or(0);
+                    // The cooldown alone went silent for 85 minutes while the
+                    // heartbeat was down (2026-08-24). A streak on the ladder
+                    // alerts even inside the cooldown window, so a long outage
+                    // keeps reporting itself at a widening interval.
+                    let escalating = alert_on_streak(streak);
                     let mut alerted = false;
                     for ch in &channels {
                         let attempt = ch.attempts + 1;
-                        if alert_on_this_attempt(ch.attempts) && !cooled {
+                        if alert_on_this_attempt(ch.attempts) && (!cooled || escalating) {
                             let alert_reminder = store::Reminder {
                                 body: format!(
-                                    "⚠️ Reminder #{} fire failed (attempt {}/{}, giving up): {}",
+                                    "⚠️ Reminder #{} fire failed (attempt {}/{}, giving up; \
+                                     {} in a row): {}",
                                     reminder.id,
                                     attempt,
                                     store::MAX_ATTEMPTS,
+                                    streak,
                                     truncate(&err, 200)
                                 ),
                                 ..reminder.clone()
@@ -1375,6 +1388,13 @@ fn alert_on_this_attempt(prior_attempts: i64) -> bool {
 /// are all still recorded in reminder_fires either way.
 const ALERT_COOLDOWN_SECS: i64 = 2 * 60 * 60;
 
+/// Alert ladder for a run of consecutive failures: 1, 2, 4, 8, 16, ...
+/// A streak on the ladder overrides the cooldown. Doubling keeps a long
+/// outage audible without sending one message per occurrence.
+fn alert_on_streak(streak: i64) -> bool {
+    streak > 0 && (streak & (streak - 1)) == 0
+}
+
 fn alert_cooldown_active(last_alerted_at: Option<&str>, now: DateTime<Utc>) -> bool {
     let Some(prev) = last_alerted_at.and_then(|s| DateTime::parse_from_rfc3339(s).ok()) else {
         return false;
@@ -1475,6 +1495,29 @@ mod condition_tests {
                 .unwrap()
                 .truthy
         );
+    }
+}
+
+#[cfg(test)]
+mod alert_streak_tests {
+    use super::alert_on_streak;
+
+    /// A run of failures stays audible at a widening interval instead of
+    /// going quiet after the first ⚠ (2026-08-24: 12 failures, 1 message).
+    #[test]
+    fn ladder_doubles() {
+        for s in [1, 2, 4, 8, 16, 32, 64] {
+            assert!(alert_on_streak(s), "streak {s} must alert");
+        }
+        for s in [3, 5, 6, 7, 9, 12, 31, 33] {
+            assert!(!alert_on_streak(s), "streak {s} must stay quiet");
+        }
+    }
+
+    /// No streak means no escalation, so the cooldown still governs.
+    #[test]
+    fn zero_never_alerts() {
+        assert!(!alert_on_streak(0));
     }
 }
 
