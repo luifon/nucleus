@@ -616,10 +616,15 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                     if let Some(ctx) = eval.context {
                         // Hand the watcher's evidence to the fire so the
                         // session doesn't re-derive it.
-                        let suffix = format!("\n\n[condition context] {ctx}");
+                        //
+                        // A skill-fire needs the label: the spawned session
+                        // reads the text as evidence rather than as part of
+                        // its instructions. A --body reminder goes straight
+                        // to the operator, where the label is noise, so the
+                        // context is appended bare.
                         match reminder.system_prompt.as_mut() {
-                            Some(sp) => sp.push_str(&suffix),
-                            None => reminder.body.push_str(&suffix),
+                            Some(sp) => sp.push_str(&format!("\n\n[condition context] {ctx}")),
+                            None => reminder.body.push_str(&format!("\n\n{ctx}")),
                         }
                     }
                 }
