@@ -117,9 +117,9 @@ async fn review(
         format!("reviewed {venue} ({} turns): {}", turns.len(), truncate(&reply, 240))
     } else {
         format!(
-            "reviewed {venue}: quarantined {} malformed skill(s): {}",
-            quarantined.len(),
-            quarantined.join(", ")
+            "reviewed {venue}: gate quarantined [{}] flagged [{}]",
+            quarantined.quarantined.join(", "),
+            quarantined.flagged.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
         )
     };
     let ctx = match chat_key {
@@ -132,12 +132,39 @@ async fn review(
 }
 
 /// Validate every SKILL.md under `root` modified since `since`; move any that
-/// fail to `<root>/.rejected/<name>-<ts>/`. Returns the names quarantined.
-fn gate_touched_skills(root: &Path, since: SystemTime) -> Result<Vec<String>> {
-    let mut quarantined = Vec::new();
+/// fail to `<root>/.rejected/<name>-<ts>/`. Returns what the gate did.
+///
+/// Only skills this agent authored (`created_by: agent`) are ever moved.
+/// A hand-written skill is reported and left alone: the format contract
+/// exists to police autonomous writes, and an operator skill never agreed
+/// to it. On 2026-08-28 the curator made a cosmetic frontmatter fix to a
+/// hand-written skill, that touch made it eligible for the gate, and a missing
+/// `# Steps` heading moved the whole directory out of the library — taking
+/// the script a reminder depended on with it.
+#[derive(Default)]
+struct GateOutcome {
+    /// Agent-authored skills moved to `.rejected/`.
+    quarantined: Vec<String>,
+    /// Hand-written skills that fail the contract, left in place.
+    flagged: Vec<(String, Vec<String>)>,
+}
+
+impl GateOutcome {
+    fn is_empty(&self) -> bool {
+        self.quarantined.is_empty() && self.flagged.is_empty()
+    }
+    fn names(&self) -> Vec<String> {
+        let mut v = self.quarantined.clone();
+        v.extend(self.flagged.iter().map(|(n, _)| n.clone()));
+        v
+    }
+}
+
+fn gate_touched_skills(root: &Path, since: SystemTime) -> Result<GateOutcome> {
+    let mut outcome = GateOutcome::default();
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
-        Err(_) => return Ok(quarantined),
+        Err(_) => return Ok(outcome),
     };
     for dirent in entries.flatten() {
         let dir = dirent.path();
@@ -159,6 +186,14 @@ fn gate_touched_skills(root: &Path, since: SystemTime) -> Result<Vec<String>> {
         if issues.is_empty() {
             continue;
         }
+        // Same ownership rule as apply_auto_transitions: only auto-manage
+        // what this agent wrote, and never touch a pinned skill.
+        let fm = skills::parse_frontmatter(&content, &skill_md).unwrap_or_default();
+        if fm.created_by.as_deref() != Some("agent") || fm.pinned {
+            tracing::warn!("review: `{name}` fails the contract but is hand-written — left in place ({issues:?})");
+            outcome.flagged.push((name, issues));
+            continue;
+        }
         // Quarantine.
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
         let rejected = root.join(".rejected").join(format!("{name}-{ts}"));
@@ -168,12 +203,68 @@ fn gate_touched_skills(root: &Path, since: SystemTime) -> Result<Vec<String>> {
         match std::fs::rename(&dir, &rejected) {
             Ok(_) => {
                 tracing::warn!("review: quarantined `{name}` → {} ({:?})", rejected.display(), issues);
-                quarantined.push(name);
+                outcome.quarantined.push(name);
             }
             Err(e) => tracing::warn!("review: failed to quarantine `{name}`: {e}"),
         }
     }
-    Ok(quarantined)
+    Ok(outcome)
+}
+
+/// Tell the operator that the gate touched his library.
+///
+/// A quarantine removes a skill from the live tree, and anything depending
+/// on that directory breaks with it — a reminder's condition watcher, a
+/// script another skill shells out to. Before 2026-08-28 this was recorded
+/// only in the diary and the log, so the first sign was a reminder that
+/// stopped arriving. Delivery goes through the `reminders` binary so it
+/// reuses the channel fan-out and the per-channel retry.
+async fn alert_gate(workspace_root: &Path, outcome: &GateOutcome) {
+    if outcome.is_empty() {
+        return;
+    }
+    let mut lines = Vec::new();
+    for name in &outcome.quarantined {
+        lines.push(format!(
+            "• `{name}` moved to .rejected/ — anything pointing at that directory is now broken"
+        ));
+    }
+    for (name, issues) in &outcome.flagged {
+        lines.push(format!("• `{name}` fails the SKILL.md contract ({}) — left in place", issues.join("; ")));
+    }
+    let body = format!("⚠️ skill-gap-learner touched the skill library\n\n{}", lines.join("\n"));
+
+    let bin = workspace_root.join("target/release/reminders");
+    if !bin.exists() {
+        tracing::warn!("gate alert: {} missing — alert not delivered", bin.display());
+        return;
+    }
+    let at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string();
+    let out = tokio::process::Command::new(&bin)
+        .current_dir(workspace_root)
+        .args([
+            "add",
+            "--at",
+            &at,
+            "--title",
+            "skill gate",
+            "--body",
+            &body,
+            "--channels",
+            "discord-home,whatsapp-dm",
+        ])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            tracing::info!("gate alert queued for {}", outcome.names().join(", "))
+        }
+        Ok(o) => tracing::warn!(
+            "gate alert failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("gate alert spawn failed: {e}"),
+    }
 }
 
 fn render_conversation(turns: &[nucleus_core::claude_session::Turn]) -> String {
@@ -290,7 +381,7 @@ async fn run_skill_session(
     operator_root: &Path,
     window: &str,
     prompt: &str,
-) -> Result<(String, Vec<String>)> {
+) -> Result<(String, GateOutcome)> {
     let started = SystemTime::now();
     let outcome = SessionProfile::one_shot_agentic(&ProfileContext {
         workspace_root,
@@ -303,8 +394,9 @@ async fn run_skill_session(
     .run_one_shot(prompt)
     .await
     .with_context(|| format!("skill session ({window})"))?;
-    let quarantined = gate_touched_skills(operator_root, started)?;
-    Ok((outcome.reply, quarantined))
+    let gate = gate_touched_skills(operator_root, started)?;
+    alert_gate(workspace_root, &gate).await;
+    Ok((outcome.reply, gate))
 }
 
 // ── periodic arm: gap detection + curator ──────────────────────────────────
@@ -338,7 +430,7 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
             run_skill_session(workspace_root, settings, &operator_root, "gap", &prompt).await?;
         gap_summary = truncate(&reply, 200);
         if !q.is_empty() {
-            gap_summary = format!("{gap_summary} (quarantined: {})", q.join(", "));
+            gap_summary = format!("{gap_summary} (gate: {})", q.names().join(", "));
         }
     }
 
@@ -351,7 +443,7 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
             run_skill_session(workspace_root, settings, &operator_root, "curate", &prompt).await?;
         let mut s = truncate(&reply, 200);
         if !q.is_empty() {
-            s = format!("{s} (quarantined: {})", q.join(", "));
+            s = format!("{s} (gate: {})", q.names().join(", "));
         }
         s
     };

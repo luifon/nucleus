@@ -643,6 +643,38 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                         store::FireOutcome { success: false, msg_id: None, error: Some(&err) },
                     )
                     .await?;
+                    // A broken watcher silences the reminder for as long as it
+                    // stays broken, so the operator has to hear about it. Same
+                    // escalating ladder as a failed fire: 1st, 2nd, 4th, 8th
+                    // occurrence in a row, overriding the cooldown.
+                    let streak = store::bump_failure_streak(&pool, reminder.id)
+                        .await
+                        .unwrap_or(0);
+                    let cooled =
+                        alert_cooldown_active(reminder.last_alerted_at.as_deref(), fired_at);
+                    if alert_on_streak(streak) || !cooled {
+                        let alert_reminder = store::Reminder {
+                            body: format!(
+                                "⚠️ Reminder #{} watcher broken ({} in a row) — the reminder is \
+                                 not firing: {}",
+                                reminder.id,
+                                streak,
+                                truncate(&err, 200)
+                            ),
+                            ..reminder.clone()
+                        };
+                        for ch in &channels {
+                            let _ = deliver(
+                                settings,
+                                workspace_root,
+                                &mention,
+                                &alert_reminder,
+                                &ch.channel,
+                            )
+                            .await;
+                        }
+                        let _ = store::record_alerted(&pool, reminder.id).await;
+                    }
                     if reminder.one_shot {
                         let _ = store::pause(&pool, reminder.id, None).await;
                     } else if let Err(e) = store::advance_after_gate(&pool, reminder.id).await {
@@ -1326,9 +1358,30 @@ struct CondEval {
 /// vault (~3.3s warm) overran it on one tick and that day's fire was lost.
 const DEFAULT_CONDITION_TIMEOUT_SECS: u64 = 15;
 
+/// Decide whether a non-zero watcher exit means "condition is false" or
+/// "this watcher is broken".
+///
+/// The contract: a watcher that means FALSE exits non-zero and stays silent
+/// on stderr, which is how `test`, `grep -q` and every shell predicate
+/// already behave. Anything that writes a diagnostic, or that the shell
+/// could not execute at all, is a broken watch.
+///
+/// Without this split a watcher whose script was deleted, whose auth
+/// expired, or that crashed reads as a plain "false" and the reminder skips
+/// its occurrence in silence. That is how the MBA nudge vanished on
+/// 2026-08-28: the skill directory had been moved, node exited 1 with a
+/// stack trace on stderr, and the tick gated as if nothing were due.
+fn watcher_is_broken(code: Option<i32>, stderr: &str) -> bool {
+    // 126 = found but not executable, 127 = not found. Neither is a verdict.
+    if matches!(code, Some(126) | Some(127)) {
+        return true;
+    }
+    !stderr.trim().is_empty()
+}
+
 /// Run a condition watcher command (sh -c, hard timeout). Exit 0 = truthy.
-/// Spawn failure or timeout is an Err — a broken watch, distinct from a
-/// false condition.
+/// Spawn failure, timeout, and a broken watch are all Err — distinct from a
+/// false condition, which is a silent non-zero exit.
 async fn eval_condition(cmd: &str, timeout_secs: u64) -> Result<CondEval> {
     let out = tokio::time::timeout(
         Duration::from_secs(timeout_secs),
@@ -1343,6 +1396,16 @@ async fn eval_condition(cmd: &str, timeout_secs: u64) -> Result<CondEval> {
     .map_err(|_| anyhow!("timed out after {timeout_secs}s"))?
     .context("spawn failed")?;
     let truthy = out.status.success();
+    if !truthy {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if watcher_is_broken(out.status.code(), &stderr) {
+            bail!(
+                "watcher exited {} with diagnostics: {}",
+                out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                truncate(stderr.trim(), 200)
+            );
+        }
+    }
     let context = if truthy {
         serde_json::from_slice::<serde_json::Value>(&out.stdout)
             .ok()
@@ -1486,6 +1549,29 @@ mod condition_tests {
         assert!(e.truthy && e.context.is_none());
         // a hung watcher is an Err (broken watch), not a false condition
         assert!(eval_condition("sleep 10", 1).await.is_err());
+    }
+
+    /// A watcher that means FALSE exits non-zero and says nothing. One that
+    /// crashed, could not be found, or failed to authenticate writes to
+    /// stderr, and must not be mistaken for a verdict (2026-08-28: a deleted
+    /// script made node exit 1 with a stack trace and the fire was skipped).
+    #[tokio::test]
+    async fn broken_watcher_is_not_a_false_condition() {
+        let t = DEFAULT_CONDITION_TIMEOUT_SECS;
+        // Silent non-zero = a real "do not fire".
+        assert!(!eval_condition("exit 1", t).await.unwrap().truthy);
+        assert!(!eval_condition("test -f /nope/definitely/missing", t).await.unwrap().truthy);
+        // Noisy non-zero = broken watch.
+        assert!(eval_condition("echo boom >&2; exit 1", t).await.is_err());
+        // Missing interpreter or script: the shell reports 127.
+        assert!(eval_condition("definitely-not-a-real-binary-xyz", t).await.is_err());
+        // A node script that does not exist exits 1 with a stack trace —
+        // the exact shape that silently killed the MBA nudge.
+        assert!(eval_condition("node /nope/missing.mjs", t).await.is_err());
+        // Success still parses its context.
+        let ok = eval_condition(r#"echo '{"context":"tudo certo"}'"#, t).await.unwrap();
+        assert!(ok.truthy);
+        assert_eq!(ok.context.as_deref(), Some("tudo certo"));
     }
 
     /// The 2026-08-24 regression: a watcher that reads real state took ~3.3s
