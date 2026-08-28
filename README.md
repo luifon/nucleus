@@ -52,7 +52,6 @@ brain is your existing Claude subscription — no separate API billing.
    whisper.cpp)  │  - memory (Tier 2 promote/read)              │
                  │  - diary (Tier 1.5 per-agent journals)       │
                  │  - health::{Check,Registry}                  │
-                 │  - mem0 client (Tier 4, deferred)            │
                  └──────────────────────────────────────────────┘
 ```
 
@@ -285,7 +284,6 @@ DISCORD_HOME_CHANNEL_ID=...
 DISCORD_ALLOWED_USER_IDS=...     # comma-separated, your Discord user ID(s)
 WHATSAPP_ALLOWED_GROUP_NAMES=Alfred
 WHATSAPP_BRAINDUMP_GROUP_NAMES="Brain Dump"
-MEM0_USER_ID=you
 ```
 
 Values with spaces must be quoted (`"Brain Dump"`) so the install.sh
@@ -335,7 +333,6 @@ Four tiers, each with a clear lifetime:
 | **T1.5** Diaries | `memory/diaries/<agent>/YYYY-MM-DD.md` | 7-day rolling | Distiller |
 | **T2** Shared facts | `$NUCLEUS_TIER2_DIR/*.md` | Auto-loaded into every `claude` session | All Claude spawns |
 | **T3** Second brain | `~/Documents/Obsidian/{0-Inbox, 1-Main-Notes, 2-Daily-Notes, 3-Projects, 4-Areas, 5-Resources, 6-Slipbox, 7-Archives}/` | Forever | User browses; bots read via `--add-dir` and write via the multi-op brain-dump pipeline (see ADR-005) |
-| **T4** mem0 vector | `tools/mem0/docker-compose.yaml` (kept idle) | Deferred indefinitely | mem0 needs embedding + LLM provider, neither covered by Claude Max — T3 covers the role |
 
 Distillation pipeline (`chores/distiller`) runs as one daily 4am pass
 (extract → judge, emitting PROMOTE / MERGE / ARCHIVE / DROP operations

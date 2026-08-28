@@ -41,8 +41,8 @@ TIER 4   — Vector recall              ❌ deferred indefinitely
             Claude Max. T3 (PARA-Obsidian + Claude reading via --add-dir)
             handles long-tail recall instead — Claude navigates the vault
             semantically through filenames + frontmatter, no embeddings
-            required. The mem0 docker stack is kept idle in
-            tools/mem0/docker-compose.yaml in case we ever revisit.
+            required. The docker stack was DELETED on 2026-08-28 (see
+            the Tier 4 section).
 ```
 
 ## Why Tier 2 lives at that path
@@ -66,6 +66,15 @@ Three layers:
 3. **Distiller** — hourly metabolism + weekly contemplation passes (`chores/distiller`) read agent diaries, ask Claude to extract candidates, then promote/merge/archive/drop against Tier 2. Catches what the in-the-moment promotion missed. See ADR-004.
 
 ## mem0 (Tier 4)
+
+**Removed 2026-08-28.** The stack was kept idle for months and its API
+container crash-looped the whole time: its Postgres died, the container could
+not resolve the host, and `restart: on-failure` respawned it forever. That
+loop was a standing CPU cost on the operator's machine and contributed to a
+day of reminder failures, because a saturated machine makes the tmux-hosted
+Claude TUI too slow to drive. Containers, volumes, images, the compose file
+and the Rust client are gone. The reasoning below stands as the record of why
+Tier 4 was never wired.
 
 **Deferred indefinitely.** mem0's architecture assumes an OpenAI-shaped split — an embedding model for vector retrieval AND an LLM for entity/relation extraction. Neither is covered by the Claude Max subscription that powers Nucleus, so wiring mem0 would re-introduce exactly the per-call API billing we removed when we ditched DeepSeek.
 

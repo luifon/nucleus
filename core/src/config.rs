@@ -43,7 +43,6 @@ pub struct Identity {
     pub user_name: String,
     pub workspace_root: PathBuf,
     pub tier2_dir: PathBuf,
-    pub mem0_user_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -281,7 +280,6 @@ impl Settings {
             user_name: env_required("NUCLEUS_USER_NAME")?,
             workspace_root: PathBuf::from(env_required("NUCLEUS_WORKSPACE_ROOT")?),
             tier2_dir: PathBuf::from(env_required("NUCLEUS_TIER2_DIR")?),
-            mem0_user_id: std::env::var("MEM0_USER_ID").unwrap_or_else(|_| "user".into()),
         };
 
         let discord = DiscordConfig {
@@ -521,7 +519,6 @@ mod persona_tests {
             user_name: "Alice".into(),
             workspace_root: workspace.to_path_buf(),
             tier2_dir: workspace.to_path_buf(),
-            mem0_user_id: "test".into(),
         }
     }
 
