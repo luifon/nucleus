@@ -73,7 +73,10 @@ fn base_spawn(ctx: &ProfileContext) -> SpawnOptions {
         add_dirs: vec![],
         tmux_session: ctx.tmux_session.to_string(),
         window_name: None,
-        ready_timeout: Duration::from_secs(20),
+        // Covers process start AND every stdio MCP server coming up. 20s was
+        // enough until an npx-launched server had to fetch on a cold cache and
+        // three fires in a row died with "TUI did not become ready".
+        ready_timeout: Duration::from_secs(60),
         resume_session_id: None,
         agent_label: Some(ctx.agent_label.to_string()),
     }

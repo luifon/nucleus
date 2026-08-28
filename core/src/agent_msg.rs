@@ -197,7 +197,7 @@ pub async fn send(opts: SendOpts) -> Result<SendReport> {
     // which transcript recorded our header.
     let send_started = std::time::SystemTime::now();
 
-    if let Err(e) = paste_and_submit_verified(&opts.to, &payload).await {
+    if let Err(e) = paste_and_submit_verified(&opts.to, &payload, None).await {
         record(
             &pool,
             &at,

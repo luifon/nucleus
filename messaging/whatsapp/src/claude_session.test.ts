@@ -15,6 +15,7 @@ import {
   extractLastAssistantText,
   lastPromptRow,
   draftFragment,
+  draftFragments,
   draftStuck,
   waitForDraftGone,
   splitRotationReply,
@@ -286,7 +287,8 @@ test("draftFragment matches the shared submit-verify vectors", () => {
 test("draftStuck matches the shared submit-verify vectors", () => {
   assert.ok(VECTORS.draft_stuck.length > 0);
   for (const c of VECTORS.draft_stuck) {
-    assert.equal(draftStuck(c.pane, c.fragment), c.expect, `vector: ${c.name}`);
+    // The shared vectors are single-line drafts, where head === tail.
+    assert.equal(draftStuck(c.pane, c.fragment, c.fragment), c.expect, `vector: ${c.name}`);
   }
 });
 
@@ -304,12 +306,22 @@ test("waitForDraftGone detects a stuck draft, then a cleared live row", async ()
     await tmux(["send-keys", "-t", target, "-l", "❯ remind me tomorrow at 9am"]);
     await new Promise((r) => setTimeout(r, 200));
 
-    const stuck = await waitForDraftGone(target, "remind me tomorrow at 9", 900);
+    const stuck = await waitForDraftGone(
+      target,
+      "remind me tomorrow at 9",
+      "remind me tomorrow at 9",
+      900,
+    );
     assert.equal(stuck, false, "draft on the live row must report NOT gone");
 
     await tmux(["send-keys", "-t", target, "Enter"]);
     await tmux(["send-keys", "-t", target, "-l", "❯ "]);
-    const gone = await waitForDraftGone(target, "remind me tomorrow at 9", 5000);
+    const gone = await waitForDraftGone(
+      target,
+      "remind me tomorrow at 9",
+      "remind me tomorrow at 9",
+      5000,
+    );
     assert.equal(gone, true, "cleared live row must report gone");
   } finally {
     await tmuxKill(session);
@@ -335,4 +347,38 @@ test("splitRotationReply matches the shared rotation-reply vectors", () => {
     assert.equal(summary, c.expect_summary, `summary vector: ${c.name}`);
     assert.equal(durable, c.expect_durable, `durable vector: ${c.name}`);
   }
+});
+
+// Mirror of core's tall_draft_is_detected_by_its_tail. A payload taller than
+// the input box scrolls its FIRST line out of view, so head-only matching
+// reported "submit landed" while the prompt sat unsent (2026-08-28).
+test("draftStuck catches a tall draft by its tail", () => {
+  const pane = [
+    "────────────────────────────────────────",
+    "❯ mutations. Before reporting, read today's reminders diary",
+    "  (memory/diaries/reminders/) for what earlier heartbeats already flagged:",
+    "  exactly: HEARTBEAT_OK",
+    "",
+    "────────────────────────────────────────",
+    "  ~/Development/nucleus  |   main",
+  ].join("\n");
+  const content = [
+    "[context: today is 2026-08-28 (Fri), local 12:44 -03:00]",
+    "Heartbeat sweep. Read the checklist and check each item cheaply — no",
+    "mutations. Before reporting, read today's reminders diary",
+    "exactly: HEARTBEAT_OK",
+  ].join("\n");
+  const { head, tail } = draftFragments(content);
+  assert.ok(!pane.includes(head), "head never reaches the screen on a tall draft");
+  assert.equal(draftStuck(pane, head, tail), true, "tall draft must read as stuck");
+
+  const sent = [
+    "  exactly: HEARTBEAT_OK",
+    "· Gallivanting… (3s)",
+    "────────────────────────────────────────",
+    "❯",
+    "────────────────────────────────────────",
+    "  ~/Development/nucleus  |   main",
+  ].join("\n");
+  assert.equal(draftStuck(sent, head, tail), false, "cleared row must read as sent");
 });

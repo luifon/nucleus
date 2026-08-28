@@ -813,11 +813,11 @@ async function pasteAndSend(target: string, content: string): Promise<void> {
       await waitForInputSettled(target, 250, 10_000);
     },
   ];
-  const fragment = draftFragment(content);
+  const { head, tail } = draftFragments(content);
   for (const recover of recoveries) {
     await recover();
     await tmux(["send-keys", "-t", target, "Enter"]);
-    if (await waitForDraftGone(target, fragment, 2_500)) return;
+    if (await waitForDraftGone(target, head, tail, 2_500)) return;
   }
   throw new WedgedInputError(target, recoveries.length);
 }
@@ -828,8 +828,23 @@ async function pasteAndSend(target: string, content: string): Promise<void> {
  *  matters: a naive "input row not empty → press Enter again" would auto-
  *  accept the default option of a permission dialog. */
 export function draftFragment(content: string): string {
-  const first = content.split("\n").find((l) => l.trim().length > 0) ?? "";
-  return first.trim().slice(0, 24);
+  return draftFragments(content).head;
+}
+
+/** Head and tail markers for the pasted content.
+ *
+ *  The input box is a few rows tall, so a long payload scrolls and only its
+ *  TAIL stays on screen — the first line is never visible. Matching the head
+ *  alone made the verifier read every tall paste as "submit landed", so a
+ *  wedged session sat with the prompt unsent and `ask` waited out its full
+ *  timeout with no signal (2026-08-28). Matching either end covers the short
+ *  and the tall shape. Mirror of core's draft_fragments. */
+export function draftFragments(content: string): { head: string; tail: string } {
+  const lines = content.split("\n").filter((l) => l.trim().length > 0);
+  const take24 = (s: string) => s.trim().slice(0, 24);
+  const head = lines.length ? take24(lines[0]) : "";
+  const tail = lines.length ? take24(lines[lines.length - 1]) : head;
+  return { head, tail };
 }
 
 /** Text after the LAST ❯ glyph on screen (trimmed), or null when no ❯ row is
@@ -854,12 +869,22 @@ export function lastPromptRow(pane: string): string | null {
  *  recovery ladder from pressing Enter into a permission picker. Mirror of
  *  core/src/claude_session.rs::draft_stuck; shared vectors in
  *  core/testdata/submit_verify_vectors.json. */
-export function draftStuck(pane: string, fragment: string): boolean {
-  const row = lastPromptRow(pane);
-  return (
-    row !== null &&
-    ((fragment.length > 0 && row.startsWith(fragment)) || row.startsWith("[Pasted text"))
-  );
+export function liveInputRegion(pane: string): string | null {
+  const lines = pane.split("\n");
+  let idx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trimStart().startsWith("❯")) idx = i;
+  }
+  if (idx < 0) return null;
+  const head = lines[idx].trimStart().slice(1).trim();
+  return [head, ...lines.slice(idx + 1).map((l) => l.trim())].join("\n");
+}
+
+export function draftStuck(pane: string, head: string, tail: string): boolean {
+  const region = liveInputRegion(pane);
+  if (region === null) return false;
+  if (region.includes("[Pasted text")) return true;
+  return (head.length > 0 && region.includes(head)) || (tail.length > 0 && region.includes(tail));
 }
 
 /** Poll until the LIVE INPUT ROW no longer carries the draft fragment —
@@ -867,7 +892,8 @@ export function draftStuck(pane: string, fragment: string): boolean {
  *  draft is still sitting unsent in the input. */
 export async function waitForDraftGone(
   target: string,
-  fragment: string,
+  head: string,
+  tail: string,
   deadlineMs: number,
 ): Promise<boolean> {
   const start = Date.now();
@@ -876,7 +902,7 @@ export async function waitForDraftGone(
       stdout: "",
       stderr: "",
     }));
-    if (stdout && !draftStuck(stdout, fragment)) return true;
+    if (stdout && !draftStuck(stdout, head, tail)) return true;
     await sleep(150);
   }
   return false;
