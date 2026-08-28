@@ -872,7 +872,22 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                     let mut alerted = false;
                     for ch in &channels {
                         let attempt = ch.attempts + 1;
-                        if alert_on_this_attempt(ch.attempts) && (!cooled || escalating) {
+                        // Two different things share this branch, and only one
+                        // of them is an alert.
+                        //
+                        // Fallback content IS the operator's message — the
+                        // whole reason the feature exists — so it ships on
+                        // every give-up. Letting the alert cooldown swallow it
+                        // would recreate the silent loss it was built to
+                        // prevent: on a bad day the streak leaves the 1-2-4-8
+                        // ladder, lands inside the 2h window, and the content
+                        // would be computed and thrown away.
+                        //
+                        // The bare ⚠️ alert stays deduped, since a repeated
+                        // "it failed again" carries nothing new.
+                        let send = alert_on_this_attempt(ch.attempts)
+                            && (fallback.is_some() || !cooled || escalating);
+                        if send {
                             let body = match &fallback {
                                 Some(content) => format!(
                                     "⚠️ Reminder #{} — a sessão falhou, conteúdo bruto abaixo \
@@ -1703,6 +1718,42 @@ mod fallback_tests {
             None,
             "missing binary"
         );
+    }
+}
+
+#[cfg(test)]
+mod fallback_gate_tests {
+    use super::{alert_on_streak, alert_on_this_attempt};
+
+    /// Fallback content ships on every give-up; only the bare alert is
+    /// deduped. Before this, a second failure the same day landed off the
+    /// 1-2-4-8 ladder and inside the 2h cooldown, so the content was
+    /// computed and thrown away — the silent loss the feature prevents.
+    #[test]
+    fn fallback_ignores_the_cooldown_but_the_bare_alert_does_not() {
+        let final_attempt = 2; // prior attempts; next one exhausts the budget
+        assert!(alert_on_this_attempt(final_attempt));
+        // A streak off the ladder, inside the cooldown: the shape that used
+        // to swallow the content.
+        let streak = 6;
+        assert!(!alert_on_streak(streak), "6 is off the doubling ladder");
+        let cooled = true;
+
+        let send = |has_fallback: bool| {
+            alert_on_this_attempt(final_attempt)
+                && (has_fallback || !cooled || alert_on_streak(streak))
+        };
+        assert!(send(true), "content must ship regardless of the cooldown");
+        assert!(!send(false), "a repeated bare alert stays deduped");
+    }
+
+    /// A non-final attempt sends nothing, fallback or not — the next tick
+    /// still has budget to succeed.
+    #[test]
+    fn nothing_ships_before_the_budget_is_exhausted() {
+        for prior in [0, 1] {
+            assert!(!alert_on_this_attempt(prior), "attempt {prior} is not final");
+        }
     }
 }
 

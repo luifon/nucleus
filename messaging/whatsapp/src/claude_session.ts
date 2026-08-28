@@ -806,7 +806,16 @@ async function pasteAndSend(target: string, content: string): Promise<void> {
       await tmux(["send-keys", "-t", target, "-l", BRACKETED_PASTE_END]);
     },
     async () => {
-      // rung 2: clear the draft entirely and re-paste from scratch
+      // rung 2: clear the draft entirely and re-paste from scratch.
+      //
+      // Only safe while OUR draft is still in the input. An empty input means
+      // the submit may already have landed and the pane check merely lagged,
+      // and re-pasting would send the operator's message twice — under his
+      // own WhatsApp identity, which is the worst surface we have.
+      const { head: h, tail: t } = draftFragments(content);
+      if (!(await draftPresent(target, h, t))) {
+        throw new WedgedInputError(target, 2);
+      }
       await tmux(["send-keys", "-t", target, "-l", BRACKETED_PASTE_END]).catch(() => {});
       await tmux(["send-keys", "-t", target, "C-u"]);
       await pasteInto(target, content);
@@ -839,11 +848,28 @@ export function draftFragment(content: string): string {
  *  wedged session sat with the prompt unsent and `ask` waited out its full
  *  timeout with no signal (2026-08-28). Matching either end covers the short
  *  and the tall shape. Mirror of core's draft_fragments. */
+/** Is OUR draft currently visible in the live input row? Mirror of core's
+ *  draft_present; gates the destructive recovery rung. */
+export async function draftPresent(
+  target: string,
+  head: string,
+  tail: string,
+): Promise<boolean> {
+  const { stdout } = await tmux(["capture-pane", "-t", target, "-p"]).catch(() => ({
+    stdout: "",
+    stderr: "",
+  }));
+  return stdout ? draftStuck(stdout, head, tail) : false;
+}
+
 export function draftFragments(content: string): { head: string; tail: string } {
   const lines = content.split("\n").filter((l) => l.trim().length > 0);
-  const take24 = (s: string) => s.trim().slice(0, 24);
-  const head = lines.length ? take24(lines[0]) : "";
-  const tail = lines.length ? take24(lines[lines.length - 1]) : head;
+  const head = lines.length ? lines[0].trim().slice(0, 24) : "";
+  // LAST 24 chars of the whole content, matching core's draft_fragments. The
+  // first 24 chars of the last line is wrong: a long final line wraps and its
+  // start scrolls out of the input box, which is the very bug this fixes.
+  const trimmed = content.trimEnd();
+  const tail = trimmed.slice(Math.max(0, trimmed.length - 24));
   return { head, tail };
 }
 
@@ -880,11 +906,23 @@ export function liveInputRegion(pane: string): string | null {
   return [head, ...lines.slice(idx + 1).map((l) => l.trim())].join("\n");
 }
 
+/** Drop every whitespace character. The TUI hard-wraps a long line across
+ *  pane rows, so a literal substring of the payload does not survive
+ *  capture-pane — the wrap inserts a newline and an indent in the middle of
+ *  it. Comparing with whitespace removed makes the match immune to where the
+ *  wrap lands. Mirror of core's squash_ws. */
+export function squashWs(s: string): string {
+  return s.replace(/\s+/g, "");
+}
+
 export function draftStuck(pane: string, head: string, tail: string): boolean {
   const region = liveInputRegion(pane);
   if (region === null) return false;
   if (region.includes("[Pasted text")) return true;
-  return (head.length > 0 && region.includes(head)) || (tail.length > 0 && region.includes(tail));
+  const r = squashWs(region);
+  const h = squashWs(head);
+  const t = squashWs(tail);
+  return (h.length > 0 && r.includes(h)) || (t.length > 0 && r.includes(t));
 }
 
 /** Poll until the LIVE INPUT ROW no longer carries the draft fragment —
