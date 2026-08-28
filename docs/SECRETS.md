@@ -25,7 +25,6 @@ are doing right now, and that drifts daily. Keep those local + gitignored.
 - `NUCLEUS_TIER2_DIR` — absolute path to shared-memory dir
 - `DISCORD_HOME_CHANNEL_ID`, `DISCORD_ALLOWED_USER_IDS`
 - `WHATSAPP_ALLOWED_CHAT_IDS`
-- `MEM0_USER_ID`
 
 Template lives in `.env.example` with placeholders.
 
