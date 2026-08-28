@@ -546,7 +546,19 @@ impl Session {
             .await
             .unwrap_or(self.cursor);
         let payload = with_date_preamble(message);
-        if let Err(e) = paste_and_send(&self.tmux_target, &payload).await {
+        // Size the transcript BEFORE sending: growth past this mark is proof
+        // claude accepted the message.
+        let pre_send_len = tokio::fs::metadata(&self.transcript_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if let Err(e) = paste_and_send(
+            &self.tmux_target,
+            &payload,
+            Some((self.transcript_path.as_path(), pre_send_len)),
+        )
+        .await
+        {
             // A wedged TUI (submit verified to have NOT landed after the full
             // recovery ladder) is unrecoverable from outside: kill the window
             // so is_alive() fails and pool callers respawn with --resume,
@@ -1458,19 +1470,70 @@ pub(crate) fn last_prompt_row(pane: &str) -> Option<String> {
 /// what keeps the recovery ladder from pressing Enter into a permission
 /// picker. Mirrored in messaging/whatsapp `draftStuck`; shared vectors in
 /// `core/testdata/submit_verify_vectors.json`.
-pub(crate) fn draft_stuck(pane: &str, fragment: &str) -> bool {
-    last_prompt_row(pane)
-        .map(|rest| {
-            (!fragment.is_empty() && rest.starts_with(fragment))
-                || rest.starts_with("[Pasted text")
-        })
-        .unwrap_or(false)
+/// Head and tail markers for the pasted content.
+///
+/// The input box is a few rows tall, so a long payload scrolls and only its
+/// TAIL stays on screen — the first line is never visible. Matching the head
+/// alone made the verifier read every tall paste as "submit landed", so a
+/// wedged fire sat with the prompt unsent while `ask` waited out its full
+/// timeout (2026-08-28). Matching either end covers the short and tall shape.
+pub(crate) fn draft_fragments(content: &str) -> (String, String) {
+    let head = draft_fragment(content);
+    let trimmed = content.trim_end();
+    let n = trimmed.chars().count();
+    let tail: String = trimmed.chars().skip(n.saturating_sub(24)).collect();
+    (head, tail)
+}
+
+/// Drop every whitespace character.
+///
+/// The TUI hard-wraps a long line across pane rows, so a literal substring of
+/// the payload does not survive `capture-pane` — the wrap inserts a newline
+/// and an indent in the middle of it. Comparing with whitespace removed makes
+/// the match immune to where the wrap lands.
+pub(crate) fn squash_ws(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The live input box: everything from the LAST ❯ row to the bottom of the
+/// pane. A submitted message re-renders above that row in the scrollback, so
+/// this region holds only what is still unsent.
+pub(crate) fn live_input_region(pane: &str) -> Option<String> {
+    let lines: Vec<&str> = pane.lines().collect();
+    let idx = lines.iter().rposition(|l| l.trim_start().starts_with('❯'))?;
+    let mut out = lines[idx]
+        .trim_start()
+        .strip_prefix('❯')
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    for l in &lines[idx + 1..] {
+        out.push('\n');
+        out.push_str(l.trim());
+    }
+    Some(out)
+}
+
+pub(crate) fn draft_stuck(pane: &str, head: &str, tail: &str) -> bool {
+    let Some(region) = live_input_region(pane) else {
+        return false;
+    };
+    if region.contains("[Pasted text") {
+        return true;
+    }
+    let region = squash_ws(&region);
+    let head = squash_ws(head);
+    let tail = squash_ws(tail);
+    (!head.is_empty() && region.contains(&head)) || (!tail.is_empty() && region.contains(&tail))
 }
 
 /// Poll until the LIVE INPUT ROW no longer carries the draft fragment — the
 /// submit landed (or the TUI moved to turn view). False on deadline: the
 /// draft is still sitting unsent in the input.
-async fn wait_for_draft_gone(target: &str, fragment: &str, deadline: Duration) -> bool {
+/// Poll until OUR draft is VISIBLE in the live input row — the paste landed
+/// and Enter will mean something. False on deadline; the caller presses on so
+/// the recovery ladder still gets its turn.
+async fn wait_for_draft_present(target: &str, head: &str, tail: &str, deadline: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < deadline {
         if let Ok(out) = Command::new("tmux")
@@ -1479,7 +1542,26 @@ async fn wait_for_draft_gone(target: &str, fragment: &str, deadline: Duration) -
             .await
         {
             let pane = String::from_utf8_lossy(&out.stdout);
-            if !draft_stuck(&pane, fragment) {
+            if draft_stuck(&pane, head, tail) {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tracing::warn!(target, "paste never appeared in the input row within the deadline");
+    false
+}
+
+async fn wait_for_draft_gone(target: &str, head: &str, tail: &str, deadline: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        if let Ok(out) = Command::new("tmux")
+            .args(["capture-pane", "-t", target, "-p"])
+            .output()
+            .await
+        {
+            let pane = String::from_utf8_lossy(&out.stdout);
+            if !draft_stuck(&pane, head, tail) {
                 return true;
             }
         }
@@ -1496,45 +1578,107 @@ async fn wait_for_draft_gone(target: &str, fragment: &str, deadline: Duration) -
 /// Ladder of increasingly forceful recoveries; every rung ends with Enter
 /// plus "did OUR draft leave the input row?". Exhausted ladder → an
 /// "input wedged" error the caller must treat as fatal for the window.
-pub(crate) async fn paste_and_submit_verified(target: &str, content: &str) -> Result<()> {
-    paste_into(target, content).await?;
-    // Wait for the bracketed-paste to fully drain into claude's TUI before
-    // pressing Enter; otherwise Enter gets eaten inside the paste and the
-    // prompt sits queued.
-    wait_for_input_settled(target, Duration::from_millis(250), Duration::from_secs(10)).await?;
+pub(crate) async fn paste_and_submit_verified(
+    target: &str,
+    content: &str,
+    transcript: Option<(&Path, u64)>,
+) -> Result<()> {
+    let (head, tail) = draft_fragments(content);
+    paste_and_wait(target, content, &head, &tail).await?;
 
-    let fragment = draft_fragment(content);
-    for rung in 0..3u8 {
+    // Ladder of increasingly forceful submits. Every rung ends with Enter and
+    // "did OUR draft leave the input row?".
+    //
+    // Rung 1 is a bare second Enter, and it is the one that matters: the TUI
+    // consumes the first Enter while it is still processing the paste, so the
+    // draft stays put and a plain retry sends it. Re-pasting before trying
+    // that throws away the very draft the second Enter would have submitted
+    // (2026-08-28), so the destructive rungs come last.
+    for rung in 0..4u8 {
         match rung {
-            0 => {} // plain Enter
-            1 => {
-                // close a possibly-stuck bracketed paste, then Enter
+            0 | 1 => {} // Enter, then a bare second Enter
+            2 => {
+                // close a possibly-open bracketed paste, then Enter
                 let _ = send_keys_literal(target, BRACKETED_PASTE_END).await;
             }
             _ => {
-                // clear the draft entirely and re-paste from scratch
+                // last resort: clear the draft and paste it again
                 let _ = send_keys_literal(target, BRACKETED_PASTE_END).await;
                 send_keys(target, "C-u").await?;
-                paste_into(target, content).await?;
-                wait_for_input_settled(
-                    target,
-                    Duration::from_millis(250),
-                    Duration::from_secs(10),
-                )
-                .await?;
+                paste_and_wait(target, content, &head, &tail).await?;
             }
         }
         send_keys(target, "Enter").await?;
-        if wait_for_draft_gone(target, &fragment, Duration::from_millis(2500)).await {
+        if submit_landed(target, transcript, &head, &tail).await {
             return Ok(());
         }
-        tracing::warn!(target, rung, "submit did not clear the input row — recovering");
+        tracing::warn!(target, rung, "submit did not land — recovering");
     }
-    anyhow::bail!("input wedged: submit did not clear after 3 recovery attempts (target {target})")
+    anyhow::bail!("input wedged: submit did not clear after 4 recovery attempts (target {target})")
 }
 
-async fn paste_and_send(target: &str, content: &str) -> Result<()> {
-    paste_and_submit_verified(target, content).await
+/// Did the message actually get submitted?
+///
+/// The transcript is ground truth: claude appends the user message the moment
+/// it accepts one, and the file cannot lie. The pane cannot be trusted for
+/// this — the TUI repaints lazily, so `capture-pane` can return a frame from
+/// before the submit and make a successful send look failed. Acting on that
+/// stale frame is worse than useless: the last recovery rung clears the draft
+/// and re-pastes, destroying a message that had already gone (2026-08-28).
+///
+/// Falls back to the pane check only when the caller has no transcript to
+/// watch (tests, ad-hoc tmux use).
+async fn submit_landed(
+    target: &str,
+    transcript: Option<(&Path, u64)>,
+    head: &str,
+    tail: &str,
+) -> bool {
+    match transcript {
+        Some((path, from)) => {
+            let start = Instant::now();
+            while start.elapsed() < SUBMIT_CONFIRM_TIMEOUT {
+                if let Ok(m) = tokio::fs::metadata(path).await {
+                    if m.len() > from {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            false
+        }
+        None => wait_for_draft_gone(target, head, tail, SUBMIT_CONFIRM_TIMEOUT).await,
+    }
+}
+
+/// How long to wait for proof that a submit landed.
+const SUBMIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How long to wait for pasted text to appear in the input row. Generous
+/// because a TUI busy with startup work (MCP servers, a remote-control
+/// handshake) can take tens of seconds to paint.
+const PASTE_VISIBLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Paste `content` and wait until it is actually visible in the input row.
+///
+/// `wait_for_input_settled` only asks "has the pane stopped changing?", and a
+/// pane that has not begun rendering the paste is perfectly still. Enter then
+/// landed on an empty input, did nothing, and the text rendered a moment
+/// later and sat there unsent — the verifier saw a clear input row, called it
+/// a success, and `ask` waited out its full timeout with no signal.
+async fn paste_and_wait(target: &str, content: &str, head: &str, tail: &str) -> Result<()> {
+    paste_into(target, content).await?;
+    wait_for_draft_present(target, head, tail, PASTE_VISIBLE_TIMEOUT).await;
+    // Then let the paste finish draining, so Enter is not eaten inside it.
+    wait_for_input_settled(target, Duration::from_millis(250), Duration::from_secs(10)).await
+}
+
+async fn paste_and_send(
+    target: &str,
+    content: &str,
+    transcript: Option<(&Path, u64)>,
+) -> Result<()> {
+    paste_and_submit_verified(target, content, transcript).await
 }
 
 /// Poll the pane content; if claude's "trust this folder" prompt is showing,
@@ -2582,6 +2726,48 @@ mod tests {
         }
     }
 
+    /// Captured from a real wedged fire window on 2026-08-28: the payload is
+    /// taller than the input box, so its FIRST line scrolled out of view and
+    /// only the tail is on screen. Head-only matching reported "submit
+    /// landed" and the fire waited out its whole timeout, prompt never sent.
+    #[test]
+    fn tall_draft_is_detected_by_its_tail() {
+        let pane = "\
+────────────────────────────────────────────────────────────────────────────────
+❯ mutations. Before reporting, read today's reminders diary
+  (memory/diaries/reminders/) for what earlier heartbeats already flagged:
+  report each item at most once per day unless its state has CHANGED since. If
+  something genuinely needs the operator's attention, reply with a short
+  plain report (2-6 lines, lead with the item). If nothing does, reply
+  exactly: HEARTBEAT_OK
+
+────────────────────────────────────────────────────────────────────────────────
+  ~/Development/nucleus  |   main  |  Opus 5 (1M context)
+  ⏵⏵ auto mode on (shift+tab to cycle)";
+        // A preamble, then ONE long system-prompt line the TUI hard-wraps
+        // across the rows above.
+        let content = "[context: today is 2026-08-28 (Fri), local 12:44 -03:00]\n\n\
+             Heartbeat sweep (ADR-026). Read the checklist and check each item \
+             cheaply — no mutations. Before reporting, read today's reminders \
+             diary (memory/diaries/reminders/) for what earlier heartbeats \
+             already flagged: report each item at most once per day unless its \
+             state has CHANGED since. If something genuinely needs the \
+             operator's attention, reply with a short plain report (2-6 lines, \
+             lead with the item). If nothing does, reply exactly: HEARTBEAT_OK";
+        let (head, tail) = draft_fragments(content);
+        assert!(!pane.contains(&head), "head never reaches the screen");
+        assert!(draft_stuck(pane, &head, &tail), "tall draft must read as stuck");
+
+        let sent = "\
+  exactly: HEARTBEAT_OK
+· Gallivanting… (3s)
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ~/Development/nucleus  |   main";
+        assert!(!draft_stuck(sent, &head, &tail), "cleared row must read as sent");
+    }
+
     #[test]
     fn submit_verify_vectors_draft_stuck() {
         let v: serde_json::Value = serde_json::from_str(SUBMIT_VERIFY_VECTORS).unwrap();
@@ -2592,7 +2778,8 @@ mod tests {
             let pane = case["pane"].as_str().unwrap();
             let fragment = case["fragment"].as_str().unwrap();
             let expect = case["expect"].as_bool().unwrap();
-            assert_eq!(draft_stuck(pane, fragment), expect, "vector: {name}");
+            // The shared vectors are single-line drafts, where head == tail.
+            assert_eq!(draft_stuck(pane, fragment, fragment), expect, "vector: {name}");
         }
     }
 
@@ -2642,7 +2829,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let stuck_result =
-            wait_for_draft_gone(&target, "remind me tomorrow at 9", Duration::from_millis(900))
+            wait_for_draft_gone(
+                &target,
+                "remind me tomorrow at 9",
+                "remind me tomorrow at 9",
+                Duration::from_millis(900),
+            )
                 .await;
         assert!(!stuck_result, "draft on the live row must report NOT gone");
 
@@ -2659,7 +2851,13 @@ mod tests {
             .output()
             .await;
         let gone_result =
-            wait_for_draft_gone(&target, "remind me tomorrow at 9", Duration::from_secs(5)).await;
+            wait_for_draft_gone(
+                &target,
+                "remind me tomorrow at 9",
+                "remind me tomorrow at 9",
+                Duration::from_secs(5),
+            )
+            .await;
         assert!(gone_result, "cleared live row must report gone");
 
         tmux_kill(session).await;
