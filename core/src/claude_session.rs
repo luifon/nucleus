@@ -1584,6 +1584,10 @@ pub(crate) async fn paste_and_submit_verified(
     transcript: Option<(&Path, u64)>,
 ) -> Result<()> {
     let (head, tail) = draft_fragments(content);
+    // What we demand back from the transcript. The head is the date preamble,
+    // which carries the wall-clock minute, so it distinguishes this payload
+    // from an earlier turn's.
+    let marker = head.clone();
     paste_and_wait(target, content, &head, &tail).await?;
 
     // Ladder of increasingly forceful submits. Every rung ends with Enter and
@@ -1602,14 +1606,45 @@ pub(crate) async fn paste_and_submit_verified(
                 let _ = send_keys_literal(target, BRACKETED_PASTE_END).await;
             }
             _ => {
-                // last resort: clear the draft and paste it again
+                // Last resort: clear the draft and paste it again. Only safe
+                // while OUR draft is still sitting in the input. If the input
+                // is empty the submit may already have gone and the
+                // confirmation merely lagged, and re-pasting would send the
+                // same message twice.
+                if !draft_present(target, &head, &tail).await {
+                    anyhow::bail!(
+                        "input wedged: draft is gone but the submit was never confirmed — \
+                         refusing to re-paste and risk a duplicate (target {target})"
+                    );
+                }
                 let _ = send_keys_literal(target, BRACKETED_PASTE_END).await;
                 send_keys(target, "C-u").await?;
                 paste_and_wait(target, content, &head, &tail).await?;
             }
         }
+        // Never press Enter blind. A pooled session parked on a permission
+        // picker would take Enter as "accept the default option", silently
+        // approving a gated tool and losing this message. The old pane-only
+        // verifier avoided that by construction; the transcript check does
+        // not, so the guard has to be explicit.
+        if let Some(dialog) = pane_awaiting_choice(target, &head, &tail).await {
+            anyhow::bail!(
+                "input wedged: the pane is showing a prompt that is not our draft, so Enter \
+                 would answer it — refusing (target {target}): {dialog}"
+            );
+        }
+        // Re-snapshot immediately before Enter. The caller's mark was taken
+        // before `paste_and_wait`, which can burn 40s; anything appended in
+        // that window is unrelated to this submit.
+        let mark = match transcript {
+            Some((path, from)) => Some((
+                path,
+                tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(from),
+            )),
+            None => None,
+        };
         send_keys(target, "Enter").await?;
-        if submit_landed(target, transcript, &head, &tail).await {
+        if submit_landed(target, mark, &marker, &head, &tail).await {
             return Ok(());
         }
         tracing::warn!(target, rung, "submit did not land — recovering");
@@ -1631,24 +1666,108 @@ pub(crate) async fn paste_and_submit_verified(
 async fn submit_landed(
     target: &str,
     transcript: Option<(&Path, u64)>,
+    marker: &str,
     head: &str,
     tail: &str,
 ) -> bool {
-    match transcript {
-        Some((path, from)) => {
-            let start = Instant::now();
-            while start.elapsed() < SUBMIT_CONFIRM_TIMEOUT {
-                if let Ok(m) = tokio::fs::metadata(path).await {
-                    if m.len() > from {
-                        return true;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-            false
+    let Some((path, from)) = transcript else {
+        return wait_for_draft_gone(target, head, tail, SUBMIT_CONFIRM_TIMEOUT).await;
+    };
+    let start = Instant::now();
+    while start.elapsed() < SUBMIT_CONFIRM_TIMEOUT {
+        if transcript_has_user_marker(path, from, marker).await {
+            return true;
         }
-        None => wait_for_draft_gone(target, head, tail, SUBMIT_CONFIRM_TIMEOUT).await,
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
+    false
+}
+
+/// Did claude append a USER entry carrying `marker` past byte `from`?
+///
+/// Byte growth alone proves nothing: a transcript collects `attachment`,
+/// `mode`, `permission-mode`, `atis-latch`, `file-history-snapshot`,
+/// `ai-title`, `system` and `cost-state` records, and a single fire's file
+/// holds far more of those than user turns. Any one of them would have
+/// "confirmed" a prompt that was never sent — the exact silent loss this
+/// check exists to catch. So parse the appended lines and demand our own
+/// text back.
+async fn transcript_has_user_marker(path: &Path, from: u64, marker: &str) -> bool {
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return false;
+    };
+    if bytes.len() as u64 <= from {
+        return false;
+    }
+    let tail = String::from_utf8_lossy(&bytes[from as usize..]);
+    for line in tail.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue; // a partially-written last line; the next poll retries
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let content = v.pointer("/message/content");
+        let text = match content {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        if squash_ws(&text).contains(&squash_ws(marker)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is OUR draft currently visible in the live input row?
+async fn draft_present(target: &str, head: &str, tail: &str) -> bool {
+    let Ok(out) = Command::new("tmux")
+        .args(["capture-pane", "-t", target, "-p"])
+        .output()
+        .await
+    else {
+        return false;
+    };
+    draft_stuck(&String::from_utf8_lossy(&out.stdout), head, tail)
+}
+
+/// Markers for a TUI screen that is waiting on a keypress ANSWER rather than
+/// holding a draft. Pressing Enter here picks the highlighted option.
+const CHOICE_MARKERS: &[&str] = &[
+    "Do you want to",
+    "❯ 1.",
+    "❯ 2.",
+    "Yes, and don't ask again",
+    "trust this folder",
+    "Resume from summary",
+    "Press up to edit queued messages",
+];
+
+/// `Some(marker)` when the pane is asking a question instead of showing our
+/// draft. `None` means Enter is safe as far as the pane can tell.
+///
+/// Deliberately conservative: if our draft IS visible, nothing else on the
+/// screen matters, because the input row owns the keystroke.
+async fn pane_awaiting_choice(target: &str, head: &str, tail: &str) -> Option<String> {
+    let out = Command::new("tmux")
+        .args(["capture-pane", "-t", target, "-p"])
+        .output()
+        .await
+        .ok()?;
+    let pane = String::from_utf8_lossy(&out.stdout);
+    if draft_stuck(&pane, head, tail) {
+        return None;
+    }
+    let region = live_input_region(&pane)?;
+    CHOICE_MARKERS
+        .iter()
+        .find(|m| region.contains(**m))
+        .map(|m| (*m).to_string())
 }
 
 /// How long to wait for proof that a submit landed.
@@ -2766,6 +2885,80 @@ mod tests {
 ────────────────────────────────────────────────────────────────────────────────
   ~/Development/nucleus  |   main";
         assert!(!draft_stuck(sent, &head, &tail), "cleared row must read as sent");
+    }
+
+    /// Byte growth is not proof. A transcript collects far more non-user
+    /// records than user turns, and any of them would have "confirmed" a
+    /// prompt that was never sent (2026-08-28 review finding).
+    #[tokio::test]
+    async fn only_a_matching_user_entry_confirms_a_submit() {
+        let dir = std::env::temp_dir().join(format!("nucleus-submit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let from = 0u64;
+        let marker = "[context: today is 2026";
+
+        // Noise the TUI writes on its own must NOT confirm anything.
+        let noise = [
+            r#"{"type":"attachment","attachment":{"type":"hook_success"}}"#,
+            r#"{"type":"file-history-snapshot","messageId":"x"}"#,
+            r#"{"type":"permission-mode","permissionMode":"auto"}"#,
+            r#"{"type":"ai-title","aiTitle":"[context: today is 2026 something"}"#,
+            r#"{"type":"cost-state"}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, format!("{noise}\n")).unwrap();
+        assert!(
+            !transcript_has_user_marker(&path, from, marker).await,
+            "non-user records must never confirm a submit"
+        );
+
+        // A user entry for a DIFFERENT payload must not confirm ours.
+        let other = r#"{"type":"user","message":{"content":"[context: today is 1999-01-01] oi"}}"#;
+        std::fs::write(&path, format!("{noise}\n{other}\n")).unwrap();
+        assert!(!transcript_has_user_marker(&path, from, marker).await);
+
+        // Ours does, as a plain string...
+        let ours = r#"{"type":"user","message":{"content":"[context: today is 2026-08-28] oi"}}"#;
+        std::fs::write(&path, format!("{noise}\n{ours}\n")).unwrap();
+        assert!(transcript_has_user_marker(&path, from, marker).await);
+
+        // ...and in the content-block form.
+        let blocks = r#"{"type":"user","message":{"content":[{"type":"text","text":"[context: today is 2026-08-28] oi"}]}}"#;
+        std::fs::write(&path, format!("{noise}\n{blocks}\n")).unwrap();
+        assert!(transcript_has_user_marker(&path, from, marker).await);
+
+        // Anything before `from` is history and must be ignored.
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(!transcript_has_user_marker(&path, len, marker).await);
+
+        // A half-written trailing line must not panic or confirm.
+        std::fs::write(&path, format!("{noise}\n{{\"type\":\"us")).unwrap();
+        assert!(!transcript_has_user_marker(&path, from, marker).await);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Enter must never be pressed into a screen that is asking a question:
+    /// it would pick the highlighted option and lose the message.
+    #[test]
+    fn choice_screens_are_recognised_and_our_draft_wins() {
+        let (head, tail) = draft_fragments("[context: today is 2026-08-28]\n\nfaça a coisa");
+        let picker = "\
+────────────────────────────────────────
+❯ Do you want to allow Bash(rm -rf /)?
+  1. Yes
+  2. No, and tell Claude what to do differently
+────────────────────────────────────────";
+        assert!(live_input_region(picker).is_some());
+        assert!(CHOICE_MARKERS.iter().any(|m| picker.contains(m)));
+        // Our own draft on the row must NOT read as a choice screen.
+        let ours = "\
+────────────────────────────────────────
+❯ [context: today is 2026-08-28]
+  faça a coisa
+────────────────────────────────────────";
+        assert!(draft_stuck(ours, &head, &tail));
     }
 
     #[test]

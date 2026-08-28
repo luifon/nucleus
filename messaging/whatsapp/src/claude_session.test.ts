@@ -362,12 +362,14 @@ test("draftStuck catches a tall draft by its tail", () => {
     "────────────────────────────────────────",
     "  ~/Development/nucleus  |   main",
   ].join("\n");
-  const content = [
-    "[context: today is 2026-08-28 (Fri), local 12:44 -03:00]",
-    "Heartbeat sweep. Read the checklist and check each item cheaply — no",
-    "mutations. Before reporting, read today's reminders diary",
-    "exactly: HEARTBEAT_OK",
-  ].join("\n");
+  // The real payload shape: a preamble, then ONE long line the TUI wraps
+  // across the rows above.
+  const content =
+    "[context: today is 2026-08-28 (Fri), local 12:44 -03:00]\n\n" +
+    "Heartbeat sweep (ADR-026). Read the checklist and check each item cheaply " +
+    "— no mutations. Before reporting, read today's reminders diary " +
+    "(memory/diaries/reminders/) for what earlier heartbeats already flagged: " +
+    "exactly: HEARTBEAT_OK";
   const { head, tail } = draftFragments(content);
   assert.ok(!pane.includes(head), "head never reaches the screen on a tall draft");
   assert.equal(draftStuck(pane, head, tail), true, "tall draft must read as stuck");
@@ -381,4 +383,20 @@ test("draftStuck catches a tall draft by its tail", () => {
     "  ~/Development/nucleus  |   main",
   ].join("\n");
   assert.equal(draftStuck(sent, head, tail), false, "cleared row must read as sent");
+});
+
+// Rust parity: draftFragments.tail must be the LAST 24 chars of the whole
+// content. Taking the first 24 chars of the last line leaves the tall-draft
+// bug reproducible whenever that line is long enough to wrap.
+test("draftFragments tail matches core: last 24 chars of the content", () => {
+  const long =
+    "[context: today is 2026-08-28]\n\n" +
+    "Heartbeat sweep. Read the checklist and check each item cheaply — no " +
+    "mutations. If nothing does, reply exactly: HEARTBEAT_OK";
+  const { head, tail } = draftFragments(long);
+  assert.equal(head, "[context: today is 2026-");
+  assert.equal(tail, long.trimEnd().slice(-24));
+  assert.ok(long.endsWith(tail), "tail must come from the END of the content");
+  assert.ok(!long.split("\n").filter(Boolean).pop()!.startsWith(tail),
+    "and NOT be the start of the last line");
 });

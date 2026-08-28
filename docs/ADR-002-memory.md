@@ -78,7 +78,7 @@ Tier 4 was never wired.
 
 **Deferred indefinitely.** mem0's architecture assumes an OpenAI-shaped split — an embedding model for vector retrieval AND an LLM for entity/relation extraction. Neither is covered by the Claude Max subscription that powers Nucleus, so wiring mem0 would re-introduce exactly the per-call API billing we removed when we ditched DeepSeek.
 
-The role mem0 was supposed to play (long-tail recall over months of accumulated facts) is filled by **T3 = PARA-Obsidian** instead: Claude navigates the vault semantically through filenames, frontmatter, and section headers — no embeddings needed because Claude reads context, not vectors. The mem0 stack is kept idle in `tools/mem0/docker-compose.yaml` in case the ergonomics ever change.
+The role mem0 was supposed to play (long-tail recall over months of accumulated facts) is filled by **T3 = PARA-Obsidian** instead: Claude navigates the vault semantically through filenames, frontmatter, and section headers — no embeddings needed because Claude reads context, not vectors.
 
 ## File format (Tier 2)
 
