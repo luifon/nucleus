@@ -83,6 +83,12 @@ enum Cmd {
         /// hits the network; leave it alone for one that only shells out.
         #[arg(long = "condition-timeout", requires = "condition")]
         condition_timeout: Option<u64>,
+        /// Shell command run when a --system-prompt fire gives up. Its stdout
+        /// is delivered in place of a bare failure alert, so a broken session
+        /// costs formatting rather than the whole message. Use it whenever
+        /// the content has a deterministic source the fire merely dresses up.
+        #[arg(long = "fallback-cmd", requires = "system_prompt")]
+        fallback_cmd: Option<String>,
     },
     /// Set (or clear with empty string) the title on an existing reminder.
     SetTitle {
@@ -151,6 +157,7 @@ async fn main() -> Result<()> {
             condition,
             condition_mode,
             condition_timeout,
+            fallback_cmd,
         } => {
             add(
                 &settings,
@@ -164,6 +171,7 @@ async fn main() -> Result<()> {
                 condition.as_deref(),
                 condition_mode.as_deref(),
                 condition_timeout,
+                fallback_cmd.as_deref(),
             )
             .await
         }
@@ -203,6 +211,7 @@ async fn add(
     condition: Option<&str>,
     condition_mode: Option<&str>,
     condition_timeout: Option<u64>,
+    fallback_cmd: Option<&str>,
 ) -> Result<()> {
     // ADR-024: validate the watcher args before touching the DB.
     let condition = match (condition, condition_mode) {
@@ -290,6 +299,7 @@ async fn add(
         system_prompt_stored.as_deref(),
         condition,
         condition_timeout.map(|t| t as i64),
+        fallback_cmd,
     )
     .await?;
     let local = next_fire_at.with_timezone(&Local);
@@ -834,12 +844,42 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                     // alerts even inside the cooldown window, so a long outage
                     // keeps reporting itself at a widening interval.
                     let escalating = alert_on_streak(streak);
+                    // Deterministic fallback: when the fire gives up, run the
+                    // reminder's fallback command and deliver its stdout in
+                    // place of a bare alert. A skill-fire usually formats and
+                    // annotates content that a plain script already produces,
+                    // so a dead session should cost the polish, not the
+                    // message (2026-08-28: a day of DSU preps was lost while
+                    // the data script kept working).
+                    let giving_up = channels.iter().any(|c| alert_on_this_attempt(c.attempts));
+                    let fallback = if giving_up {
+                        let f = run_fallback(reminder.fallback_cmd.as_deref()).await;
+                        match &f {
+                            Some(c) => tracing::info!(
+                                id = reminder.id,
+                                bytes = c.len(),
+                                "fallback produced content — delivering it instead of a bare alert"
+                            ),
+                            None => tracing::info!(
+                                id = reminder.id,
+                                "no usable fallback — sending the plain failure alert"
+                            ),
+                        }
+                        f
+                    } else {
+                        None
+                    };
                     let mut alerted = false;
                     for ch in &channels {
                         let attempt = ch.attempts + 1;
                         if alert_on_this_attempt(ch.attempts) && (!cooled || escalating) {
-                            let alert_reminder = store::Reminder {
-                                body: format!(
+                            let body = match &fallback {
+                                Some(content) => format!(
+                                    "⚠️ Reminder #{} — a sessão falhou, conteúdo bruto abaixo \
+                                     (sem formatação/análise):\n\n{content}",
+                                    reminder.id
+                                ),
+                                None => format!(
                                     "⚠️ Reminder #{} fire failed (attempt {}/{}, giving up; \
                                      {} in a row): {}",
                                     reminder.id,
@@ -848,8 +888,8 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                                     streak,
                                     truncate(&err, 200)
                                 ),
-                                ..reminder.clone()
                             };
+                            let alert_reminder = store::Reminder { body, ..reminder.clone() };
                             let _ = deliver(
                                 settings,
                                 workspace_root,
@@ -1456,6 +1496,55 @@ fn alert_on_this_attempt(prior_attempts: i64) -> bool {
 /// are all still recorded in reminder_fires either way.
 const ALERT_COOLDOWN_SECS: i64 = 2 * 60 * 60;
 
+/// Seconds a fallback command may run. Generous relative to a condition
+/// watcher: this one is producing the operator's actual content, and it only
+/// runs when a fire has already failed, so nothing is waiting behind it
+/// except the tick lock.
+const FALLBACK_TIMEOUT_SECS: u64 = 90;
+
+/// Run a reminder's fallback command and return its stdout.
+///
+/// `None` when there is no command, it fails, times out, or prints nothing —
+/// in every one of those cases the caller falls back to the plain failure
+/// alert, so a broken fallback can never silence the alert it replaces.
+async fn run_fallback(cmd: Option<&str>) -> Option<String> {
+    let cmd = cmd?;
+    if cmd.trim().is_empty() {
+        return None;
+    }
+    let out = tokio::time::timeout(
+        Duration::from_secs(FALLBACK_TIMEOUT_SECS),
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let out = match out {
+        Ok(Ok(o)) if o.status.success() => o,
+        Ok(Ok(o)) => {
+            tracing::warn!(
+                "fallback exited {}: {}",
+                o.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                truncate(String::from_utf8_lossy(&o.stderr).trim(), 200)
+            );
+            return None;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("fallback spawn failed: {e}");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("fallback timed out after {FALLBACK_TIMEOUT_SECS}s");
+            return None;
+        }
+    };
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
 /// Alert ladder for a run of consecutive failures: 1, 2, 4, 8, 16, ...
 /// A streak on the ladder overrides the cooldown. Doubling keeps a long
 /// outage audible without sending one message per occurrence.
@@ -1585,6 +1674,34 @@ mod condition_tests {
                 .await
                 .unwrap()
                 .truthy
+        );
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::run_fallback;
+
+    /// A working fallback yields its stdout, so the operator gets the content
+    /// instead of a bare failure alert.
+    #[tokio::test]
+    async fn stdout_becomes_the_message() {
+        let out = run_fallback(Some("printf 'DSU do dia\nlinha dois'")).await;
+        assert_eq!(out.as_deref(), Some("DSU do dia\nlinha dois"));
+    }
+
+    /// Every broken shape returns None, so the caller still sends the plain
+    /// alert. A broken fallback must never silence the failure it replaces.
+    #[tokio::test]
+    async fn broken_fallbacks_never_swallow_the_alert() {
+        assert_eq!(run_fallback(None).await, None);
+        assert_eq!(run_fallback(Some("   ")).await, None);
+        assert_eq!(run_fallback(Some("exit 1")).await, None, "non-zero exit");
+        assert_eq!(run_fallback(Some("true")).await, None, "empty stdout");
+        assert_eq!(
+            run_fallback(Some("definitely-not-a-real-binary-xyz")).await,
+            None,
+            "missing binary"
         );
     }
 }

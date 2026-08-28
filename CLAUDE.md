@@ -381,6 +381,29 @@ Rules:
   so a long fire doesn't get duplicated by the next minute's launchd
   tick. Stale (>10min) lockfiles are reclaimed automatically.
 
+**Fallback content (`--fallback-cmd`).** A skill-fire that cannot spawn its
+session produces nothing at all, so a broken session costs the whole message.
+When the content has a deterministic source that the fire merely formats and
+annotates, give the reminder a fallback:
+
+```bash
+./target/release/reminders add \
+  --cron "0 12 * * 1-5" \
+  --title "<short name>" \
+  --system-prompt "Run <skill>, post the result." \
+  --fallback-cmd 'node $HOME/.claude/skills/<skill>/<data-script>.mjs <arg>'
+```
+
+When the fire exhausts its attempts, the command runs (`sh -c`, 90s timeout)
+and its stdout is delivered in place of the bare ⚠️ alert, prefixed with a
+note that the session failed. The operator loses the formatting and the
+analysis, and keeps the actual content. A fallback that is missing, fails,
+times out or prints nothing falls through to the normal alert, so it can
+never silence the failure it replaces. Requires `--system-prompt`.
+
+Do NOT add one where the judgment IS the product (the heartbeat sweep): there
+is no deterministic source to fall back to.
+
 Prefer `--body` for simple text pings. Reserve `--system-prompt` for
 fires that genuinely need a Claude session — they cost a tmux+session
 spawn each time. The 18:30 timesheet stays on `--body` forever.

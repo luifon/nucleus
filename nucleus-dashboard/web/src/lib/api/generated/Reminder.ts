@@ -42,4 +42,9 @@ last_alerted_at: string | null,
  * Consecutive failed occurrences, reset to 0 on any success. Drives
  * the escalating alert gate so a long outage can't go quiet.
  */
-consecutive_failures: number, };
+consecutive_failures: number, 
+/**
+ * Shell command whose stdout is delivered when a skill-fire gives up.
+ * None = no fallback; the operator gets the plain failure alert.
+ */
+fallback_cmd: string | null, };

@@ -142,6 +142,18 @@ const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[
             "ALTER TABLE reminders ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
         ),
     },
+    // Deterministic fallback content. A skill-fire that cannot spawn its
+    // session produces nothing at all, so on 2026-08-28 a day of DSU preps
+    // was simply lost while the underlying data script kept working fine.
+    // When the fire gives up, this command runs and its stdout is delivered
+    // in place of a bare failure alert: degraded content beats silence.
+    nucleus_core::migrate::Migration {
+        version: 6,
+        name: "fallback-cmd",
+        step: nucleus_core::migrate::Step::Sql(
+            "ALTER TABLE reminders ADD COLUMN fallback_cmd TEXT",
+        ),
+    },
 ];
 
 fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
@@ -479,6 +491,9 @@ pub struct Reminder {
     /// the escalating alert gate so a long outage can't go quiet.
     #[ts(type = "number")]
     pub consecutive_failures: i64,
+    /// Shell command whose stdout is delivered when a skill-fire gives up.
+    /// None = no fallback; the operator gets the plain failure alert.
+    pub fallback_cmd: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
@@ -502,7 +517,7 @@ async fn load_reminder(pool: &SqlitePool, id: i64) -> Result<Option<Reminder>> {
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, condition_cmd, condition_mode,
                 condition_state, condition_checked_at, condition_timeout_secs,
-                last_alerted_at, consecutive_failures
+                last_alerted_at, consecutive_failures, fallback_cmd
            FROM reminders WHERE id = ?1",
     )
     .bind(id)
@@ -536,6 +551,7 @@ fn row_to_reminder(r: sqlx::sqlite::SqliteRow) -> Reminder {
         condition_timeout_secs: r.try_get::<Option<i64>, _>("condition_timeout_secs").ok().flatten(),
         last_alerted_at: r.try_get::<Option<String>, _>("last_alerted_at").ok().flatten(),
         consecutive_failures: r.try_get::<i64, _>("consecutive_failures").unwrap_or(0),
+        fallback_cmd: r.try_get::<Option<String>, _>("fallback_cmd").ok().flatten(),
     }
 }
 
@@ -595,6 +611,8 @@ pub async fn insert_with_channels(
     condition: Option<(&str, &str)>,
     // Seconds the watcher may run. None = the built-in default.
     condition_timeout_secs: Option<i64>,
+    // Shell command whose stdout is delivered when a skill-fire gives up.
+    fallback_cmd: Option<&str>,
 ) -> Result<i64> {
     if channels.is_empty() {
         bail!("at least one channel is required");
@@ -615,8 +633,8 @@ pub async fn insert_with_channels(
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO reminders
             (title, body, cron, one_shot, status, next_fire_at, created_at, created_by, system_prompt,
-             condition_cmd, condition_mode, condition_timeout_secs)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             condition_cmd, condition_mode, condition_timeout_secs, fallback_cmd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          RETURNING id",
     )
     .bind(title)
@@ -631,6 +649,7 @@ pub async fn insert_with_channels(
     .bind(condition.map(|(cmd, _)| cmd))
     .bind(condition.map(|(_, mode)| mode))
     .bind(condition_timeout_secs)
+    .bind(fallback_cmd)
     .fetch_one(&mut *tx)
     .await
     .context("insert reminder")?;
@@ -662,7 +681,7 @@ pub async fn list_all(
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, condition_cmd, condition_mode,
                 condition_state, condition_checked_at, condition_timeout_secs,
-                last_alerted_at, consecutive_failures
+                last_alerted_at, consecutive_failures, fallback_cmd
            FROM reminders WHERE 1=1",
     );
     if !include_fired {
@@ -717,7 +736,7 @@ pub async fn pending_due_with_channels(
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, title, condition_cmd, condition_mode,
                 condition_state, condition_checked_at, condition_timeout_secs,
-                last_alerted_at, consecutive_failures
+                last_alerted_at, consecutive_failures, fallback_cmd
            FROM reminders
           WHERE status IN ('active', 'pending')
             AND next_fire_at IS NOT NULL
@@ -1208,6 +1227,7 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
             &channels,
             "system",
             seed.system_prompt,
+            None,
             None,
             None,
         )
