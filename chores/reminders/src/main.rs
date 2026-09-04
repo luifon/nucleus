@@ -192,8 +192,6 @@ async fn main() -> Result<()> {
 
 async fn open_pool(workspace_root: &Path) -> Result<sqlx::SqlitePool> {
     let pool = store::open(&workspace_root.join(DB_PATH)).await?;
-    // Idempotent: skips when the row is already there (or has been
-    // cancelled — cancellation is sticky).
     store::seed_default_reminders(&pool).await?;
     Ok(pool)
 }
@@ -544,11 +542,7 @@ async fn history(
 }
 
 async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
-    // Skill-fire reminders (ADR-008) can run for minutes; the launchd
-    // plist ticks every 60s. Without a lock, a second tick would pick
-    // up the same in-flight reminder (its channel rows are still
-    // 'pending') and spawn a duplicate session. Hold a file lock for
-    // the whole tick to serialize.
+    // Serialize ticks against the next minute's launchd run (see `TickLock`).
     let lock_path = workspace_root.join("memory/reminders-tick.lock");
     let _lock = match TickLock::try_acquire(lock_path)? {
         Some(l) => l,
@@ -828,12 +822,9 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                         "skill-fire failed"
                     );
                     // Outer-error alert (ADR-008 failure handling layer 2),
-                    // but retry-aware: a channel with budget left re-spawns
-                    // the fire next tick, so alerting on a non-final attempt
-                    // is noise — the operator gets a ⚠ followed minutes
-                    // later by the successful retry's deliverable (observed
-                    // with #47, 2026-07-18). Alert only the channels this
-                    // failure exhausts; record every failure regardless.
+                    // gated by `alert_on_this_attempt`: alert only the
+                    // channels this failure exhausts; record every failure
+                    // regardless.
                     let cooled = alert_cooldown_active(reminder.last_alerted_at.as_deref(), fired_at);
                     // Count the occurrence once, before the per-channel loop.
                     let streak = store::bump_failure_streak(&pool, reminder.id)
@@ -970,7 +961,6 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                         );
                     }
                     Err(e) => {
-                        // {:#} keeps the whole anyhow chain for triage.
                         let err = format!("{e:#}");
                         store::record_channel_fire(
                             &pool,
