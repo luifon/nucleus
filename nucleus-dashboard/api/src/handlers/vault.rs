@@ -119,7 +119,6 @@ struct VaultFile {
     // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     mtime_unix: i64,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     bytes: u64,
     /// Absolute path. Used to fetch the file body separately.

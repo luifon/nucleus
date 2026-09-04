@@ -2,10 +2,6 @@
 //! directories and expose them as JSON. Discovery + frontmatter parsing live
 //! in `nucleus_core::skills` (shared with the skill-gap learner, ADR-017) so
 //! the dashboard and the learner read skills identically.
-//!
-//! Per ADR-008 storage convention:
-//!   - `~/.claude/skills/<name>/SKILL.md`   — operator-personal (not committed)
-//!   - `<repo>/.claude/skills/<name>/SKILL.md` — committed (ships with repo)
 
 use axum::{
     extract::{Query, State},
@@ -43,7 +39,6 @@ async fn list_skills(State(s): State<Arc<SkillsState>>) -> Result<Json<Vec<Skill
     })
     .await
     .map_err(|e| SkillsError::Io(format!("join: {e}")))?;
-    // Stable order: tier first, then name.
     out.sort_by(|a, b| a.tier.cmp(&b.tier).then_with(|| a.name.cmp(&b.name)));
     Ok(Json(out))
 }

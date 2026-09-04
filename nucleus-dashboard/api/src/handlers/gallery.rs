@@ -60,9 +60,7 @@ fn model_defaults(model: &str) -> (i64, i64, i64) {
     }
 }
 
-/// Versioned migrations (ADR-020): v1 = the historical ensure_schema body
-/// verbatim (idempotent CREATE + tolerated ALTERs). New schema changes go
-/// in as v2+ and run exactly once.
+/// Versioned migrations (ADR-020). v1 = the idempotent CREATE + tolerated ALTERs.
 const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[nucleus_core::migrate::Migration {
     version: 1,
     name: "baseline-adr019-gallery",
@@ -129,13 +127,10 @@ struct ImageRow {
     // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     seed: i64,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     width: i64,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     height: i64,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     steps: i64,
     created_at: String,
