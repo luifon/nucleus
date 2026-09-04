@@ -269,8 +269,7 @@ async fn get_log(
 // ─── probes ──────────────────────────────────────────────────────────────────
 
 /// `launchctl list` → label → {pid, last_exit} for `dev.nucleus.*`.
-/// Mirrors the parse in `cron.rs`; kept local so `/agents` owns its own
-/// liveness computation rather than coupling to the cron surface.
+/// Kept local so `/agents` owns its own liveness computation.
 async fn probe_launchd() -> HashMap<String, LaunchdState> {
     let mut map = HashMap::new();
     let Ok(out) = Command::new("launchctl").arg("list").output().await else {
@@ -304,7 +303,7 @@ async fn probe_launchd() -> HashMap<String, LaunchdState> {
 }
 
 /// `tmux list-sessions` → session name → (last activity unix, window count)
-/// for `nucleus-*`. Mirrors the parse in `sessions.rs`. Empty when no server.
+/// for `nucleus-*`. Empty when no server.
 async fn probe_tmux() -> HashMap<String, (i64, usize)> {
     let mut map = HashMap::new();
     let Ok(out) = Command::new("tmux")

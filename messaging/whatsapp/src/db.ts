@@ -344,12 +344,12 @@ export interface OutboundRow {
 }
 
 /** Outbound WhatsApp send queue. The reminders binary (and anyone else
- *  who needs to send a WhatsApp message from outside Alfred's process)
- *  inserts rows here. Alfred's main process drains every 5s, resolves
+ *  who needs to send a WhatsApp message from outside the bot's process)
+ *  inserts rows here. The bot's main process drains every 1s, resolves
  *  `target` to a JID via the allowlist, and sends via Baileys.
  *
  *  `target` is either a group name ("Alfred", "Brain Dump") OR a raw
- *  JID. Alfred's drainer accepts both — but only if the resolved JID
+ *  JID. The drainer accepts both — but only if the resolved JID
  *  is on the allowlist (no sending to arbitrary chats).
  *
  *  Failures bump `attempts`; after a max-attempts threshold, status

@@ -46,7 +46,7 @@ export default function RecentFireRow({ fire }: { fire: RecentFire }) {
   );
 }
 
-// Same priority order as UpcomingFireRow: title > body > derived.
+// Same priority order as ReminderRow's pickDisplayName: title > body > derived.
 function pickDisplayName(fire: RecentFire): { text: string; derived: boolean } {
   if (fire.reminder_title && fire.reminder_title.trim()) {
     return { text: fire.reminder_title, derived: false };

@@ -1336,8 +1336,6 @@ async fn ensure_tmux_session(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Send `content` into the target pane via paste-buffer (robust to quotes,
-/// newlines, emoji, etc.) and then press Enter.
 /// Load `content` into a fresh NAMED tmux buffer and paste it into `target`.
 ///
 /// NAMED buffer per paste, never the server-global default. Concurrent
@@ -1450,14 +1448,6 @@ pub(crate) fn last_prompt_row(pane: &str) -> Option<String> {
     row
 }
 
-/// Pure predicate behind [`wait_for_draft_gone`]: does the pane's live input
-/// row still carry OUR draft? Multiline pastes can render as a
-/// "[Pasted text #N +K lines]" chip instead of the literal draft — the
-/// caller pasted into an empty input, so a lingering chip is equally "our
-/// draft unsent". Matching on our fragment (never mere non-emptiness) is
-/// what keeps the recovery ladder from pressing Enter into a permission
-/// picker. Mirrored in messaging/whatsapp `draftStuck`; shared vectors in
-/// `core/testdata/submit_verify_vectors.json`.
 /// Head and tail markers for the pasted content.
 ///
 /// The input box is a few rows tall, so a long payload scrolls and only its
@@ -1502,6 +1492,14 @@ pub(crate) fn live_input_region(pane: &str) -> Option<String> {
     Some(out)
 }
 
+/// Pure predicate behind [`wait_for_draft_gone`]: does the pane's live input
+/// row still carry OUR draft? Multiline pastes can render as a
+/// "[Pasted text #N +K lines]" chip instead of the literal draft — the
+/// caller pasted into an empty input, so a lingering chip is equally "our
+/// draft unsent". Matching on our fragment (never mere non-emptiness) is
+/// what keeps the recovery ladder from pressing Enter into a permission
+/// picker. Mirrored in messaging/whatsapp `draftStuck`; shared vectors in
+/// `core/testdata/submit_verify_vectors.json`.
 pub(crate) fn draft_stuck(pane: &str, head: &str, tail: &str) -> bool {
     let Some(region) = live_input_region(pane) else {
         return false;
@@ -1515,9 +1513,6 @@ pub(crate) fn draft_stuck(pane: &str, head: &str, tail: &str) -> bool {
     (!head.is_empty() && region.contains(&head)) || (!tail.is_empty() && region.contains(&tail))
 }
 
-/// Poll until the LIVE INPUT ROW no longer carries the draft fragment — the
-/// submit landed (or the TUI moved to turn view). False on deadline: the
-/// draft is still sitting unsent in the input.
 /// Poll until OUR draft is VISIBLE in the live input row — the paste landed
 /// and Enter will mean something. False on deadline; the caller presses on so
 /// the recovery ladder still gets its turn.
@@ -1540,6 +1535,9 @@ async fn wait_for_draft_present(target: &str, head: &str, tail: &str, deadline: 
     false
 }
 
+/// Poll until the LIVE INPUT ROW no longer carries the draft fragment — the
+/// submit landed (or the TUI moved to turn view). False on deadline: the
+/// draft is still sitting unsent in the input.
 async fn wait_for_draft_gone(target: &str, head: &str, tail: &str, deadline: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < deadline {
@@ -1933,7 +1931,7 @@ async fn wait_for_transcript_quiet(path: &Path, settle_window: Duration) -> Opti
 /// Poll the transcript from `from_offset` until the assistant's turn is
 /// genuinely complete, then return the text of its final message.
 ///
-/// "Complete" is decided by `stop_reason`, NOT by a quiet transcript:
+/// With `await_turn_complete` set, "complete" is decided by `stop_reason`, not a quiet transcript:
 /// - `end_turn` / `stop_sequence` / `max_tokens` on the last assistant
 ///   message → done; return immediately (also makes normal replies snappy).
 /// - `tool_use` → the model is mid-action and a tool result is coming; we
@@ -2413,12 +2411,6 @@ mod tests {
         assert!(!fallback_model().trim().is_empty());
     }
 
-    /// Set up a tmux session whose pane contains synthetic text resembling
-    /// the resume-from-summary picker. wait_for_tui_ready should detect it,
-    /// auto-dismiss with "1" + Enter, and then either find the ready marker
-    /// (if we follow up with one) or time out. We don't need a real claude;
-    /// we just need pane content that triggers the auto-dismiss code path
-    /// and verify the keys land.
     async fn tmux_kill(session: &str) {
         let _ = Command::new("tmux")
             .args(["kill-session", "-t", session])

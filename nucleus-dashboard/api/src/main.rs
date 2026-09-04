@@ -61,8 +61,8 @@ async fn main() -> Result<()> {
         });
 
     // Both DBs are tolerated-missing — if the news / reminders subsystem
-    // hasn't been initialized yet on this machine the routes mount and
-    // return 503s rather than crashing the whole binary.
+    // hasn't been initialized yet on this machine its routes are skipped
+    // (requests fall through to a JSON 404) rather than crashing the binary.
     let news_pool = match db::open(&workspace_root.join("memory/news.db")).await {
         Ok(p) => Some(p),
         Err(e) => {

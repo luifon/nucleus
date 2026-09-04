@@ -637,7 +637,7 @@ async function resolveAllowlist(sock: WASocket, config: Config): Promise<void> {
   }
 }
 
-/** Background drain of the outbound_queue table. Runs every 5s once
+/** Background drain of the outbound_queue table. Runs every 1s once
  *  the allowlist is resolved. For each pending row:
  *    1. Resolve `target` to a JID via groupNameToJid (or treat as a
  *       literal JID if it already looks like one).
@@ -919,7 +919,7 @@ async function handleMessage(
     }
   } else {
     // 4D. DM path (ADR-005b). The sender == chatId by definition; the JID
-    //     is on `allowedDmJids` because role resolution succeeded. No
+    //     is on `allowedDmSenders` because role resolution succeeded. No
     //     participant allowlist + no membership tripwire (single-party
     //     chat). The role can't be `braindump` here — we never seed
     //     @s.whatsapp.net JIDs as braindump — but assert defensively.

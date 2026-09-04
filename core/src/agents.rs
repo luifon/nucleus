@@ -30,7 +30,7 @@ pub enum AgentClass {
     Conversational,
     /// launchd-cron domain job that drives Claude for a specific task.
     Scheduled,
-    /// Reads other agents' output to improve the system (distiller; future
+    /// Reads other agents' output to improve the system (distiller;
     /// skill-gap learner).
     Maintenance,
     /// Host process / scheduler with no operator persona of its own.
@@ -64,7 +64,7 @@ pub enum Launch {
 pub enum Capability {
     /// Daily 04:00 session rotation (summarize → diary → respawn).
     Rotates,
-    /// Future: on-the-fly post-session skill review (skill-gap learner arm).
+    /// On-the-fly post-session skill review (skill-gap learner arm).
     SkillReview,
 }
 

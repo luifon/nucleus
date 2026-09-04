@@ -2,8 +2,8 @@
 //! health overview + activity glances + docker + tunnel probe.
 //!
 //! Deliberately does NOT include a unified agents-health surface — that
-//! waits for the ADR-016 agent registry, which gives us one canonical
-//! list to read from instead of the launchctl+tmux ad-hoc model.
+//! lives at `/agents` (ADR-016), built on the registry. This hub reads
+//! only paths, DBs and tmux.
 
 use axum::{
     extract::State,

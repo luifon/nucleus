@@ -3,7 +3,7 @@
 //! exists for brain-dump applies, so the feed reflects "what files
 //! changed recently" rather than "what the apply pipeline did".
 //! Good enough for the operator's "what did the bot write?" question;
-//! see ADR-015 §"Future work" for the audit-log alternative.
+//! see ADR-015 §"Scope" for the audit-log alternative.
 
 use axum::{
     extract::{Query, State},
@@ -228,8 +228,8 @@ async fn get_file(
 
 // ─── filters ────────────────────────────────────────────────────────────────
 
-/// Skip top-level entries that aren't user content: Obsidian's
-/// settings dir, dot-files, and the vault-root home/workspace files.
+/// Skip top-level dirs that aren't user content: dot-dirs (`.obsidian`) and
+/// `node_modules`. Files are dropped by the is_dir gate in `list_buckets`.
 fn skip_top_level(name: &str) -> bool {
     name.starts_with('.') || name == "node_modules"
 }
