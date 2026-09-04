@@ -77,10 +77,8 @@ pub async fn open(path: &Path) -> Result<SqlitePool> {
     Ok(pool)
 }
 
-/// Versioned migrations (ADR-020). v1 is the historical `ensure_schema`
-/// body verbatim — intentionally idempotent so any pre-runner DB (full,
-/// partial, or pre-ADR-006) is healed once and recorded. Add new schema
-/// changes as v2+ `Step::Sql` entries; they run exactly once.
+/// Versioned migrations (ADR-020). v1 is this DB's historical
+/// `ensure_schema` body, which heals a pre-ADR-006 DB.
 const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[
     nucleus_core::migrate::Migration {
         version: 1,
@@ -171,9 +169,6 @@ fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> 
 /// channel-rename sweep at the bottom now runs once — correct going
 /// forward, since the legacy channel names can no longer be written.
 async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
-    // Base table — created fresh on new installs with the full ADR-006
-    // shape. On existing DBs this is a no-op (table already exists) and
-    // we follow up with ALTER TABLE for the new columns.
     // Base shape for fresh installs. On DBs that pre-date ADR-006,
     // this is a no-op (the table already exists with the legacy
     // shape, including the NOT NULL `due_at` column); the ALTERs +
@@ -499,12 +494,10 @@ pub struct Reminder {
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
 #[ts(export)]
 pub struct ChannelRow {
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     pub reminder_id: i64,
     pub channel: String,
     pub status: String,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     pub attempts: i64,
     pub last_error: Option<String>,

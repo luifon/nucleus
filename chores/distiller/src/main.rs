@@ -1,7 +1,6 @@
 //! distiller — diary distillation, one consolidated daily pass (ADR-016).
 //!
-//! Was two launchd jobs (hourly `metabolism` + weekly `contemplation`); now a
-//! single daily run with no subcommand. Each invocation:
+//! No subcommand. Each invocation:
 //!   1. metabolism    — extract candidates from the last day's diaries → _pending.md
 //!   2. contemplation — judge them (PROMOTE | MERGE | ARCHIVE | DROP) + prune
 //!
@@ -35,7 +34,6 @@ async fn main() -> Result<()> {
         .output()
         .await;
 
-    // One daily pass: extract fresh candidates, then judge + archive + prune.
     metabolism(&workspace_root, &diary_root, &settings).await?;
     contemplation(&workspace_root, &diary_root, &settings).await?;
     session_index_maintenance(&workspace_root, &settings).await;
@@ -149,7 +147,7 @@ async fn metabolism(workspace_root: &Path, diary_root: &Path, settings: &Setting
     let mut session = Session::spawn(spawn_opts)
         .await
         .context("spawning claude session for metabolism")?;
-    // Daily pass — scan the last day's entries (was hourly).
+    // Daily pass — scan the last day's entries.
     let since = Local::now() - Duration::days(1);
     let mut total_staged = 0usize;
     let mut agents_processed = 0usize;
@@ -371,9 +369,7 @@ PENDING CANDIDATES:
         }
         tracing::info!("contemplation: agent {} → {:?}", agent, counts);
 
-        // Prune diary files older than retain_days.
         prune_old_diaries(agent_dir, week_ago.date_naive())?;
-        // Reset _pending.md.
         let _ = std::fs::write(agent_dir.join("_pending.md"), "");
     }
 
@@ -435,10 +431,8 @@ async fn apply_decision(agent: &str, d: &Decision, vault_path: &Path) -> Result<
 }
 
 /// Write an ARCHIVE'd note into the user's PARA-organized vault under the
-/// requested bucket. Falls back to `0-Inbox/` if the bucket is missing,
-/// invalid, points outside the vault, or names a Project/Area/Resource
-/// sub-folder that doesn't already exist (per CLAUDE.md Rule 9 — bots
-/// don't auto-create those).
+/// requested bucket. Falls back to `0-Inbox/` when [`resolve_bucket`]
+/// rejects the bucket.
 fn archive_to_para(
     agent: &str,
     vault_path: &Path,

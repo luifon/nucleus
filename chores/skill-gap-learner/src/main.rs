@@ -482,7 +482,7 @@ fn apply_auto_transitions(root: &Path, stale_days: u32, archive_days: u32) -> (u
         let Ok(content) = std::fs::read_to_string(&skill_md) else { continue };
         let fm = skills::parse_frontmatter(&content, &skill_md).unwrap_or_default();
         if fm.created_by.as_deref() != Some("agent") || fm.pinned {
-            continue; // only auto-manage our own, never pinned
+            continue;
         }
         let age_days = skill_age_days(&fm, &skill_md, now);
         if age_days >= archive_days as i64 {
