@@ -1,16 +1,9 @@
-/** Connection circuit breaker (ADR-027).
+/** Connection circuit breaker. The ladder, the open-circuit thresholds,
+ *  the alert policy and the `connection_events` dataset are specified in
+ *  docs/ADR-027-adapter-circuit-breaker.md, "Decision".
  *
- *  The inner supervision layer between Baileys and launchd: transient
- *  closes reconnect in-process on an exponential ladder instead of the old
- *  fixed 2s/5s; a failure storm opens the circuit (stop hammering, hold
- *  the outbound queue, alert ONCE via Discord — the independent channel)
- *  and probes half-open on an interval. launchd stays the outer layer for
- *  crashes; this class never exits the process and NEVER touches auth
- *  state (Rule 8: no logout, no re-pair, no auth-dir writes).
- *
- *  Every close is classified and recorded (`connection_events` in
- *  whatsapp.db) — the churn-diagnosis dataset ADR-027 wants, populated
- *  passively. Pure state machine, clock injected, unit-tested.
+ *  Never touch auth state here: no logout, no re-pair, no auth-dir writes
+ *  (Rule 8). Pure state machine, clock injected, unit-tested.
  */
 
 export interface BreakerConfig {

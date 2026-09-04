@@ -21,10 +21,6 @@
 //     → reads the row, applies only the accepted ops, marks status,
 //       returns CaptureOutcome.
 //
-// captureToPara remains as a thin wrapper that does plan + apply-all
-// back-to-back, for callers that want the old eager behavior (tests,
-// future bypass flag).
-//
 // CLAUDE.md Rule 9 governs the placement rules Claude is given.
 
 import fs from "node:fs";
@@ -462,7 +458,7 @@ export async function captureToPara(
   return applyPlan(plan.planId, "all", plansStore, config);
 }
 
-// ==================== APPLY HELPERS (unchanged) ====================
+// ==================== APPLY HELPERS ====================
 
 /** Apply a field-level operator correction to one op, returning a new op
  *  (never mutates the input). Only fields valid for the op's type are taken;
@@ -1180,7 +1176,7 @@ Rules:
 Output the JSON now. Nothing else.`;
 }
 
-// ==================== VAULT SCAN (unchanged) ====================
+// ==================== VAULT SCAN ====================
 
 function summarizeVault(vault: string): string {
   const out: string[] = [`${vault}/`];
