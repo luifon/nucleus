@@ -1,10 +1,6 @@
 //! Typed settings.
 //!
-//! Two sources, with clear separation:
-//! - **`.env`** (gitignored) — anything personally identifying: user names,
-//!   workspace paths, channel/user IDs, tokens, allowlists. Loaded via dotenvy.
-//! - **`nucleus.toml`** (commit-safe) — non-identifying tunables: cron
-//!   schedules, retention windows, ports, denylists, permission mode.
+//! What belongs in `.env` vs `nucleus.toml`: see `docs/SECRETS.md`.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,7 +8,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
-    /// Personal identifiers — sourced from env, never persisted to a committed file.
     pub identity: Identity,
     pub public_urls: PublicUrls,
     pub claude: ClaudeConfig,

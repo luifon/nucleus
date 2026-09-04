@@ -1,11 +1,8 @@
 //! Session profiles (ADR-020) — the one place session-spawn posture lives.
 //!
-//! Before this module, every binary hand-rolled its own
-//! `SpawnOptions`/`AskOptions` literal: 5 distinct shapes across 7 call
-//! sites, and twice the safety-critical knobs got silently dropped
-//! (skill-gap-learner ran with `await_turn_complete: false` and without the
-//! Settings `disallowed_tools`). Profiles make those mistakes
-//! unrepresentable:
+//! The hand-rolled `SpawnOptions`/`AskOptions` drift this replaced is
+//! recorded in `docs/ADR-020` §"Session substrate". Profiles make those
+//! mistakes unrepresentable:
 //!
 //! - Every one-shot constructor hard-codes `await_turn_complete: true` —
 //!   correct for agentic multi-step work, and also *faster* for single-turn
