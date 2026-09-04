@@ -310,6 +310,11 @@ launch = "launchd-cron"
                 "conversational agent {} needs persona_venue",
                 a.name
             );
+            assert!(
+                a.has_capability(Capability::Rotates),
+                "conversational agent {} should rotate",
+                a.name
+            );
         }
     }
 }
