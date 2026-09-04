@@ -773,16 +773,21 @@ async fn post_top_notable(
     n: usize,
     feed_url: Option<&str>,
 ) -> Result<usize> {
-    // Top N notable items from this run that haven't been posted yet.
+    // Top N unposted notable items from today's fetch. Scoped to
+    // fetch_date so a "Notable in news today" post can't dredge up an
+    // unposted leftover from an earlier day.
+    let today = Utc::now().format("%Y-%m-%d").to_string();
     let rows: Vec<NotableRow> = sqlx::query_as::<_, NotableRow>(
         r#"SELECT id, title, url, notable_score, notable_reason
            FROM items
            WHERE notable_score IS NOT NULL
              AND notable_score >= 0.6
              AND posted_to_discord = 0
+             AND fetch_date = ?1
            ORDER BY notable_score DESC, fetched_at DESC
-           LIMIT ?1"#,
+           LIMIT ?2"#,
     )
+    .bind(&today)
     .bind(n as i64)
     .fetch_all(pool)
     .await?;
