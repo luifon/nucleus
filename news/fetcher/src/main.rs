@@ -114,10 +114,8 @@ async fn main() -> Result<()> {
                 if new.is_empty() {
                     continue;
                 }
-                // Two-stage cap: take the first PRE_SCORE_CAP items (RSS
-                // order = newest-first) to bound the LLM scoring call, then
-                // keep at most POST_SCORE_CAP by notable_score. Everything
-                // else (including the unscored 21..N) gets deleted by
+                // Everything outside the kept set — including the items
+                // past PRE_SCORE_CAP that were never scored — is deleted by
                 // persist_top_n so the UI isn't drowned by a single source.
                 let to_score: &[ParsedItem] = &new[..new.len().min(PRE_SCORE_CAP)];
                 let scored = score_all(&workspace_root, to_score, &settings).await?;
@@ -316,9 +314,8 @@ async fn persist_top_n(
     Ok(keep.into_iter().map(|(_, (it, _, _))| it.clone()).collect())
 }
 
-/// Versioned migrations (ADR-020): v1 = the historical ensure_schema body
-/// verbatim (idempotent CREATEs + tolerated ALTERs + fetch_date backfill).
-/// New schema changes go in as v2+ and run exactly once.
+/// Versioned migrations (ADR-020). v1 = idempotent CREATEs + tolerated
+/// ALTERs + the fetch_date backfill.
 const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[nucleus_core::migrate::Migration {
     version: 1,
     name: "baseline-news",
@@ -364,12 +361,10 @@ async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     // independent of the article's own published_at. UI groups by this.
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN fetch_date TEXT NOT NULL DEFAULT ''")
         .execute(pool).await;
-    // article_url — set when items.url points at a discussion page (HN
-    // comments, lobste.rs story page). Then article_url is the underlying
-    // primary-source URL we surface as a small "↗ original" chip.
+    // article_url — the primary-source URL when items.url is a discussion
+    // page (HN comments, lobste.rs story page).
     let _ = sqlx::query("ALTER TABLE items ADD COLUMN article_url TEXT")
         .execute(pool).await;
-    // Backfill any rows missing fetch_date — use the date portion of fetched_at.
     sqlx::query("UPDATE items SET fetch_date = substr(fetched_at, 1, 10) WHERE fetch_date = ''")
         .execute(pool).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_items_published_date ON items(published_date)")
@@ -410,9 +405,7 @@ async fn seed_default_sources(pool: &SqlitePool) -> Result<()> {
     // without disturbing the existing DB. Manual sources added via the
     // dashboard / SQL stay put.
     let defaults: &[(&str, &str)] = &[
-        // (name, url) — all sources cap at PRE_SCORE_CAP / POST_SCORE_CAP
-        // (currently 20 / 10) regardless of source. arXiv cs.AI publishes
-        // ~400/day but the pre-score slice keeps the LLM call bounded.
+        // (name, url) — every source is capped by PRE_SCORE_CAP / POST_SCORE_CAP.
         ("Hacker News",            "https://hnrss.org/frontpage"),
         ("lobste.rs",              "https://lobste.rs/rss"),
         ("Simon Willison",         "https://simonwillison.net/atom/everything/"),
@@ -469,10 +462,6 @@ async fn fetch_source(http: &reqwest::Client, src: &SourceRow) -> Result<Vec<Par
         let raw_summary = entry.summary.map(|s| s.content);
         let summary = raw_summary.as_deref().map(sanitize_summary);
 
-        // For curation sites that wrap an external article, we want clicks
-        // to land on the discussion (HN, lobste.rs), not the underlying
-        // article. Extract the discussion URL from the feed body where it
-        // lives, store the original feed link as article_url.
         let (url, article_url) = pick_primary_url(&src.name, &feed_link, raw_summary.as_deref());
 
         let published = entry.published.or(entry.updated).unwrap_or_else(Utc::now);
@@ -815,7 +804,6 @@ async fn post_top_notable(
         body.push_str(&format!("\n→ Full feed: {}", url.trim_end_matches('/')));
     }
 
-    // send_announcement: suppresses URL embeds AND enables @here parsing.
     discord_sdk::send_announcement(channel_id, &body).await?;
 
     for r in &rows {

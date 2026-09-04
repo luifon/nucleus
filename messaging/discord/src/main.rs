@@ -69,7 +69,6 @@ impl Handler {
             return None;
         }
 
-        // DM detection: fetch the channel and check kind.
         let is_dm = match msg.channel(http).await {
             Ok(Channel::Private(_)) => true,
             _ => false,
@@ -90,7 +89,6 @@ impl Handler {
             }
         }
 
-        // Strip the bot's @mention from the body.
         let cleaned = msg
             .content
             .replace(&format!("<@{}>", bot_id.get()), "")
@@ -347,15 +345,14 @@ async fn handle_remember(cmd: &CommandInteraction, settings: &Settings) -> Resul
         "project" => Kind::Project,
         _ => Kind::Reference,
     };
-    // Generate a kebab-case slug from the first few words of the fact.
     let slug: String = fact.split_whitespace().take(5).collect::<Vec<_>>().join("-")
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-')
         .collect::<String>()
         .to_lowercase();
     let slug = if slug.is_empty() { format!("note-{}", chrono::Utc::now().timestamp()) } else { slug };
-    // Sign with the resolved persona display name (ADR-009), not a hardcoded
-    // "Jerry" — this footer is persisted into the Tier-2 memory file.
+    // Sign with the resolved persona display name (ADR-009), never a hardcoded
+    // one — this footer is persisted into the Tier-2 memory file.
     let signer = nucleus_core::config::resolve_persona(&settings.identity, "discord", None)
         .map(|p| p.display_name)
         .unwrap_or_else(|_| "nucleus".into());
@@ -379,8 +376,7 @@ async fn handle_forget(cmd: &CommandInteraction) -> Result<String> {
     }
 }
 
-/// Versioned migrations (ADR-020): v1 = the historical ensure_schema
-/// body. New schema changes go in as v2+ and run exactly once.
+/// Versioned migrations (ADR-020).
 const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[nucleus_core::migrate::Migration {
     version: 1,
     name: "baseline-channel-sessions",

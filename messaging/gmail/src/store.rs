@@ -26,8 +26,7 @@ pub async fn open(path: &Path) -> Result<SqlitePool> {
     Ok(pool)
 }
 
-/// Versioned migrations (ADR-020): v1 = the historical ensure_schema
-/// body. New schema changes go in as v2+ and run exactly once.
+/// Versioned migrations (ADR-020).
 const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[nucleus_core::migrate::Migration {
     version: 1,
     name: "baseline-adr007",
