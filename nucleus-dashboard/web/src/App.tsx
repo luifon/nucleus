@@ -37,8 +37,7 @@ type RouteEntry = {
 };
 
 // ADR-015 — sidebar route inventory. Each entry becomes a page during
-// Phase 1. The scaffold lands only HomePage; subsequent commits fill
-// the rest in. Icons mirror the Iconize convention from ADR-014.
+// Phase 1. Icons mirror the Iconize convention from ADR-014.
 const ROUTES: RouteEntry[] = [
   { path: "/",          label: "dashboard", icon: LayoutDashboard, group: "primary",       impl: "scaffolded" },
   { path: "/chat",      label: "chat",      icon: MessageSquare,   group: "primary",       impl: "scaffolded" },

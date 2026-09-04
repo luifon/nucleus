@@ -6,11 +6,6 @@ import SkillRow from "@/components/skills/SkillRow";
 import { useFetch } from "@/lib/hooks";
 import { listSkills, type Skill, type SkillTier } from "@/lib/api";
 
-// Two-tab catalog per operator request:
-//   - personal: ~/.claude/skills/  (operator-only, never committed)
-//   - repo:     .claude/skills/    (committed, ships with the repo
-//                                   for other people who clone it)
-
 export default function SkillsPage() {
   const skills = useFetch(listSkills);
   const [tier, setTier] = useState<SkillTier>("personal");

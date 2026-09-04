@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 // Shared hooks. Anything fetched in more than one place lives here so
-// the dashboard tiles (which come last per the agreed build order) can
-// reuse the same patterns rather than re-implementing them.
+// the dashboard tiles can reuse the same patterns rather than
+// re-implementing them.
 
 /** State returned by `useFetch` / `usePolling`. */
 export type FetchState<T> = {

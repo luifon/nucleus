@@ -30,7 +30,6 @@ export default function RemindersPage() {
     () => listReminders({ includeFired: needFired, includeCancelled: needCancelled }),
     [needFired, needCancelled],
   );
-  // Fire-attempt audit log (folded in from the retired /cron surface).
   const history = usePolling(listReminderHistory, HISTORY_POLL_MS);
 
   // Optimistic splice on write-action responses (no list refetch).

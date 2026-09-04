@@ -49,8 +49,7 @@ export const setReminderTitle = (id: number, title: string | null) =>
     title,
   });
 
-// Fire-attempt audit log — folded in from the retired /cron surface (its one
-// view /reminders lacked). "Upcoming" is just the active/pending rows of
+// Fire-attempt audit log. "Upcoming" is just the active/pending rows of
 // listReminders sorted by next_fire, so it needs no separate fetcher.
 export type { FireRow as RecentFire } from "./generated/FireRow";
 
