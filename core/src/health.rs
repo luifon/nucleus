@@ -1,5 +1,5 @@
-//! Health check trait + registry. Used heavily by `dashboard`; other binaries
-//! can self-report. See ADR-001 for the dashboard surface.
+//! Health `Snapshot`/`Status` types: the dashboard produces them, the discord
+//! bot renders them. The `HealthCheck` trait + `Registry` are unwired (ADR-001).
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

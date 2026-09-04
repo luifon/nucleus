@@ -1,9 +1,9 @@
-//! News surface — public read API + admin views.
+//! News surface — read API + admin views.
 //!
 //! Lifted from the standalone `news/api/` crate (ADR-015 §"Migration").
-//! Routes mount under `/news/api/*` for the public contract (cloudflared
-//! whitelist post-ADR-011) and `/news/api/admin/*` for operator-only
-//! views like recent fetch runs and source health.
+//! All routes mount under `/news/api/*` — including the operator views
+//! (recent fetch runs, source health); there is no `/admin/*` prefix.
+//! Behind the tailnet post-ADR-011 (not public).
 
 use anyhow::Result;
 use axum::{

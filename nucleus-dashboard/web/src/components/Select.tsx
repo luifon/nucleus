@@ -7,7 +7,7 @@ export type SelectOption<T extends string> = {
 };
 
 // Native <select> styled to the Nucleus palette. Used for
-// single-choice filters (agent picker, channel picker). Native gives
+// single-choice filters (agent picker, bucket picker). Native gives
 // us keyboard support and accessibility for free, which the custom
 // FilterDropdown would have to reinvent.
 

@@ -1,8 +1,6 @@
-// News API — public read endpoints + vote.
+// News API — read endpoints + vote.
 // Mirrors `nucleus-dashboard/api/src/handlers/news.rs`. Routes live
-// under `/news/api/*` because they stay publicly reachable through
-// cloudflared after the ADR-011 Tailscale perimeter ships
-// (everything else gets gated).
+// under `/news/api/*`. Behind the tailnet post-ADR-011 (not public).
 // Wire types are ts-rs-generated from the Rust structs (./generated/).
 
 import { jsonGet, jsonPost, qs } from "./client";

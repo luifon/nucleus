@@ -230,7 +230,7 @@ struct Decision {
     body: Option<String>,        // markdown body for PROMOTE/MERGE/ARCHIVE
     /// PARA destination for ARCHIVE: e.g. "4-Areas/Nucleus", "0-Inbox",
     /// "5-Resources/Rust-async", "6-Slipbox". Validated against the
-    /// vault's allowed top-level buckets in [`apply_decision`]; new
+    /// vault's allowed top-level buckets in [`resolve_bucket`]; new
     /// sub-folders under 3-Projects / 4-Areas / 5-Resources are NOT
     /// auto-created (those represent durable user commitments, see
     /// CLAUDE.md Rule 9).
@@ -525,8 +525,7 @@ fn sanitize_filename(name: impl AsRef<str>) -> String {
         .to_string()
 }
 
-/// Tilde-expand a config path. Mirrors the helper in `dashboard/src/main.rs`
-/// (kept duplicated to avoid a core/ trip for one tiny function).
+/// Tilde-expand a config path.
 fn expand_home(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_default();

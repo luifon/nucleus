@@ -1,6 +1,6 @@
 //! Outbound Discord helpers — direct REST, no serenity dependency.
 //! Used by binaries that need to fan out one-shot notifications (news fetcher,
-//! reminders). The Discord bot (`jerry`) uses serenity directly for its own
+//! reminders). The Discord bot uses serenity directly for its own
 //! inbound + outbound flow.
 
 use anyhow::{Context, Result};

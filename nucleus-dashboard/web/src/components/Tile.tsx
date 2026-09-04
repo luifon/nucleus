@@ -1,9 +1,8 @@
 import { type ComponentType, type ReactNode } from "react";
 import StatusPill, { type StatusKind } from "./StatusPill";
 
-// Reusable tile — used on Home, will be reused on Dashboard once that
-// surface lands. Keep this generic; surface-specific content goes in
-// `children`.
+// Reusable tile — used by the dashboard tiles on `/`. Keep this generic;
+// surface-specific content goes in `children`.
 export default function Tile({
   Icon,
   label,

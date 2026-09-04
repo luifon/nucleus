@@ -86,7 +86,7 @@ const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[
         step: nucleus_core::migrate::Step::Rust(baseline_v1),
     },
     // ADR-024: condition watcher. When condition_cmd is set, a due tick
-    // runs it (sh -c, 5s timeout) and only exit 0 lets the reminder
+    // runs it (sh -c, 15s timeout) and only exit 0 lets the reminder
     // fire; a gated tick advances the schedule silently. condition_mode:
     // 'while-true' (default) fires on every truthy evaluation, 'change'
     // only on a false→true transition. condition_state /
@@ -311,7 +311,7 @@ async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     // name) and "whatsapp-group" (venue rename of alfred) and "braindump"
     // (capture surface mis-used as a reminder channel) all route reminder
     // delivery to a group — the wrong default for personal reminders.
-    // Sweep them all to "whatsapp-dm" idempotently on every startup.
+    // Sweep them all to "whatsapp-dm" idempotently, once (migration v1).
     sqlx::query(
         "UPDATE reminder_channels SET channel = 'whatsapp-dm'
          WHERE channel IN ('alfred', 'whatsapp-group', 'braindump')",
@@ -862,16 +862,6 @@ pub async fn record_channel_fire(
     Ok(())
 }
 
-/// Called after iterating through all of a reminder's pending channels
-/// for this tick. If any channel rows are still `pending`, leave
-/// `next_fire_at` alone (next tick retries). Once every channel has
-/// reached a terminal state (`sent` or `failed`), either:
-///   - one-shot: status='fired', next_fire_at=NULL
-///   - recurring: recompute next_fire_at from cron, reset channel rows
-///                to pending+0 for the next fire
-///
-/// Wrapped in a single transaction so the channel-reset is atomic with
-/// the next_fire_at advance.
 /// Stamp the alert-cooldown clock after delivering an outer-error ⚠.
 pub async fn record_alerted(pool: &SqlitePool, reminder_id: i64) -> Result<()> {
     sqlx::query("UPDATE reminders SET last_alerted_at = ?1 WHERE id = ?2")
@@ -944,6 +934,16 @@ pub async fn advance_after_gate(pool: &SqlitePool, reminder_id: i64) -> Result<(
     Ok(())
 }
 
+/// Called after iterating through all of a reminder's pending channels
+/// for this tick. If any channel rows are still `pending`, leave
+/// `next_fire_at` alone (next tick retries). Once every channel has
+/// reached a terminal state (`sent` or `failed`), either:
+///   - one-shot: status='fired', next_fire_at=NULL
+///   - recurring: recompute next_fire_at from cron, reset channel rows
+///                to pending+0 for the next fire
+///
+/// Wrapped in a single transaction so the channel-reset is atomic with
+/// the next_fire_at advance.
 pub async fn advance_after_fire(pool: &SqlitePool, reminder_id: i64) -> Result<()> {
     let reminder = load_reminder(pool, reminder_id)
         .await?
@@ -1133,10 +1133,10 @@ pub async fn fire_history(
         .collect())
 }
 
-/// Idempotent seeding of `created_by = 'system'` reminders. Matches on
-/// body so cancelled rows are NOT recreated (a cancelled system row
-/// stays cancelled until you delete it or re-add manually). If the row
-/// is missing entirely, insert it.
+/// Idempotent seeding of `created_by = 'system'` reminders. Matches on title,
+/// or body for legacy seeds, so cancelled rows are NOT recreated (a cancelled
+/// system row stays cancelled until you delete it or re-add manually). If the
+/// row is missing entirely, insert it.
 pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
     struct SeedRow {
         /// Stable identity for title-matched seeds (skill-fires, whose
@@ -1237,9 +1237,9 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
 // ============ WhatsApp outbound bridge ============
 //
 // To deliver a reminder to a WhatsApp chat without conflicting with
-// Alfred's Baileys auth (single-client constraint), the reminders binary
-// enqueues into a table that lives in memory/whatsapp.db. Alfred drains
-// it every 5s and sends via its existing socket. See messaging/whatsapp/
+// the whatsapp bot's Baileys auth (single-client constraint), the reminders
+// binary enqueues into a table that lives in memory/whatsapp.db. The bot
+// drains it every 1s and sends via its existing socket. See messaging/whatsapp/
 // src/db.ts OutboundQueueStore + index.ts startOutboundDrain.
 
 pub async fn open_whatsapp_db(path: &Path) -> Result<SqlitePool> {

@@ -131,16 +131,6 @@ async fn review(
     Ok(())
 }
 
-/// Validate every SKILL.md under `root` modified since `since`; move any that
-/// fail to `<root>/.rejected/<name>-<ts>/`. Returns what the gate did.
-///
-/// Only skills this agent authored (`created_by: agent`) are ever moved.
-/// A hand-written skill is reported and left alone: the format contract
-/// exists to police autonomous writes, and an operator skill never agreed
-/// to it. On 2026-08-28 the curator made a cosmetic frontmatter fix to a
-/// hand-written skill, that touch made it eligible for the gate, and a missing
-/// `# Steps` heading moved the whole directory out of the library — taking
-/// the script a reminder depended on with it.
 #[derive(Default)]
 struct GateOutcome {
     /// Agent-authored skills moved to `.rejected/`.
@@ -160,6 +150,16 @@ impl GateOutcome {
     }
 }
 
+/// Validate every SKILL.md under `root` modified since `since`; move any that
+/// fail to `<root>/.rejected/<name>-<ts>/`. Returns what the gate did.
+///
+/// Only skills this agent authored (`created_by: agent`) are ever moved.
+/// A hand-written skill is reported and left alone: the format contract
+/// exists to police autonomous writes, and an operator skill never agreed
+/// to it. On 2026-08-28 the curator made a cosmetic frontmatter fix to a
+/// hand-written skill, that touch made it eligible for the gate, and a missing
+/// `# Steps` heading moved the whole directory out of the library — taking
+/// the script a reminder depended on with it.
 fn gate_touched_skills(root: &Path, since: SystemTime) -> Result<GateOutcome> {
     let mut outcome = GateOutcome::default();
     let entries = match std::fs::read_dir(root) {

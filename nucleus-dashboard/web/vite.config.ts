@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ADR-015. Dev: Vite at :5173 proxies /api/* and /chat/ws to the axum
-// server at :8092. Prod: axum serves `dist/` directly (no Vite at all).
+// ADR-015. Dev: Vite at :5173 proxies the /api, /chat/api and /gallery
+// routes to the axum server at :8092. Prod: axum serves `dist/` (no Vite).
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {

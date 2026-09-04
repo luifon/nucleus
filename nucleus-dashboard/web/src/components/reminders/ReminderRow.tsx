@@ -257,8 +257,8 @@ function statusToKind(status: string): StatusKind {
   }
 }
 
-// Same priority order as the cron rows: title > body > derived label
-// from system_prompt.
+// Same priority order as RecentFireRow's pickDisplayName: title > body >
+// derived label from system_prompt.
 function pickDisplayName(r: ReminderView): { text: string; derived: boolean; tooltip?: string } {
   if (r.title && r.title.trim()) {
     return { text: r.title, derived: false, tooltip: r.body || r.system_prompt || undefined };

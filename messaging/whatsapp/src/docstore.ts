@@ -320,9 +320,10 @@ export class DocStore {
   }
 
   /** Exact-first tiers: (1) case-insensitive exact logical_name; (2) exact
-   *  tag; (3) substring on name/tags/filename; (4) token-overlap fuzzy.
-   *  Each tier consulted only if the previous returned nothing. TS-side
-   *  over a full active SELECT — personal-library scale (hundreds). */
+   *  tag; (3) exact keyword; (4) substring on name/filename/tags; (5)
+   *  substring on keywords/summary; (6) token-overlap fuzzy. Each tier
+   *  consulted only if the previous returned nothing. TS-side over a full
+   *  active SELECT — personal-library scale (hundreds). */
   find(query: string, limit = 10): DocRecord[] {
     const q = query.trim().toLowerCase();
     if (!q) return [];

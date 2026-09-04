@@ -1,9 +1,7 @@
-// Barrel — re-exports everything so callers can keep
-// `import { foo } from "@/lib/api"` regardless of how the per-domain
-// files are split internally.
-//
-// One re-export line per domain module. Don't add aggregated helpers
-// here — those belong in the relevant domain file.
+// Barrel — re-exports the domain modules whose consumers import from
+// "@/lib/api". gallery and documents are imported by path instead, so
+// they're intentionally not re-exported here. Don't add aggregated
+// helpers here — those belong in the relevant domain file.
 
 export * from "./client";
 export * from "./health";

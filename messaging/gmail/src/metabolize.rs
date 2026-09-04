@@ -1,4 +1,4 @@
-//! Daily inbox sweep — spawns one long-lived JARVIS session, has it
+//! Daily inbox sweep — spawns a one-shot JARVIS session, has it
 //! search / classify / label / trash via the Gmail MCP, then posts a
 //! one-line digest to Discord.
 
