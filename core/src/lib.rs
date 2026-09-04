@@ -4,8 +4,7 @@
 //! - [`agents`] — the agent registry loaded from `agents.toml` (see ADR-016).
 //! - [`claude`] — shared `PermissionMode` enum.
 //! - [`claude_session`] — long-lived interactive `claude` sessions driven via
-//!   tmux. The way to run claude under the Max subscription — `-p` headless
-//!   mode is API-only.
+//!   tmux.
 //! - [`config`] — typed settings loaded from `nucleus.toml` + env.
 //! - [`db`] — sqlx pool helpers.
 //! - [`diary`] — Tier 1.5 per-agent journals (see ADR-004).

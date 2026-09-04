@@ -1,10 +1,8 @@
 //! Shared `claude` CLI types.
 //!
-//! Historically this module wrapped `claude -p` (headless mode) via a
-//! `Runner` struct. That path is deprecated — `-p` is moving to API-only
-//! billing, so every Nucleus bot/job now uses [`crate::claude_session`]
-//! instead (long-lived interactive sessions in tmux). Only the shared
-//! `PermissionMode` enum lives here now.
+//! Every Nucleus bot/job runs claude through [`crate::claude_session`]
+//! (long-lived interactive sessions in tmux). Only the shared
+//! `PermissionMode` enum lives here.
 
 use serde::{Deserialize, Serialize};
 

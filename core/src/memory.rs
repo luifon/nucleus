@@ -60,8 +60,7 @@ pub fn tier2_dir() -> Result<PathBuf> {
 
 /// Write or overwrite a memory file AND keep `MEMORY.md` in sync — appends an
 /// index line if the file isn't already linked (idempotent; never clobbers a
-/// hand-edited hook). Without this, promoted memories were silently orphaned
-/// from the index and invisible to recall.
+/// hand-edited hook).
 pub fn promote(mem: &Memory) -> Result<PathBuf> {
     let dir = tier2_dir()?;
     std::fs::create_dir_all(&dir)?;

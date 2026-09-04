@@ -363,8 +363,6 @@ impl Session {
         model_override: Option<&str>,
     ) -> Result<Option<String>> {
         let claude_args = build_claude_args(session_id, resuming, opts, model_override);
-        // claude_bin(): same resolution as claude_version(), so the version
-        // recorded in the run-log is provably the binary that ran.
         let inner = format!(
             "cd {} && {} {}",
             shell_quote(&opts.workspace_root.to_string_lossy()),
@@ -448,13 +446,6 @@ impl Session {
         let Some(kind) = classify_infra_reply(&reply) else {
             return Ok(reply);
         };
-        // The session booted clean and died at INFERENCE time, so
-        // `launch_window`'s boot-pane check saw nothing wrong and the banner
-        // arrived as the turn's reply. Callers then posted it as content: on
-        // 2026-08-24 one fire sent "issue with the selected model
-        // (claude-fable-5)" and another sent an ENOTFOUND, each in place of
-        // the report it owed the operator.
-        //
         // Fix what can be fixed, re-ask once, and never return the banner.
         match kind {
             InfraError::NotLoggedIn => {
@@ -735,8 +726,7 @@ impl SessionPool {
 
         // Phase 1 — claim/fetch this chat's slot (brief map write), then
         // serialize on the slot's own mutex. Other chat keys proceed in
-        // parallel; pre-ADR-020 this held the map write lock across the
-        // whole cold spawn, freezing every other chat for 5-60s.
+        // parallel.
         let (slot_arc, mut guard) = loop {
             let slot_arc = {
                 let mut entries = self.entries.write().await;
@@ -848,9 +838,7 @@ impl SessionPool {
     /// Idleness is re-checked under each slot's lock (an ask may race in
     /// between the scan and the close), and the slot is unlinked from the
     /// map while its lock is held — an ask parked on the same mutex wakes
-    /// to a not-current slot and re-creates cleanly. The pre-ADR-020
-    /// `Arc::try_unwrap` dance silently leaked the session whenever an
-    /// in-flight ask still held a clone.
+    /// to a not-current slot and re-creates cleanly.
     pub async fn reap_idle(&self) -> Result<usize> {
         let idle_threshold = self.config.idle_timeout;
         let candidates: Vec<(String, Arc<Mutex<Slot>>)> = {
@@ -1590,9 +1578,6 @@ pub(crate) async fn paste_and_submit_verified(
     let marker = head.clone();
     paste_and_wait(target, content, &head, &tail).await?;
 
-    // Ladder of increasingly forceful submits. Every rung ends with Enter and
-    // "did OUR draft leave the input row?".
-    //
     // Rung 1 is a bare second Enter, and it is the one that matters: the TUI
     // consumes the first Enter while it is still processing the paste, so the
     // draft stays put and a plain retry sends it. Re-pasting before trying
