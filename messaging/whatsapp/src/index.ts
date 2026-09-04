@@ -147,9 +147,8 @@ function resolveRole(chatId: string, config: Config): ChatRole | undefined {
  *  drainer to translate "Alfred" / "Brain Dump" targets into JIDs. */
 const groupNameToJid = new Map<string, string>();
 
-// Tightened from 5s to 1s so braindump-ack messages (queued by the
-// planning Claude session via src/ack.ts) land within ~1s — close to
-// instant for the operator.
+// 1s so braindump-ack messages (queued by the planning Claude session
+// via src/ack.ts) land within ~1s — close to instant for the operator.
 const OUTBOUND_DRAIN_INTERVAL_MS = 1_000;
 const OUTBOUND_MAX_ATTEMPTS = 5;
 
@@ -1620,10 +1619,9 @@ function formatOutcomeReply(
 
 /** Persona display name on every outbound message. Code identity stays
  *  venue-based (Rule 7); the persona's user-facing name comes from the
- *  resolved persona's `display_name` frontmatter (ADR-009), which lives
- *  in the persona file's frontmatter rather than env. Initialized at boot
- *  by `configurePersona`; defaults to `"bot"` if a handler somehow runs
- *  before config is loaded. */
+ *  resolved persona's `display_name` frontmatter (ADR-009). Initialized at
+ *  boot by `configurePersona`; defaults to `"bot"` if a handler somehow
+ *  runs before config is loaded. */
 let personaDisplayName = "bot";
 
 export function configurePersona(displayName: string): void {

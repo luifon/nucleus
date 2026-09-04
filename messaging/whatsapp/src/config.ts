@@ -134,7 +134,7 @@ export interface Config {
   claudeBin: string;
   permissionMode: string;
   disallowedTools: string[];
-  /** Conversational allowlist: JID → role "whatsapp-group" (the conversational role). */
+  /** Conversational allowlist: JID → role "whatsapp-group". */
   allowedChatIds: string[];
   /** Conversational allowlist by group name. */
   allowedGroupNames: string[];
@@ -208,9 +208,6 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
   const skillLearner = parsed.skill_learner ?? {};
 
   const userName = envRequired("NUCLEUS_USER_NAME");
-  // ADR-005b: three context-scoped resolutions; each falls back to the
-  // venue default if its override env var isn't set. Single display name
-  // (from the venue default, no context) keeps the footer uniform.
   const personaDefault = resolvePersona(workspaceRoot, userName, "whatsapp");
   const personaGroup = resolvePersona(workspaceRoot, userName, "whatsapp", "group");
   const personaDm = resolvePersona(workspaceRoot, userName, "whatsapp", "dm");

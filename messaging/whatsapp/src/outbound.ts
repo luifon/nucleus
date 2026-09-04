@@ -1,11 +1,9 @@
-// Outbound media helpers (ADR-018) — pure functions the drain composes.
+// Outbound media helpers — pure functions the drain composes.
 //
-// Lifecycle contract (the part that must never regress): a media row's
-// `media_path` is a DRAIN-OWNED staged file under memory/outbound-staging/.
-// It is unlinked ONLY at terminal state — markSent, or a markFailure that
-// RETURNS status 'failed', or markFailedTerminal. A retried (still-pending)
-// row's file must survive. Filesystem actions live in the drain, never in
-// the store.
+// A staged file is unlinked ONLY at terminal state; a retried row's file
+// must survive. Full contract: docs/ADR-018-whatsapp-media.md, "Outbound
+// queue — media extension". Filesystem actions live in the drain, never
+// in the store.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -26,8 +24,8 @@ export const MAX_MEDIA_SENDS_PER_TICK = 3;
 export const DEFAULT_MEDIA_MAX_BYTES = 64 * 1024 * 1024;
 
 /** Worst legitimate tick, DERIVED so the bound can't drift from the
- *  constants it protects (pre-ADR-018 this was a hand-computed literal):
- *  (20 - 3) text sends at 20s + 3 media sends at 90s + 60s margin. */
+ *  constants it protects: (20 - 3) text sends at 20s + 3 media sends at
+ *  90s + 60s margin. */
 export const DRAIN_WATCHDOG_MS =
   (20 - MAX_MEDIA_SENDS_PER_TICK) * SEND_TIMEOUT_TEXT_MS +
   MAX_MEDIA_SENDS_PER_TICK * SEND_TIMEOUT_MEDIA_MS +
