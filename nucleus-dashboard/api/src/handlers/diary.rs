@@ -199,9 +199,6 @@ async fn list_recent(
         }
     }
 
-    // Date filter (server-side) — when set, narrow to that exact date
-    // and skip the limit truncation since a single day is bounded by
-    // the number of agents.
     if let Some(date) = q.date.as_ref() {
         candidates.retain(|(_, d, _)| d == date);
     }

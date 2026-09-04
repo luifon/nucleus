@@ -174,7 +174,6 @@ struct NextFireGlance {
 struct VaultGlance {
     relpath: String,
     bucket: String,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     mtime_unix: i64,
 }

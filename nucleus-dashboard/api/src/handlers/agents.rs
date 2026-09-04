@@ -154,8 +154,6 @@ fn view_for(
                 }
             }
         }
-        // The dashboard is serving this request, so an in-process agent
-        // (the chat pool) is up by construction.
         Launch::InProcess => "hosted",
         Launch::OnDemand => {
             if live_windows > 0 {

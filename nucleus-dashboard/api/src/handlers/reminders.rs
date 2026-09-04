@@ -94,25 +94,21 @@ struct FireRow {
     // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     id: i64,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     reminder_id: i64,
     fired_at: String,
     channel: String,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     success: i64,
     msg_id: Option<String>,
     error: Option<String>,
     reminder_title: Option<String>,
     reminder_body: Option<String>,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     is_skill_fire: i64,
 }
 
-/// Recent fire-attempt audit log, newest first (was `/cron/api/recent`) — the
-/// one view `/reminders` lacked. Per-channel success/error.
+/// Recent fire-attempt audit log, newest first. Per-channel success/error.
 async fn list_history(
     State(s): State<Arc<RemindersState>>,
 ) -> Result<Json<Vec<FireRow>>, RemindersError> {
@@ -140,7 +136,6 @@ async fn list_history(
 #[derive(Deserialize, ts_rs::TS)]
 #[ts(export)]
 struct IdReq {
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     id: i64,
 }
@@ -148,7 +143,6 @@ struct IdReq {
 #[derive(Deserialize, ts_rs::TS)]
 #[ts(export)]
 struct PauseReq {
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     id: i64,
     /// ISO-8601 (any reasonable offset; UTC if no offset). When set
@@ -159,7 +153,6 @@ struct PauseReq {
 #[derive(Deserialize, ts_rs::TS)]
 #[ts(export)]
 struct SetTitleReq {
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     id: i64,
     /// Empty / null clears the title.

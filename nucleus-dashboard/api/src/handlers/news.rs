@@ -69,7 +69,6 @@ struct ItemDto {
     fetch_date: String,
     notable_score: Option<f64>,
     notable_reason: Option<String>,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     posted_to_discord: i64,
     #[ts(type = "number | null")]
@@ -141,12 +140,10 @@ async fn list_notable(
 #[derive(Serialize, sqlx::FromRow, ts_rs::TS)]
 #[ts(export)]
 struct SourceDto {
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     id: i64,
     name: String,
     url: String,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     enabled: i64,
     last_fetched_at: Option<String>,
@@ -168,13 +165,10 @@ struct RunDto {
     run_id: String,
     started_at: String,
     finished_at: Option<String>,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     items_new: i64,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     items_notable: i64,
-    // JSON numbers, not bigint — values fit f64 (ADR-020 typegen)
     #[ts(type = "number")]
     ok: i64,
 }
