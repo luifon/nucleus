@@ -78,10 +78,9 @@ pub async fn run(settings: &Settings, workspace_root: &Path) -> Result<()> {
     // label ops are all expected; without this the run stalls on the first
     // mutation. Generous ceiling: bulk classification can run minutes;
     // idempotent — on timeout the watermark stays put and the next 5am cron
-    // retries. This path also gains await_turn_complete (agentic multi-step
-    // classification; previously flagged as a candidate, now the profile
-    // default). tmux session is the venue (Rule 7 / ADR-016); JARVIS is the
-    // persona, resolved via NUCLEUS_PERSONA_GMAIL above.
+    // retries. This path also gains await_turn_complete for agentic
+    // multi-step classification. tmux session is the venue (Rule 7 /
+    // ADR-016); JARVIS is the persona, resolved via NUCLEUS_PERSONA_GMAIL above.
     let outcome = SessionProfile::one_shot_mcp(
         &ProfileContext {
             workspace_root,
