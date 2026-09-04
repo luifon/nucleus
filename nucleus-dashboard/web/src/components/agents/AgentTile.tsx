@@ -17,7 +17,7 @@ import { listRuns, getAgentLog, type AgentView, type RunRow, type AgentLog } fro
 // One tile per registry agent (ADR-016). Liveness is computed server-side
 // per the agent's launch mechanism; this just renders it. Expanding fetches
 // the run-log (transcript pointers) for tmux agents, or the launchd log tail
-// for launchd agents — the raw output that /sessions could never show.
+// for launchd agents.
 
 const STATUS_KIND: Record<AgentView["status"], StatusKind> = {
   running: "ok",

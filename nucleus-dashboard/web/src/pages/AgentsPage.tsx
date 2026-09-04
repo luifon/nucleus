@@ -6,9 +6,8 @@ import { listAgents, type AgentClass, type AgentView } from "@/lib/api";
 
 // The ADR-016 front door. One tile per registry agent, grouped by class.
 // Liveness is computed server-side per the agent's launch mechanism; we
-// poll so PID/exit/window state drifts in real time. This is what
-// /sessions collapsed into — the attach affordance now lives per tile,
-// alongside the run-log + launchd-log the old surface could never show.
+// poll so PID/exit/window state drifts in real time. The attach affordance
+// lives per tile, alongside the run-log + launchd-log.
 const POLL_MS = 20_000;
 
 // Display order + headings for the class groups.
