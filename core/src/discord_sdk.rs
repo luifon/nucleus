@@ -21,7 +21,9 @@ pub mod flags {
 /// Send a single message to a Discord channel via REST. Returns the new message ID.
 /// `suppress_embeds=true` disables URL link previews — use for compact bulleted lists.
 pub async fn send_message(channel_id: &str, content: &str, suppress_embeds: bool) -> Result<String> {
-    let mut body = json!({ "content": content });
+    // parse: [] so a generic send can never ping @everyone/@here/roles from
+    // content. send_announcement is the explicit opt-in for broadcasts.
+    let mut body = json!({ "content": content, "allowed_mentions": { "parse": [] } });
     if suppress_embeds {
         body["flags"] = json!(flags::SUPPRESS_EMBEDS);
     }
