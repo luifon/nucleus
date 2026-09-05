@@ -9,7 +9,7 @@
 //! - [`db`] — sqlx pool helpers.
 //! - [`diary`] — Tier 1.5 per-agent journals (see ADR-004).
 //! - [`discord_sdk`] — outbound Discord helpers (S1).
-//! - [`health`] — `HealthCheck` trait + registry (S3).
+//! - [`health`] — `Snapshot`/`Status` health wire types.
 //! - [`memory`] — Tier 2 shared-fact read/write (see ADR-002).
 //! - [`runlog`] — per-agent run-log index over Claude transcripts (ADR-016).
 //! - [`skills`] — shared SKILL.md discovery/parse/validate (ADR-008/017).
