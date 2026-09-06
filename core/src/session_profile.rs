@@ -132,6 +132,15 @@ impl SessionProfile {
         self
     }
 
+    /// Resume an existing claude session id instead of spawning fresh. The
+    /// reminders daily-session path uses this so a high-frequency fire (the
+    /// ADR-026 heartbeat, */30) is one session per local day rather than one
+    /// transcript per tick. `None` spawns fresh, unchanged from the default.
+    pub fn resume(mut self, session_id: Option<String>) -> Self {
+        self.spawn.resume_session_id = session_id;
+        self
+    }
+
     pub fn add_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         self.spawn.add_dirs = dirs;
         self

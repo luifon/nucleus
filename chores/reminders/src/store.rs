@@ -152,6 +152,26 @@ const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[
             "ALTER TABLE reminders ADD COLUMN fallback_cmd TEXT",
         ),
     },
+    // Per-reminder daily-session continuity. A high-frequency skill-fire
+    // (the ADR-026 heartbeat, */30) spawned a fresh claude session every
+    // tick — ~29 transcripts/day cluttering `claude --resume`. With
+    // daily_session set, the worker resumes one session per local day
+    // (tracked in reminder_daily_session). Flip the existing heartbeat row;
+    // fresh installs get the flag from the seed.
+    nucleus_core::migrate::Migration {
+        version: 7,
+        name: "daily-session",
+        step: nucleus_core::migrate::Step::Sql(
+            "ALTER TABLE reminders ADD COLUMN daily_session INTEGER NOT NULL DEFAULT 0;
+             UPDATE reminders SET daily_session = 1
+               WHERE created_by = 'system' AND title = 'heartbeat';
+             CREATE TABLE IF NOT EXISTS reminder_daily_session (
+                 reminder_id  INTEGER PRIMARY KEY,
+                 session_date TEXT NOT NULL,
+                 session_id   TEXT NOT NULL
+             )",
+        ),
+    },
 ];
 
 fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
@@ -489,6 +509,12 @@ pub struct Reminder {
     /// Shell command whose stdout is delivered when a skill-fire gives up.
     /// None = no fallback; the operator gets the plain failure alert.
     pub fallback_cmd: Option<String>,
+    /// Opt-in daily-session continuity (migration v7): the worker resumes
+    /// one claude session per local day for this reminder instead of
+    /// spawning fresh each fire. Set on the heartbeat. Worker-internal, not
+    /// a dashboard field.
+    #[ts(skip)]
+    pub daily_session: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
@@ -510,7 +536,7 @@ async fn load_reminder(pool: &SqlitePool, id: i64) -> Result<Option<Reminder>> {
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, condition_cmd, condition_mode,
                 condition_state, condition_checked_at, condition_timeout_secs,
-                last_alerted_at, consecutive_failures, fallback_cmd
+                last_alerted_at, consecutive_failures, fallback_cmd, daily_session
            FROM reminders WHERE id = ?1",
     )
     .bind(id)
@@ -545,7 +571,51 @@ fn row_to_reminder(r: sqlx::sqlite::SqliteRow) -> Reminder {
         last_alerted_at: r.try_get::<Option<String>, _>("last_alerted_at").ok().flatten(),
         consecutive_failures: r.try_get::<i64, _>("consecutive_failures").unwrap_or(0),
         fallback_cmd: r.try_get::<Option<String>, _>("fallback_cmd").ok().flatten(),
+        daily_session: r.try_get::<i64, _>("daily_session").unwrap_or(0) != 0,
     }
+}
+
+/// The claude session id this reminder used on `date` (local `YYYY-MM-DD`),
+/// if one was recorded. Drives daily-session continuity: a match means the
+/// fire resumes that session instead of spawning fresh.
+pub async fn daily_session_for(
+    pool: &SqlitePool,
+    reminder_id: i64,
+    date: &str,
+) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT session_id FROM reminder_daily_session
+          WHERE reminder_id = ?1 AND session_date = ?2",
+    )
+    .bind(reminder_id)
+    .bind(date)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(s,)| s))
+}
+
+/// Record the session id a reminder used on `date`. One row per reminder
+/// (PK), overwritten when the date rolls over — so the next day's first
+/// fire finds no match and starts a fresh session.
+pub async fn set_daily_session(
+    pool: &SqlitePool,
+    reminder_id: i64,
+    date: &str,
+    session_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO reminder_daily_session (reminder_id, session_date, session_id)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(reminder_id) DO UPDATE SET
+             session_date = excluded.session_date,
+             session_id   = excluded.session_id",
+    )
+    .bind(reminder_id)
+    .bind(date)
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Parse a cron expression and compute the next match strictly after
@@ -674,7 +744,7 @@ pub async fn list_all(
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, condition_cmd, condition_mode,
                 condition_state, condition_checked_at, condition_timeout_secs,
-                last_alerted_at, consecutive_failures, fallback_cmd
+                last_alerted_at, consecutive_failures, fallback_cmd, daily_session
            FROM reminders WHERE 1=1",
     );
     if !include_fired {
@@ -729,7 +799,7 @@ pub async fn pending_due_with_channels(
                 last_fired_at, paused_until, created_at, created_by,
                 system_prompt, title, condition_cmd, condition_mode,
                 condition_state, condition_checked_at, condition_timeout_secs,
-                last_alerted_at, consecutive_failures, fallback_cmd
+                last_alerted_at, consecutive_failures, fallback_cmd, daily_session
            FROM reminders
           WHERE status IN ('active', 'pending')
             AND next_fire_at IS NOT NULL
@@ -1147,6 +1217,8 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
         cron: &'static str,
         one_shot: bool,
         channels: &'static [&'static str],
+        /// Opt into daily-session continuity (one claude session per day).
+        daily_session: bool,
     }
     let seeds: &[SeedRow] = &[
         SeedRow {
@@ -1156,6 +1228,7 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
             cron: "30 18 * * 1-5",
             one_shot: false,
             channels: &[CHANNEL_DISCORD_HOME],
+            daily_session: false,
         },
         // ADR-026 heartbeat: the standing "does anything need attention?"
         // sweep. Reply contract: HEARTBEAT_OK → delivery suppressed by the
@@ -1175,6 +1248,7 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
             cron: "*/30 9-23 * * *",
             one_shot: false,
             channels: &[CHANNEL_WHATSAPP_DM],
+            daily_session: true,
         },
     ];
 
@@ -1225,6 +1299,12 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
             None,
         )
         .await?;
+        if seed.daily_session {
+            sqlx::query("UPDATE reminders SET daily_session = 1 WHERE id = ?1")
+                .bind(id)
+                .execute(pool)
+                .await?;
+        }
         tracing::info!(
             id,
             title = seed.title.unwrap_or(seed.body),
