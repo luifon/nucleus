@@ -268,6 +268,10 @@ export class Session {
    *  retry; nothing else should call it. */
   private async askOnce(message: string, opts: AskOptions = {}): Promise<string> {
     const ask = { ...DEFAULT_ASK, ...opts };
+    // Settle before snapshotting the cursor. Anything written between spawn
+    // (or the previous turn) and now is not an answer to THIS message.
+    const settled = await waitForTranscriptQuiet(this.transcriptPath, ask.quiescentMs);
+    if (settled !== null && settled > this.cursor) this.cursor = settled;
     const fromOffset = this.cursor;
     try {
       await pasteAndSend(this.tmuxTarget, withDatePreamble(message));
@@ -778,7 +782,11 @@ async function pasteInto(target: string, content: string): Promise<void> {
     child.stdin!.write(content);
     child.stdin!.end();
   });
-  await tmux(["paste-buffer", "-d", "-b", buf, "-t", target]);
+  // `-p`: bracketed-paste framing. Raw keystroke replay lets the TUI's
+  // timing-based paste heuristic split one payload into a collapsed chip
+  // plus typed text, dropping the head of the message (core hit this on
+  // every distiller run from 2026-08-31). Mirrors core's `paste_into`.
+  await tmux(["paste-buffer", "-p", "-d", "-b", buf, "-t", target]);
 }
 
 /** Close-bracketed-paste escape, sent literally. If a paste ever leaves the
@@ -1023,6 +1031,48 @@ export async function waitForTuiReady(target: string, timeoutMs: number): Promis
     await sleep(200);
   }
   throw new Error(`TUI did not become ready within ${timeoutMs}ms`);
+}
+
+/** Poll `path` until its size stops changing for `settleMs`, then return that
+ *  size. Mirrors core's `wait_for_transcript_quiet`.
+ *
+ *  Why the cursor cannot be taken at spawn time: on `--resume`, Claude Code
+ *  shows the "Resume from summary" picker and `waitForTuiReady` auto-answers
+ *  it with option 1. Answering injects a `Continue from where you left off.`
+ *  user turn and the model replies to THAT. Both land in the transcript after
+ *  the spawn cursor, so `askOnce` returned the phantom reply as the answer to
+ *  the operator's message. On 2026-09-01 an operator DM got back "No response
+ *  requested."; the real answer was written 20s later and never delivered.
+ */
+async function waitForTranscriptQuiet(
+  path: string,
+  settleMs: number,
+): Promise<number | null> {
+  const MAX_WAIT_MS = 60_000;
+  const start = Date.now();
+  let lastSize: number;
+  try {
+    lastSize = (await fs.stat(path)).size;
+  } catch {
+    return null;
+  }
+  let lastChange = Date.now();
+  for (;;) {
+    let size: number;
+    try {
+      size = (await fs.stat(path)).size;
+    } catch {
+      return null;
+    }
+    if (size !== lastSize) {
+      lastSize = size;
+      lastChange = Date.now();
+    } else if (Date.now() - lastChange >= settleMs) {
+      return size;
+    }
+    if (Date.now() - start >= MAX_WAIT_MS) return lastSize;
+    await sleep(100);
+  }
 }
 
 async function waitForAssistant(
