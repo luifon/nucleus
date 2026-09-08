@@ -70,6 +70,19 @@ pub struct ObsidianConfig {
     pub vault_path: String,
 }
 
+impl ObsidianConfig {
+    /// `vault_path` with a leading `~/` expanded to `$HOME`.
+    pub fn vault_dir(&self) -> std::path::PathBuf {
+        match self.vault_path.strip_prefix("~/") {
+            Some(rest) => {
+                let home = std::env::var("HOME").unwrap_or_default();
+                std::path::PathBuf::from(home).join(rest)
+            }
+            None => std::path::PathBuf::from(&self.vault_path),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DiaryConfig {
     pub root: String,
@@ -156,6 +169,15 @@ fn default_true_bool() -> bool {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NewsConfig {
     pub fetch_cron: String,
+    /// Vault-relative path of the note the scorer appends to its rubric as
+    /// vote-learned refinements. One copy, edited in Obsidian; the fetcher
+    /// only reads it. Missing note = base rubric only.
+    #[serde(default = "default_news_preferences_note")]
+    pub preferences_note: String,
+}
+
+fn default_news_preferences_note() -> String {
+    "4-Areas/Nucleus/news-preferences.md".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

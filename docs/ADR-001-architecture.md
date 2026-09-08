@@ -74,7 +74,7 @@ templates checked in).
 | **S2** | News fetcher + news API + Discord notification. Day-partitioned SQLite, upvote/downvote endpoints, twice-daily launchd job. | ✅ shipped |
 | **S3** | Dashboard with health collectors (Docker, news job, tunnels) + `/obsidian` chat with persistent multi-chat history. | ✅ shipped |
 | **S4** | mem0 wired as MCP server for Tier 4 vector recall. | ❌ deferred indefinitely (mem0 needs an embedding + LLM provider; neither is covered by Claude Max. T3 = PARA-Obsidian replaces this role — see ADR-002.) |
-| **S5** | Preference learning loop — weekly job reads news upvote table, updates `news_preferences.md`. | ✅ shipped |
+| **S5** | Preference learning loop — weekly job reads news upvote table, updates `news_preferences.md`. (Learner sunset by ADR-016; since 2026-09-08 the fetcher reads the operator-edited vault note named by `[news].preferences_note` instead of a T2 file.) | ✅ shipped |
 | **S6** | WhatsApp bot (Alfred): Baileys session, allowlist scoping, whisper.cpp voice transcription, brain-dump router. | ✅ shipped |
 | **S7** | Tmux-hosted long-lived Sessions across every surface, replacing `claude -p`. | ✅ shipped |
 | **S8** | T3 redesign as PARA-organized Obsidian second brain. Distiller contemplation re-routes weekly digests into PARA buckets with sibling linking. WhatsApp gets a separate brain-dump channel that classifies captures into PARA. Classification-escalation state machine for low-confidence cases. See ADR-005. | ✅ shipped |

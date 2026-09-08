@@ -33,6 +33,9 @@ vault_path = "~/Documents/Obsidian"
 [news]
 # Once daily at 9am local time. Adjust to taste.
 fetch_cron = "0 9 * * *"
+# Vault-relative note the scorer reads as vote-learned refinements (edit it
+# in Obsidian; the fetcher never writes it). Missing note = base rubric only.
+preferences_note = "4-Areas/Nucleus/news-preferences.md"
 
 [diary]
 root = "memory/diaries"
