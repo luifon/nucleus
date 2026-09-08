@@ -17,6 +17,12 @@ pub enum Tag {
     Feedback,
     Observation,
     Notable,
+    /// Lifecycle bookkeeping — a boot, a reconnect, a delivery, a sweep that
+    /// found nothing, a pass with no candidates. Kept for triage within the
+    /// retention window, invisible to the distiller, and a day made only of
+    /// these is deleted at the next prune: "nothing happened" days do not
+    /// earn a diary file.
+    Routine,
 }
 
 impl Tag {
@@ -26,8 +32,90 @@ impl Tag {
             Self::Feedback => "FEEDBACK",
             Self::Observation => "OBSERVATION",
             Self::Notable => "NOTABLE",
+            Self::Routine => "ROUTINE",
         }
     }
+}
+
+/// Shorthand for a [`Tag::Routine`] entry.
+pub fn record_routine(workspace_root: &Path, agent: &str, context: &str, summary: &str) -> Result<()> {
+    record_observation(workspace_root, agent, context, summary, Tag::Routine)
+}
+
+const ROUTINE_BULLET: &str = "- ROUTINE: ";
+
+/// The diary text with every routine entry removed. An entry is the block
+/// from one `## HH:MM — context` heading to the next; it is routine when
+/// every tagged bullet in it is `ROUTINE`. The frontmatter is dropped too,
+/// so the result is only what a reader should reason about; empty when the
+/// day had nothing.
+pub fn without_routine(text: &str) -> String {
+    let mut out = String::new();
+    for block in entry_blocks(text) {
+        if !block_is_routine(&block) {
+            out.push_str(block.trim_end());
+            out.push_str("\n\n");
+        }
+    }
+    out
+}
+
+/// True when the file holds at least one non-routine entry.
+pub fn has_substance(text: &str) -> bool {
+    entry_blocks(text).iter().any(|b| !block_is_routine(b))
+}
+
+fn block_is_routine(block: &str) -> bool {
+    let bullets: Vec<&str> = block.lines().filter(|l| l.starts_with("- ") && l.contains(": ")).collect();
+    !bullets.is_empty() && bullets.iter().all(|l| l.starts_with(ROUTINE_BULLET))
+}
+
+/// Split a diary file into its `## HH:MM — …` entry blocks, skipping the
+/// frontmatter and anything before the first heading.
+fn entry_blocks(text: &str) -> Vec<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut cur: Option<String> = None;
+    for line in text.lines() {
+        if line.starts_with("## ") {
+            if let Some(b) = cur.take() {
+                blocks.push(b);
+            }
+            cur = Some(String::new());
+        }
+        if let Some(b) = cur.as_mut() {
+            b.push_str(line);
+            b.push('\n');
+        }
+    }
+    if let Some(b) = cur {
+        blocks.push(b);
+    }
+    blocks
+}
+
+/// Delete `agent_dir` day files older than today whose entries are all
+/// routine. Returns the dates removed.
+pub fn prune_routine_only_days(agent_dir: &Path) -> Result<Vec<chrono::NaiveDate>> {
+    let today = Local::now().date_naive();
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(agent_dir) else { return Ok(removed) };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('_') || !name.ends_with(".md") {
+            continue;
+        }
+        let Ok(date) = name.trim_end_matches(".md").parse::<chrono::NaiveDate>() else { continue };
+        if date >= today {
+            continue;
+        }
+        let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+        if !has_substance(&text) {
+            std::fs::remove_file(e.path())?;
+            removed.push(date);
+        }
+    }
+    removed.sort();
+    Ok(removed)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,8 +181,11 @@ pub fn redact(text: &str) -> String {
             // No look-around in the regex crate: capture the delimiters and
             // put them back. Applied until stable so two numbers separated by
             // a single delimiter both get caught.
-            (regex::Regex::new(r"(^|[^\w.-])\+?\d{10,13}([^\w.-]|$)").unwrap(), "${1}<phone>${2}"),
-            (regex::Regex::new(r#"/(?:Users|home)/[^/\s'"]+"#).unwrap(), "~"),
+            // A trailing period counts as a delimiter only when it ends the
+            // sentence (followed by whitespace or end of text), so a dotted
+            // version or an IP keeps its digits.
+            (regex::Regex::new(r"(^|[^\w.-])\+?\d{10,13}([^\w.-]|\.\s|\.$|$)").unwrap(), "${1}<phone>${2}"),
+            (regex::Regex::new(r#"/(?:Users|home)/[^/\s'")\]]+"#).unwrap(), "~"),
         ]
     });
     let mut out = text.to_string();
@@ -156,7 +247,23 @@ pub fn record_observation(
 
 #[cfg(test)]
 mod tests {
-    use super::redact;
+    use super::{has_substance, redact, without_routine};
+
+    const DAY: &str = "---\nagent: x\ndate: 2026-09-07\n---\n\n## 04:00 — boot\nConnected as <jid>\n- ROUTINE: Connected as <jid>\n\n## 12:55 — dm\nreplied to text in 3.1s\n- OBSERVATION: replied to text in 3.1s\n\n## 13:00 — reconnect\nConnected as <jid>\n- ROUTINE: Connected as <jid>\n";
+
+    #[test]
+    fn routine_entries_are_filtered_and_days_classified() {
+        let kept = without_routine(DAY);
+        assert!(kept.contains("## 12:55 — dm"), "{kept}");
+        assert!(!kept.contains("boot") && !kept.contains("reconnect"), "{kept}");
+        assert!(has_substance(DAY));
+        let quiet = "---\nagent: x\ndate: 2026-09-07\n---\n\n## 04:00 — boot\nup\n- ROUTINE: up\n";
+        assert!(!has_substance(quiet));
+        assert_eq!(without_routine(quiet), "");
+        // an untagged legacy entry counts as substance
+        let legacy = "---\nagent: x\ndate: 2026-09-07\n---\n\n## 04:00 — note\nsomething happened\n";
+        assert!(has_substance(legacy));
+    }
 
     #[test]
     fn redacts_jids_emails_phones_and_home_dirs() {
@@ -165,6 +272,9 @@ mod tests {
         assert_eq!(redact("mail someone@example.com now"), "mail <email> now");
         assert_eq!(redact("call +5511999999999 or 5511999999999"), "call <phone> or <phone>");
         assert_eq!(redact("/Users/someone/path/to/x"), "~/path/to/x");
+        assert_eq!(redact("Call +5511999999999."), "Call <phone>.");
+        assert_eq!(redact("Home (/Users/someone)."), "Home (~).");
+        assert_eq!(redact("v1.2.3456789012 stays"), "v1.2.3456789012 stays");
     }
 
     #[test]

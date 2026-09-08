@@ -511,7 +511,7 @@ async function connect(
         config.diaryRoot,
         hasConnectedOnce ? "reconnect" : "boot",
         `Connected as ${sock.user?.id ?? "unknown"}`,
-        "OBSERVATION",
+        "ROUTINE",
       );
       hasConnectedOnce = true;
     } else if (connection === "close") {

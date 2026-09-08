@@ -732,7 +732,7 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                         AGENT_NAME,
                         "fired",
                         &format!("reminder #{} skill-fire → silent (HEARTBEAT_OK)", reminder.id),
-                        diary::Tag::Observation,
+                        diary::Tag::Routine,
                     );
                 }
                 Ok(SkillFireResult { msg_id, reply, .. }) => {
@@ -814,7 +814,7 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                                 .collect::<Vec<_>>()
                                 .join(",")
                         ),
-                        diary::Tag::Observation,
+                        diary::Tag::Routine,
                     );
                 }
                 Err(e) => {
@@ -963,7 +963,7 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                                 reminder.body.len(),
                                 ch.channel
                             ),
-                            diary::Tag::Observation,
+                            diary::Tag::Routine,
                         );
                     }
                     Err(e) => {
@@ -1095,12 +1095,14 @@ async fn deliver_skill_fire(
         );
     }
 
+    // A sweep that found nothing is bookkeeping; a reply with content is
+    // what the distiller should see.
     let _ = diary::record_observation(
         workspace_root,
         AGENT_NAME,
         "skill-fire",
         &format!("reminder #{}: {}", r.id, truncate(&reply, 200)),
-        diary::Tag::Observation,
+        if is_silent_reply(&reply) { diary::Tag::Routine } else { diary::Tag::Observation },
     );
 
     Ok(SkillFireResult {

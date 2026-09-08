@@ -478,9 +478,22 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
         "stale={stale} archived={} · gap: {gap_summary} · curate: {curate_summary}",
         archived.len()
     );
-    let _ = diary::record_observation(workspace_root, AGENT_NAME, "learn", &summary, diary::Tag::Observation);
+    let nothing_happened = archived.is_empty()
+        && gap_summary.starts_with("No gaps")
+        && curate_summary.starts_with("Library is already well-shaped");
+    let _ = diary::record_observation(
+        workspace_root,
+        AGENT_NAME,
+        "learn",
+        &summary,
+        if nothing_happened { diary::Tag::Routine } else { diary::Tag::Observation },
+    );
     tracing::info!("learn: {summary}");
-    chore_state::set_watermark(workspace_root, LEARN_WATERMARK_KEY, &today.to_string()).await?;
+    // Today's diaries are still being written; mark yesterday so the next
+    // run re-reads today in full (same rule as the distiller).
+    if let Some(yesterday) = today.pred_opt() {
+        chore_state::set_watermark(workspace_root, LEARN_WATERMARK_KEY, &yesterday.to_string()).await?;
+    }
     Ok(())
 }
 
@@ -572,8 +585,10 @@ fn read_all_diaries(workspace_root: &Path, diary_root_rel: &str, days: i64) -> S
             let Some(date) = today.checked_sub_signed(chrono::Duration::days(back)) else { continue };
             let path = dir.join(format!("{date}.md"));
             if let Ok(c) = std::fs::read_to_string(&path) {
-                agent_block.push_str(&c);
-                agent_block.push('\n');
+                let kept = diary::without_routine(&c);
+                if !kept.trim().is_empty() {
+                    agent_block.push_str(&format!("#### {date}\n\n{kept}"));
+                }
             }
         }
         if !agent_block.trim().is_empty() {

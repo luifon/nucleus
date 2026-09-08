@@ -94,7 +94,7 @@ async fn session_index_maintenance(workspace_root: &Path, settings: &Settings) {
                     prune.candidates,
                     prune.deleted,
                 ),
-                nucleus_core::diary::Tag::Observation,
+                nucleus_core::diary::Tag::Routine,
             );
         }
         Err(e) => {
@@ -127,14 +127,21 @@ fn read_recent_entries(agent_dir: &Path, since: chrono::DateTime<Local>) -> Resu
 
 /// Concatenate the daily diary files from `from` through `to`, inclusive.
 /// Missing days are skipped.
+/// Concatenate the daily diary files from `from` through `to`, inclusive,
+/// with routine entries removed (see `diary::without_routine`). Missing
+/// days are skipped; a day of only routine entries contributes nothing.
 fn read_entries_between(agent_dir: &Path, from: NaiveDate, to: NaiveDate) -> Result<String> {
     let mut out = String::new();
     let mut date = from;
     while date <= to {
         let path = agent_dir.join(format!("{}.md", date));
         if path.exists() {
-            out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
-            out.push('\n');
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let kept = diary::without_routine(&text);
+            if !kept.trim().is_empty() {
+                out.push_str(&format!("### {date}\n\n{kept}"));
+            }
         }
         let Some(next) = date.succ_opt() else { break; };
         date = next;
@@ -187,12 +194,22 @@ async fn metabolism(workspace_root: &Path, diary_root: &Path, settings: &Setting
         let mut window_start = from;
         let mut agent_staged = 0usize;
         let mut agent_windows = 0usize;
+        let mut agent_parse_failures = 0usize;
         while window_start <= today {
             let window_end = (window_start + Duration::days(METABOLISM_WINDOW_DAYS - 1)).min(today);
             let body = read_entries_between(&agent_dir, window_start, window_end)?;
             if !body.trim().is_empty() {
                 agent_windows += 1;
-                let staged = metabolize_window(&mut session, &ask_opts, &agent, &agent_dir, &body).await?;
+                // Ok(None): the reply did not parse. Stop this agent here so
+                // its watermark stays on the last window whose candidates
+                // were actually staged; the next run retries from there. An
+                // ask error propagates — that is the session, not the agent.
+                let Some(staged) =
+                    metabolize_window(&mut session, &ask_opts, &agent, &agent_dir, &body).await?
+                else {
+                    agent_parse_failures += 1;
+                    break;
+                };
                 agent_staged += staged;
             }
             // Today's diary is still being written; the mark stops at
@@ -205,6 +222,12 @@ async fn metabolism(workspace_root: &Path, diary_root: &Path, settings: &Setting
                 }
             }
             window_start = window_end + Duration::days(1);
+        }
+        if agent_parse_failures > 0 {
+            tracing::warn!(
+                "metabolism: agent {} — stopped at an unparsable reply; watermark held, will retry next run",
+                agent
+            );
         }
         if agent_windows == 0 {
             continue;
@@ -231,21 +254,22 @@ async fn metabolism(workspace_root: &Path, diary_root: &Path, settings: &Setting
         AGENT_NAME,
         "metabolism",
         &format!("{} agents scanned, {} candidates staged", agents_processed, total_staged),
-        diary::Tag::Observation,
+        if total_staged == 0 { diary::Tag::Routine } else { diary::Tag::Observation },
     );
     Ok(())
 }
 
 /// One metabolism ask: extract candidates from `body` (one window of an
-/// agent's diary) and stage them in `_pending.md`. Returns how many were
-/// staged; a reply that doesn't parse stages nothing.
+/// agent's diary) and stage them in `_pending.md`. `Ok(Some(n))` = n
+/// candidates staged; `Ok(None)` = the reply did not parse, nothing staged
+/// and the caller must not advance past this window; `Err` = the ask failed.
 async fn metabolize_window(
     session: &mut nucleus_core::claude_session::Session,
     ask_opts: &nucleus_core::claude_session::AskOptions,
     agent: &str,
     agent_dir: &Path,
     body: &str,
-) -> Result<usize> {
+) -> Result<Option<usize>> {
     let prompt = format!(r#"Read these recent diary entries from agent "{agent}". Identify candidates worth
 promoting to long-term shared memory. A candidate is a stable user fact, a preference,
 a piece of feedback, or a recurring observation — not a one-off task summary.
@@ -266,14 +290,14 @@ Diary content:
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("metabolism: parse failed for {}: {} — raw: {}", agent, e, cleaned);
-            return Ok(0);
+            return Ok(None);
         }
     };
     if candidates.is_empty() {
-        return Ok(0);
+        return Ok(Some(0));
     }
     append_pending(agent_dir, &candidates)?;
-    Ok(candidates.len())
+    Ok(Some(candidates.len()))
 }
 
 fn append_pending(agent_dir: &Path, candidates: &[Candidate]) -> Result<()> {
@@ -335,6 +359,7 @@ async fn contemplation(workspace_root: &Path, diary_root: &Path, settings: &Sett
     .context("spawning claude session for contemplation")?;
     let week_ago = Local::now() - Duration::days(settings.diary.retain_days as i64);
     let vault_summary = summarize_vault(&vault_path);
+    let mut applied_all = true;
 
     for (agent, agent_dir) in &agents {
         if agent == AGENT_NAME { continue; }
@@ -440,26 +465,55 @@ PENDING CANDIDATES:
         };
 
         let mut counts = std::collections::HashMap::new();
+        let mut failed = 0usize;
         for d in &decisions {
             *counts.entry(d.op.clone()).or_insert(0) += 1;
             if let Err(e) = apply_decision(agent, d, &vault_path).await {
+                failed += 1;
                 tracing::warn!("contemplation: apply failed for {} {:?}: {}", agent, d.op, e);
             }
         }
         tracing::info!("contemplation: agent {} → {:?}", agent, counts);
 
+        // A failed op keeps its inputs: the pending candidates stay staged and
+        // the source diaries are not pruned, so the next pass sees the same
+        // evidence again instead of losing it with the failure.
+        if failed > 0 {
+            tracing::warn!(
+                "contemplation: agent {} — {} op(s) failed; keeping _pending.md and skipping the prune",
+                agent, failed
+            );
+            applied_all = false;
+            continue;
+        }
         prune_old_diaries(agent_dir, week_ago.date_naive())?;
         let _ = std::fs::write(agent_dir.join("_pending.md"), "");
     }
 
     let _ = session.close().await;
 
+    // Days with nothing but routine entries do not earn a diary file: drop
+    // them for every agent, including this one, whose own diary the loop
+    // above skips (it also never had its old days pruned — 105 files by
+    // 2026-09-08).
+    let mut dropped = 0usize;
+    for (agent, agent_dir) in &agents {
+        if agent == AGENT_NAME {
+            prune_old_diaries(agent_dir, week_ago.date_naive())?;
+        }
+        let removed = diary::prune_routine_only_days(agent_dir)?;
+        dropped += removed.len();
+        for d in removed {
+            tracing::info!("pruned routine-only diary {}/{}", agent, d);
+        }
+    }
+
     let _ = diary::record_observation(
         workspace_root,
         AGENT_NAME,
         "contemplation",
-        &format!("processed {} agents", agents.len()),
-        diary::Tag::Observation,
+        &format!("processed {} agents; {} routine-only day(s) dropped", agents.len(), dropped),
+        if applied_all && dropped == 0 { diary::Tag::Routine } else { diary::Tag::Observation },
     );
     Ok(())
 }

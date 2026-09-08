@@ -56,7 +56,18 @@ User asked when the news job last ran. Surfaced from dashboard.
 - NOTABLE: reinforces existing communication-style memory; bumping read_count.
 ```
 
-Tags: `FACT`, `FEEDBACK`, `OBSERVATION`, `NOTABLE`. The distiller treats them as classification signals.
+Tags: `FACT`, `FEEDBACK`, `OBSERVATION`, `NOTABLE`, `ROUTINE`. The distiller treats
+the first four as classification signals.
+
+`ROUTINE` (added 2026-09-08) marks lifecycle bookkeeping: a boot, a reconnect, a
+delivery, a sweep that found nothing, a pass that staged no candidates. Writers
+tag these at the source (`diary::record_routine` / `Tag::Routine`; the WhatsApp
+writer's `"ROUTINE"`). Routine entries stay in the file for triage inside the
+retention window, but the distiller and the skill-gap-learner read diaries
+through `diary::without_routine`, so they never reach a prompt, and a day whose
+entries are all routine is deleted by the distiller's prune
+(`diary::prune_routine_only_days`) — a day on which nothing happened has no
+diary file. Untagged legacy entries count as substance.
 
 ## Who writes
 
