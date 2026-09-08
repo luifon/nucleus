@@ -149,7 +149,7 @@ pub async fn run(settings: &Settings, workspace_root: &Path) -> Result<()> {
             tally.trashed,
             promoted.len()
         ),
-        diary::Tag::Observation,
+        diary::Tag::Routine,
     );
     Ok(())
 }

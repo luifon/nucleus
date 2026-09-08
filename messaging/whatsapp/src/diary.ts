@@ -1,7 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 
-export type DiaryTag = "FACT" | "FEEDBACK" | "OBSERVATION" | "NOTABLE";
+/** ROUTINE marks lifecycle bookkeeping (boot, reconnect, rotation): kept for
+ *  triage, skipped by the distiller, and a day holding only routine entries
+ *  is deleted at the next prune. Mirrors core `diary::Tag::Routine`. */
+export type DiaryTag = "FACT" | "FEEDBACK" | "OBSERVATION" | "NOTABLE" | "ROUTINE";
 
 const AGENT = "whatsapp";
 
@@ -28,8 +31,8 @@ export function redact(text: string): string {
   return text
     .replace(/\b\d{5,20}(?:-\d{5,20})?(?::\d{1,3})?@(?:s\.whatsapp\.net|lid|g\.us)\b/g, "<jid>")
     .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "<email>")
-    .replace(/(?<![\w.-])\+?\d{10,13}(?![\w.-])/g, "<phone>")
-    .replace(/\/(?:Users|home)\/[^/\s'"]+/g, "~");
+    .replace(/(?<![\w.-])\+?\d{10,13}(?![\w-])(?!\.(?!\s|$))/g, "<phone>")
+    .replace(/\/(?:Users|home)\/[^/\s'")\]]+/g, "~");
 }
 
 export function record(

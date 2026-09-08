@@ -152,7 +152,7 @@ async fn main() -> Result<()> {
             notable_count,
             posted
         ),
-        diary::Tag::Observation,
+        diary::Tag::Routine,
     );
 
     Ok(())

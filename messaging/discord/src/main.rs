@@ -211,7 +211,7 @@ impl EventHandler for Handler {
             AGENT_NAME,
             "boot",
             &format!("Connected as {} (id={})", ready.user.name, ready.user.id.get()),
-            diary::Tag::Observation,
+            diary::Tag::Routine,
         );
     }
 
