@@ -1851,7 +1851,19 @@ async fn dismiss_trust_prompt_if_present(target: &str, timeout: Duration) -> Res
             .await?;
         let pane = String::from_utf8_lossy(&out.stdout);
         if pane.contains("trust this folder") || pane.contains("trust this folder?") {
-            // Default highlighted option is "Yes, I trust this folder".
+            // Move the highlight onto the "Yes" row before confirming. The
+            // default changed between CLI versions: 2.1.263 opens with
+            // "❯ No, exit" highlighted, and a blind Enter there exits claude
+            // and the spawn fails as "TUI did not become ready".
+            if let Some(row) = pane.lines().find(|l| l.trim_start().starts_with('❯')) {
+                if row.contains("No, exit") {
+                    let _ = Command::new("tmux")
+                        .args(["send-keys", "-t", target, "Down"])
+                        .output()
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            }
             let _ = Command::new("tmux")
                 .args(["send-keys", "-t", target, "Enter"])
                 .output()
