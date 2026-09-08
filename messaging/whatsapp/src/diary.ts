@@ -19,6 +19,19 @@ function nowHHMM(): string {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
+/** Replace personal identifiers with placeholders before a line is written.
+ *  Mirrors core's `diary::redact`: diaries feed every autonomous writer, so a
+ *  JID or phone number here is one hop from T2 memory, the vault or a skill.
+ *  Covered: WhatsApp JIDs (`<digits>[:n]@s.whatsapp.net` / `@lid` / group
+ *  `@g.us`), emails, bare 10–13 digit phone numbers, home directories. */
+export function redact(text: string): string {
+  return text
+    .replace(/\b\d{5,20}(?:-\d{5,20})?(?::\d{1,3})?@(?:s\.whatsapp\.net|lid|g\.us)\b/g, "<jid>")
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "<email>")
+    .replace(/(?<![\w.-])\+?\d{10,13}(?![\w.-])/g, "<phone>")
+    .replace(/\/(?:Users|home)\/[^/\s'"]+/g, "~");
+}
+
 export function record(
   diaryRoot: string,
   context: string,
@@ -34,10 +47,8 @@ export function record(
       const date = new Date().toISOString().slice(0, 10);
       fs.writeSync(fh, `---\nagent: ${AGENT}\ndate: ${date}\n---\n\n`);
     }
-    fs.writeSync(
-      fh,
-      `## ${nowHHMM()} — ${context}\n${summary.trim()}\n- ${tag}: ${summary.trim()}\n\n`,
-    );
+    const clean = redact(summary.trim());
+    fs.writeSync(fh, `## ${nowHHMM()} — ${redact(context)}\n${clean}\n- ${tag}: ${clean}\n\n`);
   } finally {
     fs.closeSync(fh);
   }
@@ -60,7 +71,7 @@ export function appendEntry(
       const date = new Date().toISOString().slice(0, 10);
       fs.writeSync(fh, `---\nagent: ${AGENT}\ndate: ${date}\n---\n\n`);
     }
-    fs.writeSync(fh, `## ${nowHHMM()} — ${context}\n${summary.trim()}\n\n`);
+    fs.writeSync(fh, `## ${nowHHMM()} — ${redact(context)}\n${redact(summary.trim())}\n\n`);
   } finally {
     fs.closeSync(fh);
   }

@@ -43,6 +43,7 @@ anyhow = "1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1"
 async-trait = "0.1"
 futures = "0.3"
 ts-rs = { version = "12", features = ["serde-compat"] }

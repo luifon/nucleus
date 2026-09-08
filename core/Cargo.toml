@@ -23,6 +23,7 @@ futures = { workspace = true }
 figment = { workspace = true }
 dotenvy = { workspace = true }
 uuid = { workspace = true }
+regex = { workspace = true }
 reqwest = { workspace = true }
 ts-rs = { workspace = true }
 
