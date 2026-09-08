@@ -61,14 +61,72 @@ pub fn tier2_dir() -> Result<PathBuf> {
 /// Write or overwrite a memory file AND keep `MEMORY.md` in sync — appends an
 /// index line if the file isn't already linked (idempotent; never clobbers a
 /// hand-edited hook).
+///
+/// A body that arrives with its own YAML frontmatter loses it: `render`
+/// writes the canonical block, and a second copy below it (15 files by
+/// 2026-09-07, every one from a distiller PROMOTE whose body repeated the
+/// header) breaks any reader that stops at the first `---` pair.
 pub fn promote(mem: &Memory) -> Result<PathBuf> {
     let dir = tier2_dir()?;
     std::fs::create_dir_all(&dir)?;
     let filename = format!("{}.md", mem.name.replace(' ', "_"));
     let path = dir.join(&filename);
+    let mem = Memory { body: strip_frontmatter(&mem.body).to_string(), ..mem.clone() };
     std::fs::write(&path, mem.render())?;
     ensure_indexed(&dir, &filename, &humanize(&mem.name), &mem.description)?;
     Ok(path)
+}
+
+/// Append `addition` to an existing memory under a dated `## Update` heading,
+/// keeping its frontmatter and body. When no file exists yet the addition
+/// becomes the body of a new memory via [`promote`] (so `description` and
+/// `kind` only matter on that path).
+///
+/// Until 2026-09-07 the distiller's MERGE op called `promote`, which
+/// overwrote the file with the addition alone — eight memories were reduced
+/// to their last appended paragraph, some several times over.
+pub fn merge(
+    name: &str,
+    description: &str,
+    kind: Kind,
+    addition: &str,
+    date: chrono::NaiveDate,
+) -> Result<PathBuf> {
+    let dir = tier2_dir()?;
+    let filename = format!("{}.md", name.replace(' ', "_"));
+    let path = dir.join(&filename);
+    let addition = strip_frontmatter(addition).trim();
+    if !path.exists() {
+        return promote(&Memory {
+            name: name.to_string(),
+            description: description.to_string(),
+            kind,
+            body: addition.to_string(),
+        });
+    }
+    let mut existing = std::fs::read_to_string(&path)?;
+    while !existing.ends_with("\n\n") {
+        existing.push('\n');
+    }
+    existing.push_str(&format!("## Update {date}\n\n{addition}\n"));
+    std::fs::write(&path, existing)?;
+    ensure_indexed(&dir, &filename, &humanize(name), description)?;
+    Ok(path)
+}
+
+/// `body` without a leading `---` … `---` YAML block, if it carries one.
+pub fn strip_frontmatter(body: &str) -> &str {
+    let t = body.trim_start();
+    let Some(rest) = t.strip_prefix("---\n") else {
+        return body;
+    };
+    match rest.find("\n---\n") {
+        Some(i) => rest[i + "\n---\n".len()..].trim_start(),
+        None => match rest.strip_suffix("\n---") {
+            Some(_) => "",
+            None => body,
+        },
+    }
 }
 
 /// Remove a memory file and its `MEMORY.md` index line. Returns false if the
@@ -189,6 +247,54 @@ mod tests {
         assert!(!idx.contains("(b.md)"));
         assert!(idx.contains("(a.md)") && idx.contains("(c.md)"));
         assert_eq!(idx.lines().count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_frontmatter_drops_only_a_leading_block() {
+        assert_eq!(strip_frontmatter("---\nname: x\nmetadata:\n  type: project\n---\n\nBody here"), "Body here");
+        assert_eq!(strip_frontmatter("Body first\n---\nnot frontmatter\n---\n"), "Body first\n---\nnot frontmatter\n---\n");
+        assert_eq!(strip_frontmatter("plain"), "plain");
+    }
+
+    #[test]
+    fn promote_writes_one_frontmatter_block_even_if_the_body_has_one() {
+        let dir = tmpdir();
+        unsafe { std::env::set_var("NUCLEUS_TIER2_DIR", &dir) };
+        let mem = Memory {
+            name: "double-fm".into(),
+            description: "d".into(),
+            kind: Kind::Project,
+            body: "---\nname: double-fm\nmetadata:\n  type: project\n---\n\nThe fact.".into(),
+        };
+        let path = promote(&mem).unwrap();
+        let written = std::fs::read_to_string(path).unwrap();
+        assert_eq!(written.matches("\n---\n").count(), 1, "{written}");
+        assert!(written.ends_with("The fact.\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_appends_a_dated_section_and_keeps_the_body() {
+        let dir = tmpdir();
+        unsafe { std::env::set_var("NUCLEUS_TIER2_DIR", &dir) };
+        let mem = Memory { name: "m".into(), description: "orig desc".into(), kind: Kind::Feedback, body: "Original body.".into() };
+        promote(&mem).unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 7).unwrap();
+        let path = merge("m", "new desc", Kind::Project, "More evidence.", date).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("---\nname: m\ndescription: orig desc\nmetadata:\n  type: feedback\n---\n"), "{written}");
+        assert!(written.contains("Original body.\n\n## Update 2026-09-07\n\nMore evidence.\n"), "{written}");
+        assert_eq!(index(&dir).matches("(m.md)").count(), 1);
+        // a second merge stacks another section
+        merge("m", "x", Kind::Project, "Even more.", date).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written.matches("## Update 2026-09-07").count(), 2);
+        // merge into a missing file creates it with the addition as body
+        let p2 = merge("fresh", "fresh desc", Kind::Reference, "---\nname: fresh\n---\nOnly this.", date).unwrap();
+        let w2 = std::fs::read_to_string(p2).unwrap();
+        assert!(w2.ends_with("---\n\nOnly this.\n"), "{w2}");
+        assert!(w2.contains("type: reference"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
