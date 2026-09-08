@@ -690,7 +690,18 @@ async fn score_notability(workspace_root: &PathBuf, items: &[ParsedItem], settin
         priority categories above; precision matters less than making\n\
         sure they see what's relevant.";
 
-    let learned_prefs = nucleus_core::memory::read("news_preferences").ok().unwrap_or_default();
+    // Preferences live in the vault (one copy, operator-edited), not in T2
+    // memory: the T2 file was preference-learner output that nothing
+    // refreshed after that job was sunset (ADR-016), and it sat in every
+    // spawn's context for a single consumer. Moved 2026-09-08.
+    let prefs_path = settings.obsidian.vault_dir().join(&settings.news.preferences_note);
+    let learned_prefs = match std::fs::read_to_string(&prefs_path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!(path = %prefs_path.display(), err = %e, "news preferences note not readable — scoring with the base rubric only");
+            String::new()
+        }
+    };
     let learned_block = if learned_prefs.trim().is_empty() {
         String::new()
     } else {
