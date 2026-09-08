@@ -353,8 +353,11 @@ Operations:
             session). Use for short, recurring, behaviorally-binding facts the
             bots need every spawn ("user prefers terse replies", "timezone
             <region/city>", "Discord home channel = X"). One fact per file.
-  MERGE   — append/update an EXISTING Tier 2 file. Same rules as PROMOTE for
-            kind/name; the body should describe what to add.
+  MERGE   — append to an EXISTING Tier 2 file under a dated `## Update` heading.
+            `body` is the text that gets appended VERBATIM: write the new fact or
+            evidence itself, never an instruction to an editor ('Add a section...',
+            'Append to the existing body...') — nobody reads those, they get filed.
+            Do not restate what the file already says.
   ARCHIVE — write a longer-form note to T3 (the user's PARA-organized Obsidian
             second brain). Use for narrative/decisions/notes the user might
             want to browse later, not facts the bot needs every spawn.
@@ -393,6 +396,10 @@ ARCHIVE rules (CLAUDE.md Rule 9 — read it if you haven't):
 
 Vault structure right now (so you can pick a real `bucket` and link real siblings):
 {vault_summary}
+
+PROMOTE / MERGE bodies are plain markdown: no YAML frontmatter (the distiller
+writes the header from `name`/`description`/`kind`). Frontmatter belongs only in
+ARCHIVE bodies.
 
 Output a JSON array (no fences, no prose). Each element:
 {{
@@ -485,8 +492,11 @@ async fn apply_decision(agent: &str, d: &Decision, vault_path: &Path) -> Result<
                 "project" => memory::Kind::Project,
                 _ => memory::Kind::Reference,
             };
-            let mem = memory::Memory { name: name.clone(), description, kind, body };
-            let path = memory::promote(&mem)?;
+            let path = if d.op == "MERGE" {
+                memory::merge(&name, &description, kind, &body, Local::now().date_naive())?
+            } else {
+                memory::promote(&memory::Memory { name: name.clone(), description, kind, body })?
+            };
             tracing::info!("{}: {} {} -> {:?}", agent, d.op, name, path);
         }
         "ARCHIVE" => {
