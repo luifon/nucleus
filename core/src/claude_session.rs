@@ -174,6 +174,21 @@ pub struct Session {
     /// The config this session was spawned with, kept so `ask` can relaunch
     /// the window on the fallback model without the caller's help.
     spawn_opts: SpawnOptions,
+    /// Daily-session continuity (ADR-029): set by
+    /// `SessionProfile::daily_session`; the first successful `ask` records
+    /// this session as the day's session for the key. Recording only after a
+    /// reply means a session that never produced one is not what the next
+    /// spawn resumes.
+    daily: Option<DailySessionRecord>,
+}
+
+/// What `Session::ask` persists on its first success when the spawn opted
+/// into daily-session continuity.
+#[derive(Clone)]
+pub(crate) struct DailySessionRecord {
+    pub key: String,
+    pub date: String,
+    pub recorded: bool,
 }
 
 /// Options for spawning a new claude session in tmux.
@@ -344,6 +359,7 @@ impl Session {
             run_id,
             workspace_root: opts.workspace_root.clone(),
             spawn_opts: opts,
+            daily: None,
         })
     }
 
@@ -444,6 +460,7 @@ impl Session {
     pub async fn ask(&mut self, message: &str, opts: AskOptions) -> Result<String> {
         let reply = self.ask_once(message, &opts).await?;
         let Some(kind) = classify_infra_reply(&reply) else {
+            self.record_daily_session().await;
             return Ok(reply);
         };
         // Fix what can be fixed, re-ask once, and never return the banner.
@@ -483,7 +500,37 @@ impl Session {
                 "ask: {} — still failing after one retry, so this turn produced no content",
                 again.describe()
             ),
-            None => Ok(retry),
+            None => {
+                self.record_daily_session().await;
+                Ok(retry)
+            }
+        }
+    }
+
+    /// Opt this session into daily-session continuity (ADR-029). Only
+    /// `SessionProfile` calls it; the record itself happens on the first
+    /// successful `ask`.
+    pub(crate) fn set_daily_session(&mut self, key: String, date: String) {
+        self.daily = Some(DailySessionRecord { key, date, recorded: false });
+    }
+
+    /// Persist this session as the day's session for its key, once.
+    /// Best-effort: a failed write costs one extra transcript, never the turn.
+    async fn record_daily_session(&mut self) {
+        let Some(d) = self.daily.as_mut() else { return };
+        if d.recorded {
+            return;
+        }
+        match crate::chore_state::set_daily_session(
+            &self.workspace_root,
+            &d.key,
+            &d.date,
+            &self.session_id,
+        )
+        .await
+        {
+            Ok(()) => d.recorded = true,
+            Err(e) => tracing::warn!(key = %d.key, err = %e, "daily-session record failed"),
         }
     }
 
@@ -1370,8 +1417,17 @@ async fn paste_into(target: &str, content: &str) -> Result<()> {
         );
     }
 
+    // `-p`: wrap the buffer in bracketed-paste escapes. Without them tmux
+    // replays the payload as raw keystrokes and the TUI's paste heuristic
+    // decides where one "paste" ends by timing: the first burst became a
+    // collapsed chip (or was dropped outright) and the rest arrived as typed
+    // text, so the model received the message minus its head — the date
+    // preamble and the whole instruction, in the distiller's case (every
+    // night from 2026-08-31 on; the transcript verifier caught it as
+    // "draft is gone but the submit was never confirmed"). Bracketed, the
+    // whole payload lands as one paste regardless of chunking.
     let p = Command::new("tmux")
-        .args(["paste-buffer", "-d", "-b", &buf, "-t", target])
+        .args(["paste-buffer", "-p", "-d", "-b", &buf, "-t", target])
         .output()
         .await?;
     if !p.status.success() {

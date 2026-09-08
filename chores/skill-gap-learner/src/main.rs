@@ -6,6 +6,11 @@
 //!             conversational agents every N turns.
 //!   learn   — periodic (launchd-cron): propose skills for recurring patterns
 //!             across all diaries, then curate (stale/archive + consolidate).
+//!             The diary window stretches back over missed runs (ADR-029
+//!             watermark).
+//!
+//! All arms run in one claude session per local day (ADR-029 daily session,
+//! key `skill-gap-learner`).
 //!
 //! Autonomous writes go to `~/.claude/skills/` only (operator-personal,
 //! gitignored — Rule 1). Every touched SKILL.md is run through
@@ -15,6 +20,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nucleus_core::{
+    chore_state,
     claude_session::{last_n_turns, TurnRole},
     config::Settings,
     diary, skills,
@@ -25,6 +31,13 @@ use std::time::SystemTime;
 
 const AGENT_NAME: &str = "skill-gap-learner";
 const TMUX_SESSION: &str = "nucleus-skill-gap-learner";
+
+/// Watermark key for the periodic arm: the local date of the last `learn`
+/// that completed (ADR-029). The gap pass reads at least
+/// [`GAP_WINDOW_DAYS`] of diary, and further back when runs were missed.
+const LEARN_WATERMARK_KEY: &str = "skill-gap-learner.learn";
+/// The minimum diary window the gap pass reasons over.
+const GAP_WINDOW_DAYS: i64 = 7;
 
 #[derive(Parser)]
 #[command(name = "skill-gap-learner", about = "Nucleus skill-gap learner (ADR-017)")]
@@ -383,6 +396,8 @@ async fn run_skill_session(
     prompt: &str,
 ) -> Result<(String, GateOutcome)> {
     let started = SystemTime::now();
+    // ADR-029: every arm — each on-the-fly review, the gap pass, the
+    // curator — resumes one session per local day.
     let outcome = SessionProfile::one_shot_agentic(&ProfileContext {
         workspace_root,
         claude: &settings.claude,
@@ -391,6 +406,7 @@ async fn run_skill_session(
     })
     .add_dirs(vec![operator_root.to_path_buf()])
     .window_name(window)
+    .daily_session(AGENT_NAME)
     .run_one_shot(prompt)
     .await
     .with_context(|| format!("skill session ({window})"))?;
@@ -417,8 +433,18 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
         tracing::info!("learn: auto-archived {} stale skill(s): {}", archived.len(), archived.join(", "));
     }
 
-    // 2. Gap detection over recent diaries (skip our own).
-    let diaries = read_all_diaries(workspace_root, &settings.diary.root, 7);
+    // 2. Gap detection over recent diaries (skip our own). The window is
+    // GAP_WINDOW_DAYS, stretched back to the day after the last completed
+    // run when nights were missed (ADR-029 watermark).
+    let today = chrono::Local::now().date_naive();
+    let from = chore_state::resume_date_after(workspace_root, LEARN_WATERMARK_KEY, GAP_WINDOW_DAYS - 1)
+        .await?
+        .min(today - chrono::Duration::days(GAP_WINDOW_DAYS - 1));
+    let window_days = (today - from).num_days() + 1;
+    if window_days > GAP_WINDOW_DAYS {
+        tracing::info!("learn: catching up — gap window is {window_days} days (from {from})");
+    }
+    let diaries = read_all_diaries(workspace_root, &settings.diary.root, window_days);
     let mut lib = skills::read_skills(&operator_root, "personal");
     lib.extend(skills::read_skills(&repo_root, "repo"));
     let library = render_library(&lib);
@@ -454,6 +480,7 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
     );
     let _ = diary::record_observation(workspace_root, AGENT_NAME, "learn", &summary, diary::Tag::Observation);
     tracing::info!("learn: {summary}");
+    chore_state::set_watermark(workspace_root, LEARN_WATERMARK_KEY, &today.to_string()).await?;
     Ok(())
 }
 

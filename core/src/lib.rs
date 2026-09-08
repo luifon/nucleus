@@ -16,6 +16,7 @@
 
 pub mod agent_msg;
 pub mod agents;
+pub mod chore_state;
 pub mod claude;
 pub mod claude_session;
 pub mod config;

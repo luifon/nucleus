@@ -1,8 +1,14 @@
 //! distiller — diary distillation, one consolidated daily pass (ADR-016).
 //!
 //! No subcommand. Each invocation:
-//!   1. metabolism    — extract candidates from the last day's diaries → _pending.md
+//!   1. metabolism    — extract candidates from each agent's diary since its
+//!                      watermark (normally yesterday + today; a failed night
+//!                      or a machine that was off is caught up in 2-day
+//!                      windows, ADR-029) → _pending.md
 //!   2. contemplation — judge them (PROMOTE | MERGE | ARCHIVE | DROP) + prune
+//!
+//! Both passes run in one claude session per local day (ADR-029 daily
+//! session, key `distiller`).
 //!
 //! Persona auto-evolution (ADR-004's "SOUL slot") is intentionally NOT here —
 //! that's deferred to the future skill-gap learner (ADR-016), which proposes
@@ -12,7 +18,7 @@
 use anyhow::{Context, Result};
 use chrono::{Duration, Local, NaiveDate};
 use nucleus_core::{
-    claude_session::Session,
+    chore_state,
     config::Settings,
     diary, memory,
     session_profile::{ProfileContext, SessionProfile},
@@ -21,6 +27,19 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 const AGENT_NAME: &str = "distiller";
+
+/// Days of diary one metabolism ask covers: yesterday plus today, the shape
+/// the daily pass has always pasted. A catch-up after failed nights walks the
+/// missed range in windows of this size so no single ask grows with the
+/// outage.
+const METABOLISM_WINDOW_DAYS: i64 = 2;
+
+/// Per-agent watermark key: the last local date whose diary metabolism has
+/// fully processed (today's file is still being written, so the mark stops at
+/// yesterday).
+fn metabolism_watermark_key(agent: &str) -> String {
+    format!("distiller.metabolism.{agent}")
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -103,10 +122,15 @@ fn list_agent_dirs(diary_root: &Path) -> Result<Vec<(String, PathBuf)>> {
 
 fn read_recent_entries(agent_dir: &Path, since: chrono::DateTime<Local>) -> Result<String> {
     // Concatenate all daily diary files from `since` through today, inclusive.
-    let today = Local::now().date_naive();
+    read_entries_between(agent_dir, since.date_naive(), Local::now().date_naive())
+}
+
+/// Concatenate the daily diary files from `from` through `to`, inclusive.
+/// Missing days are skipped.
+fn read_entries_between(agent_dir: &Path, from: NaiveDate, to: NaiveDate) -> Result<String> {
     let mut out = String::new();
-    let mut date = since.date_naive();
-    while date <= today {
+    let mut date = from;
+    while date <= to {
         let path = agent_dir.join(format!("{}.md", date));
         if path.exists() {
             out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
@@ -133,34 +157,96 @@ async fn metabolism(workspace_root: &Path, diary_root: &Path, settings: &Setting
         return Ok(());
     }
     // One session reused across agents — pays the ~5s spawn cost once
-    // instead of per-agent; into_parts() keeps the manual lifecycle while
-    // the profile supplies the posture (ADR-020 — this path used to run
-    // without the Settings disallowed_tools).
-    let (spawn_opts, ask_opts) = SessionProfile::one_shot_utility(&ProfileContext {
+    // instead of per-agent. Daily-session continuity (ADR-029) makes it the
+    // same session contemplation resumes, so a day's distillation is one
+    // transcript. The profile supplies the posture (ADR-020 — this path used
+    // to run without the Settings disallowed_tools).
+    let (mut session, ask_opts) = SessionProfile::one_shot_utility(&ProfileContext {
         workspace_root,
         claude: &settings.claude,
         tmux_session: "nucleus-distiller",
         agent_label: "distiller",
     })
     .window_name("metabolism")
-    .into_parts();
-    let mut session = Session::spawn(spawn_opts)
-        .await
-        .context("spawning claude session for metabolism")?;
-    // Daily pass — scan the last day's entries.
-    let since = Local::now() - Duration::days(1);
+    .daily_session(AGENT_NAME)
+    .spawn()
+    .await
+    .context("spawning claude session for metabolism")?;
+
+    let today = Local::now().date_naive();
     let mut total_staged = 0usize;
     let mut agents_processed = 0usize;
 
     for (agent, agent_dir) in agents {
         if agent == AGENT_NAME { continue; }  // distiller doesn't extract from itself
-        let body = read_recent_entries(&agent_dir, since)?;
-        if body.trim().is_empty() {
+        // Start the day after this agent's watermark (ADR-029): a night the
+        // pass failed, or a machine that was off, is caught up here instead
+        // of skipped. No watermark = yesterday, the pre-watermark window.
+        let key = metabolism_watermark_key(&agent);
+        let from = chore_state::resume_date_after(workspace_root, &key, 1).await?;
+        let mut window_start = from;
+        let mut agent_staged = 0usize;
+        let mut agent_windows = 0usize;
+        while window_start <= today {
+            let window_end = (window_start + Duration::days(METABOLISM_WINDOW_DAYS - 1)).min(today);
+            let body = read_entries_between(&agent_dir, window_start, window_end)?;
+            if !body.trim().is_empty() {
+                agent_windows += 1;
+                let staged = metabolize_window(&mut session, &ask_opts, &agent, &agent_dir, &body).await?;
+                agent_staged += staged;
+            }
+            // Today's diary is still being written; the mark stops at
+            // yesterday so tomorrow's pass re-reads today in full.
+            if let Some(yesterday) = today.pred_opt() {
+                let processed_through = window_end.min(yesterday);
+                if processed_through >= window_start {
+                    chore_state::set_watermark(workspace_root, &key, &processed_through.to_string())
+                        .await?;
+                }
+            }
+            window_start = window_end + Duration::days(1);
+        }
+        if agent_windows == 0 {
             continue;
         }
         agents_processed += 1;
+        total_staged += agent_staged;
+        if agent_windows > 1 {
+            tracing::info!(
+                "metabolism: agent {} — caught up {} windows from {}",
+                agent, agent_windows, from
+            );
+        }
+        if agent_staged == 0 {
+            tracing::info!("metabolism: agent {} — no candidates", agent);
+        } else {
+            tracing::info!("metabolism: agent {} — {} candidates staged", agent, agent_staged);
+        }
+    }
 
-        let prompt = format!(r#"Read these recent diary entries from agent "{agent}". Identify candidates worth
+    let _ = session.close().await;
+
+    let _ = diary::record_observation(
+        workspace_root,
+        AGENT_NAME,
+        "metabolism",
+        &format!("{} agents scanned, {} candidates staged", agents_processed, total_staged),
+        diary::Tag::Observation,
+    );
+    Ok(())
+}
+
+/// One metabolism ask: extract candidates from `body` (one window of an
+/// agent's diary) and stage them in `_pending.md`. Returns how many were
+/// staged; a reply that doesn't parse stages nothing.
+async fn metabolize_window(
+    session: &mut nucleus_core::claude_session::Session,
+    ask_opts: &nucleus_core::claude_session::AskOptions,
+    agent: &str,
+    agent_dir: &Path,
+    body: &str,
+) -> Result<usize> {
+    let prompt = format!(r#"Read these recent diary entries from agent "{agent}". Identify candidates worth
 promoting to long-term shared memory. A candidate is a stable user fact, a preference,
 a piece of feedback, or a recurring observation — not a one-off task summary.
 
@@ -174,36 +260,20 @@ Diary content:
 {body}
 ---"#);
 
-        let raw = session.ask(&prompt, ask_opts.clone()).await?;
-        let cleaned = strip_code_fence(&raw);
-        let candidates: Vec<Candidate> = match serde_json::from_str(&cleaned) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("metabolism: parse failed for {}: {} — raw: {}", agent, e, cleaned);
-                continue;
-            }
-        };
-
-        if candidates.is_empty() {
-            tracing::info!("metabolism: agent {} — no candidates", agent);
-            continue;
+    let raw = session.ask(&prompt, ask_opts.clone()).await?;
+    let cleaned = strip_code_fence(&raw);
+    let candidates: Vec<Candidate> = match serde_json::from_str(&cleaned) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("metabolism: parse failed for {}: {} — raw: {}", agent, e, cleaned);
+            return Ok(0);
         }
-
-        append_pending(&agent_dir, &candidates)?;
-        total_staged += candidates.len();
-        tracing::info!("metabolism: agent {} — {} candidates staged", agent, candidates.len());
+    };
+    if candidates.is_empty() {
+        return Ok(0);
     }
-
-    let _ = session.close().await;
-
-    let _ = diary::record_observation(
-        workspace_root,
-        AGENT_NAME,
-        "metabolism",
-        &format!("{} agents scanned, {} candidates staged", agents_processed, total_staged),
-        diary::Tag::Observation,
-    );
-    Ok(())
+    append_pending(agent_dir, &candidates)?;
+    Ok(candidates.len())
 }
 
 fn append_pending(agent_dir: &Path, candidates: &[Candidate]) -> Result<()> {
@@ -249,7 +319,9 @@ async fn contemplation(workspace_root: &Path, diary_root: &Path, settings: &Sett
         return Ok(());
     }
     let vault_path = expand_home(&settings.obsidian.vault_path);
-    let (spawn_opts, ask_opts) = SessionProfile::one_shot_utility(&ProfileContext {
+    // Resumes the metabolism session (ADR-029 daily session) — the vault
+    // --add-dir is passed on every launch, so the resumed session has it.
+    let (mut session, ask_opts) = SessionProfile::one_shot_utility(&ProfileContext {
         workspace_root,
         claude: &settings.claude,
         tmux_session: "nucleus-distiller",
@@ -257,10 +329,10 @@ async fn contemplation(workspace_root: &Path, diary_root: &Path, settings: &Sett
     })
     .add_dirs(vec![vault_path.clone()])
     .window_name("contemplation")
-    .into_parts();
-    let mut session = Session::spawn(spawn_opts)
-        .await
-        .context("spawning claude session for contemplation")?;
+    .daily_session(AGENT_NAME)
+    .spawn()
+    .await
+    .context("spawning claude session for contemplation")?;
     let week_ago = Local::now() - Duration::days(settings.diary.retain_days as i64);
     let vault_summary = summarize_vault(&vault_path);
 
