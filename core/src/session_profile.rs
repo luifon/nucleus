@@ -45,6 +45,8 @@ pub struct ProfileContext<'a> {
 pub struct SessionProfile {
     spawn: SpawnOptions,
     ask: AskOptions,
+    /// ADR-029 daily-session continuity key; `None` spawns fresh.
+    daily_key: Option<String>,
 }
 
 fn resolve_permission_mode(claude: &ClaudeConfig) -> Option<PermissionMode> {
@@ -90,6 +92,7 @@ impl SessionProfile {
                 quiescent_window: Duration::from_secs(3),
                 await_turn_complete: true,
             },
+            daily_key: None,
         }
     }
 
@@ -105,6 +108,7 @@ impl SessionProfile {
                 quiescent_window: Duration::from_secs(5),
                 await_turn_complete: true,
             },
+            daily_key: None,
         }
     }
 
@@ -132,12 +136,15 @@ impl SessionProfile {
         self
     }
 
-    /// Resume an existing claude session id instead of spawning fresh. The
-    /// reminders daily-session path uses this so a high-frequency fire (the
-    /// ADR-026 heartbeat, */30) is one session per local day rather than one
-    /// transcript per tick. `None` spawns fresh, unchanged from the default.
-    pub fn resume(mut self, session_id: Option<String>) -> Self {
-        self.spawn.resume_session_id = session_id;
+    /// Daily-session continuity (ADR-029): spawn resumes the claude session
+    /// recorded for `key` today and the first successful ask records the
+    /// session for the rest of the day. A high-frequency or multi-pass job
+    /// (the */30 heartbeat, the distiller's two passes, the skill-gap
+    /// learner's arms) is then one transcript per local day instead of one
+    /// per invocation. Resuming a session that no longer boots falls back to
+    /// a fresh spawn and forgets the dead id.
+    pub fn daily_session(mut self, key: impl Into<String>) -> Self {
+        self.daily_key = Some(key.into());
         self
     }
 
@@ -167,21 +174,72 @@ impl SessionProfile {
         self
     }
 
-    /// Escape hatch for call sites that manage the session lifecycle
-    /// themselves (e.g. the distiller reuses one session across many asks).
-    /// The invariants baked into the options still hold.
+    /// The options a profile resolved to. Test-only: production call sites
+    /// go through [`Self::spawn`] / [`Self::run_one_shot`] so the daily-session
+    /// wiring can't be skipped.
+    #[cfg(test)]
     pub fn into_parts(self) -> (SpawnOptions, AskOptions) {
         (self.spawn, self.ask)
+    }
+
+    /// Spawn the session this profile describes and hand back the ask
+    /// options to use on it. For call sites that manage the lifecycle
+    /// themselves (the distiller runs many asks on one session, then closes
+    /// it). Honors `daily_session`.
+    pub async fn spawn(self) -> Result<(Session, AskOptions)> {
+        let label = self.spawn.agent_label.clone().unwrap_or_default();
+        let Some(key) = self.daily_key else {
+            let session = Session::spawn(self.spawn)
+                .await
+                .with_context(|| format!("spawning session ({label})"))?;
+            return Ok((session, self.ask));
+        };
+        let root = self.spawn.workspace_root.clone();
+        let date = crate::chore_state::today_local();
+        let recorded = crate::chore_state::daily_session(&root, &key, &date)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(key, err = %e, "daily-session lookup failed — spawning fresh");
+                None
+            });
+        let mut session = match recorded {
+            Some(id) => {
+                let mut opts = self.spawn.clone();
+                opts.resume_session_id = Some(id.clone());
+                match Session::spawn(opts).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // The recorded session is dead (transcript gone, TUI
+                        // stuck on a prompt we don't handle). Forget it and
+                        // continue the day on a fresh one.
+                        tracing::warn!(
+                            key, session_id = %id, err = %format!("{e:#}"),
+                            "resuming today's session failed — spawning fresh"
+                        );
+                        let _ = crate::chore_state::clear_daily_session(&root, &key).await;
+                        Session::spawn(self.spawn)
+                            .await
+                            .with_context(|| format!("spawning session ({label})"))?
+                    }
+                }
+            }
+            None => Session::spawn(self.spawn)
+                .await
+                .with_context(|| format!("spawning session ({label})"))?,
+        };
+        session.set_daily_session(key, date);
+        Ok((session, self.ask))
     }
 
     /// spawn → ask → close, with the forensics handles a caller needs
     /// afterwards. The standard shape for every one-shot fire.
     pub async fn run_one_shot(self, message: &str) -> Result<OneShotOutcome> {
         let label = self.spawn.agent_label.clone().unwrap_or_default();
-        let mut session = Session::spawn(self.spawn)
+        let (mut session, ask) = self
+            .spawn()
             .await
             .with_context(|| format!("spawning one-shot session ({label})"))?;
-        let raw = session.ask(message, self.ask).await;
+        let raw = session.ask(message, ask).await;
         let session_id = session.session_id().to_string();
         // Capture before close(); the transcript persists after the tmux
         // window dies, so the caller can inspect how the session ended.

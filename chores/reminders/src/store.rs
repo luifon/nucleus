@@ -172,6 +172,17 @@ const MIGRATIONS: &[nucleus_core::migrate::Migration] = &[
              )",
         ),
     },
+    // Daily-session continuity moved to core's chore state (ADR-029,
+    // `memory/chore_state.db`, keyed `reminder-<id>`) so the distiller and
+    // the skill-gap-learner share the mechanism instead of each growing a
+    // table. The per-reminder opt-in column stays; only the bookkeeping
+    // table goes. Cost of the move: the day it lands, one extra transcript
+    // for each daily-session reminder.
+    nucleus_core::migrate::Migration {
+        version: 8,
+        name: "daily-session-to-core",
+        step: nucleus_core::migrate::Step::Sql("DROP TABLE IF EXISTS reminder_daily_session"),
+    },
 ];
 
 fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
@@ -578,46 +589,6 @@ fn row_to_reminder(r: sqlx::sqlite::SqliteRow) -> Reminder {
 /// The claude session id this reminder used on `date` (local `YYYY-MM-DD`),
 /// if one was recorded. Drives daily-session continuity: a match means the
 /// fire resumes that session instead of spawning fresh.
-pub async fn daily_session_for(
-    pool: &SqlitePool,
-    reminder_id: i64,
-    date: &str,
-) -> Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT session_id FROM reminder_daily_session
-          WHERE reminder_id = ?1 AND session_date = ?2",
-    )
-    .bind(reminder_id)
-    .bind(date)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(s,)| s))
-}
-
-/// Record the session id a reminder used on `date`. One row per reminder
-/// (PK), overwritten when the date rolls over — so the next day's first
-/// fire finds no match and starts a fresh session.
-pub async fn set_daily_session(
-    pool: &SqlitePool,
-    reminder_id: i64,
-    date: &str,
-    session_id: &str,
-) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO reminder_daily_session (reminder_id, session_date, session_id)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(reminder_id) DO UPDATE SET
-             session_date = excluded.session_date,
-             session_id   = excluded.session_id",
-    )
-    .bind(reminder_id)
-    .bind(date)
-    .bind(session_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// Parse a cron expression and compute the next match strictly after
 /// `from`, interpreted in `tz`, returned as UTC.
 pub fn next_match_utc(cron: &str, from: DateTime<Utc>, tz: Tz) -> Result<DateTime<Utc>> {

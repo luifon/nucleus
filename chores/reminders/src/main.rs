@@ -694,31 +694,12 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
             // each channel as the actual user-visible output. The
             // session has no built-in posting tool, so the reminders
             // worker is the bridge (see persona.md for the contract).
-            // Daily-session continuity (migration v7): a reminder flagged
-            // daily_session resumes one claude session per local day instead
-            // of spawning a fresh one each tick — the heartbeat (*/30) was
-            // 29 transcripts/day in `claude --resume`. Look up today's
-            // session before firing; record the id after any successful fire.
-            let today_local = Local::now().format("%Y-%m-%d").to_string();
-            let resume = if reminder.daily_session {
-                store::daily_session_for(&pool, reminder.id, &today_local)
-                    .await
-                    .unwrap_or(None)
-            } else {
-                None
-            };
-            let fire =
-                deliver_skill_fire(settings, workspace_root, &reminder, &channels, resume).await;
-            if reminder.daily_session {
-                if let Ok(res) = &fire {
-                    if let Err(e) =
-                        store::set_daily_session(&pool, reminder.id, &today_local, &res.session_id)
-                            .await
-                    {
-                        tracing::warn!(id = reminder.id, err = %e, "set_daily_session failed");
-                    }
-                }
-            }
+            // A reminder flagged daily_session resumes one claude session
+            // per local day instead of spawning a fresh one each tick (the
+            // heartbeat, */30, was 29 transcripts/day in `claude --resume`).
+            // The continuity itself is core's ADR-029 chore state, keyed
+            // `reminder-<id>`; see deliver_skill_fire.
+            let fire = deliver_skill_fire(settings, workspace_root, &reminder, &channels).await;
             match fire {
                 Ok(SkillFireResult { msg_id, reply, .. }) if is_silent_reply(&reply) => {
                     // Reply-gated delivery (ADR-026): the session judged
@@ -1029,7 +1010,6 @@ async fn deliver_skill_fire(
     workspace_root: &Path,
     r: &store::Reminder,
     channels: &[store::ChannelRow],
-    resume: Option<String>,
 ) -> Result<SkillFireResult> {
     let system_prompt = r
         .system_prompt
@@ -1062,16 +1042,21 @@ async fn deliver_skill_fire(
     // for Playwright-driven skills. Bounded by the per-tick file lock so we
     // don't overlap. No allowed_tools pre-approval at this layer — each
     // skill's own `allowed-tools` frontmatter handles tool gating.
-    let outcome = SessionProfile::one_shot_agentic(&ProfileContext {
+    let profile = SessionProfile::one_shot_agentic(&ProfileContext {
         workspace_root,
         claude: &settings.claude,
         tmux_session: "nucleus-reminders-fire",
         agent_label: "reminders-fire",
     })
     .system_prompt(persona)
-    .window_name(format!("fire-{}", r.id))
-    .resume(resume)
-    .run_one_shot(&ask_payload)
+    .window_name(format!("fire-{}", r.id));
+    let profile = if r.daily_session {
+        profile.daily_session(format!("reminder-{}", r.id))
+    } else {
+        profile
+    };
+    let outcome = profile
+        .run_one_shot(&ask_payload)
     .await
     .with_context(|| format!("fire session for reminder #{}", r.id))?;
 
@@ -1120,7 +1105,6 @@ async fn deliver_skill_fire(
 
     Ok(SkillFireResult {
         msg_id: format!("skill-fire:{}", outcome.session_id),
-        session_id: outcome.session_id,
         reply,
     })
 }
@@ -1164,9 +1148,6 @@ const SKILL_REPLY_CAP_CHARS: usize = 1800;
 /// to the channels as the actual user-visible output.
 struct SkillFireResult {
     msg_id: String,
-    /// The claude session id the fire ran in — persisted for daily-session
-    /// reminders so the next fire the same day resumes it.
-    session_id: String,
     reply: String,
 }
 
