@@ -42,8 +42,10 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Entry point for this subcommand of the `nucleus` binary. `args` is the
+/// full argv for the subcommand, argv[0] included, so clap renders usage
+/// under the right name.
+pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     nucleus_core::init_tracing();
     let _settings = Settings::load().context("loading settings")?;
     let workspace_root = std::env::current_dir()?;

@@ -6,7 +6,8 @@
     <string>__LAUNCHD_PREFIX__.news-fetcher</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__USER_HOME__/Development/nucleus/target/release/news-fetcher</string>
+        <string>__USER_HOME__/Development/nucleus/target/release/nucleus</string>
+        <string>news-fetcher</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__USER_HOME__/Development/nucleus</string>

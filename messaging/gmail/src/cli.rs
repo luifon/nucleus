@@ -43,11 +43,11 @@ enum KilllistAction {
     List,
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     let settings = Settings::load().context("loading settings")?;
     let workspace_root = std::env::current_dir()?;
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(args);
     match cli.command.unwrap_or(Cmd::Metabolize) {
         Cmd::Metabolize => metabolize::run(&settings, &workspace_root).await,
         Cmd::Killlist { action } => match action {

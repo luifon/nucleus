@@ -22,7 +22,7 @@ notify_on_failure: []
 ## The primitive
 
 ```bash
-./target/release/session-send \
+./target/release/nucleus session-send \
   --to <tmux-session>[:<window>] --from <your-agent-label> \
   [--await-reply --timeout <secs>] \
   --message "<the brief>"
@@ -55,7 +55,7 @@ notify_on_failure: []
      [ -n "$W" ] && break; sleep 2
    done
    for i in $(seq 1 12); do
-     ./target/release/session-send --to "nucleus-whatsapp-dm:$W" --from main \
+     ./target/release/nucleus session-send --to "nucleus-whatsapp-dm:$W" --from main \
        --message '<brief>' && break
      sleep 15
    done

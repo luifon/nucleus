@@ -9,9 +9,6 @@ publish.workspace = true
 name = "reminders"
 path = "src/lib.rs"
 
-[[bin]]
-name = "reminders"
-path = "src/main.rs"
 
 [dependencies]
 nucleus-core = { workspace = true }

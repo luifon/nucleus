@@ -9,7 +9,8 @@
          them (promote to T2 / merge / archive to vault / drop), and prunes. -->
     <key>ProgramArguments</key>
     <array>
-        <string>__USER_HOME__/Development/nucleus/target/release/distiller</string>
+        <string>__USER_HOME__/Development/nucleus/target/release/nucleus</string>
+        <string>distiller</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__USER_HOME__/Development/nucleus</string>

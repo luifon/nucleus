@@ -64,12 +64,14 @@ enum Cmd {
     Learn,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Entry point for this subcommand of the `nucleus` binary. `args` is the
+/// full argv for the subcommand, argv[0] included, so clap renders usage
+/// under the right name.
+pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     nucleus_core::init_tracing();
     let settings = Settings::load().context("loading settings")?;
     let workspace_root = std::env::current_dir()?;
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(args);
 
     // A stale tmux session left from a prior crash blocks `new-window`.
     let _ = tokio::process::Command::new("tmux")
@@ -247,36 +249,24 @@ async fn alert_gate(workspace_root: &Path, outcome: &GateOutcome) {
     }
     let body = format!("⚠️ skill-gap-learner touched the skill library\n\n{}", lines.join("\n"));
 
-    let bin = workspace_root.join("target/release/reminders");
-    if !bin.exists() {
-        tracing::warn!("gate alert: {} missing — alert not delivered", bin.display());
-        return;
-    }
+    // Both halves live in the same binary since ADR-030, so this is a library
+    // call rather than a subprocess. It also removes the old silent failure
+    // mode: the alert used to be dropped whenever target/release/reminders
+    // happened not to exist.
     let at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string();
-    let out = tokio::process::Command::new(&bin)
-        .current_dir(workspace_root)
-        .args([
-            "add",
-            "--at",
-            &at,
-            "--title",
-            "skill gate",
-            "--body",
-            &body,
-            "--channels",
-            "discord-home,whatsapp-dm",
-        ])
-        .output()
-        .await;
+    let out = reminders::run(
+        ["nucleus reminders", "add", "--at", &at, "--title", "skill gate",
+         "--body", &body, "--channels", "discord-home,whatsapp-dm"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect(),
+    )
+    .await;
     match out {
-        Ok(o) if o.status.success() => {
+        Ok(()) => {
             tracing::info!("gate alert queued for {}", outcome.names().join(", "))
         }
-        Ok(o) => tracing::warn!(
-            "gate alert failed: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        ),
-        Err(e) => tracing::warn!("gate alert spawn failed: {e}"),
+        Err(e) => tracing::warn!("gate alert failed: {e:#}"),
     }
 }
 

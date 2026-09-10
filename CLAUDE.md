@@ -243,7 +243,7 @@ the user asks to be nudged at a future time or on a schedule.
 to check the deploy", "tomorrow 9am about Q3 sync") — use `--at`:
 
 ```bash
-./target/release/reminders add \
+./target/release/nucleus reminders add \
   --at "2026-05-14T16:45:00<offset>" \
   --body "dentist appointment at 17h" \
   --channels discord-home
@@ -255,7 +255,7 @@ with a standard 5-field cron expression (minute hour day month dow),
 evaluated in `NUCLEUS_TZ`:
 
 ```bash
-./target/release/reminders add \
+./target/release/nucleus reminders add \
   --cron "30 18 * * 1-5" \
   --body "⏰ End of day — time to log your hours." \
   --channels discord-home
@@ -353,7 +353,7 @@ read state and summarize, orchestrate a multi-step task) rather than
 just post a static body, use `--system-prompt` instead of `--body`:
 
 ```bash
-./target/release/reminders add \
+./target/release/nucleus reminders add \
   --cron "20 8 * * 1-5" \
   --system-prompt "Run pre-meeting-prep skill, post results to discord-home." \
   --channels discord-home
@@ -387,7 +387,7 @@ When the content has a deterministic source that the fire merely formats and
 annotates, give the reminder a fallback:
 
 ```bash
-./target/release/reminders add \
+./target/release/nucleus reminders add \
   --cron "0 12 * * 1-5" \
   --title "<short name>" \
   --system-prompt "Run <skill>, post the result." \

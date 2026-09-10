@@ -6,7 +6,8 @@
     <string>__LAUNCHD_PREFIX__.gmail-metabolism</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__USER_HOME__/Development/nucleus/target/release/gmail-metabolism</string>
+        <string>__USER_HOME__/Development/nucleus/target/release/nucleus</string>
+        <string>gmail-metabolism</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__USER_HOME__/Development/nucleus</string>

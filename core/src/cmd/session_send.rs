@@ -1,6 +1,6 @@
 //! `session-send` — the ONE sanctioned way an agent writes into another
 //! agent's live Claude session (ADR-021). Thin CLI over
-//! `nucleus_core::agent_msg::send`.
+//! `crate::agent_msg::send`.
 //!
 //! Examples:
 //!   session-send --to nucleus-whatsapp-dm:1 --from main \
@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use nucleus_core::agent_msg::{SendOpts, send};
+use crate::agent_msg::{SendOpts, send};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -46,10 +46,11 @@ struct Cli {
     workspace_root: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
-    let cli = Cli::parse();
+/// Entry point for the `nucleus session-send` subcommand. `args` is the full
+/// argv for the subcommand, argv[0] included, so clap renders usage under
+/// the right name.
+pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
+    let cli = Cli::parse_from(args);
     let workspace_root = match cli.workspace_root {
         Some(p) => p,
         None => std::env::current_dir()?,

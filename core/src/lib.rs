@@ -19,6 +19,7 @@ pub mod agents;
 pub mod chore_state;
 pub mod claude;
 pub mod claude_session;
+pub mod cmd;
 pub mod config;
 pub mod db;
 pub mod diary;

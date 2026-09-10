@@ -1,7 +1,7 @@
 # ADR-021 — Agent-to-agent session messaging (`session-send`)
 
 **Status:** Accepted + built (2026-07-18). `core/src/agent_msg.rs` +
-`target/release/session-send`; E2E-verified (registry refusal, hop refusal,
+`nucleus session-send`; E2E-verified (registry refusal, hop refusal,
 idle gate, verified submit, logged delivery, awaited reply).
 
 ## Context

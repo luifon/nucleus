@@ -14,7 +14,7 @@
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use nucleus_core::session_index;
+use crate::session_index;
 
 #[derive(Parser)]
 #[command(
@@ -49,10 +49,12 @@ struct Cli {
     max_age_days: i64,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    nucleus_core::init_tracing();
-    let cli = Cli::parse();
+/// Entry point for the `nucleus session-search` subcommand. `args` is the full
+/// argv for the subcommand, argv[0] included, so clap renders usage under
+/// the right name.
+pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
+    crate::init_tracing();
+    let cli = Cli::parse_from(args);
     let workspace_root = std::env::current_dir()?;
     let pool = session_index::open(&workspace_root).await?;
 

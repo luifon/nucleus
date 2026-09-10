@@ -41,8 +41,10 @@ fn metabolism_watermark_key(agent: &str) -> String {
     format!("distiller.metabolism.{agent}")
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Entry point for this subcommand of the `nucleus` binary. `args` is the
+/// full argv for the subcommand, argv[0] included, so clap renders usage
+/// under the right name.
+pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     nucleus_core::init_tracing();
     let settings = Settings::load().context("loading settings")?;
     let workspace_root = std::env::current_dir()?;
@@ -678,6 +680,17 @@ fn summarize_vault(vault: &Path) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "{}/", vault.display());
+    // Report a failed listing instead of silently yielding an empty summary.
+    // An unsigned binary loses its Full Disk Access grant (ADR-030) and this
+    // read comes back as a permission error; swallowing it made the whole vault
+    // look empty with nothing in the log to say why.
+    if let Err(e) = std::fs::read_dir(vault) {
+        tracing::error!(
+            path = %vault.display(), err = %e,
+            "cannot list the vault — contemplation will run without vault structure. \
+             If this is a permission error, the binary is probably unsigned: run ./tools/build.sh"
+        );
+    }
     let mut tops: Vec<_> = std::fs::read_dir(vault).into_iter()
         .flatten().flatten()
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))

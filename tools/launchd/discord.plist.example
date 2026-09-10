@@ -6,7 +6,8 @@
     <string>__LAUNCHD_PREFIX__.discord</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__USER_HOME__/Development/nucleus/target/release/discord</string>
+        <string>__USER_HOME__/Development/nucleus/target/release/nucleus</string>
+        <string>discord</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__USER_HOME__/Development/nucleus</string>
