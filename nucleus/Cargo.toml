@@ -1,0 +1,22 @@
+[package]
+name = "nucleus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "nucleus"
+path = "src/main.rs"
+
+[dependencies]
+nucleus-core = { workspace = true }
+reminders = { workspace = true }
+distiller = { path = "../chores/distiller" }
+skill-gap-learner = { path = "../chores/skill-gap-learner" }
+discord = { path = "../messaging/discord" }
+gmail = { path = "../messaging/gmail" }
+news-fetcher = { path = "../news/fetcher" }
+nucleus-dashboard = { path = "../nucleus-dashboard/api" }
+tokio = { workspace = true }
+anyhow = { workspace = true }

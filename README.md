@@ -142,8 +142,18 @@ cp nucleus.toml.example nucleus.toml
 
 ### 2. Build
 
+Everything ships as one signed binary, `target/release/nucleus`, which
+dispatches to every service (`nucleus distiller`, `nucleus reminders due`, …).
+It holds a macOS Full Disk Access grant, and that grant is pinned to the signing
+identity — so build through `tools/build.sh`, never bare `cargo build
+--release`, or the grant stops applying and vault reads fail (ADR-030).
+
 ```bash
-cargo build --release
+./tools/codesign/create-identity.sh   # once per machine: self-signed identity
+./tools/build.sh                      # build + sign + verify
+# The first build shows a keychain dialog. Click "Always Allow", not "Allow".
+# Then grant Full Disk Access to target/release/nucleus in
+# System Settings → Privacy & Security → Full Disk Access.
 (cd messaging/whatsapp && npm install)
 (cd nucleus-dashboard/web && npm install && npm run build)
 (cd tools/playwright-auth && npm install && node playwright-auth.mjs init)
@@ -482,7 +492,7 @@ tmux attach -t nucleus-skill-gap-learner  # skill review (on-the-fly) + daily le
 tmux attach -t nucleus-gmail              # gmail metabolism + calendar fires (was nucleus-jarvis)
 
 # Reload a specific service after a code change
-cargo build --release && ./tools/launchd/install.sh discord
+./tools/build.sh && ./tools/launchd/install.sh discord
 
 # Stop everything
 ./tools/launchd/install.sh --uninstall
@@ -497,7 +507,7 @@ launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.gmail
 tmux kill-window -t nucleus-discord:<window-prefix>
 
 # Ad-hoc reminders (the bots usually do this for you via natural language)
-./target/release/reminders add \
+./target/release/nucleus reminders add \
   --at "2026-05-14T16:45:00<your-tz-offset>" \
   --body "dentist appointment" \
   --channels discord-home         # or whatsapp-dm | calendar
@@ -505,17 +515,17 @@ tmux kill-window -t nucleus-discord:<window-prefix>
 # Skill-fire reminder (ADR-008): spawns a one-shot Claude session at fire
 # time, executes the prompt (possibly invoking a skill), forwards the
 # reply to the channels. Use --system-prompt instead of --body.
-./target/release/reminders add \
+./target/release/nucleus reminders add \
   --cron "20 8 * * 1-5" \
   --system-prompt "Run pre-meeting-prep skill, post results to discord-home." \
   --channels discord-home
 
-./target/release/reminders list   # see pending
+./target/release/nucleus reminders list   # see pending
 
 # Search past session transcripts (ADR-023; index refreshes on every run)
-./target/release/session-search "what did we decide about X" --days 30
-./target/release/session-search --prune            # junk-transcript report (dry-run)
-./target/release/reminders cancel <id>
+./target/release/nucleus session-search "what did we decide about X" --days 30
+./target/release/nucleus session-search --prune            # junk-transcript report (dry-run)
+./target/release/nucleus reminders cancel <id>
 
 # One-shot WhatsApp send (uses the paired session)
 cd messaging/whatsapp && npm run send -- <phone-or-jid> "<message>"

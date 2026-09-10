@@ -6,7 +6,8 @@
     <string>__LAUNCHD_PREFIX__.nucleus-dashboard</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__USER_HOME__/Development/nucleus/target/release/nucleus-dashboard</string>
+        <string>__USER_HOME__/Development/nucleus/target/release/nucleus</string>
+        <string>dashboard</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__USER_HOME__/Development/nucleus</string>

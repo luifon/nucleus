@@ -460,8 +460,10 @@ async fn send_chunked(http: &Http, channel: ChannelId, body: &str) -> Result<()>
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Entry point for this subcommand of the `nucleus` binary. `args` is the
+/// full argv for the subcommand, argv[0] included, so clap renders usage
+/// under the right name.
+pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     nucleus_core::init_tracing();
     let settings = Settings::load().context("loading nucleus.toml + .env")?;
     let token = std::env::var("DISCORD_BOT_TOKEN").context("DISCORD_BOT_TOKEN not set")?;

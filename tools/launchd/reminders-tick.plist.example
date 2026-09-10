@@ -6,7 +6,8 @@
     <string>__LAUNCHD_PREFIX__.reminders-tick</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__USER_HOME__/Development/nucleus/target/release/reminders</string>
+        <string>__USER_HOME__/Development/nucleus/target/release/nucleus</string>
+        <string>reminders</string>
         <string>due</string>
     </array>
     <key>WorkingDirectory</key>

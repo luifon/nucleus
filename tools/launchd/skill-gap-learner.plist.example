@@ -9,7 +9,8 @@
          on-the-fly arm runs inside the conversational agents, not here. -->
     <key>ProgramArguments</key>
     <array>
-        <string>__USER_HOME__/Development/nucleus/target/release/skill-gap-learner</string>
+        <string>__USER_HOME__/Development/nucleus/target/release/nucleus</string>
+        <string>skill-gap-learner</string>
         <string>learn</string>
     </array>
     <key>WorkingDirectory</key>

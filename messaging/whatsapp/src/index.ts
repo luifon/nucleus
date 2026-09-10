@@ -1287,14 +1287,15 @@ function fireSkillReview(
   chatKey: string,
   transcriptPath: string,
 ): void {
-  const release = path.join(workspaceRoot, "target/release/skill-gap-learner");
-  const debug = path.join(workspaceRoot, "target/debug/skill-gap-learner");
+  // ADR-030: one signed binary, subcommand dispatch.
+  const release = path.join(workspaceRoot, "target/release/nucleus");
+  const debug = path.join(workspaceRoot, "target/debug/nucleus");
   const bin = fs.existsSync(release) ? release : fs.existsSync(debug) ? debug : null;
   if (!bin) return;
   try {
     const child = spawn(
       bin,
-      ["review", "--transcript", transcriptPath, "--venue", venue, "--chat-key", chatKey],
+      ["skill-gap-learner", "review", "--transcript", transcriptPath, "--venue", venue, "--chat-key", chatKey],
       { cwd: workspaceRoot, detached: true, stdio: "ignore" },
     );
     child.unref();

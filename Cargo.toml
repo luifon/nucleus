@@ -9,6 +9,7 @@ members = [
     "chores/reminders",
     "chores/skill-gap-learner",
     "nucleus-dashboard/api",
+    "nucleus",
 ]
 
 [workspace.package]

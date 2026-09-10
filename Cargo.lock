@@ -1544,6 +1544,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nucleus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "discord",
+ "distiller",
+ "gmail",
+ "news-fetcher",
+ "nucleus-core",
+ "nucleus-dashboard",
+ "reminders",
+ "skill-gap-learner",
+ "tokio",
+]
+
+[[package]]
 name = "nucleus-core"
 version = "0.1.0"
 dependencies = [
@@ -2513,6 +2529,7 @@ dependencies = [
  "chrono",
  "clap",
  "nucleus-core",
+ "reminders",
  "serde",
  "serde_json",
  "tokio",

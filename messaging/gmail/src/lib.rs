@@ -12,13 +12,15 @@
 //! the operator's Claude Max integrations.
 
 use anyhow::Result;
+use std::ffi::OsString;
 
 mod store;
 mod metabolize;
 mod cli;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    nucleus_core::init_tracing();
-    cli::run().await
+/// Entry point for the `nucleus gmail-metabolism` subcommand. `args` is the
+/// full argv for this subcommand, argv[0] included, so clap renders usage
+/// under the right name.
+pub async fn run(args: Vec<OsString>) -> Result<()> {
+    cli::run(args).await
 }

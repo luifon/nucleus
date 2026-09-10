@@ -105,10 +105,18 @@ else FAIL "vault read EPERM — FDA revoked (System Settings ▸ Privacy ▸ Ful
 
 # --- reminders ----------------------------------------------------------
 HEAD "reminders (ticker primitive)"
-if [ -x ./target/release/reminders ]; then
-  if ./target/release/reminders list >/dev/null 2>&1; then PASS "reminders binary + db OK ($(./target/release/reminders list 2>/dev/null | grep -c '^#') active)"
+if [ -x ./target/release/nucleus ]; then
+  # ADR-030: the privacy grant is pinned to the signing identity. An unsigned
+  # build silently loses Full Disk Access, so the vault reads empty with no
+  # dialog to explain it — check the signature before anything that uses it.
+  if ./tools/build.sh --check >/dev/null 2>&1; then
+    PASS "nucleus binary signed (Full Disk Access grant applies)"
+  else
+    FAIL "nucleus binary is not signed by the Nucleus identity — run ./tools/build.sh"
+  fi
+  if ./target/release/nucleus reminders list >/dev/null 2>&1; then PASS "reminders + db OK ($(./target/release/nucleus reminders list 2>/dev/null | grep -c '^#') active)"
   else FAIL "reminders list errored (db locked / corrupt?)"; fi
-else WARN "reminders binary not built (cargo build --release -p reminders)"; fi
+else WARN "nucleus binary not built (run ./tools/build.sh)"; fi
 
 # --- whatsapp reconnect (no fresh QR) -----------------------------------
 HEAD "whatsapp link state"

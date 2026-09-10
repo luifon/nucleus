@@ -248,17 +248,21 @@ pub fn default_roots(home: &Path, workspace_root: &Path) -> Vec<(PathBuf, &'stat
 }
 
 /// Fire a detached on-the-fly skill review (ADR-017) for a conversation that
-/// just crossed the nudge interval. Best-effort and fully decoupled: it shells
-/// out to the built `skill-gap-learner` binary and returns immediately, so it
-/// never blocks the caller's reply or fails it. A no-op if the binary isn't
-/// built yet. The conversational agents call this when `AskResult.review_due`.
+/// just crossed the nudge interval. Best-effort and fully decoupled: it spawns
+/// `nucleus skill-gap-learner review` and returns immediately, so it never
+/// blocks the caller's reply or fails it. A no-op if the binary isn't built
+/// yet. The conversational agents call this when `AskResult.review_due`.
+///
+/// Deliberately a subprocess rather than a library call even though both halves
+/// now live in one binary (ADR-030): the review must outlive the reply it was
+/// triggered by, and it must not be able to fail the conversation turn.
 pub fn fire_skill_review(workspace_root: &Path, venue: &str, chat_key: &str, transcript_path: &str) {
     use std::process::{Command, Stdio};
-    let release = workspace_root.join("target/release/skill-gap-learner");
+    let release = workspace_root.join("target/release/nucleus");
     let bin = if release.exists() {
         release
     } else {
-        workspace_root.join("target/debug/skill-gap-learner")
+        workspace_root.join("target/debug/nucleus")
     };
     if !bin.exists() {
         return;
@@ -266,6 +270,7 @@ pub fn fire_skill_review(workspace_root: &Path, venue: &str, chat_key: &str, tra
     let _ = Command::new(bin)
         .current_dir(workspace_root)
         .args([
+            "skill-gap-learner",
             "review",
             "--transcript",
             transcript_path,
