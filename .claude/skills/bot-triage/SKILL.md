@@ -10,7 +10,7 @@ description: >
 flavor: recipe
 trigger: model
 mcp_needed: []
-last_used: 2026-09-04
+last_used: 2026-09-11
 last_failure: null
 failure_count_30d: 0
 notify_on_failure: []
