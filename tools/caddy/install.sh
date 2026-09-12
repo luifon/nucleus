@@ -10,6 +10,8 @@
 #   CF_API_TOKEN         — Cloudflare token with Zone:DNS:Edit on the zone
 # Optional:
 #   NUCLEUS_LAUNCHD_PREFIX (default dev.nucleus)
+#   NUCLEUS_EXTRA_TAILNET_SERVICES — extra host=port services to front on the
+#     tailnet, same perimeter as nucleus (comma/space/newline separated)
 #
 # Output (both gitignored):
 #   tools/caddy/Caddyfile
@@ -44,6 +46,33 @@ sed \
   -e "s|__TAILNET_IP__|$TAILNET_IP|g" \
   "$SCRIPT_DIR/Caddyfile.example" > "$SCRIPT_DIR/Caddyfile"
 echo "wrote $SCRIPT_DIR/Caddyfile (host=$NUCLEUS_HOSTNAME, bind=$TAILNET_IP)"
+
+# Optional extra tailnet-fronted services, listed in .env as host=port pairs
+# (comma/space/newline separated). Each gets its own reverse-proxy block with
+# the same tailnet-only perimeter as nucleus. The specific service — its
+# hostname and port — stays in the gitignored .env, never in this committed
+# template.
+extra="${NUCLEUS_EXTRA_TAILNET_SERVICES:-}"
+for entry in ${extra//,/ }; do
+  host="${entry%%=*}"
+  port="${entry##*=}"
+  if [ -z "$host" ] || [ -z "$port" ] || [ "$host" = "$entry" ]; then
+    echo "skipping malformed NUCLEUS_EXTRA_TAILNET_SERVICES entry '$entry' (want host=port)" >&2
+    continue
+  fi
+  cat >> "$SCRIPT_DIR/Caddyfile" <<BLOCK
+
+$host {
+	bind $TAILNET_IP
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+		resolvers 1.1.1.1
+	}
+	reverse_proxy localhost:$port
+}
+BLOCK
+  echo "  + extra tailnet service $host -> localhost:$port"
+done
 
 # LaunchDaemon plist (carries the token in its EnvironmentVariables; lands in
 # a gitignored file + /Library/LaunchDaemons, never the repo).
