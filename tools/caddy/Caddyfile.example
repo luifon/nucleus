@@ -7,6 +7,10 @@
 #   __NUCLEUS_HOSTNAME__ → host portion of NUCLEUS_PUBLIC_URL
 #   __TAILNET_IP__       → `tailscale ip -4` of this host (a 100.x CGNAT addr)
 #
+# install.sh also appends a block per entry in NUCLEUS_EXTRA_TAILNET_SERVICES
+# (host=port pairs in .env) to front additional services on the same tailnet
+# perimeter. Those specifics live in the gitignored .env, not in this template.
+#
 # CF_API_TOKEN is read from the environment (set in the LaunchDaemon plist),
 # never baked into this file. The cert is issued via the ACME DNS-01
 # challenge against Cloudflare DNS — the host needs no public :80/:443
