@@ -25,7 +25,7 @@ Services (run by launchd):
   skill-gap-learner     skill review + curator (learn|review)
   discord               Discord bot daemon
   gmail-metabolism      daily inbox sweep
-  news-fetcher          RSS pull + notability scoring
+  news-fetcher          feed pull + profile ranking → widget feed
   dashboard             web dashboard + API
 
 Operator tools:
@@ -78,10 +78,7 @@ async fn main() -> Result<()> {
             no_args(&name, &sub, "run the Discord bot daemon")?;
             discord::run(sub).await
         }
-        "news-fetcher" => {
-            no_args(&name, &sub, "pull RSS and score notability")?;
-            news_fetcher::run(sub).await
-        }
+        "news-fetcher" => news_fetcher::run(sub).await,
         "dashboard" => {
             no_args(&name, &sub, "serve the web dashboard and its API")?;
             nucleus_dashboard::run(sub).await

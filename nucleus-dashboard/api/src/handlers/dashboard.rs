@@ -341,9 +341,11 @@ async fn glance_top_news(pool: &Option<SqlitePool>) -> Option<NewsGlance> {
     let pool = pool.as_ref()?;
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     sqlx::query_as::<_, (String, String, String, Option<f64>)>(
+        // stale = 1 is resurfaced old content (ADR-031); it stays in the DB
+        // for the record but never represents "today".
         "SELECT i.title, s.name, i.url, i.notable_score
            FROM items i JOIN sources s ON s.id = i.source_id
-          WHERE i.fetch_date = ?1
+          WHERE i.fetch_date = ?1 AND i.stale = 0
           ORDER BY i.notable_score DESC NULLS LAST, i.published_at DESC
           LIMIT 1",
     )

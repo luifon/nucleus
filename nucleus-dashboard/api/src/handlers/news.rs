@@ -69,13 +69,24 @@ struct ItemDto {
     fetch_date: String,
     notable_score: Option<f64>,
     notable_reason: Option<String>,
+    /// Display label for the underlying event (ADR-031). Never a dedup key.
+    event_slug: Option<String>,
+    /// 1 when the ranker judged this resurfaced old content. Stale items are
+    /// kept in the DB and withheld from the widget.
     #[ts(type = "number")]
-    posted_to_discord: i64,
-    #[ts(type = "number | null")]
-    upvotes: Option<i64>,
-    #[ts(type = "number | null")]
-    downvotes: Option<i64>,
+    stale: i64,
+    /// Effective vote: the latest vote row for this item, 0 when there is
+    /// none. Votes supersede rather than accumulate (ADR-031), so this is a
+    /// state, not a tally.
+    #[ts(type = "number")]
+    vote: i64,
 }
+
+/// Effective vote per item — the latest row wins, so a reversal counts once.
+const EFFECTIVE_VOTE_SQL: &str = "COALESCE((SELECT v.vote FROM votes v
+              WHERE v.item_id = i.id
+              ORDER BY v.created_at DESC, v.rowid DESC
+              LIMIT 1), 0) AS vote";
 
 async fn list_items(
     State(s): State<Arc<NewsState>>,
@@ -84,22 +95,21 @@ async fn list_items(
     let day = q.fetch_date_or_today();
     let min_score = q.min_score.unwrap_or(0.0);
     let limit = q.limit.unwrap_or(200).clamp(1, 500);
-    let rows: Vec<ItemDto> = sqlx::query_as::<_, ItemDto>(
+    let rows: Vec<ItemDto> = sqlx::query_as::<_, ItemDto>(&format!(
         r#"
         SELECT i.id, i.source_id, s.name AS source_name,
                i.url, i.article_url,
                i.title, i.summary, i.published_at, i.published_date,
-               i.fetch_date, i.notable_score, i.notable_reason, i.posted_to_discord,
-               (SELECT COUNT(*) FROM votes v WHERE v.item_id = i.id AND v.vote =  1) AS upvotes,
-               (SELECT COUNT(*) FROM votes v WHERE v.item_id = i.id AND v.vote = -1) AS downvotes
+               i.fetch_date, i.notable_score, i.notable_reason, i.event_slug, i.stale,
+               {EFFECTIVE_VOTE_SQL}
         FROM items i
         JOIN sources s ON s.id = i.source_id
         WHERE i.fetch_date = ?1
           AND COALESCE(i.notable_score, 0) >= ?2
         ORDER BY i.notable_score DESC NULLS LAST, i.published_at DESC
         LIMIT ?3
-        "#,
-    )
+        "#
+    ))
     .bind(day)
     .bind(min_score)
     .bind(limit)
@@ -114,22 +124,22 @@ async fn list_notable(
 ) -> Result<Json<Vec<ItemDto>>, NewsError> {
     let day = q.fetch_date_or_today();
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
-    let rows: Vec<ItemDto> = sqlx::query_as::<_, ItemDto>(
+    let rows: Vec<ItemDto> = sqlx::query_as::<_, ItemDto>(&format!(
         r#"
         SELECT i.id, i.source_id, s.name AS source_name,
                i.url, i.article_url,
                i.title, i.summary, i.published_at, i.published_date,
-               i.fetch_date, i.notable_score, i.notable_reason, i.posted_to_discord,
-               (SELECT COUNT(*) FROM votes v WHERE v.item_id = i.id AND v.vote =  1) AS upvotes,
-               (SELECT COUNT(*) FROM votes v WHERE v.item_id = i.id AND v.vote = -1) AS downvotes
+               i.fetch_date, i.notable_score, i.notable_reason, i.event_slug, i.stale,
+               {EFFECTIVE_VOTE_SQL}
         FROM items i
         JOIN sources s ON s.id = i.source_id
         WHERE i.fetch_date = ?1
+          AND i.stale = 0
           AND COALESCE(i.notable_score, 0) >= 0.6
         ORDER BY i.notable_score DESC, i.published_at DESC
         LIMIT ?2
-        "#,
-    )
+        "#
+    ))
     .bind(day)
     .bind(limit)
     .fetch_all(&s.pool)
@@ -166,16 +176,33 @@ struct RunDto {
     started_at: String,
     finished_at: Option<String>,
     #[ts(type = "number")]
-    items_new: i64,
-    #[ts(type = "number")]
-    items_notable: i64,
-    #[ts(type = "number")]
     ok: i64,
+    error: Option<String>,
+    // Per-run funnel (ADR-031): how many entries the feeds produced, what
+    // each mechanical filter removed, and what reached the reader.
+    #[ts(type = "number")]
+    items_input: i64,
+    #[ts(type = "number")]
+    rejected_stale: i64,
+    #[ts(type = "number")]
+    rejected_dup_url: i64,
+    #[ts(type = "number")]
+    rejected_dup_title: i64,
+    #[ts(type = "number")]
+    items_ranked: i64,
+    #[ts(type = "number")]
+    items_surfaced: i64,
+    #[ts(type = "number")]
+    brief_ok: i64,
+    profile_hash: Option<String>,
 }
 
 async fn list_runs(State(s): State<Arc<NewsState>>) -> Result<Json<Vec<RunDto>>, NewsError> {
     let rows: Vec<RunDto> = sqlx::query_as::<_, RunDto>(
-        "SELECT run_id, started_at, finished_at, items_new, items_notable, ok FROM fetcher_runs ORDER BY started_at DESC LIMIT 30",
+        "SELECT run_id, started_at, finished_at, ok, error,
+                items_input, rejected_stale, rejected_dup_url, rejected_dup_title,
+                items_ranked, items_surfaced, brief_ok, profile_hash
+           FROM fetcher_runs ORDER BY started_at DESC LIMIT 30",
     )
     .fetch_all(&s.pool)
     .await?;
@@ -193,20 +220,34 @@ async fn vote(
     State(s): State<Arc<NewsState>>,
     Json(req): Json<VoteReq>,
 ) -> Result<Json<serde_json::Value>, NewsError> {
-    let v = if req.vote > 0 {
-        1
-    } else if req.vote < 0 {
-        -1
-    } else {
-        return Err(NewsError::BadRequest("vote must be -1 or 1".into()));
+    let v = match req.vote.signum() {
+        1 => 1,
+        -1 => -1,
+        _ => 0,
     };
-    let now = Utc::now().to_rfc3339();
-    sqlx::query("INSERT INTO votes (item_id, vote, created_at) VALUES (?1, ?2, ?3)")
+    // votes.item_id is a foreign key and the pool enforces them, so an
+    // unknown id would surface as a 500. Answer it as what it is.
+    let known: Option<(String,)> = sqlx::query_as("SELECT id FROM items WHERE id = ?1")
         .bind(&req.item_id)
-        .bind(v)
-        .bind(&now)
-        .execute(&s.pool)
+        .fetch_optional(&s.pool)
         .await?;
+    if known.is_none() {
+        return Err(NewsError::BadRequest(format!("unknown item {}", req.item_id)));
+    }
+    // Votes are append-only and supersede by timestamp (ADR-031), so a
+    // reversal is a new row, not an update. 0 is a valid vote — it's how the
+    // reader takes one back.
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO votes (vote_id, item_id, vote, origin, created_at)
+         VALUES (?1, ?2, ?3, 'dashboard', ?4)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&req.item_id)
+    .bind(v)
+    .bind(&now)
+    .execute(&s.pool)
+    .await?;
     Ok(Json(
         serde_json::json!({ "ok": true, "item_id": req.item_id, "vote": v }),
     ))

@@ -36,11 +36,23 @@ NUCLEUS_LAUNCHD_PREFIX=tech.mycompany ./tools/launchd/install.sh
 | `whatsapp.plist.example` | WhatsApp bot | KeepAlive (always running) |
 | `news-api.plist.example` | News HTTP server | KeepAlive |
 | `dashboard.plist.example` | Dashboard HTTP server | KeepAlive |
-| `news-fetcher.plist.example` | Twice-daily news pull | StartCalendarInterval (e.g. 09:00 + 18:00) |
+| `news-fetcher.plist.example` | Twice-daily news pull | StartCalendarInterval array (09:00 + 19:00) |
 | `distiller-hourly.plist.example` | Diary metabolism | StartInterval 3600 |
 | `distiller-weekly.plist.example` | Sunday 04:00 contemplation | StartCalendarInterval |
 | `preference-learner.plist.example` | Weekly news preference learning | StartCalendarInterval |
 | `reminders-tick.plist.example` | Reminders polling worker | StartInterval 60 |
+
+## Pausing a job
+
+Remove its `.plist.example` (the next full `install.sh` boots it out and
+deletes the installed plist) or `launchctl bootout` it by hand.
+
+Do **not** use `launchctl disable`. That writes to launchd's override
+database, survives bootout, outlives the plist, and makes every later
+bootstrap fail with a bare `Input/output error` that names no cause. A
+news-fetcher paused that way in August 2026 refused to reload a month
+later for exactly this reason. `install.sh` now clears the flag before
+bootstrapping, so a job stuck this way recovers on the next install run.
 
 ## Gitignore
 
