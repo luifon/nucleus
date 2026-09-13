@@ -18,6 +18,13 @@ use crate::feed::{ParsedItem, SourceRow};
 pub const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "baseline-news", step: Step::Rust(baseline_v1) },
     Migration { version: 2, name: "profile-ranking-and-widget-delivery", step: Step::Sql(V2_SQL) },
+    Migration {
+        version: 3,
+        name: "brief-length-diagnostic",
+        step: Step::Sql(
+            "ALTER TABLE fetcher_runs ADD COLUMN brief_too_long INTEGER NOT NULL DEFAULT 0",
+        ),
+    },
 ];
 
 fn baseline_v1(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
@@ -417,6 +424,10 @@ pub struct RunDiagnostics {
     pub items_ranked: usize,
     pub items_surfaced: usize,
     pub brief_ok: bool,
+    /// The brief exceeded the widget's word cap twice and was discarded in
+    /// favour of the previous one. Distinct from `brief_ok = false` for a
+    /// session failure — this one is a prompt problem, not an infra problem.
+    pub brief_too_long: bool,
     pub profile_hash: String,
 }
 
@@ -440,8 +451,8 @@ pub async fn record_run_finish(
               SET finished_at = ?1, ok = ?2, error = ?3,
                   items_input = ?4, rejected_stale = ?5, rejected_dup_url = ?6,
                   rejected_dup_title = ?7, items_ranked = ?8, items_surfaced = ?9,
-                  brief_ok = ?10, profile_hash = ?11
-            WHERE run_id = ?12"#,
+                  brief_ok = ?10, brief_too_long = ?11, profile_hash = ?12
+            WHERE run_id = ?13"#,
     )
     .bind(Utc::now().to_rfc3339())
     .bind(i64::from(error.is_none()))
@@ -453,6 +464,7 @@ pub async fn record_run_finish(
     .bind(diag.items_ranked as i64)
     .bind(diag.items_surfaced as i64)
     .bind(i64::from(diag.brief_ok))
+    .bind(i64::from(diag.brief_too_long))
     .bind(&diag.profile_hash)
     .bind(run_id)
     .execute(pool)

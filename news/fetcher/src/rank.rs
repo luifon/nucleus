@@ -209,13 +209,80 @@ pub struct BriefInput<'a> {
     pub event: &'a str,
 }
 
+/// What the prompt asks for. Comfortably inside the tile.
+const BRIEF_TARGET_WORDS: usize = 50;
+
+/// What the widget tile can actually render. A brief over this is not a
+/// stylistic miss, it is a layout break — the 68-word brief from the first
+/// production run overflowed the tile — so length is validated like any
+/// other part of the contract rather than left to the prompt.
+const BRIEF_MAX_WORDS: usize = 60;
+
+/// Why a brief couldn't be used. The caller needs to tell these apart: one
+/// is a session problem, the other is a model that wouldn't stop writing.
+#[derive(Debug)]
+pub enum BriefFailure {
+    /// Both attempts came back over `BRIEF_MAX_WORDS`.
+    TooLong { words: usize },
+    /// The session failed, or returned nothing usable.
+    Unusable(anyhow::Error),
+}
+
+impl std::fmt::Display for BriefFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLong { words } => {
+                write!(f, "brief still {words} words after a shorten retry (max {BRIEF_MAX_WORDS})")
+            }
+            Self::Unusable(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+pub fn word_count(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
 /// Write the one-paragraph state-of-things the widget shows above the list.
-/// Errors are the caller's to absorb — a failed brief must not fail the run.
+///
+/// Two attempts: the first asks for the brief, and if it comes back over the
+/// cap the second is handed the overlong text and told to shorten it while
+/// keeping the same points — cheaper and more faithful than asking for a
+/// fresh brief that might pick different items. Still over the cap after
+/// that and the caller falls back to the previous brief, the same way it
+/// handles an empty one.
 pub async fn write_brief(
     workspace_root: &PathBuf,
     settings: &Settings,
     profile: &Profile,
     items: &[BriefInput<'_>],
+) -> std::result::Result<String, BriefFailure> {
+    let first = match brief_attempt(workspace_root, settings, profile, items, None).await {
+        Ok(t) => t,
+        Err(e) => return Err(BriefFailure::Unusable(e)),
+    };
+    if word_count(&first) <= BRIEF_MAX_WORDS {
+        return Ok(first);
+    }
+
+    tracing::warn!(words = word_count(&first), "brief over the word cap — asking for a shorter one");
+    let second = match brief_attempt(workspace_root, settings, profile, items, Some(&first)).await {
+        Ok(t) => t,
+        Err(e) => return Err(BriefFailure::Unusable(e)),
+    };
+    let words = word_count(&second);
+    if words <= BRIEF_MAX_WORDS {
+        return Ok(second);
+    }
+    Err(BriefFailure::TooLong { words })
+}
+
+async fn brief_attempt(
+    workspace_root: &PathBuf,
+    settings: &Settings,
+    profile: &Profile,
+    items: &[BriefInput<'_>],
+    too_long: Option<&str>,
 ) -> Result<String> {
     if items.is_empty() {
         bail!("no surfaced items to brief");
@@ -233,8 +300,9 @@ pub async fn write_brief(
         })
         .collect();
 
-    let prompt = format!(
-        r#"You are writing the daily news brief for one specific reader.
+    let prompt = match too_long {
+        None => format!(
+            r#"You are writing the daily news brief for one specific reader.
 
 Here is a profile of the reader:
 
@@ -246,14 +314,31 @@ These are the items that made it through to them today, already ranked:
 
 {items}
 
-Write 2 to 4 sentences, at most about 60 words, in English, that tell the
+Write 2 to 3 sentences, at most {target} words, in English, that tell the
 reader the state of things today and the one to three points that matter
-most, naming the items you mean. Plain text only: no preamble, no greeting,
-no markdown, no bullet list, no closing line. Reply with the brief itself and
-nothing else."#,
-        profile = profile.text.trim(),
-        items = serde_json::to_string_pretty(&listed)?,
-    );
+most, naming the items you mean. It is shown in a small fixed-size tile, so
+the word limit is a hard constraint, not a guideline. Plain text only: no
+preamble, no greeting, no markdown, no bullet list, no closing line. Reply
+with the brief itself and nothing else."#,
+            profile = profile.text.trim(),
+            items = serde_json::to_string_pretty(&listed)?,
+            target = BRIEF_TARGET_WORDS,
+        ),
+        Some(previous) => format!(
+            r#"This news brief is {words} words and has to fit in a small fixed-size
+tile:
+
+---
+{previous}
+---
+
+Shorten it to under {target} words. Keep the same points and the same items;
+cut wording, not content. Plain text only: no preamble, no markdown, no
+closing line. Reply with the shortened brief and nothing else."#,
+            words = word_count(previous),
+            target = BRIEF_TARGET_WORDS,
+        ),
+    };
 
     let outcome = SessionProfile::one_shot_utility(&ProfileContext {
         workspace_root,
@@ -349,5 +434,38 @@ mod tests {
     fn fences_are_stripped() {
         assert_eq!(strip_fences("```json\n[1]\n```"), "[1]");
         assert_eq!(strip_fences("  [1]  "), "[1]");
+    }
+
+    #[test]
+    fn word_count_ignores_how_the_whitespace_falls() {
+        assert_eq!(word_count(""), 0);
+        assert_eq!(word_count("   "), 0);
+        assert_eq!(word_count("one"), 1);
+        assert_eq!(word_count("one two  three"), 3);
+        assert_eq!(word_count("one two\nthree\tfour\n\nfive"), 5);
+        assert_eq!(word_count("  leading and trailing  "), 3);
+    }
+
+    #[test]
+    fn the_cap_is_inclusive_at_the_boundary() {
+        let at_cap = "word ".repeat(BRIEF_MAX_WORDS);
+        let over_cap = "word ".repeat(BRIEF_MAX_WORDS + 1);
+        assert_eq!(word_count(&at_cap), BRIEF_MAX_WORDS);
+        assert!(word_count(&at_cap) <= BRIEF_MAX_WORDS, "exactly at the cap is accepted");
+        assert!(word_count(&over_cap) > BRIEF_MAX_WORDS, "one word over is rejected");
+    }
+
+    #[test]
+    fn the_prompt_target_leaves_headroom_under_the_hard_cap() {
+        // The retry asks for TARGET; the gate rejects above MAX. If they were
+        // equal, a model landing exactly on target would be a coin flip.
+        assert!(BRIEF_TARGET_WORDS < BRIEF_MAX_WORDS);
+    }
+
+    #[test]
+    fn the_brief_that_broke_the_tile_would_now_be_rejected() {
+        // Verbatim length of the 2026-09-13 production brief that overflowed.
+        let sixty_eight = "word ".repeat(68);
+        assert!(word_count(&sixty_eight) > BRIEF_MAX_WORDS);
     }
 }

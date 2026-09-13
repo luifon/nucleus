@@ -187,27 +187,31 @@ async fn pipeline(
     let recent_titles = store::recent_titles(pool, SUPPRESSION_DAYS).await?;
     let fresh = select_new_items(fetched, &known_urls, &recent_titles, diag);
 
+    // A run that finds nothing new still rebuilds the feed. The surfaced set
+    // is a rolling 24h window, not this run's catch, so the evening run
+    // refreshes the day — and a brief that needs rewriting (too long, or a
+    // session that failed this morning) gets another chance without waiting
+    // for new items to show up.
     if fresh.is_empty() {
-        tracing::info!("nothing new survived freshness and dedup — widget feed left untouched");
-        return Ok(());
+        tracing::info!("nothing new survived freshness and dedup — refreshing the feed in place");
+    } else {
+        tracing::info!(count = fresh.len(), "ranking");
+        store::insert_items(pool, &fresh).await?;
+
+        let ranked = rank::rank_items(workspace_root, settings, &profile, &fresh).await?;
+        diag.items_ranked = ranked.len();
+        let rankings: Vec<Ranking<'_>> = ranked
+            .iter()
+            .map(|r| Ranking {
+                item_id: &r.id,
+                score: r.score,
+                reason: r.reason.trim(),
+                event_slug: r.event.trim(),
+                stale: r.stale,
+            })
+            .collect();
+        store::save_rankings(pool, &rankings, &profile.hash, rank::PROMPT_VERSION).await?;
     }
-    tracing::info!(count = fresh.len(), "ranking");
-
-    store::insert_items(pool, &fresh).await?;
-
-    let ranked = rank::rank_items(workspace_root, settings, &profile, &fresh).await?;
-    diag.items_ranked = ranked.len();
-    let rankings: Vec<Ranking<'_>> = ranked
-        .iter()
-        .map(|r| Ranking {
-            item_id: &r.id,
-            score: r.score,
-            reason: r.reason.trim(),
-            event_slug: r.event.trim(),
-            stale: r.stale,
-        })
-        .collect();
-    store::save_rankings(pool, &rankings, &profile.hash, rank::PROMPT_VERSION).await?;
 
     let surfaced = store::surfaced_items(
         pool,
@@ -244,7 +248,10 @@ async fn pipeline(
             text
         }
         Err(e) => {
-            tracing::warn!(error = %e, "brief failed — reusing the last one");
+            if matches!(e, rank::BriefFailure::TooLong { .. }) {
+                diag.brief_too_long = true;
+            }
+            tracing::warn!(error = %e, "brief unusable — reusing the last one");
             store::last_brief(pool).await?.unwrap_or_default()
         }
     };

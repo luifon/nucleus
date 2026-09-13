@@ -194,6 +194,10 @@ struct RunDto {
     items_surfaced: i64,
     #[ts(type = "number")]
     brief_ok: i64,
+    /// 1 when the brief blew the widget's word cap twice and the previous
+    /// one was kept instead (ADR-031).
+    #[ts(type = "number")]
+    brief_too_long: i64,
     profile_hash: Option<String>,
 }
 
@@ -201,7 +205,7 @@ async fn list_runs(State(s): State<Arc<NewsState>>) -> Result<Json<Vec<RunDto>>,
     let rows: Vec<RunDto> = sqlx::query_as::<_, RunDto>(
         "SELECT run_id, started_at, finished_at, ok, error,
                 items_input, rejected_stale, rejected_dup_url, rejected_dup_title,
-                items_ranked, items_surfaced, brief_ok, profile_hash
+                items_ranked, items_surfaced, brief_ok, brief_too_long, profile_hash
            FROM fetcher_runs ORDER BY started_at DESC LIMIT 30",
     )
     .fetch_all(&s.pool)
