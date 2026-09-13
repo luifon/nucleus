@@ -14,7 +14,7 @@ brain is your existing Claude subscription — no separate API billing.
 |---|---|
 | **Discord bot** (Jerry Lewis) | DM or @-mention → wakes Claude → replies with per-channel session continuity. Slash commands: `/status`, `/news`, `/remember`, `/forget`. |
 | **WhatsApp bot** (Alfred) | Self-only group, voice memos transcribed locally via whisper.cpp, brain-dump classified and routed (TODOs → tasks, facts → memory, etc.). Iron-tight allowlist scoping. |
-| **News pipeline** | Daily 9am RSS pull (HN, arXiv cs.AI, Simon Willison, Pragmatic Engineer, Latent Space, …) → Claude scores notability against your learned preferences → top items posted to Discord → full feed at `news.<your-domain>`. Upvote/downvote teaches the scorer. |
+| **News pipeline** | 09:00 + 19:00 feed pull (HN, lobste.rs, Simon Willison, Pragmatic Engineer, Latent Space, Julia Evans) → freshness and duplicate filtering → Claude ranks each item against a prose profile of the reader you keep in your vault → `news.json` for the macOS notch widget. Votes come back through the widget's outbox and feed a monthly profile review. Nothing is posted to Discord. See ADR-031. |
 | **nucleus-dashboard** | Single operator app subsuming dashboard widgets, chat against your PARA vault, the public news API, and every admin surface (agents, skills, diary, reminders, vault writes) at `nucleus.<your-domain>`. See ADR-015/016. |
 | **Distiller** | Single daily 4am pass (consolidated per ADR-016; absorbed the old preference learner) that promotes diary observations to long-term memory (PROMOTE / MERGE / ARCHIVE / DROP, Mem0-style ops). |
 | **Reminders** | Ask either bot "remind me at 16:45 about dentist" → Claude schedules via the `reminders` CLI. Once-per-minute polling delivers to one or more channels (`discord-home`, `whatsapp-dm` via the bot-drained outbound queue, `calendar`). Supports `--at` (one-shot) and `--cron` (recurring) with pause/resume + per-channel retry; daily end-of-day nudge is seeded as a recurring system reminder. |
@@ -35,7 +35,7 @@ brain is your existing Claude subscription — no separate API billing.
                                      │ SQLite
    WhatsApp ←─┐                      │
               │  ┌───────────────────▼──────┐
-              │  │ news-fetcher (launchd 1x)│ ← claude session
+              │  │ news-fetcher (launchd 2x)│ ← claude session
               │  │ distiller (daily)        │
               │  │ gmail-metabolism         │
               │  │ skill-gap-learner (daily)│
@@ -317,7 +317,10 @@ disallowed_tools = ["Bash(rm *)", "Bash(sudo *)", ...]
 vault_path = "~/Documents/Obsidian"
 
 [news]
-fetch_cron = "0 9,18 * * *"
+fetch_cron = "0 9,19 * * *"          # informational; the plist holds the real schedule
+profile_note = "4-Areas/Nucleus/news-profile.md"   # vault-relative; this note IS the rubric
+min_score = 0.35                     # relevance floor, not a count cap
+widget_feed_dir = "~/Library/Application Support/NotchWidget"
 
 [distiller]
 cron = "0 4 * * *"          # one consolidated daily pass (ADR-016)
@@ -420,7 +423,7 @@ nucleus/
 │   ├── whatsapp/           WhatsApp bot (TS, Baileys, whisper.cpp)
 │   └── gmail/              gmail-metabolism — inbox triage via JARVIS persona (ADR-007)
 ├── news/
-│   └── fetcher/            launchd-driven RSS pull + scorer
+│   └── fetcher/            launchd-driven feed pull + profile ranker → widget feed (ADR-031)
 ├── nucleus-dashboard/      unified operator app (ADR-015) — axum API + React SPA;
 │                           subsumes the old dashboard/, chat/, news/api/ crates
 ├── chores/

@@ -12,7 +12,7 @@ export default function NewsCard({
 }: {
   item: NewsItem;
   variant: NewsCardVariant;
-  onVote: (vote: 1 | -1) => void;
+  onVote: (vote: 1 | -1 | 0) => void;
 }) {
   const score = item.notable_score ?? 0;
 
@@ -59,7 +59,7 @@ export default function NewsCard({
               )}
             </div>
           </div>
-          <VoteButtons up={item.upvotes ?? 0} down={item.downvotes ?? 0} onVote={onVote} stacked />
+          <VoteButtons vote={item.vote} onVote={onVote} stacked />
         </div>
       </article>
     );
@@ -116,7 +116,7 @@ function CardFooter({
   compact,
 }: {
   item: NewsItem;
-  onVote: (vote: 1 | -1) => void;
+  onVote: (vote: 1 | -1 | 0) => void;
   compact?: boolean;
 }) {
   const score = item.notable_score ?? 0;
@@ -149,40 +149,50 @@ function CardFooter({
         </a>
       )}
       <span className="ml-auto">
-        <VoteButtons up={item.upvotes ?? 0} down={item.downvotes ?? 0} onVote={onVote} />
+        <VoteButtons vote={item.vote} onVote={onVote} />
       </span>
     </div>
   );
 }
 
+// A vote is a state, not a tally (ADR-031): one reader, latest verdict wins.
+// The buttons show which way the item is currently voted, not how many times.
 function VoteButtons({
-  up,
-  down,
+  vote,
   onVote,
   stacked,
 }: {
-  up: number;
-  down: number;
-  onVote: (vote: 1 | -1) => void;
+  vote: number;
+  onVote: (vote: 1 | -1 | 0) => void;
   stacked?: boolean;
 }) {
+  const base =
+    "flex items-center rounded border px-1.5 py-0.5 text-[11px] border-[var(--color-nucleus-border)] text-[var(--color-nucleus-faint)]";
   return (
     <div className={`flex ${stacked ? "flex-col" : "flex-row"} items-center gap-1`}>
       <button
-        onClick={(e) => { e.preventDefault(); onVote(1); }}
-        title="upvote"
-        className="flex items-center gap-0.5 rounded border border-[var(--color-nucleus-border)] px-1.5 py-0.5 text-[11px] text-[var(--color-nucleus-faint)] hover:border-[var(--color-status-ok)] hover:text-[var(--color-status-ok)]"
+        onClick={(e) => { e.preventDefault(); onVote(vote === 1 ? 0 : 1); }}
+        title={vote === 1 ? "upvoted — click to clear" : "upvote"}
+        aria-pressed={vote === 1}
+        className={
+          vote === 1
+            ? `${base} border-[var(--color-status-ok)] text-[var(--color-status-ok)]`
+            : `${base} hover:border-[var(--color-status-ok)] hover:text-[var(--color-status-ok)]`
+        }
       >
         <ArrowUp size={11} strokeWidth={2} />
-        {up}
       </button>
       <button
-        onClick={(e) => { e.preventDefault(); onVote(-1); }}
-        title="downvote"
-        className="flex items-center gap-0.5 rounded border border-[var(--color-nucleus-border)] px-1.5 py-0.5 text-[11px] text-[var(--color-nucleus-faint)] hover:border-[var(--color-status-down)] hover:text-[var(--color-status-down)]"
+        onClick={(e) => { e.preventDefault(); onVote(vote === -1 ? 0 : -1); }}
+        title={vote === -1 ? "downvoted — click to clear" : "downvote"}
+        aria-pressed={vote === -1}
+        className={
+          vote === -1
+            ? `${base} border-[var(--color-status-down)] text-[var(--color-status-down)]`
+            : `${base} hover:border-[var(--color-status-down)] hover:text-[var(--color-status-down)]`
+        }
       >
         <ArrowDown size={11} strokeWidth={2} />
-        {down}
       </button>
     </div>
   );

@@ -186,6 +186,14 @@ for template in "$SCRIPT_DIR"/*.plist.example; do
     -e "s|__TZ__|$NUCLEUS_TZ|g" \
     -e "s|__NUCLEUS_BONSAI_DIR__|${NUCLEUS_BONSAI_DIR:-}|g" \
     "$template" > "$dest"
+  # `launchctl disable` is sticky: it lives in launchd's override database,
+  # survives bootout and outlives the plist itself. A label disabled months
+  # ago refuses every later bootstrap with a bare "Input/output error" (EIO,
+  # errno 5) that names nothing. Clear it first — a template existing in this
+  # directory is the statement that the service should run, the same
+  # assertion prune_orphans makes in reverse. Pause a job by removing its
+  # template or by `launchctl bootout`, not by disabling the label.
+  launchctl enable "$DOMAIN/${PREFIX}.${service}" 2>/dev/null || true
   # bootout first — bootstrap fails (EEXIST) if the service is already
   # loaded; bootout of a not-loaded service exits nonzero (tolerated). The
   # one-retry covers the rare race where a KeepAlive daemon hasn't fully

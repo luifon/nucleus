@@ -31,11 +31,18 @@ dms_always_respond = true
 vault_path = "~/Documents/Obsidian"
 
 [news]
-# Once daily at 9am local time. Adjust to taste.
-fetch_cron = "0 9 * * *"
-# Vault-relative note the scorer reads as vote-learned refinements (edit it
-# in Obsidian; the fetcher never writes it). Missing note = base rubric only.
-preferences_note = "4-Areas/Nucleus/news-preferences.md"
+# Informational — the real schedule is the plist's StartCalendarInterval
+# (09:00 + 19:00 local, ADR-031).
+fetch_cron = "0 9,19 * * *"
+# Vault-relative prose profile of the reader. This note IS the ranking rubric
+# (ADR-031): the operator writes it, the fetcher only reads it, and a run
+# without it fails rather than guessing.
+profile_note = "4-Areas/Nucleus/news-profile.md"
+# Relevance floor for what reaches the widget. Not a count cap.
+min_score = 0.35
+# Where the notch widget reads its feeds. The fetcher writes news.json here
+# and drains news-votes.json back out of it.
+widget_feed_dir = "~/Library/Application Support/NotchWidget"
 
 [diary]
 root = "memory/diaries"

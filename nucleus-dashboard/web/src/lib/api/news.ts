@@ -40,7 +40,9 @@ export const listNewsSources = () => jsonGet<NewsSource[]>("/news/api/sources");
 
 export const listNewsRuns = () => jsonGet<NewsRun[]>("/news/api/runs");
 
-export const voteOnNews = (itemId: string, vote: 1 | -1) =>
+// 0 clears a vote — the fetcher reads the latest row per item as the
+// effective verdict (ADR-031), so taking one back is itself a vote.
+export const voteOnNews = (itemId: string, vote: 1 | -1 | 0) =>
   jsonPost<{ ok: boolean; item_id: string; vote: number }, { item_id: string; vote: number }>(
     "/news/api/vote",
     { item_id: itemId, vote },

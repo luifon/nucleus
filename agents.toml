@@ -67,7 +67,9 @@ launch        = "launchd-cron"
 runtime       = "rust"
 launchd_label = "dev.nucleus.news-fetcher"
 tmux_session  = "nucleus-news-fetcher"
-schedule      = "0 9 * * *"
+# ADR-031: twice daily, ranked against the operator's profile note and
+# delivered only to the notch widget's feed dir. Posts nowhere.
+schedule      = "0 9,19 * * *"
 log_path      = "memory/news-fetcher.log"
 diary_key     = "news-fetcher"
 

@@ -73,13 +73,19 @@ pub struct ObsidianConfig {
 impl ObsidianConfig {
     /// `vault_path` with a leading `~/` expanded to `$HOME`.
     pub fn vault_dir(&self) -> std::path::PathBuf {
-        match self.vault_path.strip_prefix("~/") {
-            Some(rest) => {
-                let home = std::env::var("HOME").unwrap_or_default();
-                std::path::PathBuf::from(home).join(rest)
-            }
-            None => std::path::PathBuf::from(&self.vault_path),
+        expand_home(&self.vault_path)
+    }
+}
+
+/// Expand a leading `~/` to `$HOME`. Config paths are operator-written and
+/// routinely use `~`; every consumer would otherwise re-implement this.
+pub fn expand_home(path: &str) -> std::path::PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join(rest)
         }
+        None => std::path::PathBuf::from(path),
     }
 }
 
@@ -168,16 +174,41 @@ fn default_true_bool() -> bool {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NewsConfig {
+    /// Informational — the real schedule is the plist's
+    /// `StartCalendarInterval` (ADR-031: 09:00 and 19:00 local).
     pub fetch_cron: String,
-    /// Vault-relative path of the note the scorer appends to its rubric as
-    /// vote-learned refinements. One copy, edited in Obsidian; the fetcher
-    /// only reads it. Missing note = base rubric only.
-    #[serde(default = "default_news_preferences_note")]
-    pub preferences_note: String,
+    /// Vault-relative path of the prose profile of the reader. This note IS
+    /// the ranking rubric (ADR-031) — the operator owns it, the fetcher only
+    /// reads it, and a run without it fails rather than guessing.
+    #[serde(default = "default_news_profile_note")]
+    pub profile_note: String,
+    /// Relevance floor for what reaches the widget. Not a count cap — a day
+    /// with twenty items above the floor surfaces twenty.
+    #[serde(default = "default_news_min_score")]
+    pub min_score: f64,
+    /// Directory the notch widget reads its feeds from. The fetcher writes
+    /// `news.json` here and reads `news-votes.json` back out of it.
+    #[serde(default = "default_news_widget_feed_dir")]
+    pub widget_feed_dir: String,
 }
 
-fn default_news_preferences_note() -> String {
-    "4-Areas/Nucleus/news-preferences.md".to_string()
+impl NewsConfig {
+    /// `widget_feed_dir` with a leading `~/` expanded to `$HOME`.
+    pub fn widget_feed_path(&self) -> std::path::PathBuf {
+        expand_home(&self.widget_feed_dir)
+    }
+}
+
+fn default_news_profile_note() -> String {
+    "4-Areas/Nucleus/news-profile.md".to_string()
+}
+
+fn default_news_min_score() -> f64 {
+    0.35
+}
+
+fn default_news_widget_feed_dir() -> String {
+    "~/Library/Application Support/NotchWidget".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
