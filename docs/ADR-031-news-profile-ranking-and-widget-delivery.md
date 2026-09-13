@@ -129,13 +129,29 @@ whether the brief succeeded, and the profile hash.
 
 ### Two calls: rank, then brief
 
-After ranking validates, a second call writes the day's brief — 2–4
-sentences, ≤ ~60 words, plain text, naming the items that matter. It sees
-the surfaced list and the profile.
+After ranking validates, a second call writes the day's brief — 2–3
+sentences, plain text, naming the items that matter. It sees the surfaced
+list and the profile.
 
-The brief is framing, not content. A failed brief falls back to the last
-one stored in the `briefs` table rather than failing the run: the items
-are what the reader came for.
+**Length is validated, not requested.** The widget renders the brief in a
+fixed-size tile, so a long one is a layout break rather than a stylistic
+miss; the first production run returned 68 words and overflowed. The
+prompt asks for at most 50 words. The reply is then counted: over 60 and
+the text goes back for one shortening pass ("keep the same points, cut
+wording") rather than a fresh brief that might choose different items.
+Still over 60 and it is discarded, with `brief_too_long` recorded in the
+run diagnostics — distinct from `brief_ok = false`, which means the
+session itself failed.
+
+The brief is framing, not content. A brief that is unusable for either
+reason falls back to the last one stored in the `briefs` table rather than
+failing the run: the items are what the reader came for.
+
+The brief step runs on every successful run, including one that fetched
+nothing new. The surfaced set is a rolling 24h window rather than the
+current run's catch, so the evening run refreshes the day — and a brief
+that needs rewriting gets another attempt at the next run instead of
+waiting for new items to arrive.
 
 ### Delivery: one JSON file, atomically replaced
 
@@ -215,9 +231,14 @@ This is the right trade for one reader; it would not be for many.
 The brief is skippable by construction, so the marginal cost of a failure
 is the framing, not the day.
 
-**A run can produce nothing.** If every item is stale, duplicated, or
-below the floor, `news.json` is left alone and the widget keeps yesterday.
-Silence is a valid output; a padded day is not.
+**A run can produce nothing.** If nothing clears the floor at all,
+`news.json` is left alone and the widget keeps the previous day. Silence is
+a valid output; a padded day is not. A run that merely finds no *new*
+items is different — it still rewrites the feed from the 24h window.
+
+**The brief costs up to two sessions.** A run whose first brief is too
+long spends a third Claude call on the shortening pass. That is the price
+of the tile fitting, and it only applies when the model overshoots.
 
 **Title-overlap suppression will occasionally be wrong.** Jaccard ≥ 0.6 on
 token sets is a heuristic. It was tuned so that two stories about one
