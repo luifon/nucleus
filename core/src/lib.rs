@@ -13,6 +13,7 @@
 //! - [`memory`] — Tier 2 shared-fact read/write (see ADR-002).
 //! - [`runlog`] — per-agent run-log index over Claude transcripts (ADR-016).
 //! - [`skills`] — shared SKILL.md discovery/parse/validate (ADR-008/017).
+//! - [`timestamp`] — the canonical sortable text form for stored timestamps.
 
 pub mod agent_msg;
 pub mod agents;
@@ -31,6 +32,7 @@ pub mod runlog;
 pub mod session_index;
 pub mod session_profile;
 pub mod skills;
+pub mod timestamp;
 
 pub fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
