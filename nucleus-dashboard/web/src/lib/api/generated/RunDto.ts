@@ -5,4 +5,10 @@ export type RunDto = { run_id: string, started_at: string, finished_at: string |
  * 1 when the brief blew the widget's word cap twice and the previous
  * one was kept instead (ADR-031).
  */
-brief_too_long: number, profile_hash: string | null, };
+brief_too_long: number, 
+/**
+ * 1 when the brief call failed and the stored brief couldn't stand in
+ * because it named an item the reader has since downvoted. The day went
+ * out with no brief rather than with a retracted recommendation.
+ */
+brief_dropped_downvoted: number, profile_hash: string | null, };

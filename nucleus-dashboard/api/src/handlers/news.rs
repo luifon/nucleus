@@ -198,6 +198,11 @@ struct RunDto {
     /// one was kept instead (ADR-031).
     #[ts(type = "number")]
     brief_too_long: i64,
+    /// 1 when the brief call failed and the stored brief couldn't stand in
+    /// because it named an item the reader has since downvoted. The day went
+    /// out with no brief rather than with a retracted recommendation.
+    #[ts(type = "number")]
+    brief_dropped_downvoted: i64,
     profile_hash: Option<String>,
 }
 
@@ -205,7 +210,8 @@ async fn list_runs(State(s): State<Arc<NewsState>>) -> Result<Json<Vec<RunDto>>,
     let rows: Vec<RunDto> = sqlx::query_as::<_, RunDto>(
         "SELECT run_id, started_at, finished_at, ok, error,
                 items_input, rejected_stale, rejected_dup_url, rejected_dup_title,
-                items_ranked, items_surfaced, brief_ok, brief_too_long, profile_hash
+                items_ranked, items_surfaced, brief_ok, brief_too_long,
+                brief_dropped_downvoted, profile_hash
            FROM fetcher_runs ORDER BY started_at DESC LIMIT 30",
     )
     .fetch_all(&s.pool)
@@ -241,7 +247,11 @@ async fn vote(
     // Votes are append-only and supersede by timestamp (ADR-031), so a
     // reversal is a new row, not an update. 0 is a valid vote — it's how the
     // reader takes one back.
-    let now = Utc::now().to_rfc3339();
+    //
+    // The stamp goes in canonical sortable form: "latest wins" is a text
+    // comparison in SQLite, and the widget's votes arrive in the same shape.
+    // `reason_key` and `note` stay NULL — the dashboard has no reason picker.
+    let now = nucleus_core::timestamp::now();
     sqlx::query(
         "INSERT INTO votes (vote_id, item_id, vote, origin, created_at)
          VALUES (?1, ?2, ?3, 'dashboard', ?4)",

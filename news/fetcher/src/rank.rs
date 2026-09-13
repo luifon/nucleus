@@ -17,7 +17,7 @@ use crate::feed::ParsedItem;
 
 /// Bump when the prompt changes. Stored per item so a later "why was this
 /// scored that way" has the prompt generation to hand.
-pub const PROMPT_VERSION: &str = "2026-09-13-profile-v1";
+pub const PROMPT_VERSION: &str = "2026-09-13-profile-v2";
 
 /// One call covers a normal day's batch. Beyond this the payload starts
 /// competing with the profile for the model's attention, so we chunk —
@@ -133,8 +133,23 @@ fn validate(parsed: &[RankedItem], chunk: &[ParsedItem]) -> Result<()> {
         if r.reason.trim().is_empty() {
             bail!("empty reason for id {:?}", r.id);
         }
+        if !is_kebab_slug(r.event.trim()) {
+            bail!("event slug {:?} for id {:?} is not a non-empty kebab-case slug", r.event, r.id);
+        }
     }
     Ok(())
+}
+
+/// The slug is no longer only a display label: the brief groups items by it to
+/// avoid telling the reader about one story twice. A blank or malformed slug
+/// silently turns that grouping off, so it is validated like any other field
+/// of the contract — and a batch that fails retries, same as a missing id.
+fn is_kebab_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && !s.contains("--")
 }
 
 fn ranking_prompt(profile: &Profile, items: &[ParsedItem]) -> Result<String> {
@@ -182,8 +197,10 @@ How to score:
 - `reason` is one short clause explaining the score to the reader. It is
   shown to them, so write it for them, not for a log.
 - `event` is a short kebab-case slug naming the underlying event
-  (`opus-5-release`, `cloudflare-outage`). Items covering the same event
-  should share a slug. It is a display label only.
+  (`opus-5-release`, `cloudflare-outage`). Items covering the same event MUST
+  share a slug — the brief uses it to avoid telling the reader the same story
+  twice. It is never a reason to drop an item. Lowercase letters, digits and
+  single hyphens only, and never empty.
 - `stale` is true when the item is old content resurfacing rather than
   news: an essay from years ago submitted to an aggregator today, a
   re-announcement, a link roundup of old material. The `published_at` field
@@ -314,6 +331,9 @@ These are the items that made it through to them today, already ranked:
 
 {items}
 
+Items that share an `event` value are the same story reported twice. Treat
+each `event` as one story and mention it at most once.
+
 Write 2 to 3 sentences, at most {target} words, in English, that tell the
 reader the state of things today and the one to three points that matter
 most, naming the items you mean. It is shown in a small fixed-size tile, so
@@ -397,7 +417,23 @@ mod tests {
     }
 
     fn ranked(id: &str, score: f64, reason: &str) -> RankedItem {
-        RankedItem { id: id.into(), score, reason: reason.into(), event: "e".into(), stale: false }
+        RankedItem {
+            id: id.into(),
+            score,
+            reason: reason.into(),
+            event: "some-event".into(),
+            stale: false,
+        }
+    }
+
+    fn ranked_with_event(id: &str, event: &str) -> RankedItem {
+        RankedItem {
+            id: id.into(),
+            score: 0.5,
+            reason: "x".into(),
+            event: event.into(),
+            stale: false,
+        }
     }
 
     #[test]
@@ -428,6 +464,23 @@ mod tests {
         assert!(validate(&[ranked("a", -0.1, "x")], &chunk).is_err());
         assert!(validate(&[ranked("a", f64::NAN, "x")], &chunk).is_err());
         assert!(validate(&[ranked("a", 0.5, "  ")], &chunk).is_err());
+    }
+
+    #[test]
+    fn rejects_a_missing_or_malformed_event_slug() {
+        let chunk = [item("a")];
+        for bad in ["", "   ", "Opus 5 Release", "opus_5_release", "-opus-5", "opus-5-", "a--b"] {
+            assert!(
+                validate(&[ranked_with_event("a", bad)], &chunk).is_err(),
+                "{bad:?} should not pass as a slug"
+            );
+        }
+        for good in ["opus-5-release", "cloudflare-outage", "rubygems-agent-attack", "gpt6"] {
+            assert!(
+                validate(&[ranked_with_event("a", good)], &chunk).is_ok(),
+                "{good:?} should pass as a slug"
+            );
+        }
     }
 
     #[test]

@@ -1,11 +1,11 @@
 //! news-fetcher — twice-daily news pull, ranked against a profile of the
 //! reader and delivered to the notch widget (ADR-031).
 //!
-//! A run is: ingest the widget's votes → fetch every enabled feed → drop
+//! A run is: ingest the widget's outboxes → fetch every enabled feed → drop
 //! anything stale or duplicated (mechanically, no model involved) → ask
 //! Claude to rank what's left against the operator's profile note → ask it
-//! for a two-sentence brief → write `news.json` for the widget. Nothing is
-//! posted anywhere.
+//! for a two-sentence brief over what he hasn't rejected → write `news.json`
+//! for the widget. Nothing is posted anywhere.
 //!
 //! The run either produces a complete day or leaves yesterday's `news.json`
 //! untouched. There is no partial write.
@@ -47,16 +47,19 @@ write the widget feed.
 
 Usage:
   nucleus news-fetcher                 run the full pipeline
-  nucleus news-fetcher --ingest-votes  drain the widget vote outbox and exit
+  nucleus news-fetcher --ingest        drain the widget outboxes and exit
+                                       (--ingest-votes is the old name for it)
 ";
 
 /// Entry point for this subcommand of the `nucleus` binary.
 pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     let flags: Vec<String> = args.iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
-    let mut votes_only = false;
+    let mut ingest_only = false;
     for flag in &flags {
         match flag.as_str() {
-            "--ingest-votes" => votes_only = true,
+            // `--ingest-votes` predates the opens outbox and is documented in
+            // ADR-031, so it keeps working; it now drains both.
+            "--ingest" | "--ingest-votes" => ingest_only = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return Ok(());
@@ -79,11 +82,12 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
 
     let feed_dir = settings.news.widget_feed_path();
 
-    // Votes come back before anything else so today's feed carries the
-    // operator's latest verdicts, and so `--ingest-votes` is the same code.
-    let ingested = widget::ingest_votes(&pool, &feed_dir).await?;
-    if votes_only {
-        tracing::info!(ingested, "vote ingest only — exiting");
+    // The outboxes come back before anything else, so today's feed carries the
+    // reader's latest verdicts — and so the brief knows what he has rejected
+    // before it is written. `--ingest` is the same code, stopped early.
+    let ingested = widget::ingest_outboxes(&pool, &feed_dir).await?;
+    if ingest_only {
+        tracing::info!(ingested, "outbox ingest only — exiting");
         return Ok(());
     }
 
@@ -213,12 +217,14 @@ async fn pipeline(
         store::save_rankings(pool, &rankings, &profile.hash, rank::PROMPT_VERSION).await?;
     }
 
-    let surfaced = store::surfaced_items(
-        pool,
-        settings.news.min_score,
-        Duration::hours(SURFACE_WINDOW_HOURS),
-    )
-    .await?;
+    let surfaced = group_same_event_adjacent(
+        store::surfaced_items(
+            pool,
+            settings.news.min_score,
+            Duration::hours(SURFACE_WINDOW_HOURS),
+        )
+        .await?,
+    );
     diag.items_surfaced = surfaced.len();
 
     if surfaced.is_empty() {
@@ -229,32 +235,7 @@ async fn pipeline(
         return Ok(());
     }
 
-    // A failed brief must not cost the day. Fall back to the last one we
-    // wrote; the items are the product, the sentence is the framing.
-    let brief_inputs: Vec<rank::BriefInput<'_>> = surfaced
-        .iter()
-        .map(|r| rank::BriefInput {
-            title: &r.title,
-            source: &r.source_name,
-            score: r.notable_score,
-            reason: &r.notable_reason,
-            event: &r.event_slug,
-        })
-        .collect();
-    let brief = match rank::write_brief(workspace_root, settings, &profile, &brief_inputs).await {
-        Ok(text) => {
-            diag.brief_ok = true;
-            store::save_brief(pool, run_id, &text).await?;
-            text
-        }
-        Err(e) => {
-            if matches!(e, rank::BriefFailure::TooLong { .. }) {
-                diag.brief_too_long = true;
-            }
-            tracing::warn!(error = %e, "brief unusable — reusing the last one");
-            store::last_brief(pool).await?.unwrap_or_default()
-        }
-    };
+    let brief = write_brief(pool, workspace_root, settings, &profile, &surfaced, run_id, diag).await?;
 
     let feed = widget::Feed {
         as_of: chrono::Local::now().to_rfc3339(),
@@ -272,12 +253,118 @@ async fn pipeline(
                 reason: r.notable_reason.clone(),
                 event: r.event_slug.clone(),
                 vote: r.vote,
+                vote_reason: r.vote_reason.clone(),
+                vote_note: r.vote_note.clone(),
+                opened: r.opened,
             })
             .collect(),
     };
     widget::write_feed(&settings.news.widget_feed_path(), &feed)?;
     tracing::info!(count = feed.count, "wrote widget feed");
     Ok(())
+}
+
+/// Write the day's brief over the items the reader hasn't rejected.
+///
+/// A downvote is the clearest instruction the widget can send, and a brief
+/// that goes on to recommend the downvoted item reads as the system ignoring
+/// it. So downvoted items are not brief inputs, and a stored brief is only
+/// reusable while none of the items it was written from has been downvoted
+/// since. When neither is available the day ships with an empty brief — the
+/// items are the product, the sentence is the framing.
+async fn write_brief(
+    pool: &SqlitePool,
+    workspace_root: &PathBuf,
+    settings: &Settings,
+    profile: &rank::Profile,
+    surfaced: &[store::SurfacedRow],
+    run_id: &str,
+    diag: &mut RunDiagnostics,
+) -> Result<String> {
+    let accepted: Vec<&store::SurfacedRow> = surfaced.iter().filter(|r| r.vote != -1).collect();
+    let excluded = surfaced.len() - accepted.len();
+    if excluded > 0 {
+        tracing::info!(excluded, "downvoted items withheld from the brief");
+    }
+    if accepted.is_empty() {
+        // Every surfaced item is one he rejected. There is nothing to say
+        // about the day that isn't a contradiction.
+        tracing::warn!("every surfaced item is downvoted — writing an empty brief");
+        return Ok(String::new());
+    }
+
+    let inputs: Vec<rank::BriefInput<'_>> = accepted
+        .iter()
+        .map(|r| rank::BriefInput {
+            title: &r.title,
+            source: &r.source_name,
+            score: r.notable_score,
+            reason: &r.notable_reason,
+            event: &r.event_slug,
+        })
+        .collect();
+
+    match rank::write_brief(workspace_root, settings, profile, &inputs).await {
+        Ok(text) => {
+            diag.brief_ok = true;
+            let ids: Vec<String> = accepted.iter().map(|r| r.id.clone()).collect();
+            store::save_brief(pool, run_id, &text, &ids).await?;
+            Ok(text)
+        }
+        Err(e) => {
+            if matches!(e, rank::BriefFailure::TooLong { .. }) {
+                diag.brief_too_long = true;
+            }
+            match store::last_reusable_brief(pool).await? {
+                store::BriefFallback::Reuse(text) => {
+                    tracing::warn!(error = %e, "brief unusable — reusing the last one");
+                    Ok(text)
+                }
+                store::BriefFallback::Blocked => {
+                    diag.brief_dropped_downvoted = true;
+                    tracing::warn!(
+                        error = %e,
+                        "brief unusable and the stored one names a downvoted item — shipping no brief"
+                    );
+                    Ok(String::new())
+                }
+                store::BriefFallback::Empty => {
+                    tracing::warn!(error = %e, "brief unusable and nothing stored to reuse");
+                    Ok(String::new())
+                }
+            }
+        }
+    }
+}
+
+/// Pull same-event items together without reordering the events themselves.
+///
+/// Two write-ups of one story that both survive dedup are still two items —
+/// ADR-031 is explicit that a slug never collapses anything — but showing them
+/// six rows apart reads as two separate stories. Each event keeps the position
+/// of its highest-scoring item; the rest of its items follow immediately, in
+/// the order they already had.
+fn group_same_event_adjacent(rows: Vec<store::SurfacedRow>) -> Vec<store::SurfacedRow> {
+    let mut out: Vec<store::SurfacedRow> = Vec::with_capacity(rows.len());
+    let mut placed = vec![false; rows.len()];
+    for i in 0..rows.len() {
+        if placed[i] {
+            continue;
+        }
+        placed[i] = true;
+        let slug = rows[i].event_slug.clone();
+        out.push(rows[i].clone());
+        if slug.is_empty() {
+            continue;
+        }
+        for (j, row) in rows.iter().enumerate().skip(i + 1) {
+            if !placed[j] && row.event_slug == slug {
+                placed[j] = true;
+                out.push(row.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Everything mechanical that decides what reaches the ranker: the 48h
@@ -440,6 +527,105 @@ mod tests {
         );
         assert!(kept.is_empty());
         assert_eq!(diag.rejected_dup_url, 1);
+    }
+
+    fn surfaced(id: &str, score: f64, event: &str, vote: i64) -> store::SurfacedRow {
+        store::SurfacedRow {
+            id: id.into(),
+            title: format!("title {id}"),
+            source_name: "Hacker News".into(),
+            canonical_url: format!("https://example.com/{id}"),
+            published_at: "2026-09-13T09:00:00.000Z".into(),
+            notable_score: score,
+            notable_reason: "r".into(),
+            event_slug: event.into(),
+            vote,
+            vote_reason: None,
+            vote_note: None,
+            opened: false,
+        }
+    }
+
+    fn ids(rows: &[store::SurfacedRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    #[test]
+    fn same_event_items_are_pulled_under_the_higher_scoring_one() {
+        // The RubyGems shape: two write-ups of one story, 0.72 and 0.50, with
+        // four unrelated items scored between them.
+        let rows = vec![
+            surfaced("homebrew", 0.82, "homebrew-7-release", 0),
+            surfaced("rubygems-a", 0.72, "rubygems-agent-attack", 0),
+            surfaced("fde", 0.68, "forward-deployed-engineer", 0),
+            surfaced("openrouter", 0.62, "openrouter-pitfalls", 0),
+            surfaced("rubygems-b", 0.50, "rubygems-agent-attack", 0),
+        ];
+        assert_eq!(
+            ids(&group_same_event_adjacent(rows)),
+            ["homebrew", "rubygems-a", "rubygems-b", "fde", "openrouter"],
+        );
+    }
+
+    #[test]
+    fn grouping_keeps_every_item_and_leaves_distinct_events_in_score_order() {
+        let rows = vec![
+            surfaced("a", 0.9, "one", 0),
+            surfaced("b", 0.8, "two", 0),
+            surfaced("c", 0.7, "three", 0),
+        ];
+        let grouped = group_same_event_adjacent(rows.clone());
+        assert_eq!(ids(&grouped), ["a", "b", "c"]);
+        assert_eq!(grouped.len(), rows.len(), "nothing is collapsed by slug");
+    }
+
+    #[test]
+    fn an_empty_slug_groups_with_nothing() {
+        // Pre-ADR rows and anything the ranker left blank must not all clump.
+        let rows = vec![
+            surfaced("a", 0.9, "", 0),
+            surfaced("b", 0.8, "real", 0),
+            surfaced("c", 0.7, "", 0),
+        ];
+        assert_eq!(ids(&group_same_event_adjacent(rows)), ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn the_brief_is_written_over_what_the_reader_has_not_rejected() {
+        let f = store::testdb::fixture().await;
+        for id in ["keep", "reject"] {
+            store::testdb::add_item(&f.pool, id).await;
+        }
+        sqlx::query("INSERT INTO fetcher_runs (run_id, started_at) VALUES ('r1', '2026-09-13T09:00:00.000Z')")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        store::save_brief(&f.pool, "r1", "Yesterday's sentence about reject.", &["reject".into()])
+            .await
+            .unwrap();
+        store::insert_vote(
+            &f.pool,
+            &store::IncomingVote {
+                vote_id: "v1",
+                item_id: "reject",
+                vote: -1,
+                origin: "widget",
+                created_at: "2026-09-13T11:26:10-03:00",
+                reason_key: Some("dup"),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The fallback path is what a failed brief session lands on, and the
+        // stored brief was written over the item he just rejected.
+        assert_eq!(store::last_reusable_brief(&f.pool).await.unwrap(), store::BriefFallback::Blocked);
+
+        let rows = store::surfaced_items(&f.pool, 0.0, Duration::hours(24)).await.unwrap();
+        let accepted: Vec<&str> =
+            rows.iter().filter(|r| r.vote != -1).map(|r| r.id.as_str()).collect();
+        assert_eq!(accepted, ["keep"], "a downvoted item is not a brief input");
     }
 
     #[test]

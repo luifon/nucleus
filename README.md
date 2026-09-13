@@ -14,7 +14,7 @@ brain is your existing Claude subscription — no separate API billing.
 |---|---|
 | **Discord bot** (Jerry Lewis) | DM or @-mention → wakes Claude → replies with per-channel session continuity. Slash commands: `/status`, `/news`, `/remember`, `/forget`. |
 | **WhatsApp bot** (Alfred) | Self-only group, voice memos transcribed locally via whisper.cpp, brain-dump classified and routed (TODOs → tasks, facts → memory, etc.). Iron-tight allowlist scoping. |
-| **News pipeline** | 09:00 + 19:00 feed pull (HN, lobste.rs, Simon Willison, Pragmatic Engineer, Latent Space, Julia Evans) → freshness and duplicate filtering → Claude ranks each item against a prose profile of the reader you keep in your vault → `news.json` for the macOS notch widget. Votes come back through the widget's outbox and feed a monthly profile review. Nothing is posted to Discord. See ADR-031. |
+| **News pipeline** | 09:00 + 19:00 feed pull (HN, lobste.rs, Simon Willison, Pragmatic Engineer, Latent Space, Julia Evans) → freshness and duplicate filtering → Claude ranks each item against a prose profile of the reader you keep in your vault → `news.json` for the macOS notch widget. Votes (with an optional reason) and click-throughs come back through the widget's outboxes; the fetcher keeps downvoted items out of the day's brief, and the votes feed a monthly profile review. Nothing is posted to Discord. See ADR-031. |
 | **nucleus-dashboard** | Single operator app subsuming dashboard widgets, chat against your PARA vault, the public news API, and every admin surface (agents, skills, diary, reminders, vault writes) at `nucleus.<your-domain>`. See ADR-015/016. |
 | **Distiller** | Single daily 4am pass (consolidated per ADR-016; absorbed the old preference learner) that promotes diary observations to long-term memory (PROMOTE / MERGE / ARCHIVE / DROP, Mem0-style ops). |
 | **Reminders** | Ask either bot "remind me at 16:45 about dentist" → Claude schedules via the `reminders` CLI. Once-per-minute polling delivers to one or more channels (`discord-home`, `whatsapp-dm` via the bot-drained outbound queue, `calendar`). Supports `--at` (one-shot) and `--cron` (recurring) with pause/resume + per-channel retry; daily end-of-day nudge is seeded as a recurring system reminder. |
@@ -504,6 +504,9 @@ tmux attach -t nucleus-gmail              # gmail metabolism + calendar fires (w
 launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.news-fetcher
 launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.distiller       # daily pass (prunes diaries + writes memory/vault)
 launchctl kickstart -k gui/$(id -u)/${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}.gmail-metabolism
+
+# Drain the notch widget's outboxes (votes + click-throughs) without a full run
+./target/release/nucleus news-fetcher --ingest
 
 # Force a stuck per-chat session to respawn fresh (next message cold-spawns,
 # but with --resume so prior turns are still there)

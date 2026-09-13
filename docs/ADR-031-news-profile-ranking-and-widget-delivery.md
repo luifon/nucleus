@@ -188,8 +188,9 @@ run drains it with `INSERT OR IGNORE` on `vote_id`, tagging them
 `origin = "widget"`; the dashboard tags its own `origin = "dashboard"`.
 The fetcher never deletes or rewrites that file — the widget owns its
 outbox and prunes it. Replaying the whole file every run is the normal
-case, not a recovery path. `nucleus news-fetcher --ingest-votes` runs the
-same drain alone.
+case, not a recovery path. `nucleus news-fetcher --ingest` runs the same
+drain alone (`--ingest-votes` is the original name and still works; the
+addendum below adds a second outbox for it to drain).
 
 Votes do not feed back into scoring automatically. They are evidence for
 the monthly review conversation, where a human decides what they mean.
@@ -254,3 +255,131 @@ The run-history table is the only place a failure is recorded.
 **The dashboard news surface is now secondary.** It still reads the same
 DB and still takes votes, but it is no longer where the reader meets the
 day's news.
+
+## Addendum 2026-09-13: opens, vote reasons, brief exclusions
+
+The first day of real use produced three findings, all from the same run.
+Two write-ups of one disclosure surfaced six rows apart; the brief
+recommended one of them; the reader downvoted both and had no way to say
+why. What follows extends the widget seam to carry the missing signal and
+tightens what the brief is allowed to say.
+
+### Opens are attention, not preference
+
+A third outbox, `news-opens.json`, in the same directory and under the same
+ownership rule — the widget appends, the fetcher replays it whole every run
+and never writes to it:
+
+```json
+{ "opens": [ { "openId": "<uuid>", "itemId": "<id>",
+               "url": "<url opened>", "at": "<ISO8601>" } ] }
+```
+
+Rows land in `opens(open_id PK, item_id, url, origin, created_at)`,
+idempotent by `open_id`. The item's `opened` flag round-trips in
+`news.json` so the widget can mark what has been read.
+
+**An open does not feed ranking, scoring, surfacing or the brief, and it is
+not allowed to.** Clicking a headline means it was worth checking, which is
+not the same as it being worth reading, and the gap between the two is
+exactly where an engagement signal turns a feed into a slot machine. The
+one reader here has a direct channel for preference — the vote — so opens
+stay descriptive: they round-trip to the widget, and they are evidence in
+the monthly review, where a human decides whether a pattern of opening
+without upvoting means anything.
+
+`opens` carries no foreign key, unlike `votes`. A record of what he read is
+worth keeping even if the item row it names is gone.
+
+### A downvote can now say why
+
+Vote entries may carry `voteReason` — one of `dup`, `old`, `knew-it`,
+`off-topic`, `weak-piece`, `other` — and a free-text `voteNote` capped at
+500 characters. `votes` gains `reason_key` and `note`; an unrecognised key
+is stored as NULL with a warning, because a label no consumer can read is
+worse stored than absent.
+
+The keys split by who acts on them:
+
+- **`dup` and `old` are claims about the pipeline.** They say a mechanical
+  filter missed something, and they feed the fetcher's own work: the
+  per-run diagnostics, and the corpus of real title pairs the dedup
+  thresholds are tuned against.
+- **`knew-it`, `off-topic`, `weak-piece` and free text are claims about
+  taste.** They reach the monthly profile review and nothing else, as
+  patterns to discuss, never as rules. One item is an anecdote; the same
+  reason five times is a sentence the profile note is missing. Nothing
+  automated reads them, which is the same reason the profile note is
+  human-owned.
+
+**A reason is a new vote, not an edit.** The widget appends a second entry
+for the same item carrying the reason, and both sides stay append-only.
+That made ordering load-bearing: the effective vote is the row with the
+latest `created_at`, and the reason pick often shares a second with the
+vote it explains. Ties break by **insertion order, which is outbox file
+order** — rows go into the DB as they appear in the array, and the query
+orders by `created_at, rowid`, so the later entry in the file wins.
+
+For that comparison to mean anything the timestamps had to agree on a
+shape. SQLite compares `TEXT` byte by byte, and the widget was writing
+local time with an offset while the dashboard wrote UTC with nanoseconds —
+where `'.' < 'Z'` sorts a sub-second stamp *before* the second it follows.
+Every producer now writes `nucleus_core::timestamp`'s canonical form (UTC,
+milliseconds, `Z`, fixed width) and everything arriving from outside is
+normalized on the way in. Migration v5 rewrites the rows already stored.
+
+### The brief may not name something he rejected
+
+Three rules, in order of how much they cost:
+
+- **Downvoted items are not brief inputs.** The clearest instruction the
+  widget can send is a downvote, and a brief that goes on to recommend the
+  item reads as the system ignoring it. If every surfaced item is
+  downvoted, the day ships an empty brief.
+- **A stored brief may only be reused while it is still true.** `briefs`
+  now records the item ids each brief was written from. The fallback on a
+  failed brief call is allowed only when none of those ids has since been
+  downvoted; otherwise the day ships an empty brief and the run records
+  `brief_dropped_downvoted`. A brief predating the column can't be checked,
+  so it isn't reused either. An empty tile is a smaller failure than a
+  retracted recommendation the reader has no way to argue with.
+- **One event is one story.** The ranker's `event` slug goes to the brief
+  prompt with an instruction to mention each event once, so two write-ups
+  of one disclosure can't fill two of the brief's three sentences. The slug
+  is now validated as non-empty kebab-case in the ranking reply, and a
+  batch that fails retries like one with a missing id — it stopped being a
+  display label the moment the brief started grouping on it.
+
+The slug still suppresses nothing. Both write-ups stay in the list, per the
+original decision; they are only pulled adjacent, each event keeping the
+position of its highest-scoring item, so one story reads as one story
+without anything being hidden.
+
+### The dedup miss that started it
+
+"OpenAI agents attacked RubyGems back in May" and "OpenAI agents carried
+out an undisclosed attack on RubyGems" are one disclosure. Token Jaccard
+scored them under 0.6 for two reasons: `attacked` and `attack` are
+different strings, and the longer headline's extra words inflate the union
+that Jaccard divides by.
+
+Both are fixed in `canonical.rs`:
+
+- **Light stemming** folds the inflections two outlets pick differently —
+  three suffix rules and a silent final `e`, guarded on length, with `-ss`
+  and `-us` endings left alone. Not a real stemmer; it only has to make two
+  headlines about one event agree more often than it makes two headlines
+  about different events agree.
+- **A containment rule** measures overlap against the shorter title
+  (intersection over `min(|A|,|B|)`) instead of against both, which is what
+  Jaccard gets wrong when one headline is terse and the other isn't. It
+  fires at **≥ 0.8 with at least 3 shared content tokens**. The floor stops
+  a three-word headline from matching on a coincidence; 0.8 rather than
+  0.75 is set by "Anthropic releases Claude Opus 5" against a longer Haiku
+  release headline — three of four tokens shared, two genuinely different
+  releases.
+
+Jaccard ≥ 0.6 stays as the general rule; containment is a second sufficient
+condition, not a replacement. The consequence recorded in the original
+decision still holds — this is a heuristic and it will occasionally be
+wrong — but it now errs in a direction the `dup` reason key can report.
