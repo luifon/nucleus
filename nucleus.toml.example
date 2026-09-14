@@ -43,6 +43,8 @@ min_score = 0.35
 # Where the notch widget reads its feeds. The fetcher writes news.json here
 # and drains news-votes.json back out of it.
 widget_feed_dir = "~/Library/Application Support/NotchWidget"
+# Case-insensitive regex; a title/summary match drops the item before ranking.
+exclude_title_regex = ""
 
 [diary]
 root = "memory/diaries"

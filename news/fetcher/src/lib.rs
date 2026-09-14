@@ -185,6 +185,9 @@ async fn pipeline(
             }
         }
     }
+    if let Some(re) = settings.news.exclude_regex() {
+        fetched.retain(|it| !matches_excluded_topic(it, &re));
+    }
     diag.items_input = fetched.len();
 
     let known_urls = store::known_canonical_urls(pool).await?;
@@ -373,6 +376,11 @@ fn group_same_event_adjacent(rows: Vec<store::SurfacedRow>) -> Vec<store::Surfac
 ///
 /// Kept pure and separate from the pipeline so it can be reasoned about — and
 /// tested — without a database or a network.
+fn matches_excluded_topic(item: &ParsedItem, pattern: &regex::Regex) -> bool {
+    pattern.is_match(&item.title)
+        || item.summary.as_deref().is_some_and(|s| pattern.is_match(s))
+}
+
 fn select_new_items(
     fetched: Vec<ParsedItem>,
     known_urls: &[String],
@@ -417,6 +425,23 @@ mod tests {
     use super::*;
     use canonical::canonicalize;
     use chrono::DateTime;
+
+    #[test]
+    fn excluded_topic_matches_title_and_summary() {
+        let re = regex::Regex::new(
+            r"(?i)\brust\b|rust-?lang|crates\.io|\brustc\b|\bclippy\b|\bcargo\b",
+        )
+        .unwrap();
+        let mut rusty = item("Stabilizing Rust's never type", "https://ex.com/a", 1);
+        assert!(matches_excluded_topic(&rusty, &re));
+        rusty.title = "A tool published to crates.io".into();
+        assert!(matches_excluded_topic(&rusty, &re));
+
+        let mut agentic = item("Claude Opus 5 ships agentic coding", "https://ex.com/b", 1);
+        assert!(!matches_excluded_topic(&agentic, &re));
+        agentic.summary = Some("Uses cargo cults as a metaphor".into());
+        assert!(matches_excluded_topic(&agentic, &re));
+    }
 
     fn item(title: &str, url: &str, age_hours: i64) -> ParsedItem {
         let published = Utc::now() - Duration::hours(age_hours);

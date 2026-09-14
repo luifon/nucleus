@@ -383,3 +383,18 @@ Jaccard ≥ 0.6 stays as the general rule; containment is a second sufficient
 condition, not a replacement. The consequence recorded in the original
 decision still holds — this is a heuristic and it will occasionally be
 wrong — but it now errs in a direction the `dup` reason key can report.
+
+## Addendum 2026-09-14: mechanical topic exclusion
+
+The profile note only *demotes*. Rust, which the reader does not want, still
+reached the widget: it arrives mixed into the general Hacker News and
+lobste.rs streams (no Rust-free source exists), the ranker scored it low but
+above the surface floor, and on a thin day low-scored items fill the list.
+
+`[news].exclude_title_regex` is a hard kill that runs before ranking: any
+fetched item whose title or summary matches is dropped the moment it is read,
+so nothing downstream — ranker, DB, widget — sees it. It is separate from the
+profile: the profile expresses taste, this expresses an absolute exclusion.
+The committed template ships the key empty; the operator's real pattern lives
+in their private `nucleus.toml`, so no personal topic preference lands in the
+public repo.

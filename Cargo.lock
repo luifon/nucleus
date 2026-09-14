@@ -1524,6 +1524,7 @@ dependencies = [
  "futures",
  "hex",
  "nucleus-core",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

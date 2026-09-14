@@ -24,6 +24,7 @@ sha2 = "0.10"
 hex = "0.4"
 url = "2"
 uuid = { workspace = true }
+regex = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]

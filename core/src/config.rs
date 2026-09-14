@@ -190,12 +190,24 @@ pub struct NewsConfig {
     /// `news.json` here and reads `news-votes.json` back out of it.
     #[serde(default = "default_news_widget_feed_dir")]
     pub widget_feed_dir: String,
+    /// Case-insensitive regex matched against each fetched item's title and
+    /// summary; a match drops the item before ranking. Empty disables it.
+    #[serde(default = "default_news_exclude_title_regex")]
+    pub exclude_title_regex: String,
 }
 
 impl NewsConfig {
     /// `widget_feed_dir` with a leading `~/` expanded to `$HOME`.
     pub fn widget_feed_path(&self) -> std::path::PathBuf {
         expand_home(&self.widget_feed_dir)
+    }
+
+    pub fn exclude_regex(&self) -> Option<regex::Regex> {
+        let pat = self.exclude_title_regex.trim();
+        if pat.is_empty() {
+            return None;
+        }
+        regex::Regex::new(pat).ok()
     }
 }
 
@@ -209,6 +221,10 @@ fn default_news_min_score() -> f64 {
 
 fn default_news_widget_feed_dir() -> String {
     "~/Library/Application Support/NotchWidget".to_string()
+}
+
+fn default_news_exclude_title_regex() -> String {
+    String::new()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
