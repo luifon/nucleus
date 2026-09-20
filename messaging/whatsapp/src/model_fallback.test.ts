@@ -50,6 +50,33 @@ test("classifyInfraReply catches the banners that got posted as deliverables", (
   assert.equal(classifyInfraReply("API Error: 529 Overloaded"), "api");
   // Expired credentials are fatal, never a retryable API error.
   assert.equal(classifyInfraReply("Not logged in \u00b7 Please run /login"), "not-logged-in");
+  // The Max session-limit banner the heartbeat flooded WhatsApp with, 2026-09-19.
+  assert.equal(
+    classifyInfraReply("You've hit your session limit \u00b7 resets 8:50pm"),
+    "usage-limit",
+  );
+  assert.equal(
+    classifyInfraReply("Claude usage limit reached. Resets at 8:50pm."),
+    "usage-limit",
+  );
+  // The phantom turn a still-limited respawned session returned.
+  assert.equal(classifyInfraReply("No response requested."), "no-turn");
+  assert.equal(classifyInfraReply("  No response requested  "), "no-turn");
+});
+
+test("classifyInfraReply leaves multi-line limit reports alone", () => {
+  // A multi-line report ABOUT a limit keeps its newlines and must deliver.
+  const report =
+    "Heartbeat: the WhatsApp session hit its usage limit at 23:00.\n" +
+    "It resets at 8:50pm; reminders will queue until then.";
+  assert.equal(classifyInfraReply(report), null);
+  // A single-line report quoting the phantom is content, not the phantom.
+  assert.equal(
+    classifyInfraReply(
+      'The 23:30 fire came back with "No response requested." \u2014 still usage-limited.',
+    ),
+    null,
+  );
 });
 
 test("classifyInfraReply leaves real answers alone", () => {

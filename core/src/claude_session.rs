@@ -82,6 +82,18 @@ enum InfraError {
     Api,
     /// The CLI's credentials expired. No retry helps; only the operator can.
     NotLoggedIn,
+    /// The account hit its Max-subscription usage/session limit. The CLI
+    /// prints a one-line "you've hit your … limit · resets …" banner in
+    /// place of an answer; only time restores the quota, so an in-fire
+    /// retry is pointless. (The heartbeat sweep flooded the operator's
+    /// WhatsApp DM with this banner every 30 min, 2026-09-19.)
+    UsageLimit,
+    /// The session produced a degenerate non-answer — the literal
+    /// "No response requested." phantom turn — instead of real content.
+    /// Seen when a usage-limited session is respawned and can't run the
+    /// prompt at all; the same string is the cursor/quiescence phantom the
+    /// venue sessions have hit before. Not a deliverable. (2026-09-19.)
+    NoTurn,
 }
 
 impl InfraError {
@@ -90,8 +102,35 @@ impl InfraError {
             Self::ModelUnavailable => "the model cannot serve inference",
             Self::Api => "the API is unreachable or overloaded",
             Self::NotLoggedIn => "the claude CLI is not logged in",
+            Self::UsageLimit => "the account hit its usage limit",
+            Self::NoTurn => "the session produced no real reply",
         }
     }
+}
+
+/// True if `reply` is the CLI's one-line usage/session-limit banner rather
+/// than an answer. Requires a limit noun AND a banner verb, on a single
+/// line: a genuine multi-line report that merely mentions a limit keeps its
+/// newlines and won't match, so it still delivers.
+fn is_usage_limit_banner(reply: &str) -> bool {
+    if reply.contains('\n') {
+        return false;
+    }
+    let lc = reply.to_ascii_lowercase();
+    (lc.contains("usage limit") || lc.contains("session limit"))
+        && (lc.contains("hit your") || lc.contains("reached") || lc.contains("resets"))
+}
+
+/// True if `reply` is the "No response requested." phantom — a session that
+/// yielded no genuine assistant turn. Single line, exact modulo trailing
+/// punctuation/whitespace so a report quoting the phrase still delivers.
+fn is_no_turn_phantom(reply: &str) -> bool {
+    if reply.contains('\n') {
+        return false;
+    }
+    reply
+        .trim_end_matches(['.', ' '])
+        .eq_ignore_ascii_case("no response requested")
 }
 
 /// Classify an `ask` reply that is infrastructure failing rather than an
@@ -119,6 +158,15 @@ fn classify_infra_reply(reply: &str) -> Option<InfraError> {
     }
     if pane_shows_model_error(reply) {
         return Some(InfraError::ModelUnavailable);
+    }
+    // Usage limit and the phantom turn are both fatal-for-this-fire: no
+    // in-fire retry recovers them, so classify them before the transient
+    // API case so the retry path never burns a second turn on them.
+    if is_usage_limit_banner(reply) {
+        return Some(InfraError::UsageLimit);
+    }
+    if is_no_turn_phantom(reply) {
+        return Some(InfraError::NoTurn);
     }
     if reply.contains("API Error") {
         return Some(InfraError::Api);
@@ -472,6 +520,14 @@ impl Session {
                     "ask: {} — no reply was produced (log the CLI back in)",
                     kind.describe()
                 );
+            }
+            InfraError::UsageLimit | InfraError::NoTurn => {
+                // Neither recovers on a re-ask inside this fire: the usage
+                // quota only refills with time, and the phantom turn means
+                // the session couldn't run the prompt at all. Fail so the
+                // caller's failure path (cooldown + alert-on-exhaustion)
+                // handles it — never forward the banner/phantom as content.
+                anyhow::bail!("ask: {} — no reply was produced", kind.describe());
             }
             InfraError::ModelUnavailable => {
                 let fb = fallback_model();
@@ -2442,6 +2498,39 @@ mod tests {
             classify_infra_reply("Not logged in · Please run /login"),
             Some(InfraError::NotLoggedIn)
         );
+        // The exact banner the heartbeat sweep posted to WhatsApp every 30
+        // min on 2026-09-19 once the account hit its Max session limit.
+        assert_eq!(
+            classify_infra_reply("You've hit your session limit · resets 8:50pm"),
+            Some(InfraError::UsageLimit)
+        );
+        assert_eq!(
+            classify_infra_reply("Claude usage limit reached. Resets at 8:50pm."),
+            Some(InfraError::UsageLimit)
+        );
+        // The phantom turn the respawned, still-limited session returned.
+        assert_eq!(
+            classify_infra_reply("No response requested."),
+            Some(InfraError::NoTurn)
+        );
+        assert_eq!(
+            classify_infra_reply("  No response requested  "),
+            Some(InfraError::NoTurn)
+        );
+    }
+
+    #[test]
+    fn classify_infra_reply_leaves_limit_reports_alone() {
+        // A genuine multi-line heartbeat report ABOUT a usage limit keeps its
+        // newlines and must still deliver — only the one-line banner is a
+        // failure surface.
+        let report = "Heartbeat: the WhatsApp session hit its usage limit at 23:00.\n\
+                      It resets at 8:50pm; reminders will queue until then.";
+        assert_eq!(classify_infra_reply(report), None);
+        // A report quoting the phantom string is content, not the phantom.
+        let quoting = "The 23:30 fire came back with \"No response requested.\" — the session \
+                       was still usage-limited and produced no turn.";
+        assert_eq!(classify_infra_reply(quoting), None);
     }
 
     #[test]

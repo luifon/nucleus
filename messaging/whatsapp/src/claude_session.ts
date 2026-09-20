@@ -209,6 +209,12 @@ export class Session {
       // instead of burning a second turn.
       throw new Error(`ask: ${what} — no reply was produced (log the CLI back in)`);
     }
+    if (kind === "usage-limit" || kind === "no-turn") {
+      // Neither recovers on a re-ask this turn: the quota only refills with
+      // time, and the phantom means the session couldn't run the prompt at
+      // all. Fail so the caller surfaces it, never the banner/phantom.
+      throw new Error(`ask: ${what} — no reply was produced`);
+    }
     if (kind === "model-unavailable") {
       const fb = fallbackModel();
       console.error(`whatsapp: ${what} — relaunching on fallback ${fb} and re-asking once`);
@@ -625,13 +631,42 @@ export const INFRA_ERROR_REPLY_MAX_LEN = 400;
 const API_ERROR_RETRY_DELAY_MS = 10_000;
 
 /** An `ask` reply that is infrastructure failing, not an answer. */
-export type InfraError = "model-unavailable" | "api" | "not-logged-in";
+export type InfraError =
+  | "model-unavailable"
+  | "api"
+  | "not-logged-in"
+  | "usage-limit"
+  | "no-turn";
 
 const INFRA_ERROR_DESCRIPTION: Record<InfraError, string> = {
   "model-unavailable": "the model cannot serve inference",
   api: "the API is unreachable or overloaded",
   "not-logged-in": "the claude CLI is not logged in",
+  "usage-limit": "the account hit its usage limit",
+  "no-turn": "the session produced no real reply",
 };
+
+/** True if `reply` is the CLI's one-line usage/session-limit banner (Max
+ *  subscription cap) rather than an answer. Requires a limit noun AND a
+ *  banner verb on a single line, so a multi-line report mentioning a limit
+ *  keeps its newlines and still delivers. Mirrors core's
+ *  is_usage_limit_banner. */
+function isUsageLimitBanner(reply: string): boolean {
+  if (reply.includes("\n")) return false;
+  const lc = reply.toLowerCase();
+  return (
+    (lc.includes("usage limit") || lc.includes("session limit")) &&
+    (lc.includes("hit your") || lc.includes("reached") || lc.includes("resets"))
+  );
+}
+
+/** True if `reply` is the "No response requested." phantom — a session that
+ *  yielded no genuine assistant turn. Single line, exact modulo trailing
+ *  punctuation. Mirrors core's is_no_turn_phantom. */
+function isNoTurnPhantom(reply: string): boolean {
+  if (reply.includes("\n")) return false;
+  return reply.replace(/[.\s]+$/, "").toLowerCase() === "no response requested";
+}
 
 /** Classify an `ask` reply that is infrastructure failing rather than an
  *  answer, or null when it's real content.
@@ -651,6 +686,10 @@ export function classifyInfraReply(reply: string): InfraError | null {
   // a transient API error and retried.
   if (trimmed.includes("Please run /login")) return "not-logged-in";
   if (paneShowsModelError(trimmed)) return "model-unavailable";
+  // Usage limit and the phantom turn are fatal-for-this-turn: no in-turn
+  // retry recovers them, so classify them before the transient API case.
+  if (isUsageLimitBanner(trimmed)) return "usage-limit";
+  if (isNoTurnPhantom(trimmed)) return "no-turn";
   if (trimmed.includes("API Error")) return "api";
   return null;
 }
