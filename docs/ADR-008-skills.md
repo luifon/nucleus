@@ -138,7 +138,7 @@ ALTER TABLE reminders ADD COLUMN system_prompt TEXT;
 ```bash
 # Body-based reminder (existing, unchanged):
 reminders add --cron "30 18 * * 1-5" \
-              --body "⏰ End of day — wrap up the day" \
+              --body "⏰ End of day — wrap up." \
               --channels discord-home
 
 # System-prompt-based reminder (new):

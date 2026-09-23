@@ -40,7 +40,7 @@ Single Cargo workspace at `~/Development/nucleus/`. Crates:
 | `dashboard` (`dashboard`) | bin | axum, health collectors for Docker / launchd / tunnels / news job, plus `/obsidian` chat (its own per-chat `SessionPool` over the vault). Served at the URL in `NUCLEUS_DASHBOARD_PUBLIC_URL` |
 | `chores/distiller` (`distiller`) | bin | Hourly metabolism + weekly contemplation passes (one Session reused across agents). |
 | `chores/preference-learner` (`preference-learner`) | bin | Weekly: read news votes, ask Claude to derive preferences, write `news_preferences.md`. |
-| `chores/reminders` (`end-of-day-reminder`) | bin | Daily end-of-day nudge to Discord (extensible to other reminders). |
+| `chores/reminders` (`reminders`) | bin | DB-backed reminders: one-shot and recurring schedules, delivered to one or more channels (ADR-006). |
 
 ## Stack
 

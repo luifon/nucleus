@@ -50,8 +50,8 @@ reminders); what's missing is reply-gated delivery.
    `4-Areas/Nucleus/HEARTBEAT.md` in the vault (T3 — it is curated prose,
    not config). Free-form markdown: items, per-item cadence hints,
    whatever the operator wants the sweep to read.
-3. **A system-seeded heartbeat reminder** (same seeding mechanism as the
-   18:30 end-of-day, `created_by='system'`, cancellation sticky):
+3. **A system-seeded heartbeat reminder** (the reminders seeding
+   mechanism, `created_by='system'`, cancellation sticky):
    cron `*/30 9-23 * * *` in `NUCLEUS_TZ` — active hours only, no
    overnight fires — with a system prompt of: read `HEARTBEAT.md`, check
    each item cheaply (Bash/reads only; no outbound actions without the

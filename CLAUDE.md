@@ -109,8 +109,7 @@ sending to a destination that isn't:
 - A WhatsApp DM from the operator's JID (per `WHATSAPP_ALLOWED_DM_JIDS`,
   ADR-005b) — replying in the same DM thread is pre-authorized
 - The configured home channel (`DISCORD_HOME_CHANNEL_ID`)
-- A pre-authorized scheduled output (daily news, end-of-day reminder, weekly
-  distillation digest)
+- A pre-authorized scheduled output (daily news, weekly distillation digest)
 
 …ask. Don't infer "the user probably wants this." For WhatsApp specifically,
 remember messages appear from the user's own identity, not a separate bot
@@ -249,7 +248,7 @@ to check the deploy", "tomorrow 9am about Q3 sync") — use `--at`:
   --channels discord-home
 ```
 
-**Recurring** ("every weekday at 18:30 remind me to wrap up the day", "every
+**Recurring** ("every weekday at 18:30 send an end-of-day reminder", "every
 Monday morning at 9 send me the weekly review prompt") — use `--cron`
 with a standard 5-field cron expression (minute hour day month dow),
 evaluated in `NUCLEUS_TZ`:
@@ -257,7 +256,7 @@ evaluated in `NUCLEUS_TZ`:
 ```bash
 ./target/release/nucleus reminders add \
   --cron "30 18 * * 1-5" \
-  --body "⏰ End of day — time to wrap up." \
+  --body "⏰ End of day — wrap up." \
   --channels discord-home
 ```
 
@@ -342,9 +341,10 @@ comma list. Each channel retries independently up to 3 attempts before
 giving up for that fire; the others aren't redelivered while a laggard
 retries.
 
-The 18:30 weekday end-of-day reminder is seeded as a `created_by =
-'system'` row on binary startup — don't add it manually. If the user
-cancels it, the seeder won't re-create it (cancellation is sticky).
+System reminders (currently the ADR-026 heartbeat) are seeded as
+`created_by = 'system'` rows on binary startup — don't add them
+manually. If the user cancels one, the seeder won't re-create it
+(cancellation is sticky).
 
 ### Skill-fire reminders (`--system-prompt`, ADR-008)
 
@@ -406,7 +406,7 @@ is no deterministic source to fall back to.
 
 Prefer `--body` for simple text pings. Reserve `--system-prompt` for
 fires that genuinely need a Claude session — they cost a tmux+session
-spawn each time. The 18:30 end-of-day stays on `--body` forever.
+spawn each time.
 
 ## Rule 11 — Skills (ADR-008): never author in one shot
 

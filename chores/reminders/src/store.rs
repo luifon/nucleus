@@ -1174,81 +1174,62 @@ pub async fn fire_history(
         .collect())
 }
 
-/// Idempotent seeding of `created_by = 'system'` reminders. Matches on title,
-/// or body for legacy seeds, so cancelled rows are NOT recreated (a cancelled
-/// system row stays cancelled until you delete it or re-add manually). If the
-/// row is missing entirely, insert it.
+/// Idempotent seeding of `created_by = 'system'` reminders. Each seed is
+/// identified by its title. A seed is inserted only when no system row with
+/// that title exists in any status, so a cancelled system row is NOT
+/// recreated (it stays cancelled until you delete it or re-add manually).
 pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
-    struct SeedRow {
-        /// Stable identity for title-matched seeds (skill-fires, whose
-        /// prompt wording may evolve). None → legacy body-matched seed.
-        title: Option<&'static str>,
-        body: &'static str,
-        system_prompt: Option<&'static str>,
-        cron: &'static str,
-        one_shot: bool,
-        channels: &'static [&'static str],
-        /// Opt into daily-session continuity (one claude session per day).
-        daily_session: bool,
-    }
-    let seeds: &[SeedRow] = &[
-        SeedRow {
-            title: None,
-            body: "⏰ End of day — time to wrap up.",
-            system_prompt: None,
-            cron: "30 18 * * 1-5",
-            one_shot: false,
-            channels: &[CHANNEL_DISCORD_HOME],
-            daily_session: false,
-        },
-        // ADR-026 heartbeat: the standing "does anything need attention?"
-        // sweep. Reply contract: HEARTBEAT_OK → delivery suppressed by the
-        // worker. Prompt wording may evolve; identity is the title.
-        SeedRow {
-            title: Some("heartbeat"),
-            body: "",
-            system_prompt: Some(
-                "Heartbeat sweep (ADR-026). Read ~/Documents/Obsidian/4-Areas/Nucleus/HEARTBEAT.md \
-                 and check each item cheaply — file reads and read-only Bash only; no outbound \
-                 actions, no mutations. Before reporting, read today's reminders diary \
-                 (memory/diaries/reminders/) for what earlier heartbeats already flagged: report \
-                 each item at most once per day unless its state has CHANGED since. If something \
-                 genuinely needs the operator's attention, reply with a short plain report \
-                 (2-6 lines, lead with the item). If nothing does, reply exactly: HEARTBEAT_OK",
-            ),
-            cron: "*/30 9-23 * * *",
-            one_shot: false,
-            channels: &[CHANNEL_WHATSAPP_DM],
-            daily_session: true,
-        },
-    ];
+    seed_reminders(pool, DEFAULT_SEEDS).await
+}
 
+struct SeedRow {
+    /// Stable identity of the seed. The body or prompt wording may change
+    /// between releases; the title does not.
+    title: &'static str,
+    body: &'static str,
+    system_prompt: Option<&'static str>,
+    cron: &'static str,
+    one_shot: bool,
+    channels: &'static [&'static str],
+    /// Opt into daily-session continuity (one claude session per day).
+    daily_session: bool,
+}
+
+const DEFAULT_SEEDS: &[SeedRow] = &[
+    // ADR-026 heartbeat: the standing "does anything need attention?"
+    // sweep. Reply contract: HEARTBEAT_OK → delivery suppressed by the
+    // worker.
+    SeedRow {
+        title: "heartbeat",
+        body: "",
+        system_prompt: Some(
+            "Heartbeat sweep (ADR-026). Read ~/Documents/Obsidian/4-Areas/Nucleus/HEARTBEAT.md \
+             and check each item cheaply — file reads and read-only Bash only; no outbound \
+             actions, no mutations. Before reporting, read today's reminders diary \
+             (memory/diaries/reminders/) for what earlier heartbeats already flagged: report \
+             each item at most once per day unless its state has CHANGED since. If something \
+             genuinely needs the operator's attention, reply with a short plain report \
+             (2-6 lines, lead with the item). If nothing does, reply exactly: HEARTBEAT_OK",
+        ),
+        cron: "*/30 9-23 * * *",
+        one_shot: false,
+        channels: &[CHANNEL_WHATSAPP_DM],
+        daily_session: true,
+    },
+];
+
+async fn seed_reminders(pool: &SqlitePool, seeds: &[SeedRow]) -> Result<()> {
     let tz = nucleus_tz();
     for seed in seeds {
-        // Uniqueness survives cancellation by leaving the cancelled row
-        // alone: title match for titled seeds, body match for legacy ones.
-        let existing: Option<(i64,)> = match seed.title {
-            Some(title) => {
-                sqlx::query_as(
-                    "SELECT id FROM reminders
-                      WHERE created_by = 'system' AND title = ?1
-                      LIMIT 1",
-                )
-                .bind(title)
-                .fetch_optional(pool)
-                .await?
-            }
-            None => {
-                sqlx::query_as(
-                    "SELECT id FROM reminders
-                      WHERE created_by = 'system' AND body = ?1
-                      LIMIT 1",
-                )
-                .bind(seed.body)
-                .fetch_optional(pool)
-                .await?
-            }
-        };
+        // Match any status, so a cancelled row blocks re-insertion.
+        let existing: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM reminders
+              WHERE created_by = 'system' AND title = ?1
+              LIMIT 1",
+        )
+        .bind(seed.title)
+        .fetch_optional(pool)
+        .await?;
         if existing.is_some() {
             continue;
         }
@@ -1257,7 +1238,7 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
         let channels: Vec<String> = seed.channels.iter().map(|s| s.to_string()).collect();
         let id = insert_with_channels(
             pool,
-            seed.title,
+            Some(seed.title),
             seed.body,
             seed.cron,
             seed.one_shot,
@@ -1278,7 +1259,7 @@ pub async fn seed_default_reminders(pool: &SqlitePool) -> Result<()> {
         }
         tracing::info!(
             id,
-            title = seed.title.unwrap_or(seed.body),
+            title = seed.title,
             "reminders: seeded system reminder"
         );
     }
@@ -1377,4 +1358,81 @@ pub fn parse_at(at: &str) -> Result<DateTime<Tz>> {
         .single()
         .ok_or_else(|| anyhow!("ambiguous or non-existent local time {naive}"))?;
     Ok(local)
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    async fn temp_pool(name: &str) -> SqlitePool {
+        let dir = std::env::temp_dir().join(format!(
+            "nucleus-seed-tests-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        open(&dir.join("reminders.db")).await.unwrap()
+    }
+
+    async fn system_rows(pool: &SqlitePool, title: &str) -> Vec<Reminder> {
+        list_all(pool, true, true)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.created_by == "system" && r.title.as_deref() == Some(title))
+            .collect()
+    }
+
+    const TEST_SEEDS: &[SeedRow] = &[SeedRow {
+        title: "test-seed",
+        body: "synthetic seeded body",
+        system_prompt: None,
+        cron: "0 9 * * 1",
+        one_shot: false,
+        channels: &[CHANNEL_DISCORD_HOME],
+        daily_session: false,
+    }];
+
+    /// Seeding twice inserts one row; the row starts active with a
+    /// computed next fire time.
+    #[tokio::test]
+    async fn seeding_is_idempotent() {
+        let pool = temp_pool("idempotent").await;
+        seed_reminders(&pool, TEST_SEEDS).await.unwrap();
+        seed_reminders(&pool, TEST_SEEDS).await.unwrap();
+        let rows = system_rows(&pool, "test-seed").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "active");
+        assert!(rows[0].next_fire_at.is_some());
+    }
+
+    /// A cancelled system row is not recreated by a later seeding pass.
+    #[tokio::test]
+    async fn cancellation_is_sticky() {
+        let pool = temp_pool("sticky").await;
+        seed_reminders(&pool, TEST_SEEDS).await.unwrap();
+        let id = system_rows(&pool, "test-seed").await[0].id;
+        assert!(cancel(&pool, id).await.unwrap());
+        seed_reminders(&pool, TEST_SEEDS).await.unwrap();
+        let rows = system_rows(&pool, "test-seed").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "cancelled");
+    }
+
+    /// The default seed set is the ADR-026 heartbeat only, with its
+    /// daily-session flag applied.
+    #[tokio::test]
+    async fn default_seeds_are_the_heartbeat() {
+        let pool = temp_pool("defaults").await;
+        seed_default_reminders(&pool).await.unwrap();
+        let all: Vec<Reminder> = list_all(&pool, true, true)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.created_by == "system")
+            .collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].title.as_deref(), Some("heartbeat"));
+        assert!(all[0].daily_session);
+    }
 }

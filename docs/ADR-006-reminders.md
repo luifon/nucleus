@@ -8,14 +8,14 @@ Today's reminder system is two things glued together:
 
 1. **Ad-hoc reminders** — the `reminders` binary's `add` / `list` / `cancel` / `due` subcommands, backed by a single `reminders` table in `memory/reminders.db`. Schema: `id, due_at, body, channel, status, fired_at, fired_msg_id, cancelled_at, created_at`. The `due` subcommand polls every minute via the `reminders-tick` launchd plist (`StartInterval=60`) and fires whatever's due. Works fine.
 
-2. **The daily end-of-day reminder** — a `end-of-day` subcommand on the same binary with the body hardcoded into the source (`"⏰ End of day — time to wrap up."`), the channel hardcoded (`discord-home`), and the schedule expressed by a *separate* `dev.nucleus.end-of-day-reminder` launchd plist that fires `reminders end-of-day` at `Hour=18, Minute=30` via `StartCalendarInterval`.
+2. **The daily end-of-day reminder** — a dedicated subcommand on the same binary with the body hardcoded into the source, the channel hardcoded (`discord-home`), and the schedule expressed by a *separate* launchd plist that runs that subcommand at `Hour=18, Minute=30` via `StartCalendarInterval`.
 
-The second thing is wrong. A end-of-day reminder is just a reminder — same shape (body, channel, time) — but it's been special-cased into code constants + a parallel launchd plist. That has two concrete costs:
+The second thing is wrong. The end-of-day reminder is just a reminder — same shape (body, channel, time) — but it's been special-cased into code constants + a parallel launchd plist. That has two concrete costs:
 
-- **Configuration requires a rebuild.** Want to move end-of-day from 18:30 to 19:00? Edit the plist *and* rebuild after the user logs out (because launchd caches the plist's TZ at bootstrap time — see [`launchd_tz_pitfall`](../memory…) memory). Want to change the body? Edit Rust source and rebuild.
-- **The StartCalendarInterval path is fragile on macOS.** Today, 2026-05-15, the end-of-day missed its 18:30 fire entirely because `OS_REASON_CODESIGNING` killed the launch — macOS caches the binary's codesign identity at plist-load time and SIGKILLs the next launch if the binary on disk changed (today's `cargo build` rebuilt `reminders` cascaded from a `nucleus_core` touch). The same plist class also lost the morning fire weeks ago when the launchd user-bootstrap captured the wrong TZ at first login.
+- **Configuration requires a rebuild.** Want to move the end-of-day reminder from 18:30 to 19:00? Edit the plist *and* rebuild after the user logs out (because launchd caches the plist's TZ at bootstrap time — see [`launchd_tz_pitfall`](../memory…) memory). Want to change the body? Edit Rust source and rebuild.
+- **The StartCalendarInterval path is fragile on macOS.** Today, 2026-05-15, the end-of-day reminder missed its 18:30 fire entirely because `OS_REASON_CODESIGNING` killed the launch — macOS caches the binary's codesign identity at plist-load time and SIGKILLs the next launch if the binary on disk changed (today's `cargo build` rebuilt `reminders` cascaded from a `nucleus_core` touch). The same plist class also lost the morning fire weeks ago when the launchd user-bootstrap captured the wrong TZ at first login.
 
-The ad-hoc reminder path doesn't have either of those problems (it runs from `StartInterval=60` + program-side wallclock decisions), and it already has all the moving parts — DB-backed schedule, per-row body, per-row channel, idempotent firing. The end-of-day should be a *row in that table*, not a separate code path.
+The ad-hoc reminder path doesn't have either of those problems (it runs from `StartInterval=60` + program-side wallclock decisions), and it already has all the moving parts — DB-backed schedule, per-row body, per-row channel, idempotent firing. The end-of-day reminder should be a *row in that table*, not a separate code path.
 
 Beyond that, the current model has limitations that show up as soon as anything more complex than "remind me once" lands:
 
@@ -34,7 +34,7 @@ This ADR redesigns the reminders subsystem to subsume all of those — one model
 - **when** — a cron expression, evaluated in the operator's local timezone (`NUCLEUS_TZ`); for one-shot use a cron pattern that matches a single calendar date plus a `one_shot` flag that prevents re-firing
 - **who** — one or more channels (Discord home, the WhatsApp conversational group, the WhatsApp brain-dump group, WhatsApp DM, Calendar)
 
-The `reminders due` polling worker is the single execution engine. The standalone `end-of-day` subcommand + `dev.nucleus.end-of-day-reminder` plist are removed. Default reminders (end-of-day, anything else "this is just how Nucleus operates") get inserted by a seeder on binary startup, idempotently — the same pattern news-fetcher uses for default sources.
+The `reminders due` polling worker is the single execution engine. The dedicated end-of-day subcommand and its `StartCalendarInterval` plist are removed. Default reminders (anything "this is just how Nucleus operates") get inserted by a seeder on binary startup, idempotently — the same pattern news-fetcher uses for default sources.
 
 ## Data model
 
@@ -114,7 +114,7 @@ CREATE INDEX idx_reminder_fires_at ON reminder_fires(fired_at DESC);
 CREATE INDEX idx_reminder_fires_reminder ON reminder_fires(reminder_id, fired_at DESC);
 ```
 
-One row per (fire, channel) attempt. Powers `reminders history` and any future dashboard widget that wants to surface "did last night's end-of-day land?" without joining against Discord. Retained indefinitely — it's tiny.
+One row per (fire, channel) attempt. Powers `reminders history` and any future dashboard widget that wants to surface "did last night's reminder land?" without joining against Discord. Retained indefinitely — it's tiny.
 
 ## Cron crate
 
@@ -190,13 +190,9 @@ reminders due                                                                  #
 
 ## Seeding
 
-`seed_default_reminders()` runs at binary startup, idempotently. Initial set (v1):
+`seed_default_reminders()` runs at binary startup, idempotently. The v1 set was one row: the weekday 18:30 end-of-day reminder (`"30 18 * * 1-5"`, `[discord-home]`, `created_by = 'system'`).
 
-| body | cron | one_shot | channels | created_by |
-|------|------|----------|----------|------------|
-| `"⏰ End of day — time to wrap up."` | `"30 18 * * 1-5"` | 0 | `[discord-home]` | `system` |
-
-The seeder checks `WHERE created_by = 'system' AND body = ?` before inserting — so if the row was cancelled, the seeder won't re-create it on next startup (cancelled stays cancelled until you explicitly re-add). If the row was deleted (you wiped the DB), the seeder re-inserts.
+Update (2026-09-23): the end-of-day seed was removed. The current set is the ADR-026 heartbeat. Each seed is identified by its title: the seeder checks `WHERE created_by = 'system' AND title = ?` before inserting. The title stays stable when the body or prompt wording changes. If the row was cancelled, the seeder does not re-create it on the next startup (cancelled stays cancelled until you explicitly re-add). If the row was deleted (for example, the DB was wiped), the seeder re-inserts it. Removing a seed from the code does not remove a row that an earlier version already inserted; cancel that row with `reminders cancel <id>`.
 
 Future "system" reminders (weekly review, monthly bookkeeping, whatever) plug into the same seeder.
 
@@ -205,7 +201,7 @@ Future "system" reminders (weekly review, monthly bookkeeping, whatever) plug in
 After this lands, the launchd inventory shrinks by one:
 
 - `dev.nucleus.reminders-tick` (`StartInterval=60`) — **kept.** This is the polling engine.
-- `dev.nucleus.end-of-day-reminder` (`StartCalendarInterval`) — **deleted** (both `.example` template and the installed plist). Its functionality is a row in `reminders` now.
+- The end-of-day reminder plist (`StartCalendarInterval`) — **deleted** (both `.example` template and the installed plist). Its functionality is a row in `reminders` now.
 
 No `StartCalendarInterval` left in the Nucleus stack. All scheduling decisions happen in code, against `chrono::Local::now()`, with the TZ env var the plist passes in. The launchd-bootstrap-TZ bug and the StartCalendarInterval-codesign-cache bug both become impossible by construction.
 
@@ -225,24 +221,24 @@ The implementation session should land this in one commit (or two — schema + c
 2. **Backfill existing rows:**
    - For each row in `reminders` with old-shape data: derive a cron string from `due_at` (`MM HH DD MO *`), set `one_shot = 1`, copy `due_at` → `next_fire_at`, set `status` based on the old enum, insert a `reminder_channels` row with the existing `channel` and `status = 'pending'` (or `'sent'` if the row was already fired).
 3. **Code:**
-   - Drop the `Cmd::EndOfDay` variant from the CLI.
-   - Drop the `end_of_day()` function.
+   - Drop the end-of-day subcommand variant from the CLI.
+   - Drop the function that implemented it.
    - Wire `croner` into `due()` for cron evaluation and `next_fire_at` computation.
    - Implement the new lifecycle helpers in `store.rs`: `pending_due_with_channels`, `record_channel_fire`, `advance_after_fire`, `auto_resume_paused`.
    - Implement the new CLI verbs.
    - Add `seed_default_reminders()` and call it from `main` like the existing schema bootstrap.
 4. **Launchd:**
-   - `launchctl bootout gui/$UID/dev.nucleus.end-of-day-reminder`
-   - `rm ~/Library/LaunchAgents/dev.nucleus.end-of-day-reminder.plist`
-   - `rm tools/launchd/end-of-day-reminder.plist.example`
+   - `launchctl bootout` the end-of-day reminder plist.
+   - Remove the installed plist from `~/Library/LaunchAgents/`.
+   - Remove its `.plist.example` template from `tools/launchd/`.
    - That's it. `reminders-tick.plist` stays untouched.
 5. **Build + reload:**
    - `cargo build --release --bin reminders`
    - `launchctl bootout gui/$UID/dev.nucleus.reminders-tick && launchctl bootstrap gui/$UID ~/Library/LaunchAgents/dev.nucleus.reminders-tick.plist` (refreshes the codesign cache for the new binary)
 6. **Smoke test:**
-   - `reminders list` shows the seeded end-of-day with `next_fire_at` set to next weekday 18:30 BRT.
+   - `reminders list` shows the seeded end-of-day reminder with `next_fire_at` set to next weekday 18:30 BRT.
    - `reminders add --at <iso 2 min from now> --body "test"` + observe firing within 2 min.
-   - `reminders pause <reminder_id> --until <iso 1 min from now>` + observe auto-resume after the timestamp.
+   - `reminders pause <seeded_id> --until <iso 1 min from now>` + observe auto-resume after the timestamp.
 
 ## What's out of v1 (deferred)
 
@@ -257,7 +253,7 @@ Everything else discussed during design — multi-channel, per-channel retry, hi
 
 **Positive:**
 - One model, one ticker, one CLI for all time-triggered notifications.
-- Changing the end-of-day time/body/channel becomes `reminders edit` (v2) or a quick SQL update — no rebuild required.
+- Changing a seeded reminder's time/body/channel becomes `reminders edit` (v2) or a quick SQL update — no rebuild required.
 - No more `StartCalendarInterval`-based plists in the stack → immune to the launchd-TZ-bootstrap and codesign-cache failure modes that cost a day this week.
 - Multi-channel delivery just works; no per-feature plumbing required to send the same reminder to both Discord and Alfred.
 - History log unlocks dashboard surfaces ("did anything fail to deliver last night?") cheaply.

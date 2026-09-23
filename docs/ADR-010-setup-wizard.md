@@ -242,7 +242,7 @@ This teaches the operator the skill-creator flow during install rather
 than leaving it as "go read ADR-008 someday."
 
 **c. Seed defaults** — for any service that has a default to seed:
-- Default reminders (end-of-day etc.) via `reminders add` if the
+- Default reminders via `reminders add` if the
   reminders table is empty
 - PARA vault buckets at `~/Documents/Obsidian/` if the vault is empty
   (creates `0-Inbox/`, `1-Main-Notes/`, `2-Daily-Notes/`, `3-Projects/`,
