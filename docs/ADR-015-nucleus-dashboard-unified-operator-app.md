@@ -58,7 +58,8 @@ operator**:
 - **Sessions** (tmux-hosted long-lived Claude sessions, Rule 4) — daily
   04:00 rotation lands silently; no UI to see what's running, what
   rotated when, what's idle.
-- **Skills** (ADR-008) — operator-personal at `~/.claude/skills/`,
+- **Skills** (ADR-008) — operator-personal at `~/.claude/skills/` (moved to
+  `.nucleus/.claude/skills/` by ADR-032),
   developer at `.claude/skills/`. No surface lists them, shows
   `last_used`, or surfaces `failure_count_30d` / `notify_on_failure`.
   The "skill quietly broke three weeks ago" failure mode is real.

@@ -3,8 +3,9 @@
 **Hard rule:** anything that personally identifies a specific human, machine,
 account, channel, path, or external party lives in `.env` (gitignored) — and
 **this repo is public**, so personal information of any kind, and any content
-belonging to an operator-personal skill (`~/.claude/skills/`, as opposed to
-the repo-wired `.claude/skills/`), must never appear in a tracked file.
+belonging to an operator-personal skill (the gitignored
+`.nucleus/.claude/skills/`, as opposed to the repo-wired `.claude/skills/`;
+see ADR-032), must never appear in a tracked file.
 Sensitive literals that aren't `.env` values go in the gitignored
 `.claude/secret-strings` denylist. `tools/check-secrets.sh` enforces all of
 this (see `.claude/rules/secrets.md`). Nothing committed to the repo should

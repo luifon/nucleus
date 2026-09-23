@@ -17,9 +17,9 @@ and route through `.env` instead:
 - **Personal information of any kind** — anything identifying a person,
   account, contact, or external party
 - **Operator-personal-skill content** — anything belonging to a skill in the
-  `~/.claude/skills/` tree (as opposed to the repo-wired `.claude/skills/`).
-  That tooling and everything it names lives in the personal tree, never in
-  a tracked file.
+  gitignored `.nucleus/.claude/skills/` tree (as opposed to the repo-wired
+  `.claude/skills/`; see ADR-032). That tooling and everything it names
+  lives in the private tree, never in a tracked file.
 
 **This repo is public.** Nothing above may appear in tracked source, docs,
 comments, or test fixtures. If the value should be identical for everyone
@@ -29,7 +29,7 @@ in `.env`. The specific real literals a value-scan can't infer (names that
 aren't env values) go in the gitignored `.claude/secret-strings` denylist.
 
 **Placement rule:** anything that integrates or names a specific external
-product/service is operator-personal → `~/.claude/skills/` + `.env`, never
+product/service is operator-personal → `.nucleus/.claude/skills/` + `.env`, never
 under `tools/`, `core/`, `chores/`, or `docs/` (those are venue/
 infrastructure code that refers to any external party by role, not name).
 
@@ -363,8 +363,8 @@ At fire time the worker spawns a one-shot interactive Claude session
 inside the `nucleus-reminders-fire` tmux session, sends the
 `system_prompt` as the first message (with a small routing-hint
 preamble), and forwards the session's reply to the listed channels.
-All skills (project `.claude/skills/` + operator `~/.claude/skills/`)
-auto-load, so the prompt can name a skill by `/<name>` or describe an
+All skills (project `.claude/skills/` + operator
+`.nucleus/.claude/skills/`, loaded through `--add-dir`, ADR-032) auto-load, so the prompt can name a skill by `/<name>` or describe an
 ad-hoc task. The session's final reply IS the post — don't add
 preamble like "Here is the summary:".
 
@@ -391,7 +391,7 @@ annotates, give the reminder a fallback:
   --cron "0 12 * * 1-5" \
   --title "<short name>" \
   --system-prompt "Run <skill>, post the result." \
-  --fallback-cmd 'node $HOME/.claude/skills/<skill>/<data-script>.mjs <arg>'
+  --fallback-cmd 'node $NUCLEUS_WORKSPACE_ROOT/.nucleus/.claude/skills/<skill>/<data-script>.mjs <arg>'
 ```
 
 When the fire exhausts its attempts, the command runs (`sh -c`, 90s timeout)
@@ -414,16 +414,29 @@ A skill (`SKILL.md`) is **procedural memory** — a memorized "when X
 comes up, do Y" the bot can invoke. See ADR-008. Two storage trees:
 
 - `.claude/skills/<name>/` — **developer/repo** workflows. Committed.
-- `~/.claude/skills/<name>/` — **operator-personal** routines. Not
-  committed; the operator owns this tree.
+- `.nucleus/.claude/skills/<name>/` — **operator-private** routines.
+  `.nucleus/` is gitignored and is its own local git repository; the
+  operator owns this tree (ADR-032).
 
-Default to `~/.claude/skills/` for anything that names a real tool,
+Default to `.nucleus/.claude/skills/` for anything that names a real tool,
 contact, URL, or routine. Rule 1 still applies — identifiers don't go
-into committed files even via skill bodies.
+into committed files even via skill bodies. `~/.claude/skills/` holds only
+skills meant for every project on the machine; Nucleus tooling does not
+read or write it.
+
+Every Nucleus-spawned session gets `--add-dir <workspace_root>/.nucleus`
+automatically (`build_claude_args` in Rust, `launchWindow` in TS).
+Interactive shells get the same flag from `tools/claude-wrapper.zsh`,
+sourced from `~/.zshenv`. A session started without it (a deep link,
+`bash`, a script, a `claude --resume` outside the wrapper) does not see
+the private skills; `/add-dir .nucleus` loads them. Never keep the same
+skill name in two trees — the `~/.claude/skills/` or committed copy wins
+without a warning. Skill bodies refer to their own files through
+`${CLAUDE_SKILL_DIR}`. Do not create `.nucleus/CLAUDE.md`.
 
 **Skills are now also written autonomously** by the `skill-gap-learner`
 (ADR-017): an on-the-fly reviewer after conversations + a daily curator.
-Its skills land in `~/.claude/skills/` with `flavor: learned` +
+Its skills land in `.nucleus/.claude/skills/` with `flavor: learned` +
 `created_by: agent`, validated against the SKILL.md contract (the
 `# Failure modes` requirement below is enforced mechanically — malformed
 writes are quarantined to `.rejected/`). So expect agent-authored skills
@@ -433,7 +446,7 @@ deletes; skips `pinned: true`). `/skill-creator` remains the operator's
 
 When invoking `/skill-creator create`, **name the destination path in
 the prompt** rather than letting the model infer it. Example:
-`/skill-creator create daily-digest at ~/.claude/skills/daily-digest` (personal)
+`/skill-creator create daily-digest at .nucleus/.claude/skills/daily-digest` (personal)
 vs `/skill-creator create rust-build-check at .claude/skills/rust-build-check`
 (generic, repo-committed). If a SKILL.md appears unexpectedly in
 `git status`, that's the signal — the model placed it in the committed

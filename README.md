@@ -138,6 +138,14 @@ cd ~/Development/nucleus
 cp .env.example .env
 cp nucleus.toml.example nucleus.toml
 # Edit both — see "Configuration" below for what to fill in.
+
+# Operator-private skills tree (gitignored, own local git repo — ADR-032)
+mkdir -p .nucleus/.claude/skills
+git -C .nucleus init
+echo '/.nucleus' >> "$(git rev-parse --git-common-dir)/info/exclude"
+
+# Load that tree in your own `claude` sessions in this repo and its worktrees
+echo "source $PWD/tools/claude-wrapper.zsh" >> ~/.zshenv
 ```
 
 ### 2. Build
@@ -363,7 +371,7 @@ mechanism with Nucleus-specific frontmatter on top (see ADR-008).
 | Path | Audience | Committed? |
 |---|---|---|
 | `.claude/skills/<name>/SKILL.md` | Skills for *working on* Nucleus (debug helpers, dev workflows) | Yes |
-| `~/.claude/skills/<name>/SKILL.md` | Skills for the operator's own recurring flows (pre-meeting prep, weekly review, etc.) | No — operator-personal |
+| `.nucleus/.claude/skills/<name>/SKILL.md` | Skills for the operator's own recurring flows (pre-meeting prep, weekly review, etc.) | No — operator-private; `.nucleus/` is gitignored and is its own local git repo (ADR-032) |
 
 Skills run two ways:
 
@@ -372,6 +380,14 @@ Skills run two ways:
    `reminders add`. At fire time the worker spawns a one-shot
    interactive Claude session, sends the prompt as the first message,
    captures the reply, and forwards it to the configured channels.
+
+Nucleus-spawned sessions receive `--add-dir <repo>/.nucleus`
+automatically, which is how they load the operator-private skills.
+Interactive shells get the same flag from `tools/claude-wrapper.zsh`
+(see Quick start step 1). A session started without the flag (a deep
+link, `bash`, a script) does not see those skills; `/add-dir .nucleus`
+inside the session loads them. `~/.claude/skills/` is loaded in every
+project on the machine, so it holds only skills meant for all projects.
 
 The session sees every skill's description in its tool listing, so the
 prompt can compose (`"Run skill-A, then skill-B, summarize both."`) or
@@ -402,12 +418,15 @@ The bot **should not author a skill in one shot.** The recommended flow
 ### Sensitivity defaults
 
 Skill bodies that name real tools, contacts, URLs, or recurring routines
-**must** live in `~/.claude/skills/` (not the repo). Per `CLAUDE.md`
+**must** live in `.nucleus/.claude/skills/` (gitignored, not committed). Per `CLAUDE.md`
 Rule 1, anything identifying belongs in `.env`-substituted strings or
 operator-personal files. The `.claude/skills/` tree is for generic
 dev/debug workflows that any contributor could use.
 
-If you're unsure where a skill belongs, default to `~/.claude/skills/`.
+If you're unsure where a skill belongs, default to `.nucleus/.claude/skills/`.
+Never keep the same skill name in two trees: a copy in `~/.claude/skills/`
+or `.claude/skills/` is loaded instead of the `.nucleus` copy, without a
+warning.
 
 ## Folder layout
 
@@ -416,6 +435,7 @@ nucleus/
 ├── Cargo.toml              workspace manifest
 ├── nucleus.toml            non-identifying tunables (gitignored copy)
 ├── .env                    identifiers + secrets (gitignored)
+├── .nucleus/               operator-private skills, own local git repo (gitignored, ADR-032)
 ├── agents.toml             agent registry — single source of truth (ADR-016)
 ├── core/                   shared Rust lib — claude wrapper, config, memory, diary, agents, runlog, …
 ├── messaging/
@@ -468,6 +488,7 @@ nucleus/
 - `docs/ADR-025-pre-rotation-memory-flush.md` — persist-before-recycle DURABLE section in the rotation ask
 - `docs/ADR-026-heartbeat.md` — HEARTBEAT.md checklist sweep + reply-gated silent fires
 - `docs/ADR-027-adapter-circuit-breaker.md` — WhatsApp connection supervisor: close-reason taxonomy, backoff ladder, open-circuit alerts (proposed)
+- `docs/ADR-032-repo-private-skills-tree.md` — operator-private skills in the gitignored `.nucleus/.claude/skills/`, loaded via `--add-dir`; rejected alternatives
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session

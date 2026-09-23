@@ -54,9 +54,12 @@ The `skill-gap-learner` maintenance agent (launchd-cron daily). `learn` runs:
 
 ### Autonomy + the validation gate
 
-Skills are written **autonomously** (Hermes-faithful) to `~/.claude/skills/`
-only (operator-personal, gitignored — Rule 1; never the committed tree),
-`flavor: learned`, `created_by: agent`. Oversight is the curator
+Skills are written **autonomously** (Hermes-faithful) to the operator-personal
+tree only (gitignored — Rule 1; never the committed tree). Since ADR-032 that
+tree is `.nucleus/.claude/skills/` (resolved by
+`nucleus_core::skills::personal_skills_root`); it was `~/.claude/skills/` when
+this ADR was written. Written skills carry `flavor: learned` and
+`created_by: agent`. Oversight is the curator
 (archive-never-delete), the `/skills` dashboard, and — the key safeguard —
 a **validation gate**: every touched SKILL.md is re-parsed by
 `nucleus_core::skills::validate` (required frontmatter + the required
@@ -96,4 +99,4 @@ just by prompt.
 - An interactive skill-authoring UI — `/skill-creator` remains the operator's
   manual path; this is the autonomous complement.
 - Touching the committed `.claude/skills/` tree — the learner writes only to
-  the operator-personal tree.
+  the operator-personal tree (`.nucleus/.claude/skills/`, ADR-032).

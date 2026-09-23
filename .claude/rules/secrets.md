@@ -20,7 +20,8 @@ into committed files — is the reason this rule has teeth, not just text.
 - **Personal information of any kind** — anything identifying a person,
   account, contact, or external party
 - **Operator-personal-skill content** — anything belonging to a skill in
-  `~/.claude/skills/` (not the repo-wired `.claude/skills/`)
+  the gitignored `.nucleus/.claude/skills/` (not the repo-wired
+  `.claude/skills/`; see ADR-032)
 - Anything that would be regrettable in public `git blame` (this repo is
   public)
 
@@ -38,7 +39,7 @@ one per line, whole-word matched. Never put a real value in the committed
 | `.env.example` | Obviously-fake placeholders (`5511999999999`, `you@example.com`), never real values |
 | ADR / docs | Refer by role ("the trash account", `$NUCLEUS_PERSONAL_EMAIL`), never the literal — including any external party (name them by role, not literally) |
 | Test data | Synthetic values, not redacted real values |
-| A tool/skill that integrates a specific external product | It's operator-personal → `~/.claude/skills/` + `.env`, never committed under `tools/`/`core/`/`chores/` |
+| A tool/skill that integrates a specific external product | It's operator-personal → `.nucleus/.claude/skills/` + `.env`, never committed under `tools/`/`core/`/`chores/` |
 | A sensitive literal that isn't an `.env` value | Add it to the gitignored `.claude/secret-strings` denylist so the guard catches it |
 
 ## Enforcement layers
@@ -46,9 +47,11 @@ one per line, whole-word matched. Never put a real value in the committed
 All three call `tools/check-secrets.sh`, which scans for **four** things:
 `.env` values (substring), the gitignored `.claude/secret-strings` denylist
 (whole-word), generic PII heuristics (emails / JIDs / phones / home paths),
-and operator-personal-skill names (`~/.claude/skills/` minus the repo-wired
-`.claude/skills/`). Add an env var or a denylist line → all three call sites
-cover it without code changes.
+and operator-personal-skill names (`.nucleus/.claude/skills/` plus
+`~/.claude/skills/`, minus the repo-wired `.claude/skills/`). It also rejects
+any staged path under `.nucleus/`; a pre-push hook repeats that path check.
+Add an env var or a denylist line → all three call sites cover it without
+code changes.
 
 | Layer | Where | Fires on |
 |---|---|---|

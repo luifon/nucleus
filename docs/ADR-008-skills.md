@@ -1,6 +1,6 @@
 # ADR-008 — Skills: procedural memory via Claude Code's native skill mechanism
 
-**Status:** Accepted (2026-05-16) — Implemented (2026-05-18)
+**Status:** Accepted (2026-05-16) — Implemented (2026-05-18) — Superseded in part by ADR-032 (2026-09-23): operator-personal skill location
 
 ## Context
 
@@ -20,11 +20,20 @@ The reminders subsystem (ADR-006) is extended with a `system_prompt` column so r
 
 ## Storage locations
 
+> **Superseded in part by ADR-032 (2026-09-23).** Operator-personal skills
+> moved from `~/.claude/skills/` to the gitignored
+> `<repo>/.nucleus/.claude/skills/`, loaded into Nucleus sessions through
+> `--add-dir`. `~/.claude/skills/` is loaded in every project on the machine,
+> which listed Nucleus routines in unrelated work. The audience split below
+> still holds; only the operator path changed. Later mentions of
+> `~/.claude/skills/` in this ADR describe the original (pre-ADR-032)
+> location unless marked otherwise.
+
 Two locations, chosen by **audience**, not by sensitivity:
 
 | Path | Audience | Committed? |
 |---|---|---|
-| `~/.claude/skills/<name>/SKILL.md` | Skills for *using* Nucleus — anything the assistant does on the operator's behalf (recurring fetches, daily preps, weekly reviews). Default for new skills. | No (user-global) |
+| `.nucleus/.claude/skills/<name>/SKILL.md` (originally `~/.claude/skills/<name>/SKILL.md`; ADR-032) | Skills for *using* Nucleus — anything the assistant does on the operator's behalf (recurring fetches, daily preps, weekly reviews). Default for new skills. | No (gitignored, local nested git repo; originally user-global) |
 | `.claude/skills/<name>/SKILL.md` | Skills for *working on* Nucleus — debug helpers, replay tools, dev workflows. | Yes (in-repo) |
 
 The dimension is "who's the audience": operator vs. developer. Sensitivity falls out of that — operator skills are inherently personal (they reveal the operator's routines, tools, contacts), developer skills are inherently generic (any contributor could use them).
@@ -37,11 +46,11 @@ A skill body can use Claude Code's `` !`shell-command` `` syntax to resolve iden
 Open !`echo $EXTERNAL_TOOL_URL` and navigate to the $workspace board.
 ```
 
-This makes it possible to commit a skill's *structure* while keeping the identifying URL in `.env`. **It does not make it OK to commit a skill whose structure itself reveals routine** (workspace names, meeting times, third-party tool affiliation). When in doubt, default to `~/.claude/skills/`.
+This makes it possible to commit a skill's *structure* while keeping the identifying URL in `.env`. **It does not make it OK to commit a skill whose structure itself reveals routine** (workspace names, meeting times, third-party tool affiliation). When in doubt, default to the operator-personal tree (`.nucleus/.claude/skills/` since ADR-032).
 
 ### Why not `$NUCLEUS_TIER2_DIR/skills/`?
 
-An earlier design proposed storing skills in T2 (`~/.claude/projects/<encoded-cwd>/memory/skills/`). Dropped: that location isn't recognized by Claude Code's native skill loader. We'd reinvent loading, discovery, slash invocation, the `!`cmd`` substitution, and the auto-load-on-keyword behavior. Using `~/.claude/skills/` cedes one dimension (Nucleus-scoping) to gain all of Claude Code's plumbing for free.
+An earlier design proposed storing skills in T2 (`~/.claude/projects/<encoded-cwd>/memory/skills/`). Dropped: that location isn't recognized by Claude Code's native skill loader. We'd reinvent loading, discovery, slash invocation, the `!`cmd`` substitution, and the auto-load-on-keyword behavior. Using `~/.claude/skills/` cedes one dimension (Nucleus-scoping) to gain all of Claude Code's plumbing for free. ADR-032 later recovered Nucleus-scoping without losing the native loader, by passing a gitignored in-repo directory to `--add-dir`.
 
 ## Skill file format
 
@@ -107,11 +116,11 @@ The bot should **not** author a skill in one shot. Too many wrong turns get bake
 
 1. **Explore interactively.** Open a Claude Code session, walk the surface together (Playwright MCP, the external tool, whatever's involved). Try the workflow. Hit failures, work around them.
 2. **Capture what worked.** When the operator says "this is the flow," summarize: trigger, steps, observed failure modes.
-3. **Formalize with skill-creator.** Invoke `/skill-creator create`, give it the summary, let it scaffold `SKILL.md` in the correct location (default: `~/.claude/skills/<name>/`).
+3. **Formalize with skill-creator.** Invoke `/skill-creator create`, give it the summary, let it scaffold `SKILL.md` in the correct location (default: `.nucleus/.claude/skills/<name>/` since ADR-032; originally `~/.claude/skills/<name>/`).
 4. **Test from a fresh session.** Close the exploratory session. Open a new one. Trigger the skill (manually or via reminder). Verify it executes correctly.
 5. **Iterate.** `/skill-creator improve` after observing real fires.
 
-Authoring sensitive flows (operator routines, third-party tools): always end up in `~/.claude/skills/`. The skill-creator plugin doesn't know our policy — the operator is responsible for the choice. ADR-010 (future) may automate this.
+Authoring sensitive flows (operator routines, third-party tools): always end up in the operator-personal tree (`.nucleus/.claude/skills/` since ADR-032). The skill-creator plugin doesn't know our policy — the operator is responsible for the choice. ADR-010 (future) may automate this.
 
 ## Reminders extension
 
@@ -184,8 +193,8 @@ Phase 1 alone delivers the recurring-flow value. Phase 2 closes the Hermes-style
 - Add `procedure` to `diary::Tag` (alongside `observation`, `decision`)
 - A bot that resolves a non-trivial situation appends a procedure entry: *"When I needed X, Y worked. Z failed first."*
 - Hourly metabolism reads by tag (existing infrastructure, ADR-004)
-- Weekly contemplation promotes entries with recurrence ≥2 to `~/.claude/skills/<slug>/SKILL.md` with `flavor: learned`
-- The distiller is responsible for placing learned skills in the operator's user-global tree (not the project tree) — the safe default
+- Weekly contemplation promotes entries with recurrence ≥2 to `~/.claude/skills/<slug>/SKILL.md` with `flavor: learned` (as built by ADR-017, learned skills go to `.nucleus/.claude/skills/` since ADR-032)
+- The distiller is responsible for placing learned skills in the operator's personal tree (not the committed project tree) — the safe default
 
 Phase 2 isn't a blocker. The schema and frontmatter are forward-compatible.
 
@@ -194,7 +203,7 @@ Phase 2 isn't a blocker. The schema and frontmatter are forward-compatible.
 Weekly contemplation gains skill-maintenance routes, reusing the existing PROMOTE / MERGE / ARCHIVE vocabulary from ADR-004:
 
 - **ARCHIVE** — `last_used > 60 days`. Move the directory out of the `skills/` tree entirely:
-  - `~/.claude/skills/<name>/` → `~/.claude/archive/skills/<name>/`
+  - `~/.claude/skills/<name>/` → `~/.claude/archive/skills/<name>/` (pre-ADR-032 location; the ADR-017 curator archives to `.archive/` inside the operator tree)
   - `.claude/skills/<name>/` → `.claude/archive/skills/<name>/`
   - Claude Code's recursive auto-discovery includes nested subdirectories within `skills/`, so renaming to `skills/_archive/` would still load them. Moving out of `skills/` is the safe pattern. Restore by moving back.
 - **MERGE** — two skills with ≥80% body overlap. Distiller proposes; operator confirms.
@@ -211,19 +220,19 @@ Weekly contemplation gains skill-maintenance routes, reusing the existing PROMOT
 - **Sharing / marketplace.** No skill export, no community repo. If a skill ever generalizes enough to ship, reimplement it as code (a CLI subcommand, a persona instruction, a bot feature). The friction is intentional.
 - **Skill-calls-skill.** A SKILL.md body shouldn't `/invoke` another skill. Composition happens at the reminder layer (multi-skill `--system-prompt`), not inside a skill.
 - **Formal typed parameters.** Claude Code's `arguments:` frontmatter handles positional args; most skills will be parameterless. Don't build a parameter DSL.
-- **Skill versioning.** `~/.claude/skills/` lives in the user's home directory and is backed up however the operator backs up `~/.claude/` generally (today: not formalized). If a skill regresses, restore from backup or recreate.
+- **Skill versioning.** `~/.claude/skills/` lives in the user's home directory and is backed up however the operator backs up `~/.claude/` generally (today: not formalized). If a skill regresses, restore from backup or recreate. (Since ADR-032, `.nucleus/` is a local nested git repository, which gives operator skills a history. It has no remote.)
 
 ## Migration / rollout
 
 Greenfield. No existing skills to migrate. Steps:
 
 1. Add `skill-creator` plugin to `.claude/settings.json` (committed). Document install in README.
-2. Create `~/.claude/skills/` and `.claude/skills/` (the latter empty in the initial commit, with a `.gitkeep`).
+2. Create `~/.claude/skills/` and `.claude/skills/` (the latter empty in the initial commit, with a `.gitkeep`). (ADR-032 replaced the first with `.nucleus/.claude/skills/`.)
 3. Apply the `reminders.system_prompt` schema migration on next `reminders` binary startup (`ALTER TABLE ... IF NOT EXISTS` pattern, like ADR-006 did for other columns).
 4. Add `--system-prompt` flag to `reminders add`, with mutual-exclusion validation against `--body`.
 5. Update `nucleus_core::claude_session::Session` reminders path to spawn with `--append-system-prompt` when the reminder has a `system_prompt`.
 6. Add `reminders.default_channels` to `nucleus.toml.example`.
-7. Author the first real skill via skill-creator → `~/.claude/skills/<name>/`. Use it for at least a week before formalizing Phase 2.
+7. Author the first real skill via skill-creator → `~/.claude/skills/<name>/` (`.nucleus/.claude/skills/<name>/` since ADR-032). Use it for at least a week before formalizing Phase 2.
 
 ## Future work
 
@@ -298,7 +307,8 @@ text above. Recording them here so the next reader has the ground truth:
 - ADR-004 — diary, distillation, PROMOTE/MERGE/ARCHIVE vocabulary
 - ADR-006 — reminders schema, ticker, channel infrastructure
 - CLAUDE.md Rule 1 — secrets stay in `.env`, applies to skill bodies
-- CLAUDE.md Rule 2 — personal state stays uncommitted, applies to `~/.claude/skills/` choice
+- CLAUDE.md Rule 2 — personal state stays uncommitted, applies to the operator-personal tree choice
+- ADR-032 — operator-personal skills moved to the gitignored `.nucleus/.claude/skills/`, loaded via `--add-dir`
 - CLAUDE.md Rule 10 — reminders CLI usage, extended here
 - Claude Code skills docs — https://code.claude.com/docs/en/skills.md
 - skill-creator plugin — https://claude.com/plugins/skill-creator

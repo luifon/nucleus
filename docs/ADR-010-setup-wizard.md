@@ -232,7 +232,7 @@ asks rather than skipping:
 ```
 ? Want to scaffold an initial skill? (y/N) ›
 ? Personal (uses Nucleus) or developer (works on Nucleus)?
-    > Personal — lives in ~/.claude/skills/, not committed
+    > Personal — lives in .nucleus/.claude/skills/, not committed (ADR-032)
       Developer — lives in .claude/skills/, committed
 ? Skill name › morning-review
 [ wizard invokes /skill-creator create with the right location ]
