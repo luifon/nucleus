@@ -261,8 +261,10 @@ evaluated in `NUCLEUS_TZ`:
 ```
 
 `--at` and `--cron` are mutually exclusive. `--at` accepts RFC3339 with
-offset (e.g. `2026-05-14T16:45:00-03:00`) or a naive local timestamp
-that's interpreted in `NUCLEUS_TZ`. You're responsible for converting
+offset (e.g. `2026-05-14T16:45:00-03:00`), a naive local timestamp
+that's interpreted in `NUCLEUS_TZ`, or `now` (due at the next tick). The
+DB is always `$NUCLEUS_WORKSPACE_ROOT/memory/reminders.db`, whatever the
+shell's current directory is. You're responsible for converting
 natural language to ISO — read `$NUCLEUS_TZ` (or `/etc/localtime` if
 unset) to resolve the offset, and resolve relative phrases ("tomorrow",
 "in N hours") against *now*, not session start.

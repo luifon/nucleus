@@ -1334,12 +1334,21 @@ pub async fn enqueue_whatsapp(
     Ok(row.0)
 }
 
-/// Parse an `--at` RFC3339 string into a `DateTime<Tz>` localized to
-/// the operator's timezone. Accepts either offset-aware input ("…+00:00")
-/// or a naive local timestamp ("2026-05-15T16:45:00") interpreted as
-/// `NUCLEUS_TZ` for ergonomics.
+/// Parse an `--at` string into a `DateTime<Tz>` localized to the
+/// operator's timezone. Accepts `now` (case-insensitive: the current time,
+/// so the reminder is due at the next tick), offset-aware RFC3339
+/// ("…+00:00"), or a naive local timestamp ("2026-05-15T16:45:00")
+/// interpreted as `NUCLEUS_TZ` for ergonomics.
 pub fn parse_at(at: &str) -> Result<DateTime<Tz>> {
+    parse_at_with_now(at, Utc::now())
+}
+
+/// [`parse_at`] with the current time passed in, so `now` is testable.
+pub fn parse_at_with_now(at: &str, now: DateTime<Utc>) -> Result<DateTime<Tz>> {
     let tz = nucleus_tz();
+    if at.trim().eq_ignore_ascii_case("now") {
+        return Ok(now.with_timezone(&tz));
+    }
     if let Ok(d) = DateTime::parse_from_rfc3339(at) {
         return Ok(d.with_timezone(&tz));
     }
@@ -1350,7 +1359,7 @@ pub fn parse_at(at: &str) -> Result<DateTime<Tz>> {
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M"))
         .map_err(|_| {
             anyhow!(
-                "--at must be RFC3339 with offset (e.g. 2026-05-14T16:45:00-03:00) or local ISO without offset"
+                "--at must be `now`, RFC3339 with offset (e.g. 2026-05-14T16:45:00-03:00), or local ISO without offset"
             )
         })?;
     let local = tz
@@ -1434,5 +1443,45 @@ mod seed_tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].title.as_deref(), Some("heartbeat"));
         assert!(all[0].daily_session);
+    }
+}
+
+#[cfg(test)]
+mod parse_at_tests {
+    use super::*;
+
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-05-14T19:45:30Z").unwrap().with_timezone(&Utc)
+    }
+
+    /// `now` in any case resolves to the given current time, so the one-shot
+    /// is due at the next tick.
+    #[test]
+    fn now_is_the_current_time() {
+        for s in ["now", "NOW", "Now", " now "] {
+            let at = parse_at_with_now(s, fixed_now()).unwrap();
+            assert_eq!(at.with_timezone(&Utc), fixed_now(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn rfc3339_still_parses() {
+        let at = parse_at_with_now("2026-05-14T16:45:00-03:00", fixed_now()).unwrap();
+        assert_eq!(at.with_timezone(&Utc).to_rfc3339(), "2026-05-14T19:45:00+00:00");
+    }
+
+    #[test]
+    fn naive_local_still_parses_and_garbage_is_rejected() {
+        let tz = nucleus_tz();
+        let at = parse_at_with_now("2026-05-14T16:45", fixed_now()).unwrap();
+        let expected = tz
+            .from_local_datetime(
+                &chrono::NaiveDateTime::parse_from_str("2026-05-14T16:45", "%Y-%m-%dT%H:%M").unwrap(),
+            )
+            .single()
+            .unwrap();
+        assert_eq!(at, expected);
+        assert!(parse_at_with_now("nowish", fixed_now()).is_err());
+        assert!(parse_at_with_now("tomorrow", fixed_now()).is_err());
     }
 }
