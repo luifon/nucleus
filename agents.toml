@@ -112,7 +112,8 @@ tmux_session  = "nucleus-skill-gap-learner"
 # ADR-017: all-facets successor to the sunset preference-learner. The periodic
 # `learn` pass (this entry) proposes missing skills across diaries + curates
 # the library; the on-the-fly arm is the `skill_review` capability on the
-# conversational agents below. Writes to ~/.claude/skills (operator-personal).
+# conversational agents below. Writes to .nucleus/.claude/skills under the
+# workspace root (operator-personal, gitignored).
 schedule      = "30 4 * * *"
 log_path      = "memory/skill-gap-learner.log"
 diary_key     = "skill-gap-learner"

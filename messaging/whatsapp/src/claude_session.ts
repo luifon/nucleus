@@ -7,7 +7,7 @@
 import { spawn, exec } from "node:child_process";
 import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -694,6 +694,32 @@ export function classifyInfraReply(reply: string): InfraError | null {
   return null;
 }
 
+/** Directory holding the operator-private skill tree
+ *  (`<dir>/.claude/skills/<name>/`). Gitignored; Claude Code only loads
+ *  skills from it when the dir is passed with `--add-dir`. */
+export const PRIVATE_SKILLS_DIR = ".nucleus";
+
+/** The `--add-dir` list for a spawn: the caller's `addDirs`, then
+ *  `<workspaceRoot>/.nucleus` when that directory exists and is not already
+ *  listed. Mirrors core's `build_claude_args`. */
+export function addDirsWithPrivateSkills(
+  workspaceRoot: string,
+  addDirs: readonly string[] | undefined,
+): string[] {
+  const dirs = [...(addDirs ?? [])];
+  const privateDir = path.join(workspaceRoot, PRIVATE_SKILLS_DIR);
+  const resolved = path.resolve(privateDir);
+  if (dirs.some((d) => path.resolve(d) === resolved)) return dirs;
+  let isDir = false;
+  try {
+    isDir = statSync(privateDir).isDirectory();
+  } catch {
+    isDir = false;
+  }
+  if (isDir) dirs.push(privateDir);
+  return dirs;
+}
+
 /** Create one tmux window running claude, dismiss the trust prompt, wait for
  *  the TUI, and check for a fatal model-unavailable banner. Returns the
  *  window target, or null if the model is unavailable (window killed so the
@@ -715,7 +741,9 @@ async function launchWindow(
   if (modelOverride) args.push("--model", modelOverride);
   if (opts.permissionMode) args.push("--permission-mode", opts.permissionMode);
   if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
-  for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
+  for (const d of addDirsWithPrivateSkills(opts.workspaceRoot, opts.addDirs)) {
+    args.push("--add-dir", d);
+  }
   if (opts.disallowedTools?.length) {
     args.push("--disallowed-tools", opts.disallowedTools.join(" "));
   }

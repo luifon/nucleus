@@ -84,3 +84,6 @@ design-mocks/
 core/bindings/
 chores/reminders/bindings/
 nucleus-dashboard/api/bindings/
+
+# Operator-private tree (ADR-032): private skills, loaded via --add-dir .nucleus
+/.nucleus

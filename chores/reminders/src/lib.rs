@@ -600,14 +600,14 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
             // tick costs a whole day's fire — that is how a 2026-08-24 daily
             // nudge went missing. A watcher is a cheap subprocess; running it
             // twice is far cheaper than losing the delivery.
-            let mut eval = eval_condition(&cmd, timeout_secs).await;
+            let mut eval = eval_condition(workspace_root, &cmd, timeout_secs).await;
             if let Err(e) = &eval {
                 tracing::warn!(
                     id = reminder.id,
                     err = %format!("{e:#}"),
                     "condition watcher failed; retrying once"
                 );
-                eval = eval_condition(&cmd, timeout_secs).await;
+                eval = eval_condition(workspace_root, &cmd, timeout_secs).await;
             }
             match eval {
                 Ok(eval) => {
@@ -854,11 +854,11 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                     // place of a bare alert. A skill-fire usually formats and
                     // annotates content that a plain script already produces,
                     // so a dead session should cost the polish, not the
-                    // message (2026-08-28: a day of daily-report preps was lost while
+                    // message (2026-08-28: a day of scheduled reports was lost while
                     // the data script kept working).
                     let giving_up = channels.iter().any(|c| alert_on_this_attempt(c.attempts));
                     let fallback = if giving_up {
-                        let f = run_fallback(reminder.fallback_cmd.as_deref()).await;
+                        let f = run_fallback(workspace_root, reminder.fallback_cmd.as_deref()).await;
                         match &f {
                             Some(c) => tracing::info!(
                                 id = reminder.id,
@@ -1435,7 +1435,7 @@ const DEFAULT_CONDITION_TIMEOUT_SECS: u64 = 15;
 ///
 /// Without this split a watcher whose script was deleted, whose auth
 /// expired, or that crashed reads as a plain "false" and the reminder skips
-/// its occurrence in silence. That is how the daily nudge vanished on
+/// its occurrence in silence. That is how a daily nudge vanished on
 /// 2026-08-28: the skill directory had been moved, node exited 1 with a
 /// stack trace on stderr, and the tick gated as if nothing were due.
 fn watcher_is_broken(code: Option<i32>, stderr: &str) -> bool {
@@ -1446,18 +1446,28 @@ fn watcher_is_broken(code: Option<i32>, stderr: &str) -> bool {
     !stderr.trim().is_empty()
 }
 
+/// `sh -c <cmd>` for an operator-authored reminder command (condition
+/// watcher or fallback). Sets `NUCLEUS_WORKSPACE_ROOT` explicitly to the
+/// workspace root the tick itself uses (its DB, lock file and sessions), so
+/// commands that reference `$NUCLEUS_WORKSPACE_ROOT/.nucleus/.claude/skills/...`
+/// resolve against the same root as the rest of the tick.
+fn reminder_shell(cmd: &str, workspace_root: &Path) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new("sh");
+    c.arg("-c")
+        .arg(cmd)
+        .env("NUCLEUS_WORKSPACE_ROOT", workspace_root)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    c
+}
+
 /// Run a condition watcher command (sh -c, hard timeout). Exit 0 = truthy.
 /// Spawn failure, timeout, and a broken watch are all Err — distinct from a
 /// false condition, which is a silent non-zero exit.
-async fn eval_condition(cmd: &str, timeout_secs: u64) -> Result<CondEval> {
+async fn eval_condition(workspace_root: &Path, cmd: &str, timeout_secs: u64) -> Result<CondEval> {
     let out = tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+        reminder_shell(cmd, workspace_root).output(),
     )
     .await
     .map_err(|_| anyhow!("timed out after {timeout_secs}s"))?
@@ -1534,19 +1544,14 @@ const FALLBACK_TIMEOUT_SECS: u64 = 90;
 /// `None` when there is no command, it fails, times out, or prints nothing —
 /// in every one of those cases the caller falls back to the plain failure
 /// alert, so a broken fallback can never silence the alert it replaces.
-async fn run_fallback(cmd: Option<&str>) -> Option<String> {
+async fn run_fallback(workspace_root: &Path, cmd: Option<&str>) -> Option<String> {
     let cmd = cmd?;
     if cmd.trim().is_empty() {
         return None;
     }
     let out = tokio::time::timeout(
         Duration::from_secs(FALLBACK_TIMEOUT_SECS),
-        tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+        reminder_shell(cmd, workspace_root).output(),
     )
     .await;
     let out = match out {
@@ -1621,7 +1626,8 @@ mod alert_cooldown_tests {
 
 #[cfg(test)]
 mod condition_tests {
-    use super::{DEFAULT_CONDITION_TIMEOUT_SECS, condition_should_fire, eval_condition};
+    use super::{DEFAULT_CONDITION_TIMEOUT_SECS, condition_should_fire, eval_condition, run_fallback};
+    use std::path::Path;
 
     /// A false condition never fires, in any mode, whatever the history.
     #[test]
@@ -1653,18 +1659,34 @@ mod condition_tests {
         assert!(!condition_should_fire(Some("change"), true, Some(true)));
     }
 
+    fn ws() -> &'static Path {
+        Path::new("/nucleus-test-ws")
+    }
+
+    /// Watchers reference skill scripts as
+    /// `$NUCLEUS_WORKSPACE_ROOT/.nucleus/.claude/skills/...`; the variable
+    /// is the workspace root passed in, not whatever the process inherited.
+    #[tokio::test]
+    async fn reminder_commands_see_the_given_workspace_root() {
+        let t = DEFAULT_CONDITION_TIMEOUT_SECS;
+        let check = r#"test "$NUCLEUS_WORKSPACE_ROOT" = /nucleus-test-ws"#;
+        assert!(eval_condition(ws(), check, t).await.unwrap().truthy);
+        let out = run_fallback(ws(), Some(r#"printf %s "$NUCLEUS_WORKSPACE_ROOT""#)).await;
+        assert_eq!(out.as_deref(), Some("/nucleus-test-ws"));
+    }
+
     #[tokio::test]
     async fn eval_condition_truthiness_and_context() {
         let t = DEFAULT_CONDITION_TIMEOUT_SECS;
-        assert!(eval_condition("true", t).await.unwrap().truthy);
-        assert!(!eval_condition("false", t).await.unwrap().truthy);
+        assert!(eval_condition(ws(), "true", t).await.unwrap().truthy);
+        assert!(!eval_condition(ws(), "false", t).await.unwrap().truthy);
         // context comes only from valid JSON stdout on truthy exits
-        let e = eval_condition(r#"echo '{"context":"queue depth 14"}'"#, t).await.unwrap();
+        let e = eval_condition(ws(), r#"echo '{"context":"queue depth 14"}'"#, t).await.unwrap();
         assert_eq!(e.context.as_deref(), Some("queue depth 14"));
-        let e = eval_condition("echo not-json", t).await.unwrap();
+        let e = eval_condition(ws(), "echo not-json", t).await.unwrap();
         assert!(e.truthy && e.context.is_none());
         // a hung watcher is an Err (broken watch), not a false condition
-        assert!(eval_condition("sleep 10", 1).await.is_err());
+        assert!(eval_condition(ws(), "sleep 10", 1).await.is_err());
     }
 
     /// A watcher that means FALSE exits non-zero and says nothing. One that
@@ -1675,17 +1697,17 @@ mod condition_tests {
     async fn broken_watcher_is_not_a_false_condition() {
         let t = DEFAULT_CONDITION_TIMEOUT_SECS;
         // Silent non-zero = a real "do not fire".
-        assert!(!eval_condition("exit 1", t).await.unwrap().truthy);
-        assert!(!eval_condition("test -f /nope/definitely/missing", t).await.unwrap().truthy);
+        assert!(!eval_condition(ws(), "exit 1", t).await.unwrap().truthy);
+        assert!(!eval_condition(ws(), "test -f /nope/definitely/missing", t).await.unwrap().truthy);
         // Noisy non-zero = broken watch.
-        assert!(eval_condition("echo boom >&2; exit 1", t).await.is_err());
+        assert!(eval_condition(ws(), "echo boom >&2; exit 1", t).await.is_err());
         // Missing interpreter or script: the shell reports 127.
-        assert!(eval_condition("definitely-not-a-real-binary-xyz", t).await.is_err());
+        assert!(eval_condition(ws(), "definitely-not-a-real-binary-xyz", t).await.is_err());
         // A node script that does not exist exits 1 with a stack trace —
-        // the exact shape that silently killed the daily nudge.
-        assert!(eval_condition("node /nope/missing.mjs", t).await.is_err());
+        // the exact shape that silently killed a daily nudge.
+        assert!(eval_condition(ws(), "node /nope/missing.mjs", t).await.is_err());
         // Success still parses its context.
-        let ok = eval_condition(r#"echo '{"context":"tudo certo"}'"#, t).await.unwrap();
+        let ok = eval_condition(ws(), r#"echo '{"context":"tudo certo"}'"#, t).await.unwrap();
         assert!(ok.truthy);
         assert_eq!(ok.context.as_deref(), Some("tudo certo"));
     }
@@ -1697,7 +1719,7 @@ mod condition_tests {
     async fn default_condition_timeout_clears_a_slow_watcher() {
         assert!(DEFAULT_CONDITION_TIMEOUT_SECS >= 15);
         assert!(
-            eval_condition("sleep 4 && true", DEFAULT_CONDITION_TIMEOUT_SECS)
+            eval_condition(ws(), "sleep 4 && true", DEFAULT_CONDITION_TIMEOUT_SECS)
                 .await
                 .unwrap()
                 .truthy
@@ -1708,12 +1730,17 @@ mod condition_tests {
 #[cfg(test)]
 mod fallback_tests {
     use super::run_fallback;
+    use std::path::Path;
+
+    fn ws() -> &'static Path {
+        Path::new("/nucleus-test-ws")
+    }
 
     /// A working fallback yields its stdout, so the operator gets the content
     /// instead of a bare failure alert.
     #[tokio::test]
     async fn stdout_becomes_the_message() {
-        let out = run_fallback(Some("printf 'report line one\nline two'")).await;
+        let out = run_fallback(ws(), Some("printf 'report line one\nline two'")).await;
         assert_eq!(out.as_deref(), Some("report line one\nline two"));
     }
 
@@ -1721,12 +1748,12 @@ mod fallback_tests {
     /// alert. A broken fallback must never silence the failure it replaces.
     #[tokio::test]
     async fn broken_fallbacks_never_swallow_the_alert() {
-        assert_eq!(run_fallback(None).await, None);
-        assert_eq!(run_fallback(Some("   ")).await, None);
-        assert_eq!(run_fallback(Some("exit 1")).await, None, "non-zero exit");
-        assert_eq!(run_fallback(Some("true")).await, None, "empty stdout");
+        assert_eq!(run_fallback(ws(), None).await, None);
+        assert_eq!(run_fallback(ws(), Some("   ")).await, None);
+        assert_eq!(run_fallback(ws(), Some("exit 1")).await, None, "non-zero exit");
+        assert_eq!(run_fallback(ws(), Some("true")).await, None, "empty stdout");
         assert_eq!(
-            run_fallback(Some("definitely-not-a-real-binary-xyz")).await,
+            run_fallback(ws(), Some("definitely-not-a-real-binary-xyz")).await,
             None,
             "missing binary"
         );

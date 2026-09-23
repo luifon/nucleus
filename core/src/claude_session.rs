@@ -1397,6 +1397,15 @@ fn build_claude_args(
         args.push("--add-dir".into());
         args.push(dir.to_string_lossy().into_owned());
     }
+    // Operator-private skills live in `<workspace>/.nucleus/.claude/skills`;
+    // Claude Code loads `.claude/skills/` from every `--add-dir` directory, so
+    // every Nucleus session (fresh and `--resume` alike) gets `.nucleus`
+    // added. Skipped when the directory is absent (fresh clone) or already
+    // listed explicitly.
+    if let Some(private) = private_add_dir(opts) {
+        args.push("--add-dir".into());
+        args.push(private.to_string_lossy().into_owned());
+    }
     if !opts.disallowed_tools.is_empty() {
         args.push("--disallowed-tools".into());
         args.push(opts.disallowed_tools.join(" "));
@@ -1406,6 +1415,21 @@ fn build_claude_args(
         args.push(opts.allowed_tools.join(" "));
     }
     args
+}
+
+/// `<workspace>/.nucleus` when it exists and `opts.add_dirs` does not already
+/// name it (compared after canonicalization, so `./.nucleus` and an absolute
+/// path to the same directory count as one).
+fn private_add_dir(opts: &SpawnOptions) -> Option<PathBuf> {
+    let private = crate::skills::private_dir(&opts.workspace_root);
+    if !private.is_dir() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(&private).unwrap_or_else(|_| private.clone());
+    let already_listed = opts.add_dirs.iter().any(|d| {
+        d == &private || std::fs::canonicalize(d).map(|c| c == canonical).unwrap_or(false)
+    });
+    (!already_listed).then_some(private)
 }
 
 fn transcript_path_for(workspace_root: &Path, session_id: &str) -> PathBuf {
@@ -2448,6 +2472,63 @@ fn with_date_preamble(message: &str) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn args_test_opts(workspace_root: &Path, add_dirs: Vec<PathBuf>) -> SpawnOptions {
+        SpawnOptions {
+            workspace_root: workspace_root.to_path_buf(),
+            append_system_prompt: None,
+            permission_mode: None,
+            disallowed_tools: vec![],
+            allowed_tools: vec![],
+            add_dirs,
+            tmux_session: "test".into(),
+            window_name: None,
+            ready_timeout: Duration::from_secs(1),
+            resume_session_id: None,
+            agent_label: None,
+        }
+    }
+
+    fn add_dir_values(args: &[String]) -> Vec<String> {
+        args.windows(2).filter(|w| w[0] == "--add-dir").map(|w| w[1].clone()).collect()
+    }
+
+    #[test]
+    fn private_dir_is_added_when_present() {
+        let ws = tempfile::tempdir().unwrap();
+        let private = crate::skills::private_dir(ws.path());
+        std::fs::create_dir_all(&private).unwrap();
+        let extra = ws.path().join("extra");
+        let opts = args_test_opts(ws.path(), vec![extra.clone()]);
+        for resuming in [false, true] {
+            let args = build_claude_args("sid", resuming, &opts, None);
+            assert_eq!(
+                add_dir_values(&args),
+                vec![extra.to_string_lossy().into_owned(), private.to_string_lossy().into_owned()],
+                "resuming={resuming}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_dir_is_not_duplicated_when_already_listed() {
+        let ws = tempfile::tempdir().unwrap();
+        let private = crate::skills::private_dir(ws.path());
+        std::fs::create_dir_all(&private).unwrap();
+        // Same directory, spelled differently (non-canonical form).
+        let spelled = ws.path().join(".").join(crate::skills::PRIVATE_DIR);
+        let opts = args_test_opts(ws.path(), vec![spelled.clone()]);
+        let args = build_claude_args("sid", false, &opts, None);
+        assert_eq!(add_dir_values(&args), vec![spelled.to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn private_dir_is_skipped_when_absent() {
+        let ws = tempfile::tempdir().unwrap();
+        let opts = args_test_opts(ws.path(), vec![]);
+        let args = build_claude_args("sid", false, &opts, None);
+        assert!(add_dir_values(&args).is_empty(), "{args:?}");
+    }
 
     #[test]
     fn pane_model_error_detection() {

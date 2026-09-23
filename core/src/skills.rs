@@ -5,16 +5,43 @@
 //! (read + write + validate) so both judge skills identically. Mirrors the
 //! lib+bin sharing the reminders crate does.
 //!
-//! Two storage trees per ADR-008:
-//!   - `~/.claude/skills/<name>/SKILL.md`   — operator-personal (gitignored)
-//!   - `<repo>/.claude/skills/<name>/SKILL.md` — committed
+//! Two storage trees, both under the workspace root:
+//!   - `<workspace>/.nucleus/.claude/skills/<name>/SKILL.md` — operator-personal
+//!     (tier "personal"; `.nucleus/` is gitignored)
+//!   - `<workspace>/.claude/skills/<name>/SKILL.md` — committed (tier "repo")
 //!
-//! The learner only ever *writes* to the operator-personal tree (Rule 1).
+//! Claude Code loads `.claude/skills/` from every `--add-dir` directory, so
+//! every Nucleus-spawned session gets `--add-dir <workspace>/.nucleus`
+//! (see `claude_session::build_claude_args`). The paths are defined only by
+//! the functions below. The learner only ever *writes* to the
+//! operator-personal tree (Rule 1).
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const SKILL_FILE: &str = "SKILL.md";
+
+/// Gitignored operator-private directory under the workspace root. Passed to
+/// every Nucleus-spawned session as `--add-dir`, so its `.claude/skills/`
+/// tree loads alongside the repo's.
+pub const PRIVATE_DIR: &str = ".nucleus";
+
+/// `<workspace_root>/.nucleus` — the operator-private directory.
+pub fn private_dir(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(PRIVATE_DIR)
+}
+
+/// `<workspace_root>/.nucleus/.claude/skills` — the operator-personal skills
+/// tree (tier "personal"). The learner writes here, and its `.archive/` and
+/// `.rejected/` sub-directories live here.
+pub fn personal_skills_root(workspace_root: &Path) -> PathBuf {
+    private_dir(workspace_root).join(".claude").join("skills")
+}
+
+/// `<workspace_root>/.claude/skills` — the committed skills tree (tier "repo").
+pub fn repo_skills_root(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".claude").join("skills")
+}
 
 /// A parsed skill, ready for the dashboard API or the learner's library view.
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
@@ -23,7 +50,8 @@ pub struct Skill {
     /// Frontmatter `name`, falling back to the directory name (CC convention).
     pub name: String,
     pub description: String,
-    /// "personal" (`~/.claude/skills`) or "repo" (`.claude/skills`).
+    /// "personal" (`.nucleus/.claude/skills`, gitignored) or "repo"
+    /// (`.claude/skills`, committed). Both relative to the workspace root.
     pub tier: String,
     /// Absolute path to the SKILL.md file.
     pub path: String,
@@ -238,12 +266,12 @@ pub fn validate(content: &str) -> Vec<String> {
     issues
 }
 
-/// Default skills roots: operator-personal first (where the learner writes),
-/// then the repo-committed tree. `home` and `workspace_root` resolved by caller.
-pub fn default_roots(home: &Path, workspace_root: &Path) -> Vec<(PathBuf, &'static str)> {
+/// Skills roots with their tier labels: operator-personal first (where the
+/// learner writes), then the repo-committed tree.
+pub fn default_roots(workspace_root: &Path) -> Vec<(PathBuf, &'static str)> {
     vec![
-        (home.join(".claude/skills"), "personal"),
-        (workspace_root.join(".claude/skills"), "repo"),
+        (personal_skills_root(workspace_root), "personal"),
+        (repo_skills_root(workspace_root), "repo"),
     ]
 }
 
@@ -288,6 +316,21 @@ pub fn fire_skill_review(workspace_root: &Path, venue: &str, chat_key: &str, tra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_roots_live_under_the_workspace() {
+        let ws = Path::new("/ws");
+        assert_eq!(private_dir(ws), PathBuf::from("/ws/.nucleus"));
+        assert_eq!(personal_skills_root(ws), PathBuf::from("/ws/.nucleus/.claude/skills"));
+        assert_eq!(repo_skills_root(ws), PathBuf::from("/ws/.claude/skills"));
+        assert_eq!(
+            default_roots(ws),
+            vec![
+                (PathBuf::from("/ws/.nucleus/.claude/skills"), "personal"),
+                (PathBuf::from("/ws/.claude/skills"), "repo"),
+            ]
+        );
+    }
 
     const GOOD: &str = "---\nname: x\ndescription: does a thing\nflavor: learned\ncreated_by: agent\n---\n\n# When to invoke\nwhen y\n\n# Steps\n1. a\n\n# Failure modes\n- boom\n";
 

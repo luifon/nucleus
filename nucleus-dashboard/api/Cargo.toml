@@ -30,3 +30,6 @@ uuid = { workspace = true }
 bollard = { workspace = true }
 reqwest = { workspace = true }
 ts-rs = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

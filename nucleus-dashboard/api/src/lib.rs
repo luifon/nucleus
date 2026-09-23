@@ -162,18 +162,11 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
         }
     }
 
-    // Skills router — walks both skill trees. Operator tier resolves
-    // to $HOME/.claude/skills/; repo tier is relative to the workspace
-    // root. Both tolerated-missing.
-    let operator_skills = std::env::var("HOME")
-        .map(PathBuf::from)
-        .map(|h| h.join(".claude/skills"))
-        .unwrap_or_else(|_| PathBuf::from(".claude/skills"));
-    let repo_skills = workspace_root.join(".claude/skills");
-    let skills_state = Arc::new(handlers::skills::SkillsState {
-        operator_root: operator_skills,
-        repo_root: repo_skills,
-    });
+    // Skills router — walks both skill trees under the workspace root
+    // (`nucleus_core::skills::default_roots`): personal =
+    // `.nucleus/.claude/skills` (gitignored), repo = `.claude/skills`
+    // (committed). Both tolerated-missing.
+    let skills_state = Arc::new(handlers::skills::SkillsState::new(&workspace_root));
     app = app.nest("/skills/api", handlers::skills::router(skills_state));
 
     // Diary router — per ADR-004, every bot writes to

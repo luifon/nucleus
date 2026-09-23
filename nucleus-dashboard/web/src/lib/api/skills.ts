@@ -1,7 +1,8 @@
 // Skills API — operator-personal + repo-committed skill catalogs.
 // Mirrors `nucleus-dashboard/api/src/handlers/skills.rs`. Tiers per
-// ADR-008 storage convention: `personal` lives at ~/.claude/skills/,
-// `repo` lives at .claude/skills/ (committed).
+// ADR-008 storage convention: `personal` lives at .nucleus/.claude/skills/
+// (gitignored, operator-private), `repo` lives at .claude/skills/
+// (committed). Both paths are relative to the repo root.
 // Wire types are ts-rs-generated from the Rust structs (./generated/).
 
 import { jsonGet, qs } from "./client";

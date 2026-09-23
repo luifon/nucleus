@@ -85,7 +85,7 @@ function TierHint({ tier }: { tier: SkillTier }) {
     <p className="mb-4 text-xs leading-relaxed text-[var(--color-nucleus-faint)]">
       {tier === "personal" ? (
         <>
-          Operator-only skills at <code>~/.claude/skills/</code>. Not committed; encode
+          Operator-only skills at <code>.nucleus/.claude/skills/</code>. Gitignored; encode
           your routines, contacts, third-party tools.
         </>
       ) : (
@@ -105,7 +105,7 @@ function EmptyTier({ tier }: { tier: SkillTier }) {
       <div>
         No {tier} skills yet. Author one with{" "}
         <code className="rounded border border-[var(--color-nucleus-border)] px-1 py-px">
-          /skill-creator create &lt;name&gt; at {tier === "personal" ? "~/.claude/skills/<name>" : ".claude/skills/<name>"}
+          /skill-creator create &lt;name&gt; at {tier === "personal" ? ".nucleus/.claude/skills/<name>" : ".claude/skills/<name>"}
         </code>{" "}
         (see Rule 11).
       </div>

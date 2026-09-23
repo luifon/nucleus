@@ -128,13 +128,13 @@ function MetaRow({ skill }: { skill: Skill }) {
 }
 
 function shortPath(p: string): string {
-  // Show as `~/.claude/skills/<name>/SKILL.md` or `.claude/skills/<name>/SKILL.md`.
-  const home = "/Users/";
-  const idx = p.indexOf(home);
-  if (idx !== -1) {
-    const tail = p.slice(idx);
-    return tail.replace(/^\/Users\/[^/]+/, "~");
-  }
+  // Show relative to the repo root: `.nucleus/.claude/skills/<name>/SKILL.md`
+  // (personal) or `.claude/skills/<name>/SKILL.md` (repo). The personal
+  // segment is checked first because it contains the repo segment.
+  const personal = p.lastIndexOf("/.nucleus/.claude/skills/");
+  if (personal !== -1) return p.slice(personal + 1);
+  const repo = p.lastIndexOf("/.claude/skills/");
+  if (repo !== -1) return p.slice(repo + 1);
   return p;
 }
 

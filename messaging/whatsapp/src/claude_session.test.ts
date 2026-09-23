@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { exec } from "node:child_process";
-import { writeFileSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { writeFileSync, mkdtempSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,7 @@ import {
   draftStuck,
   waitForDraftGone,
   splitRotationReply,
+  addDirsWithPrivateSkills,
   Turn,
 } from "./claude_session.js";
 
@@ -399,4 +400,29 @@ test("draftFragments tail matches core: last 24 chars of the content", () => {
   assert.ok(long.endsWith(tail), "tail must come from the END of the content");
   assert.ok(!long.split("\n").filter(Boolean).pop()!.startsWith(tail),
     "and NOT be the start of the last line");
+});
+
+test("addDirsWithPrivateSkills: appends <root>/.nucleus only when it exists and is unlisted", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "nucleus-adddir-"));
+  try {
+    const priv = path.join(root, ".nucleus");
+    // Absent dir → caller's list unchanged.
+    assert.deepEqual(addDirsWithPrivateSkills(root, undefined), []);
+    assert.deepEqual(addDirsWithPrivateSkills(root, ["/a"]), ["/a"]);
+
+    mkdirSync(path.join(priv, ".claude", "skills"), { recursive: true });
+    // Present → appended after the caller's dirs.
+    assert.deepEqual(addDirsWithPrivateSkills(root, undefined), [priv]);
+    assert.deepEqual(addDirsWithPrivateSkills(root, ["/a"]), ["/a", priv]);
+    // Already listed (also with a trailing slash) → not duplicated.
+    assert.deepEqual(addDirsWithPrivateSkills(root, [priv]), [priv]);
+    assert.deepEqual(addDirsWithPrivateSkills(root, [priv + "/"]), [priv + "/"]);
+
+    // A regular file named .nucleus is not a skill dir.
+    rmSync(priv, { recursive: true });
+    writeFileSync(priv, "");
+    assert.deepEqual(addDirsWithPrivateSkills(root, undefined), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

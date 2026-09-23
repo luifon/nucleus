@@ -9,7 +9,8 @@ export type Skill = {
  */
 name: string, description: string, 
 /**
- * "personal" (`~/.claude/skills`) or "repo" (`.claude/skills`).
+ * "personal" (`.nucleus/.claude/skills`, gitignored) or "repo"
+ * (`.claude/skills`, committed). Both relative to the workspace root.
  */
 tier: string, 
 /**
