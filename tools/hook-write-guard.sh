@@ -8,9 +8,12 @@
 # the guard. The commit-time layers (git-commit PreToolUse + git pre-commit)
 # are the real enforcement, and they never see gitignored content anyway.
 #
-# Skips it likewise for a target OUTSIDE the repo (~/.claude/skills/…, the
-# operator-personal tree): this repo can never commit those, and they must
-# legitimately name the very literals the denylist carries.
+# Operator-private skills live under .nucleus/.claude/skills/ inside the repo.
+# .nucleus/ is gitignored, so writes there take the gitignored branch below:
+# they must legitimately name the very literals the denylist carries.
+#
+# Skips it likewise for a target OUTSIDE the repo (e.g. ~/.claude/skills/…):
+# this repo can never commit those.
 #
 # For a tracked (committable) target, pipes the proposed content through
 # tools/check-secrets.sh exactly as before. Any state where that scan can't
@@ -34,15 +37,15 @@ fi
 input="$(cat)"
 fp="$(printf '%s' "$input" | jq -r '.tool_input.file_path // empty')"
 
-# Target outside the repo (e.g. ~/.claude/skills/…, the operator-personal
-# tree) → this repo can never commit it → don't scan. Same rationale as the
-# gitignored case below.
+# Target outside the repo (e.g. ~/.claude/skills/…) → this repo can never
+# commit it → don't scan. Same rationale as the gitignored case below.
 case "$fp" in
   "$ROOT"/*) ;;                 # inside the repo → keep checking
   /*) exit 0 ;;                 # absolute path elsewhere → out of scope
 esac
 
-# Gitignored target → never committed → don't scan.
+# Gitignored target → never committed → don't scan. This is the branch that
+# covers the operator-private skill tree (.nucleus/.claude/skills/…).
 if [ -n "$fp" ] && git -C "$ROOT" check-ignore -q -- "$fp" 2>/dev/null; then
   exit 0
 fi

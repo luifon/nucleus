@@ -12,10 +12,14 @@ bot/fire sessions `cd` into the repo and load `.claude/settings.json`.
 
 Contract: reads the Claude Code PostToolUse hook JSON on stdin. No-op (exit 0)
 for anything that isn't a `Skill` invocation or a skill we can't locate in the
-two ADR-008 skill trees. NEVER blocks or errors out — always exits 0.
+skill trees below. NEVER blocks or errors out — always exits 0.
 
-Skill trees (ADR-008):
-  - operator-personal: $HOME/.claude/skills/<name>/SKILL.md
+Skill trees (ADR-008), every existing match is stamped:
+  - user-global:        $HOME/.claude/skills/<name>/SKILL.md
+  - operator-private:   <main checkout>/.nucleus/.claude/skills/<name>/SKILL.md
+                        (gitignored; loaded via --add-dir .nucleus). The main
+                        checkout is resolved through git's common dir, because
+                        a linked worktree has no .nucleus/ of its own.
   - repo-committed:     $CLAUDE_PROJECT_DIR/.claude/skills/<name>/SKILL.md
 
 Scope note: this only writes `last_used`. Failure tracking
@@ -27,6 +31,7 @@ import datetime
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 
@@ -45,7 +50,7 @@ def main() -> int:
     if not name or not isinstance(name, str):
         return 0
     # Plugin-namespaced skills (e.g. "skill-creator:skill-creator") live in a
-    # plugin tree, not our two roots. Strip the namespace and try the bare dir;
+    # plugin tree, not our roots. Strip the namespace and try the bare dir;
     # if it doesn't resolve below it's a harmless no-op.
     bare = name.split(":")[-1].strip()
     if not bare or "/" in bare or bare.startswith("."):
@@ -55,6 +60,11 @@ def main() -> int:
     repo = os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or ""
     candidates = [os.path.join(home, ".claude", "skills", bare, "SKILL.md")]
     if repo:
+        candidates.append(
+            os.path.join(
+                main_checkout(repo), ".nucleus", ".claude", "skills", bare, "SKILL.md"
+            )
+        )
         candidates.append(os.path.join(repo, ".claude", "skills", bare, "SKILL.md"))
 
     today = datetime.date.today().isoformat()  # local date, YYYY-MM-DD
@@ -62,6 +72,34 @@ def main() -> int:
         if os.path.isfile(path):
             stamp(path, today)
     return 0
+
+
+def main_checkout(repo: str) -> str:
+    """Return the main checkout of the repository that contains `repo`.
+
+    In a linked worktree `--git-common-dir` points at the main checkout's
+    `.git`; stripping that component gives the directory that holds
+    `.nucleus/`. Falls back to `repo` when git is unavailable or the path is
+    not a git work tree.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return repo
+    common = out.stdout.strip()
+    if out.returncode != 0 or not common:
+        return repo
+    common = common.rstrip("/")
+    if os.path.basename(common) == ".git":
+        root = os.path.dirname(common)
+        if os.path.isdir(root):
+            return root
+    return repo
 
 
 def stamp(path: str, today: str) -> None:

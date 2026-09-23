@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Git pre-push hook: refuse a push whose new commits touch any path under
+# .nucleus/ (the gitignored operator-private tree, ADR-032).
+#
+# The pre-commit layer (tools/check-secrets.sh, section E) already blocks
+# staging it; this is the backstop for commits made with --no-verify or from
+# a clone without the pre-commit hook. It inspects every commit being pushed
+# (git log --name-only), not only the end-state diff, so a file that was added
+# and deleted again inside the pushed range is still caught: it would remain
+# in the public history. `-m` diffs merge commits against each parent (plain
+# --name-only prints nothing for merges, so a path added inside a merge would
+# pass), and `-z` keeps non-ASCII names unquoted so the path pattern matches.
+#
+# Install per clone (hooks in .git/hooks/ are not tracked):
+#   cp tools/git-hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# Bypass intentionally: git push --no-verify
+#
+# stdin protocol (githooks(5)), one line per ref being pushed:
+#   <local ref> <local sha> <remote ref> <remote sha>
+
+set -euo pipefail
+
+remote_name="${1:-origin}"
+zero="$(git hash-object --stdin </dev/null | tr '0-9a-f' '0')"
+hits=""
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${local_sha:-}" ] && continue
+  [ "$local_sha" = "$zero" ] && continue          # branch deletion: nothing pushed
+
+  if [ "$remote_sha" != "$zero" ] && git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+    range=("$remote_sha..$local_sha")
+  else
+    # New remote ref, or the remote tip is unknown locally: every commit
+    # reachable from local_sha that no remote-tracking ref of this remote has.
+    range=("$local_sha" --not "--remotes=$remote_name")
+  fi
+
+  if ! changed="$(git log -m --name-only --no-renames -z --format= "${range[@]}" -- | tr '\0' '\n')"; then
+    echo "✖ pre-push: git log failed for ${local_ref} -> ${remote_ref}; refusing the push." >&2
+    echo "  Bypass intentionally: git push --no-verify" >&2
+    exit 1
+  fi
+  paths="$(printf '%s\n' "$changed" | grep -iE '^\.nucleus(/|$)' | sort -u || true)"
+  if [ -n "$paths" ]; then
+    hits+="  ${local_ref} -> ${remote_ref}:"$'\n'
+    hits+="$(printf '%s\n' "$paths" | sed 's/^/    - /')"$'\n'
+  fi
+done
+
+if [ -n "$hits" ]; then
+  {
+    echo "✖ push refused: commits touch .nucleus/ (the gitignored operator-private tree):"
+    printf '%s' "$hits"
+    echo ""
+    echo "  Remove those paths from the pushed commits (rewrite them), then push again."
+    echo "  Bypass intentionally: git push --no-verify"
+  } >&2
+  exit 1
+fi
+
+exit 0

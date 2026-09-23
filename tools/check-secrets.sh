@@ -2,7 +2,7 @@
 # Block leaks of personal information into committed source.
 #
 # Scans stdin (a `git diff --cached` or proposed Write/Edit content) against
-# four independent layers and exits non-zero on ANY hit. Called from three
+# five independent layers and exits non-zero on ANY hit. Called from three
 # places (all pipe through here, so strengthening this arms all of them):
 #   1. .git/hooks/pre-commit              — staged diff piped in
 #   2. Claude PreToolUse on Bash          — staged diff on `git commit`
@@ -17,11 +17,14 @@
 #      snowflake IDs, and the operator's home path. Catches personal data
 #      even when it isn't registered anywhere.
 #   D. Operator-personal-skill leakage — names of skills that live in
-#      ~/.claude/skills (operator-personal) but NOT in .claude/skills
-#      (repo-wired). That content belongs in the personal tree, never here.
+#      ~/.claude/skills or .nucleus/.claude/skills (operator-private, the
+#      latter gitignored) but NOT in .claude/skills (repo-wired). That
+#      content belongs in the private trees, never here.
+#   E. Structural (staged diffs only) — any staged path under .nucleus/.
+#      That tree is gitignored; a staged path there means it was force-added.
 #
 # Nothing sensitive is hardcoded in this file — every literal is derived at
-# runtime from .env / the gitignored denylist / the personal-skill tree, so
+# runtime from .env / the gitignored denylist / the private skill trees, so
 # the guard itself is safe to commit. Bypass intentionally: git commit --no-verify.
 
 set -euo pipefail
@@ -73,26 +76,79 @@ if [ -f "$DENYLIST" ]; then
   done < "$DENYLIST"
 fi
 
-# D. operator-personal-skill names = ls ~/.claude/skills MINUS repo-wired
-# .claude/skills. Whole-word. A tiny allowlist covers generic/functional
-# markers that legitimately appear as constants in infra code.
+# D. operator-personal-skill names = the skill dirs in ~/.claude/skills and
+# <main checkout>/.nucleus/.claude/skills, MINUS repo-wired .claude/skills.
+# Whole-word. The main checkout is resolved through the common git dir so a
+# linked worktree (which has no .nucleus/ of its own) still sees the private
+# tree. A tiny allowlist covers generic/functional markers that legitimately
+# appear as constants in infra code.
 SKILL_ALLOW="test-skill"
-if [ -d "$HOME/.claude/skills" ]; then
-  repo_skills="$(git -C "$WORKSPACE_ROOT" ls-files .claude/skills 2>/dev/null | cut -d/ -f2 | sort -u)"
-  for d in "$HOME"/.claude/skills/*/; do
+MAIN_CHECKOUT="$(git -C "$WORKSPACE_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+MAIN_CHECKOUT="${MAIN_CHECKOUT%/.git}"
+{ [ -n "$MAIN_CHECKOUT" ] && [ -d "$MAIN_CHECKOUT" ]; } || MAIN_CHECKOUT="$WORKSPACE_ROOT"
+# Repo-wired names come from the COMMITTED tree (HEAD), not the index: reading
+# the index would let a commit that stages .claude/skills/<private name>/ make
+# that name "repo-wired" and pass in the same commit. An unborn HEAD (first
+# commit) yields an empty list, so every private name stays blocked.
+repo_skills=""
+if git -C "$WORKSPACE_ROOT" rev-parse -q --verify 'HEAD^{tree}' >/dev/null 2>&1; then
+  repo_skills="$(git -C "$WORKSPACE_ROOT" ls-tree -r --name-only HEAD -- .claude/skills 2>/dev/null | cut -d/ -f3 | sort -u || true)"
+fi
+PRIVATE_SKILLS=()
+for tree in "$HOME/.claude/skills" "$MAIN_CHECKOUT/.nucleus/.claude/skills"; do
+  [ -d "$tree" ] || continue
+  for d in "$tree"/*/; do
+    [ -d "$d" ] || continue                                        # unmatched glob
     name="$(basename "$d")"
     case "$name" in .*) continue ;; esac
     printf '%s\n' "$repo_skills" | grep -qxF "$name" && continue   # repo-wired, fine
     printf '%s' "$SKILL_ALLOW" | grep -qwF "$name" && continue     # generic marker
     WORD+=("$name")
+    PRIVATE_SKILLS+=("$name")
   done
-fi
+done
 
 # ── read the haystack; reduce a staged diff to ADDED lines ─────────────────
 HAY="$(cat)"
 [ -z "$HAY" ] && exit 0
 case "$HAY" in
   "diff --git"*)
+    # E. structural: nothing under .nucleus/ may be staged. The path check
+    # reads the index directly, so it holds even for a staged file whose
+    # content matches none of the literal layers.
+    # `-z` output is never quoted, so non-ASCII names (which core.quotePath
+    # would print as "\303\247...") still match the path patterns below.
+    staged_paths="$(git -C "$WORKSPACE_ROOT" diff --cached --name-only --no-renames -z 2>/dev/null | tr '\0' '\n' || true)"
+    staged_private="$(printf '%s\n' "$staged_paths" | grep -iE '^\.nucleus(/|$)' || true)"
+    if [ -n "$staged_private" ]; then
+      {
+        echo "✖ staged paths under .nucleus/ (the gitignored operator-private tree):"
+        printf '%s\n' "$staged_private" | sed 's/^/    - /'
+        echo ""
+        echo "  Unstage: git restore --staged -- .nucleus"
+      } >&2
+      exit 2
+    fi
+    # D (structural): a staged .claude/skills/<name>/ path whose <name> is a
+    # private skill. Caught by path, so it holds even when the copied files
+    # never spell the name in their content.
+    staged_skill_dirs="$(printf '%s\n' "$staged_paths" | grep -E '^\.claude/skills/[^/]+/' | cut -d/ -f3 | sort -u || true)"
+    leaked_skills=()
+    if [ -n "$staged_skill_dirs" ]; then
+      for name in ${PRIVATE_SKILLS[@]+"${PRIVATE_SKILLS[@]}"}; do
+        printf '%s\n' "$staged_skill_dirs" | grep -qxF -- "$name" && leaked_skills+=("$name")
+      done
+    fi
+    if [ ${#leaked_skills[@]} -gt 0 ]; then
+      {
+        echo "✖ staged .claude/skills/ directories named after operator-private skills:"
+        printf '    - .claude/skills/%s/\n' "${leaked_skills[@]}"
+        echo ""
+        echo "  Private skills live in .nucleus/.claude/skills or ~/.claude/skills."
+        echo "  Bypass intentionally: git commit --no-verify"
+      } >&2
+      exit 2
+    fi
     HAY="$(printf '%s' "$HAY" | grep '^+' | grep -v '^+++' || true)"
     [ -z "$HAY" ] && exit 0
     ;;
@@ -129,7 +185,7 @@ if [ ${#FOUND[@]} -gt 0 ]; then
     echo ""
     echo "  Personal info, third-party identifiers, and operator-personal-skill"
     echo "  content do not belong in this public repo. See .claude/rules/secrets.md."
-    echo "  Route real values through .env / .claude/secret-strings / ~/.claude/skills."
+    echo "  Route real values through .env / .claude/secret-strings / .nucleus/.claude/skills."
     echo "  Bypass intentionally: git commit --no-verify"
   } >&2
   exit 2
