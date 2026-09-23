@@ -111,7 +111,7 @@ async fn review(
     let conversation = render_conversation(&turns);
 
     // Library summary so the reviewer can decide patch-vs-create.
-    let library = library_summary(&operator_root, &repo_root, machine_skills_root().as_deref());
+    let library = library_summary(&operator_root, &repo_root, skills::global_skills_root().as_deref());
 
     let prompt = build_review_prompt(&operator_root, &library, venue, &conversation);
     let (reply, quarantined) =
@@ -163,15 +163,6 @@ impl GateOutcome {
     }
 }
 
-/// `$HOME/.claude/skills` — the machine-wide skills tree Claude Code loads in
-/// every project. A skill there wins over a same-named project or `--add-dir`
-/// skill. `None` when HOME is unset.
-fn machine_skills_root() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join(".claude").join("skills"))
-}
-
 /// Skill names already taken outside the personal tree, keyed to the reason
 /// a personal skill with that name is a problem. Both the directory name and
 /// the frontmatter `name` count. Machine-wide entries take precedence over
@@ -181,7 +172,7 @@ fn reserved_skill_names(
     machine_root: Option<&Path>,
 ) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    let mut add = |root: &Path, tier: &str, reason: &dyn Fn(&str) -> String| {
+    let mut add = |root: &Path, tier: skills::SkillTier, reason: &dyn Fn(&str) -> String| {
         for s in skills::read_skills(root, tier) {
             let dir_name = Path::new(&s.path)
                 .parent()
@@ -194,11 +185,11 @@ fn reserved_skill_names(
         }
     };
     if let Some(machine) = machine_root {
-        add(machine, "machine", &|n| {
+        add(machine, skills::SkillTier::Global, &|n| {
             format!("the machine-wide skill `{n}` in ~/.claude/skills has the same name and shadows it — this copy never loads")
         });
     }
-    add(repo_root, "repo", &|n| {
+    add(repo_root, skills::SkillTier::Repo, &|n| {
         format!("duplicates the committed skill `{n}` in .claude/skills")
     });
     out
@@ -401,10 +392,10 @@ fn render_library(lib: &[skills::Skill]) -> String {
 /// model must neither recreate nor edit one. The section is omitted when
 /// HOME or the machine-wide tree is missing or empty.
 fn library_summary(operator_root: &Path, repo_root: &Path, machine_root: Option<&Path>) -> String {
-    let mut lib = skills::read_skills(operator_root, "personal");
-    lib.extend(skills::read_skills(repo_root, "repo"));
+    let mut lib = skills::read_skills(operator_root, skills::SkillTier::Personal);
+    lib.extend(skills::read_skills(repo_root, skills::SkillTier::Repo));
     let mut out = render_library(&lib);
-    let machine = machine_root.map(|r| skills::read_skills(r, "machine")).unwrap_or_default();
+    let machine = machine_root.map(|r| skills::read_skills(r, skills::SkillTier::Global)).unwrap_or_default();
     if !machine.is_empty() {
         if !out.ends_with('\n') {
             out.push('\n');
@@ -529,7 +520,7 @@ async fn run_skill_session(
     let gate = gate_touched_skills(
         operator_root,
         &skills::repo_skills_root(workspace_root),
-        machine_skills_root().as_deref(),
+        skills::global_skills_root().as_deref(),
         started,
     )?;
     alert_gate(&gate).await;
@@ -566,7 +557,7 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
         tracing::info!("learn: catching up — gap window is {window_days} days (from {from})");
     }
     let diaries = read_all_diaries(workspace_root, &settings.diary.root, window_days);
-    let library = library_summary(&operator_root, &repo_root, machine_skills_root().as_deref());
+    let library = library_summary(&operator_root, &repo_root, skills::global_skills_root().as_deref());
 
     let mut gap_summary = "no diaries to scan".to_string();
     if !diaries.trim().is_empty() {
@@ -580,7 +571,7 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
     }
 
     // 3. Curator consolidation over the (refreshed) agent-created library.
-    let library = library_summary(&operator_root, &repo_root, machine_skills_root().as_deref());
+    let library = library_summary(&operator_root, &repo_root, skills::global_skills_root().as_deref());
     let curate_summary = {
         let prompt = build_curate_prompt(&operator_root, &library);
         let (reply, q) =
@@ -645,7 +636,7 @@ fn apply_auto_transitions(root: &Path, stale_days: u32, archive_days: u32) -> (u
         let age_days = skill_age_days(&fm, &skill_md, now);
         if age_days >= archive_days as i64 {
             let ts = now.format("%Y%m%dT%H%M%S");
-            let dest = root.join(".archive").join(format!("{name}-{ts}"));
+            let dest = root.join(skills::ARCHIVE_DIR).join(format!("{name}-{ts}"));
             if let Some(p) = dest.parent() {
                 let _ = std::fs::create_dir_all(p);
             }
@@ -896,7 +887,7 @@ mod tests {
         assert!(main.contains("- committed-one [repo]: d"));
         assert!(!main.contains("machine-one"));
         assert!(machine.contains("READ-ONLY"));
-        assert!(machine.contains("- machine-one [machine]: d"));
+        assert!(machine.contains("- machine-one [global]: d"));
 
         let without = library_summary(&t.personal, &t.repo, None);
         assert!(!without.contains("Machine-wide"));

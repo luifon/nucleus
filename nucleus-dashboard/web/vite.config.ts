@@ -20,6 +20,7 @@ export default defineConfig({
     proxy: {
       "/api": "http://localhost:8092",
       "/chat/api": "http://localhost:8092",
+      "/skills/api": "http://localhost:8092",
       // Image-generation surface (ADR-019): API + served PNGs proxy to axum;
       // the SPA route /gallery itself stays with Vite for HMR.
       "/gallery/api": "http://localhost:8092",

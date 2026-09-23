@@ -162,11 +162,16 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
         }
     }
 
-    // Skills router — walks both skill trees under the workspace root
-    // (`nucleus_core::skills::default_roots`): personal =
+    // Skills router — lists and manages the skill tiers
+    // (`nucleus_core::skills::LibraryRoots`): personal =
     // `.nucleus/.claude/skills` (gitignored), repo = `.claude/skills`
-    // (committed). Both tolerated-missing.
-    let skills_state = Arc::new(handlers::skills::SkillsState::new(&workspace_root));
+    // (committed), global = `$HOME/.claude/skills`, plus both archives. All
+    // tolerated-missing. The reminders pool lets writes refuse to move a
+    // skill a live reminder references.
+    let skills_state = Arc::new(handlers::skills::SkillsState::new(
+        &workspace_root,
+        reminders_pool.clone(),
+    ));
     app = app.nest("/skills/api", handlers::skills::router(skills_state));
 
     // Diary router — per ADR-004, every bot writes to

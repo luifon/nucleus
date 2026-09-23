@@ -50,7 +50,11 @@ Operator-private skills live in `<repo>/.nucleus/.claude/skills/<name>/`.
 - `.nucleus/` has no remote. It is local-only by decision.
 
 `~/.claude/skills/` keeps only skills meant for every project on the machine.
-Nucleus tooling no longer reads or writes that directory.
+Nucleus tooling does not write there on its own. The skill-gap learner reads
+it only to avoid names that a machine-wide copy would shadow. The dashboard
+`/skills` surface lists it as tier `global` and changes it only on an explicit
+operator action: moving a skill between it and `.nucleus/.claude/skills`, or
+archiving it to `~/.claude/skills-archive/`.
 
 ### Loading: `--add-dir`
 
