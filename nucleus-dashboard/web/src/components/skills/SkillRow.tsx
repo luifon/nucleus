@@ -17,6 +17,7 @@ import {
   FileText,
   Trash2,
 } from "lucide-react";
+import InlineConfirm from "@/components/InlineConfirm";
 import StatusPill from "@/components/StatusPill";
 import { type Skill, getSkillBody } from "@/lib/api";
 import {
@@ -145,25 +146,16 @@ export default function SkillRow({
       </div>
 
       {confirmingDelete && (
-        <div className="flex flex-wrap items-center gap-2 border-t border-[var(--color-status-down)] px-4 py-2 text-xs">
-          <span className="min-w-0 flex-1 text-[var(--color-status-down)]">{deleteConfirmText(skill)}</span>
-          <button
-            onClick={() => {
-              setConfirmingDelete(false);
-              onAction("delete", skill);
-            }}
-            disabled={busy}
-            className="rounded border border-[var(--color-status-down)] px-2 py-0.5 text-[var(--color-status-down)] transition-colors hover:bg-[var(--color-nucleus-bg)] disabled:opacity-40"
-          >
-            {skill.tier === "global-archive" ? "delete permanently" : "delete"}
-          </button>
-          <button
-            onClick={() => setConfirmingDelete(false)}
-            className="rounded border border-[var(--color-nucleus-border)] px-2 py-0.5 text-[var(--color-nucleus-faint)] transition-colors hover:text-[var(--color-nucleus-text)]"
-          >
-            keep
-          </button>
-        </div>
+        <InlineConfirm
+          message={deleteConfirmText(skill)}
+          confirmLabel={skill.tier === "global-archive" ? "delete permanently" : "delete"}
+          busy={busy}
+          onConfirm={() => {
+            setConfirmingDelete(false);
+            onAction("delete", skill);
+          }}
+          onCancel={() => setConfirmingDelete(false)}
+        />
       )}
 
       {expanded && (

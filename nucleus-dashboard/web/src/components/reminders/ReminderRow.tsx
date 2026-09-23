@@ -10,6 +10,7 @@ import {
   Check,
   AlertCircle,
 } from "lucide-react";
+import InlineConfirm from "@/components/InlineConfirm";
 import StatusPill, { type StatusKind } from "@/components/StatusPill";
 import {
   type ReminderView,
@@ -22,7 +23,7 @@ import {
 // One row per reminder. Title (or body, or derived) gets the
 // prominent slot; cron, next-fire, channels in a secondary row.
 // Per-row actions: pause/resume (terminal-aware), cancel (with
-// confirm), inline edit-title (pencil → input → save).
+// inline confirmation strip), inline edit-title (pencil → input → save).
 
 export default function ReminderRow({
   reminder,
@@ -37,6 +38,7 @@ export default function ReminderRow({
   const [draft, setDraft] = useState(reminder.title ?? "");
   const [pending, setPending] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [confirmingCancel, setConfirmingCancel] = useState(false);
 
   const isSkill = !!reminder.system_prompt;
   const display = pickDisplayName(reminder);
@@ -49,6 +51,7 @@ export default function ReminderRow({
       const next = await fn();
       onChange(next);
       if (label === "title") setEditing(false);
+      if (label === "cancel") setConfirmingCancel(false);
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -59,8 +62,8 @@ export default function ReminderRow({
   const isTerminal = reminder.status === "fired" || reminder.status === "cancelled";
 
   return (
-    <article className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)] px-4 py-3">
-      <div className="flex items-start gap-3">
+    <article className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)]">
+      <div className="flex items-start gap-3 px-4 py-3">
         {isSkill && (
           <Sparkles
             size={14}
@@ -122,7 +125,7 @@ export default function ReminderRow({
                 </span>
               )}
               <button
-                onClick={() => { setDraft(reminder.title ?? ""); setEditing(true); }}
+                onClick={() => { setDraft(reminder.title ?? ""); setConfirmingCancel(false); setEditing(true); }}
                 title="edit title"
                 className="shrink-0 text-[var(--color-nucleus-faint)] hover:text-[var(--color-nucleus-accent)]"
               >
@@ -181,25 +184,21 @@ export default function ReminderRow({
             {reminder.status === "paused" ? (
               <ActionButton
                 onClick={() => run("resume", () => resumeReminder(reminder.id))}
-                disabled={pending !== null}
+                disabled={pending !== null || confirmingCancel}
                 title="resume"
                 Icon={Play}
               />
             ) : (
               <ActionButton
                 onClick={() => run("pause", () => pauseReminder(reminder.id))}
-                disabled={pending !== null}
+                disabled={pending !== null || confirmingCancel}
                 title="pause"
                 Icon={Pause}
               />
             )}
             <ActionButton
-              onClick={() => {
-                if (confirm(`Cancel reminder #${reminder.id}? Cancellation is sticky (system seeder won't re-create it).`)) {
-                  void run("cancel", () => cancelReminder(reminder.id));
-                }
-              }}
-              disabled={pending !== null}
+              onClick={() => setConfirmingCancel(true)}
+              disabled={pending !== null || confirmingCancel}
               title="cancel"
               Icon={X}
               danger
@@ -207,6 +206,16 @@ export default function ReminderRow({
           </div>
         )}
       </div>
+
+      {confirmingCancel && !isTerminal && (
+        <InlineConfirm
+          message={`Cancel reminder #${reminder.id}? It stops firing. Cancellation is sticky: the system seeder does not re-create it.`}
+          confirmLabel={pending === "cancel" ? "cancelling…" : "cancel reminder"}
+          busy={pending !== null}
+          onConfirm={() => void run("cancel", () => cancelReminder(reminder.id))}
+          onCancel={() => setConfirmingCancel(false)}
+        />
+      )}
     </article>
   );
 }
