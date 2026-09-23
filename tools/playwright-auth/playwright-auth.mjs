@@ -54,6 +54,7 @@ async function openProfile({ headless }) {
     return await chromium.launchPersistentContext(profileDir, {
       channel: 'chrome',
       headless,
+      ignoreDefaultArgs: ['--use-mock-keychain'],
     });
   } catch (err) {
     if (String(err).includes('ProcessSingleton') || String(err).includes('SingletonLock')) {
