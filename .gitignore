@@ -66,11 +66,11 @@ design-mocks/
 *-news-*.yml
 
 # Sibling-project artifacts that land HERE by accident.
-# Other local repos (sibling projects) are
-# separate repos, but screenshots/dumps taken while working on them get
-# written to the CWD — which is usually this repo — and then sit untracked
-# in the root until someone `git add -A`s them in. Nothing belonging to
-# another project may be committed here, so ignore the shapes outright.
+# Screenshots/dumps taken while working on other local repos get written to
+# the CWD — which is usually this repo — and then sit untracked in the root
+# until someone `git add -A`s them in. Nothing belonging to another project
+# may be committed here. Patterns that name a specific sibling project go in
+# the untracked .git/info/exclude, not in this file.
 
 # Scratch captures from ad-hoc work (dumps, previews, page grabs).
 *_dump.txt

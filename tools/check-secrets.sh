@@ -81,8 +81,9 @@ fi
 # Whole-word. The main checkout is resolved through the common git dir so a
 # linked worktree (which has no .nucleus/ of its own) still sees the private
 # tree. A tiny allowlist covers generic/functional markers that legitimately
-# appear as constants in infra code.
-SKILL_ALLOW="test-skill"
+# appear as constants in infra code, plus machine-wide skill names that are
+# ordinary words used throughout the codebase.
+SKILL_ALLOW="test-skill handoff orchestration synced computer-use"
 MAIN_CHECKOUT="$(git -C "$WORKSPACE_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
 MAIN_CHECKOUT="${MAIN_CHECKOUT%/.git}"
 { [ -n "$MAIN_CHECKOUT" ] && [ -d "$MAIN_CHECKOUT" ]; } || MAIN_CHECKOUT="$WORKSPACE_ROOT"
