@@ -162,9 +162,13 @@ rules.
   each returned note's text. Its `bucket` filter is parsed and opened like
   `/file`; an excluded folder returns an empty list. It returns relative
   paths and the vault folder name, never an absolute path.
-- `/vault/api/buckets` and the home-page "latest vault write" glance use the
-  same walk. `/vault/api/search` drops any hit that `/file` would refuse
-  under the current rules.
+- `/vault/api/buckets` counts only the notes that may be shown: allowed
+  by the path rules and, read through the root descriptor, by the content
+  rules; a note over the size limit is not counted. The content verdicts
+  are kept per file identity between requests and cleared when the rules
+  change, so a listing re-reads only notes that changed. The home-page
+  "latest vault write" glance uses the same walk. `/vault/api/search` drops
+  any hit that `/file` would refuse under the current rules.
 
 The walk shared by the index, the check and the dashboard (`vault::scan`)
 uses the same descriptor access: each folder is opened from the root

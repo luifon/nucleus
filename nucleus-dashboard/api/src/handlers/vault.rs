@@ -50,6 +50,9 @@ pub struct VaultState {
     pub search: Option<VaultSearch>,
     /// `memory/vault_check.db`, opened read-only per request.
     pub check_db: PathBuf,
+    /// Content-rule verdicts for the bucket counts, kept between requests
+    /// so a listing re-reads only notes that changed.
+    pub bucket_verdicts: Arc<Mutex<access::ContentVerdicts>>,
 }
 
 /// Brings the index up to date by running its writer.
@@ -411,7 +414,11 @@ async fn list_buckets(State(s): State<Arc<VaultState>>) -> Result<Json<Vec<Bucke
     if !root.exists() {
         return Ok(Json(vec![]));
     }
-    let buckets = blocking(move || access::buckets(&root, &ex))
+    let verdicts = s.bucket_verdicts.clone();
+    let buckets = blocking(move || {
+        let mut v = verdicts.lock().unwrap_or_else(|p| p.into_inner());
+        access::buckets(&root, &ex, &mut v)
+    })
         .await?
         .map_err(|e| VaultError::Io(format!("{e:#}")))?;
     Ok(Json(buckets.into_iter().map(|(name, file_count)| Bucket { name, file_count }).collect()))
@@ -649,6 +656,7 @@ mod tests {
             workspace_root: ws.clone(),
             search: Some(VaultSearch { index_db, refresh }),
             check_db: tmp.join("check.db"),
+            bucket_verdicts: Default::default(),
         });
         (router(state), root, ws, started, walks)
     }

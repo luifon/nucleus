@@ -203,11 +203,64 @@ pub fn recent(
     Ok(out)
 }
 
-/// Top-level folders that may be shown, with their count of markdown files
-/// the walk admits, sorted by name. Dot folders and excluded folders are
-/// left out.
-pub fn buckets(vault: &Path, ex: &Exclusions) -> anyhow::Result<Vec<(String, usize)>> {
+/// Which notes the content rules allow, remembered per file identity so a
+/// repeated listing re-reads only notes that changed. Cleared when the
+/// rules change (their fingerprint).
+#[derive(Debug, Default)]
+pub struct ContentVerdicts {
+    fingerprint: String,
+    /// Vault-relative path → identity when read, and whether it may be shown.
+    notes: std::collections::HashMap<String, (scan::IndexIdentity, bool)>,
+}
+
+impl ContentVerdicts {
+    /// Whether the walked note `f` may be shown by content: within the size
+    /// ceiling, readable, and not a credential note. A note over the ceiling
+    /// cannot be checked and is not shown, as in [`recent`].
+    fn allowed(&mut self, walk: &scan::Walk, f: &scan::VaultFile, ex: &Exclusions) -> bool {
+        let id = f.identity();
+        if let Some(&(known, ok)) = self.notes.get(&f.rel) {
+            if known == id {
+                return ok;
+            }
+        }
+        let ok = f.size <= MAX_NOTE_BYTES
+            && matches!(walk.read_note(f), Ok(Some(text)) if !ex.content_excluded(&text));
+        self.notes.insert(f.rel.clone(), (id, ok));
+        ok
+    }
+
+    /// Start a listing under `ex`: forget every verdict made under other
+    /// rules.
+    fn begin(&mut self, ex: &Exclusions) {
+        if self.fingerprint != ex.fingerprint() {
+            self.fingerprint = ex.fingerprint().to_string();
+            self.notes.clear();
+        }
+    }
+
+    /// Forget notes that were not seen in the latest walk.
+    fn retain_seen(&mut self, seen: &std::collections::HashSet<&str>) {
+        self.notes.retain(|rel, _| seen.contains(rel.as_str()));
+    }
+}
+
+/// Top-level folders that may be shown, with their count of markdown notes
+/// that may be shown (allowed by the path rules and by the content rules),
+/// sorted by name. Dot folders and excluded folders are left out.
+/// `verdicts` keeps the content decisions between calls.
+pub fn buckets(vault: &Path, ex: &Exclusions, verdicts: &mut ContentVerdicts) -> anyhow::Result<Vec<(String, usize)>> {
     let walk = scan::walk(vault, ex)?;
+    verdicts.begin(ex);
+    let mut seen = std::collections::HashSet::new();
+    let mut shown: Vec<&scan::VaultFile> = Vec::new();
+    for f in walk.files.iter().filter(|f| f.is_markdown()) {
+        seen.insert(f.rel.as_str());
+        if verdicts.allowed(&walk, f, ex) {
+            shown.push(f);
+        }
+    }
+    verdicts.retain_seen(&seen);
     let mut out: Vec<(String, usize)> = Vec::new();
     for (raw, id) in fsx::list(walk.root.fd())? {
         if id.kind != Kind::Dir {
@@ -218,7 +271,7 @@ pub fn buckets(vault: &Path, ex: &Exclusions) -> anyhow::Result<Vec<(String, usi
             continue;
         }
         let prefix = format!("{name}/");
-        let count = walk.files.iter().filter(|f| f.is_markdown() && f.rel.starts_with(&prefix)).count();
+        let count = shown.iter().filter(|f| f.rel.starts_with(&prefix)).count();
         out.push((name, count));
     }
     out.sort();
@@ -394,10 +447,24 @@ mod tests {
         assert!(matches!(resolve_folder(&vault, &e, "4-Areas/Homelab"), Err(AccessError::Excluded)));
         assert!(matches!(resolve_folder(&vault, &e, "3-Projects/Alpha/index.md"), Err(AccessError::NotFound)));
 
-        let b = buckets(&vault, &e).unwrap();
+        // Low (round 3): the credential note in 6-Slipbox is not counted.
+        let mut v = ContentVerdicts::default();
+        let b = buckets(&vault, &e, &mut v).unwrap();
         assert_eq!(
             b,
-            vec![("3-Projects".to_string(), 1), ("4-Areas".to_string(), 0), ("6-Slipbox".to_string(), 2)]
+            vec![("3-Projects".to_string(), 1), ("4-Areas".to_string(), 0), ("6-Slipbox".to_string(), 1)]
         );
+
+        // A credential written into a counted note changes its file
+        // identity, so its remembered verdict is not reused.
+        write(&vault, "6-Slipbox/idea.md", "password: correct horse battery staple\n");
+        let b = buckets(&vault, &e, &mut v).unwrap();
+        assert_eq!(b[2], ("6-Slipbox".to_string(), 0));
+        // New rules clear the remembered verdicts: the unchanged note is
+        // judged again under a content regex that now matches it.
+        write(&vault, "6-Slipbox/idea.md", "# Idea\n");
+        assert_eq!(buckets(&vault, &e, &mut v).unwrap()[2], ("6-Slipbox".to_string(), 1));
+        let e2 = Exclusions::new(&[], "^# Idea").unwrap();
+        assert_eq!(buckets(&vault, &e2, &mut v).unwrap()[2], ("6-Slipbox".to_string(), 0));
     }
 }

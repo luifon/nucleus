@@ -152,6 +152,7 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
         workspace_root: workspace_root.clone(),
         search: vault_search,
         check_db: workspace_root.join(nucleus_core::vault::check::DB_PATH),
+        bucket_verdicts: Default::default(),
     });
     app = app.nest("/vault/api", handlers::vault::router(vault_state));
 
