@@ -31,6 +31,7 @@ Services (run by launchd):
 Operator tools:
   session-search        FTS5 search over session transcripts
   session-send          send a message into another agent session
+  usage <sub>           token and cost accounting (refresh|report)
 
 Every command accepts --help.
 ";
@@ -88,6 +89,7 @@ async fn main() -> Result<()> {
         "gmail-metabolism" => gmail::run(sub).await,
         "session-search" => nucleus_core::cmd::session_search::run(sub).await,
         "session-send" => nucleus_core::cmd::session_send::run(sub).await,
+        "usage" => nucleus_core::cmd::usage::run(sub).await,
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
             Ok(())

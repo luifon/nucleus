@@ -21,6 +21,7 @@ pub struct Settings {
     pub gmail: GmailConfig,
     pub reminders: RemindersConfig,
     pub session_search: SessionSearchConfig,
+    pub usage: UsageConfig,
     pub ports: PortsConfig,
 }
 
@@ -287,6 +288,64 @@ impl Default for SessionSearchConfig {
     }
 }
 
+/// ADR-034 usage accounting. Every field is optional: the defaults read the
+/// standard Claude Code and Codex transcript locations and use the built-in
+/// price table (`nucleus_core::usage::pricing`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UsageConfig {
+    /// Claude Code transcript root. Tilde-expanded.
+    #[serde(default = "default_claude_projects_dir")]
+    pub claude_projects_dir: String,
+    /// Codex session-log root. Tilde-expanded.
+    #[serde(default = "default_codex_sessions_dir")]
+    pub codex_sessions_dir: String,
+    /// Path fragments that mark a git worktree nested inside its repository
+    /// (`<repo>/.claude/worktrees/<name>`). A working directory that contains
+    /// one is attributed to the part before the fragment, also after the
+    /// worktree directory is deleted.
+    #[serde(default = "default_worktree_markers")]
+    pub worktree_markers: Vec<String>,
+    /// Per-model price overrides and additions in USD per million tokens,
+    /// keyed by model id or model-id prefix. Merged over the built-in table.
+    #[serde(default)]
+    pub prices: std::collections::BTreeMap<String, ModelPrice>,
+}
+
+/// List price of one model in USD per million tokens. `cache_write_5m` and
+/// `cache_write_1h` are the two Anthropic cache-write durations; a vendor
+/// with one cache-write price sets both to the same value.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct ModelPrice {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write_5m: f64,
+    pub cache_write_1h: f64,
+}
+
+fn default_claude_projects_dir() -> String {
+    "~/.claude/projects".to_string()
+}
+
+fn default_codex_sessions_dir() -> String {
+    "~/.codex/sessions".to_string()
+}
+
+fn default_worktree_markers() -> Vec<String> {
+    vec!["/.claude/worktrees/".to_string(), "/.worktrees/".to_string()]
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            claude_projects_dir: default_claude_projects_dir(),
+            codex_sessions_dir: default_codex_sessions_dir(),
+            worktree_markers: default_worktree_markers(),
+            prices: Default::default(),
+        }
+    }
+}
+
 fn default_reminder_channels() -> Vec<String> {
     vec!["discord-home".to_string()]
 }
@@ -321,6 +380,8 @@ struct TomlConfig {
     reminders: RemindersConfig,
     #[serde(default)]
     session_search: SessionSearchConfig,
+    #[serde(default)]
+    usage: UsageConfig,
     ports: PortsConfig,
 }
 
@@ -380,6 +441,7 @@ impl Settings {
             gmail,
             reminders: toml.reminders,
             session_search: toml.session_search,
+            usage: toml.usage,
             ports: toml.ports,
         })
     }
