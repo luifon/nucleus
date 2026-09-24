@@ -115,6 +115,20 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
         }
     }
 
+    // Usage accounting (ADR-034) — read-only over memory/usage.db; refresh
+    // spawns `nucleus usage refresh` (the DB's single writer). Always
+    // mounted: before the first refresh the endpoints report "no data".
+    let scheduled_agents = nucleus_core::agents::Registry::load_from(workspace_root.join("agents.toml"))
+        .map(|r| {
+            r.enabled()
+                .filter(|a| a.launch == nucleus_core::agents::Launch::LaunchdCron)
+                .map(|a| a.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let usage_state = Arc::new(handlers::usage::UsageState::new(workspace_root.clone(), scheduled_agents));
+    app = app.nest("/usage/api", handlers::usage::router(usage_state));
+
     // Vault — filesystem mtime feed over the Obsidian vault.
     // Tilde-expand the configured vault_path since the config loader
     // doesn't do it for us today.

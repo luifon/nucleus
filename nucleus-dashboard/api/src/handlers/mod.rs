@@ -7,4 +7,5 @@ pub mod gallery;
 pub mod news;
 pub mod reminders;
 pub mod skills;
+pub mod usage;
 pub mod vault;
