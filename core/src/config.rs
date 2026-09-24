@@ -2,9 +2,9 @@
 //!
 //! What belongs in `.env` vs `nucleus.toml`: see `docs/SECRETS.md`.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -383,6 +383,55 @@ impl Settings {
             ports: toml.ports,
         })
     }
+
+    /// The workspace root that every entry point resolves its paths against:
+    /// the `memory/` DBs, logs, diaries, `agents.toml`, and the working
+    /// directory of the sessions and processes it spawns.
+    ///
+    /// The value is `identity.workspace_root` (`NUCLEUS_WORKSPACE_ROOT` in
+    /// `.env`), never the process's current directory: a `nucleus <command>`
+    /// run from another directory must reach the operator's DBs, not create
+    /// empty ones next to the caller. See [`resolve_workspace_root`].
+    pub fn workspace_root(&self) -> Result<PathBuf> {
+        let cwd = std::env::current_dir().ok();
+        resolve_workspace_root(&self.identity.workspace_root, cwd.as_deref())
+    }
+}
+
+/// Pure half of [`Settings::workspace_root`]. Rejects a relative root (it
+/// would be resolved against the current directory, which is the failure
+/// this function exists to prevent) and a root without a `memory/`
+/// directory (a set-up workspace always has one: `memory/.gitkeep` is
+/// tracked), so no DB is ever created in an unexpected place. Creates
+/// nothing. `cwd` is only compared, for a debug log when it differs.
+pub fn resolve_workspace_root(configured: &Path, cwd: Option<&Path>) -> Result<PathBuf> {
+    if !configured.is_absolute() {
+        bail!(
+            "NUCLEUS_WORKSPACE_ROOT must be an absolute path, got {}",
+            configured.display()
+        );
+    }
+    let memory = configured.join("memory");
+    if !memory.is_dir() {
+        bail!(
+            "{} does not exist or is not a directory; NUCLEUS_WORKSPACE_ROOT ({}) \
+             must point at the Nucleus checkout",
+            memory.display(),
+            configured.display()
+        );
+    }
+    let root = configured.canonicalize().unwrap_or_else(|_| configured.to_path_buf());
+    if let Some(cwd) = cwd {
+        let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        if cwd != root {
+            tracing::debug!(
+                cwd = %cwd.display(),
+                workspace_root = %root.display(),
+                "current directory differs from the workspace root; using the workspace root"
+            );
+        }
+    }
+    Ok(root)
 }
 
 fn env_optional(key: &str) -> Option<String> {
@@ -549,6 +598,77 @@ fn extract_yaml_field(frontmatter: &str, field: &str) -> Option<String> {
         return Some(v.to_string());
     }
     None
+}
+
+#[cfg(test)]
+mod workspace_root_tests {
+    use super::*;
+
+    fn temp_ws(name: &str, with_memory: bool) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nucleus-wsroot-tests-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if with_memory {
+            std::fs::create_dir_all(dir.join("memory")).unwrap();
+        }
+        dir.canonicalize().unwrap()
+    }
+
+    /// The configured root wins over a different current directory, so a
+    /// call from elsewhere reaches the operator's DBs.
+    #[test]
+    fn configured_root_wins_over_cwd() {
+        let ws = temp_ws("wins", true);
+        let elsewhere = temp_ws("elsewhere", false);
+        assert_eq!(resolve_workspace_root(&ws, Some(&elsewhere)).unwrap(), ws);
+        assert_eq!(resolve_workspace_root(&ws, Some(&ws)).unwrap(), ws);
+        assert_eq!(resolve_workspace_root(&ws, None).unwrap(), ws);
+        assert!(!elsewhere.join("memory").exists());
+    }
+
+    /// A subdirectory of the workspace as cwd still resolves to the root.
+    #[test]
+    fn subdirectory_cwd_resolves_to_root() {
+        let ws = temp_ws("subdir", true);
+        let sub = ws.join("chores/reminders/src");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(resolve_workspace_root(&ws, Some(&sub)).unwrap(), ws);
+        assert!(!sub.join("memory").exists());
+    }
+
+    /// A non-canonical configured path (with `..`) is returned canonical.
+    #[test]
+    fn configured_root_is_canonicalized() {
+        let ws = temp_ws("canon", true);
+        let dotted = ws.join("memory").join("..");
+        assert_eq!(resolve_workspace_root(&dotted, None).unwrap(), ws);
+    }
+
+    /// A root without `memory/` is an error, and nothing is created there.
+    #[test]
+    fn missing_memory_dir_is_an_error_and_creates_nothing() {
+        let ws = temp_ws("no-memory", false);
+        let err = resolve_workspace_root(&ws, None).unwrap_err().to_string();
+        assert!(err.contains("memory"), "{err}");
+        assert!(!ws.join("memory").exists());
+    }
+
+    /// `memory` as a regular file does not count as a set-up workspace.
+    #[test]
+    fn memory_file_is_not_a_directory() {
+        let ws = temp_ws("memory-file", false);
+        std::fs::write(ws.join("memory"), "").unwrap();
+        assert!(resolve_workspace_root(&ws, None).is_err());
+    }
+
+    #[test]
+    fn relative_root_is_rejected() {
+        let err = resolve_workspace_root(Path::new("nucleus"), None).unwrap_err().to_string();
+        assert!(err.contains("absolute"), "{err}");
+    }
 }
 
 #[cfg(test)]

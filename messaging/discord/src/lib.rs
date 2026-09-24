@@ -468,7 +468,7 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     let settings = Settings::load().context("loading nucleus.toml + .env")?;
     let token = std::env::var("DISCORD_BOT_TOKEN").context("DISCORD_BOT_TOKEN not set")?;
 
-    let workspace_root = std::env::current_dir()?;
+    let workspace_root = settings.workspace_root()?;
     let persona = nucleus_core::config::resolve_persona(&settings.identity, "discord", None)
         .context("resolving Discord persona (ADR-009)")?;
 

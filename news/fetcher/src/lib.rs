@@ -70,7 +70,7 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
 
     nucleus_core::init_tracing();
     let settings = Settings::load().context("loading nucleus.toml + .env")?;
-    let workspace_root = std::env::current_dir()?;
+    let workspace_root = settings.workspace_root()?;
     let pool = db::open(&workspace_root.join(DB_PATH)).await?;
 
     nucleus_core::migrate::migrate(&pool, store::MIGRATIONS)

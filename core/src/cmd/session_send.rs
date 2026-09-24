@@ -8,7 +8,7 @@
 //!   session-send --to nucleus-gmail --from reminders-fire --await-reply \
 //!     --timeout 120 --message "what's the state of the inbox sweep?"
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use crate::agent_msg::{SendOpts, send};
 use std::path::PathBuf;
@@ -41,7 +41,7 @@ struct Cli {
     /// Reply timeout in seconds (only with --await-reply).
     #[arg(long, default_value_t = 120)]
     timeout: u64,
-    /// Workspace root (defaults to the current directory).
+    /// Workspace root (defaults to `NUCLEUS_WORKSPACE_ROOT` from settings).
     #[arg(long)]
     workspace_root: Option<PathBuf>,
 }
@@ -53,7 +53,7 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     let cli = Cli::parse_from(args);
     let workspace_root = match cli.workspace_root {
         Some(p) => p,
-        None => std::env::current_dir()?,
+        None => crate::config::Settings::load().context("loading settings")?.workspace_root()?,
     };
     let report = send(SendOpts {
         to: cli.to,

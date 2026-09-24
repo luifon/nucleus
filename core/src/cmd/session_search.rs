@@ -12,7 +12,7 @@
 //! Query syntax is FTS5: bare words AND together, `OR` works, quoted
 //! phrases match exactly. Porter stemming is on (deciding ~ decide).
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crate::session_index;
 
@@ -55,7 +55,7 @@ struct Cli {
 pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     crate::init_tracing();
     let cli = Cli::parse_from(args);
-    let workspace_root = std::env::current_dir()?;
+    let workspace_root = crate::config::Settings::load().context("loading settings")?.workspace_root()?;
     let pool = session_index::open(&workspace_root).await?;
 
     let stats = session_index::update_index(&pool, &workspace_root).await?;

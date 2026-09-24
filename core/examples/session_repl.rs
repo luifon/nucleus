@@ -19,7 +19,7 @@ use std::time::Duration;
 async fn main() -> Result<()> {
     nucleus_core::init_tracing();
 
-    let workspace_root = std::env::current_dir()?;
+    let workspace_root = nucleus_core::config::Settings::load()?.workspace_root()?;
     println!("spawning interactive claude in tmux session 'nucleus-test'…");
     let t0 = Instant::now();
     // Dev REPL — full literals on purpose (Default is gone per ADR-020;

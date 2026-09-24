@@ -131,12 +131,6 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Load `agents.toml` from the current working directory (the workspace
-    /// root in every deployed binary, per the launchd `WorkingDirectory`).
-    pub fn load() -> Result<Self> {
-        Self::load_from("agents.toml")
-    }
-
     /// Load and validate from an explicit path.
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();

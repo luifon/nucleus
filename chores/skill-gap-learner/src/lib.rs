@@ -72,7 +72,7 @@ enum Cmd {
 pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     nucleus_core::init_tracing();
     let settings = Settings::load().context("loading settings")?;
-    let workspace_root = std::env::current_dir()?;
+    let workspace_root = settings.workspace_root()?;
     let cli = Cli::parse_from(args);
 
     // A stale tmux session left from a prior crash blocks `new-window`.

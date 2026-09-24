@@ -47,8 +47,8 @@ async fn health() -> Json<HealthResponse> {
 /// under the right name.
 pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     nucleus_core::init_tracing();
-    let _settings = Settings::load().context("loading settings")?;
-    let workspace_root = std::env::current_dir()?;
+    let settings = Settings::load().context("loading settings")?;
+    let workspace_root = settings.workspace_root()?;
 
     // Vite build output. In dev, the Vite dev server runs separately and
     // proxies /api/* to this server; the ServeDir below is only used in
@@ -106,7 +106,7 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
             let agents_state = Arc::new(handlers::agents::AgentsState {
                 workspace_root: workspace_root.clone(),
                 registry,
-                identity: _settings.identity.clone(),
+                identity: settings.identity.clone(),
             });
             app = app.nest("/agents/api", handlers::agents::router(agents_state));
         }
@@ -118,7 +118,7 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     // Vault — filesystem mtime feed over the Obsidian vault.
     // Tilde-expand the configured vault_path since the config loader
     // doesn't do it for us today.
-    let vault_path_raw = &_settings.obsidian.vault_path;
+    let vault_path_raw = &settings.obsidian.vault_path;
     let vault_root = if let Some(rest) = vault_path_raw.strip_prefix("~/") {
         std::env::var("HOME")
             .map(|h| PathBuf::from(h).join(rest))
@@ -135,7 +135,7 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     });
     app = app.nest("/vault/api", handlers::vault::router(vault_state));
 
-    let diary_root_for_dash = workspace_root.join(&_settings.diary.root);
+    let diary_root_for_dash = workspace_root.join(&settings.diary.root);
     let chat_pool_for_dash = match db::open(&workspace_root.join("memory/chat.db")).await {
         Ok(p) => Some(p),
         Err(_) => None,
@@ -147,11 +147,11 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
         news_pool: news_pool.clone(),
         reminders_pool: reminders_pool.clone(),
         chat_pool: chat_pool_for_dash,
-        tunnel_probe_url: _settings.public_urls.nucleus.clone(),
+        tunnel_probe_url: settings.public_urls.nucleus.clone(),
     });
     app = app.nest("/api/dashboard", handlers::dashboard::router(dashboard_state));
 
-    match init_chat(&workspace_root, &_settings, &vault_root).await {
+    match init_chat(&workspace_root, &settings, &vault_root).await {
         Ok(state) => {
             let state = Arc::new(state);
             spawn_daily_rotation(state.clone());
@@ -176,7 +176,7 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
 
     // Diary router — per ADR-004, every bot writes to
     // memory/diaries/<agent>/<YYYY-MM-DD>.md.
-    let diary_root = workspace_root.join(&_settings.diary.root);
+    let diary_root = workspace_root.join(&settings.diary.root);
     let diary_state = Arc::new(handlers::diary::DiaryState { root: diary_root });
     app = app.nest("/diary/api", handlers::diary::router(diary_state));
 
@@ -198,7 +198,7 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
                     pool,
                     files_dir: gallery_files_dir.clone(),
                     backends: vec![
-                        ("bonsai".to_string(), format!("http://127.0.0.1:{}", _settings.ports.bonsai)),
+                        ("bonsai".to_string(), format!("http://127.0.0.1:{}", settings.ports.bonsai)),
                     ],
                     // Safe API fallback when a request omits `model` (always-up);
                     // the UI defaults its selector to noobai independently.
@@ -320,7 +320,7 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
         })
         .layer(TraceLayer::new_for_http());
 
-    let port = _settings.ports.nucleus_dashboard;
+    let port = settings.ports.nucleus_dashboard;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!(
         "nucleus-dashboard listening on http://{} (serving SPA from {:?})",
