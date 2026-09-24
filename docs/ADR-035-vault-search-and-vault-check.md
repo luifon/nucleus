@@ -94,15 +94,35 @@ dashboard. Two layers, shared by search, check and the dashboard:
   `*.pem`, `*.key`, and any folder named `homelab`, where operators keep
   service logins. `[vault_search] exclude` adds globs (default:
   attachment and asset folders). Non-markdown files are never indexed.
-- **Content.** A built-in detector, also not removable: well-known key
-  formats and PEM private keys anywhere; a label that is exactly a secret
-  word with a one-token value (`password: x`, `- **Senha:** x`,
-  `API_KEY=x`); or a label of any length naming a secret whose value, on the
-  same line or the next non-empty line, is a token of six or more
-  characters with letters and digits (`API key on file:` followed by the
-  key). A value loses a trailing comment first: YAML (` # prod`), HTML
+- **Content.** A built-in detector, also not removable:
+  - well-known key formats and PEM private keys anywhere;
+  - a **secret label** followed by any value that is not a placeholder.
+    A secret label is exactly a secret word or pair (`password`,
+    `passphrase`, `senha`, `pin`, `secret`, `token`, `API key`, `chave de
+    API`, with markdown removed: `- **Senha:**`, `API_KEY=`), a secret word
+    followed by an owner preposition (`senha do roteador`, `password for
+    the printer`), or two to four words ending in a secret word that is not
+    preceded by a modifier preposition (`wifi password`; not `reset de
+    senha`). The value may contain spaces (`password: correct horse
+    battery staple`); when the line has no value, the next non-empty line
+    that is not a heading is the value. Placeholders are an empty value,
+    a value wrapped in `<>`, `[]`, `{}` or `()` (template slots and
+    `[[note links]]`), mask characters only (`xxx`, `***`, `...`), a short
+    list of words (`none`, `n/a`, `tbd`, `redacted`, `true`, `false`, …),
+    and a reference of at most six words that starts with a word such as
+    `see`/`in`/`no`/`veja` and names a store (`see vault`, `in 1password`,
+    `no cofre`). This rule has false positives (`Token: create one under
+    Settings` excludes its note) by design;
+  - a label of any other length that mentions a secret word, whose value,
+    on the same line or the next non-empty line, is one token of six or
+    more characters with letters and digits (`API key on file:` followed
+    by the key). Prose such as `Password policy: 12 characters` stays
+    searchable.
+
+  A value loses a trailing comment first: YAML (` # prod`), HTML
   (`<!-- -->`) or Obsidian (`%% %%`). `[vault_search]
-  credential_content_regex` adds patterns.
+  credential_content_regex` adds patterns. The detector has a version in
+  the index fingerprint; a change to it rebuilds every index.
 - **Folding.** Paths and text are compared after Unicode NFKC and the
   removal of every Default_Ignorable_Code_Point, so full-width letters or a
   zero-width character inside a word (`pass<U+200B>word`) match the plain

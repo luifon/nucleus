@@ -125,7 +125,7 @@ impl Exclusions {
 
 /// Bumped whenever [`looks_like_credentials`] changes, so existing indexes
 /// are rebuilt under the new rule.
-const DETECTOR_VERSION: &str = "credential-detector-v2";
+const DETECTOR_VERSION: &str = "credential-detector-v3";
 
 /// Unicode compatibility normalization (NFKC) with every
 /// Default_Ignorable_Code_Point removed. NFKC turns full-width and other
@@ -168,12 +168,12 @@ fn is_default_ignorable(c: char) -> bool {
 
 /// Words that name a secret when they label a value.
 const SECRET_WORDS: &[&str] = &[
-    "password", "passwords", "passwd", "passphrase", "senha", "senhas", "secret",
-    "token", "apikey", "pin", "credential", "credentials", "credencial", "credenciais",
+    "password", "passwords", "passwd", "passphrase", "passphrases", "passcode", "senha", "senhas",
+    "secret", "token", "apikey", "pin", "credential", "credentials", "credencial", "credenciais",
 ];
 
-/// Two-word labels that name a secret (`chave de API` is folded to
-/// `chave api` by [`normalize_label`]).
+/// Two-word labels that name a secret (`chave de API` is read as `chave
+/// api`, see [`LabelWords`]).
 const SECRET_PAIRS: &[(&str, &str)] = &[
     ("api", "key"),
     ("api", "keys"),
@@ -183,6 +183,17 @@ const SECRET_PAIRS: &[(&str, &str)] = &[
     ("client", "secret"),
     ("access", "token"),
 ];
+
+/// Words dropped from a label before it is compared with the secret words.
+const FILLER_WORDS: &[&str] = &["de", "do", "da", "of", "the", "my", "meu", "minha"];
+
+/// Prepositions that attach a secret word to the thing it belongs to:
+/// `senha do roteador`, `password for the printer`.
+const OWNER_LINKS: &[&str] = &["de", "do", "da", "dos", "das", "for", "of", "para"];
+
+/// Prepositions that make the secret word a modifier of the word before it:
+/// `reset de senha` is about passwords, it does not hold one.
+const MODIFIER_LINKS: &[&str] = &["de", "do", "da", "dos", "das", "of", "about", "sobre"];
 
 /// Well-known API key formats and PEM private keys, matched anywhere.
 fn known_key_re() -> &'static Regex {
@@ -206,19 +217,32 @@ fn known_key_re() -> &'static Regex {
 ///
 /// 1. it contains a well-known key format or a PEM private key; or
 /// 2. a line is `label: value` (or `label = value`) where the label, with
-///    markdown removed, is exactly a secret word or pair (`password: x`,
-///    `- **Senha:** x`, `API_KEY=x`) and the value is one token of 3 or
-///    more characters; or
+///    markdown removed, is a **secret label** and the value is anything
+///    other than a placeholder ([`is_placeholder`]). The value may contain
+///    spaces (`password: correct horse battery staple`). When the same line
+///    has no value, the next non-empty line that is not a heading is the
+///    value. A secret label is one of:
+///    - exactly a secret word or pair (`password`, `- **Senha:**`,
+///      `API_KEY`, `chave de API`);
+///    - a secret word or pair followed by an owner preposition, in a label
+///      of up to six words (`senha do roteador`, `password for the printer`);
+///    - two to four words ending in a secret word or pair that is not
+///      preceded by a modifier preposition (`wifi password`, `github
+///      token`; not `reset de senha`); or
 /// 3. the label, of any length, contains a secret word or pair (`API key on
-///    file:`, `senha do roteador:`), and the value — on the same line, or on
-///    the next non-empty line when the same line has none — is a single
-///    token of 6 or more characters with both letters and digits.
+///    file:`, `the shared password for the office printer:`), and the value
+///    — on the same line, or on the next non-empty line when the same line
+///    has none — is a single token of 6 or more characters with both letters
+///    and digits.
 ///
 /// A value loses a trailing comment before it is judged: a YAML comment
 /// (` # prod`), an HTML comment (`<!-- -->`) or an Obsidian comment
 /// (`%% %%`). Rule 3 keeps prose such as `Token budget: 5000 per call` or
-/// `Max tokens: 4096` searchable, and still catches a key written on the
-/// line below its label.
+/// `Password policy: 12 characters minimum` searchable.
+///
+/// Rule 2 has false positives by design (`Token: see Settings → create one`
+/// excludes its note). A false positive costs one note missing from search;
+/// a false negative puts a credential in a search result.
 ///
 /// The caller folds the text first ([`fold`]); [`Exclusions::content_excluded`]
 /// does.
@@ -243,57 +267,179 @@ pub fn looks_like_credentials(text: &str) -> bool {
     false
 }
 
+/// How a label relates to secrets.
+#[derive(Debug, PartialEq, Eq)]
+enum LabelKind {
+    /// The label names the secret that the value is (rule 2).
+    Secret,
+    /// The label mentions a secret word somewhere (rule 3).
+    Mentions,
+    None,
+}
+
+/// A label split into lowercase alphanumeric words. `all` keeps every word;
+/// `kept` holds the indexes (into `all`) of the words that are not
+/// [`FILLER_WORDS`].
+struct LabelWords {
+    all: Vec<String>,
+    kept: Vec<usize>,
+}
+
+impl LabelWords {
+    fn new(raw: &str) -> Self {
+        let all: Vec<String> = raw
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect();
+        let kept = (0..all.len()).filter(|&i| !FILLER_WORDS.contains(&all[i].as_str())).collect();
+        Self { all, kept }
+    }
+
+    fn kept(&self, k: usize) -> &str {
+        &self.all[self.kept[k]]
+    }
+
+    /// Length (1 or 2 kept words) of a secret word or pair starting at
+    /// kept word `k`.
+    fn secret_term_at(&self, k: usize) -> Option<usize> {
+        let w = self.kept(k);
+        if k + 1 < self.kept.len() && SECRET_PAIRS.contains(&(w, self.kept(k + 1))) {
+            return Some(2);
+        }
+        SECRET_WORDS.contains(&w).then_some(1)
+    }
+
+    fn word_after(&self, kept_k: usize) -> Option<&str> {
+        self.all.get(self.kept[kept_k] + 1).map(String::as_str)
+    }
+
+    fn word_before(&self, kept_k: usize) -> Option<&str> {
+        self.kept[kept_k].checked_sub(1).map(|i| self.all[i].as_str())
+    }
+
+    fn classify(&self) -> LabelKind {
+        let n = self.kept.len();
+        if n == 0 {
+            return LabelKind::None;
+        }
+        // Exactly a secret word or pair.
+        if self.secret_term_at(0) == Some(n) {
+            return LabelKind::Secret;
+        }
+        // Head first: `senha do roteador`, `password for the printer`.
+        if let Some(len) = self.secret_term_at(0) {
+            if n <= 6 && self.word_after(len - 1).is_some_and(|w| OWNER_LINKS.contains(&w)) {
+                return LabelKind::Secret;
+            }
+        }
+        // Head last: `wifi password`, `github token`, not `reset de senha`.
+        if (2..=4).contains(&n) {
+            for len in [2, 1] {
+                if n > len && self.secret_term_at(n - len) == Some(len) {
+                    let modifier = self.word_before(n - len).is_some_and(|w| MODIFIER_LINKS.contains(&w));
+                    if !modifier {
+                        return LabelKind::Secret;
+                    }
+                }
+            }
+        }
+        if (0..n).any(|k| self.secret_term_at(k).is_some()) {
+            LabelKind::Mentions
+        } else {
+            LabelKind::None
+        }
+    }
+}
+
 /// Rules 2 and 3 for one `label: value` candidate. `following` is the text
 /// after the line, for a value written on the next non-empty line.
 fn label_value_is_secret(raw_label: &str, raw_value: &str, following: &[&str]) -> bool {
-    let label = normalize_label(raw_label);
-    if label.is_empty() {
+    let kind = LabelWords::new(raw_label).classify();
+    if kind == LabelKind::None {
         return false;
     }
-    let words: Vec<&str> = label.split_whitespace().collect();
-    let value = clean_value(raw_value);
-    let exact = match words.as_slice() {
-        [w] => SECRET_WORDS.contains(w),
-        [a, b] => SECRET_PAIRS.contains(&(*a, *b)),
-        _ => false,
-    };
-    // One token: `password: hunter2`. Prose after the label (`Token: create
-    // one under Settings`) is instructions, not a secret.
-    if exact && value.chars().count() >= 3 && !value.chars().any(char::is_whitespace) {
+    let mut value = clean_value(raw_value);
+    if value.is_empty() {
+        value = following
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .filter(|l| !is_heading(l))
+            .map(|l| clean_value(l))
+            .unwrap_or_default();
+    }
+    match kind {
+        LabelKind::Secret => !is_placeholder(&value),
+        LabelKind::Mentions => is_secret_token(&value),
+        LabelKind::None => false,
+    }
+}
+
+fn is_heading(line: &str) -> bool {
+    let t = line.trim_start();
+    let hashes = t.chars().take_while(|&c| c == '#').count();
+    (1..=6).contains(&hashes) && t[hashes..].starts_with([' ', '\t'])
+}
+
+/// Values that stand in for a secret instead of being one. A secret label
+/// followed by one of these does not exclude the note:
+///
+/// - an empty value;
+/// - a value wrapped in `<…>`, `[…]` (including `[[note links]]`), `{…}` or
+///   `(…)`: a template slot or a pointer to another note;
+/// - a value made only of mask characters: `x`, `*`, `.`, `-`, `_`, `•`,
+///   `…`, `?`, `#` (`xxx`, `***`, `...`);
+/// - one of [`PLACEHOLDER_WORDS`] (`none`, `n/a`, `tbd`, `redacted`,
+///   `true`, `false`, …);
+/// - a short reference to where the secret is kept: at most six words,
+///   starting with a [`REFERENCE_LEADS`] word and naming a
+///   [`SECRET_STORES`] word (`see vault`, `in 1password`, `use the
+///   manager`, `no cofre`).
+///
+/// A reference is the one case where a value an operator could have typed
+/// as a passphrase is accepted (`see the vault now`); the lead-plus-store
+/// requirement keeps that set small.
+pub fn is_placeholder(v: &str) -> bool {
+    let t = v.trim().to_lowercase();
+    if t.is_empty() {
         return true;
     }
-    // No limit on the label's length: a long label that names a secret and
-    // is followed by a strong token is still a credential.
-    if !mentions_secret(&words) {
-        return false;
-    }
-    let value = if value.is_empty() {
-        following.iter().map(|l| clean_value(l)).find(|v| !v.is_empty()).unwrap_or_default()
-    } else {
-        value
-    };
-    is_secret_token(&value)
-}
-
-/// Lowercase label words with markdown and punctuation removed; filler
-/// words (`de`, `do`, `da`, `of`, `the`, `my`, `meu`, `minha`) dropped so
-/// `chave de API` reads as `chave api`.
-fn normalize_label(raw: &str) -> String {
-    let lower = raw.to_lowercase();
-    let mut words: Vec<&str> = Vec::new();
-    for w in lower.split(|c: char| !c.is_alphanumeric()) {
-        if w.is_empty() || matches!(w, "de" | "do" | "da" | "of" | "the" | "my" | "meu" | "minha") {
-            continue;
+    for (open, close) in [('<', '>'), ('[', ']'), ('{', '}'), ('(', ')')] {
+        if t.len() >= 2 && t.starts_with(open) && t.ends_with(close) {
+            return true;
         }
-        words.push(w);
     }
-    words.join(" ")
+    if t.chars().all(|c| matches!(c, 'x' | '*' | '.' | '-' | '_' | '•' | '…' | '?' | '#' | ' ')) {
+        return true;
+    }
+    if PLACEHOLDER_WORDS.contains(&t.as_str()) {
+        return true;
+    }
+    let words: Vec<&str> = t
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.len() <= 6
+        && words.first().is_some_and(|w| REFERENCE_LEADS.contains(w))
+        && words.iter().any(|w| SECRET_STORES.contains(&w.trim_end_matches(['.', '!'])))
 }
 
-fn mentions_secret(words: &[&str]) -> bool {
-    words.iter().any(|w| SECRET_WORDS.contains(w))
-        || words.windows(2).any(|p| SECRET_PAIRS.contains(&(p[0], p[1])))
-}
+const PLACEHOLDER_WORDS: &[&str] = &[
+    "none", "n/a", "na", "nil", "null", "tbd", "todo", "redacted", "removed", "hidden",
+    "omitted", "placeholder", "empty", "true", "false", "yes", "no", "sim", "não", "nao",
+    "nenhum", "nenhuma", "vazio",
+];
+
+const REFERENCE_LEADS: &[&str] = &[
+    "see", "in", "on", "stored", "saved", "kept", "use", "ask", "check", "from", "ver", "veja",
+    "no", "na", "em", "está", "esta", "guardada", "guardado", "salva", "salvo", "usar",
+];
+
+const SECRET_STORES: &[&str] = &[
+    "vault", "manager", "keychain", "keyring", "1password", "bitwarden", "keepass", "lastpass",
+    "gerenciador", "cofre", ".env", "env",
+];
 
 /// The value with a trailing comment, list markers, emphasis, quotes and
 /// backticks removed.
@@ -494,7 +640,6 @@ mod tests {
             "The secret of the method is repetition.",
             "password:\n",
             "Token type: bearer",
-            "2. Token: GitHub → Settings → create a token",
             "Password: use the manager",
             "O modelo processa tokens: unidade real de processamento.",
             "Reset de senha: fluxo com e-mail e link temporário.",
@@ -540,6 +685,72 @@ mod tests {
         // A `#` that starts the value, or sits inside it, is the value.
         assert!(e.content_excluded("password: #Xk29abc"));
         assert!(e.content_excluded("password: abc#123"));
+    }
+
+    /// Round-3 regression: a value with spaces under a secret label is a
+    /// credential. Before detector v3 the one-token requirement let every
+    /// multi-word passphrase through.
+    #[test]
+    fn multi_word_values_under_a_secret_label_are_credentials() {
+        let e = ex(&[]);
+        for text in [
+            "password: correct horse battery staple",
+            "Passphrase: correct horse battery staple",
+            "passphrase = correct horse battery staple",
+            "**Password:** correct horse battery staple",
+            "- **Senha:** cavalo correto bateria grampo",
+            "* senha: cavalo correto bateria grampo",
+            "1. PIN: 12 34 56",
+            "> secret: the blue door opens at dawn",
+            "- **Senha do roteador:** cavalo correto bateria",
+            "Senha do wifi: cavalo correto bateria",
+            "password for the printer: correct horse battery",
+            "Wifi password: correct horse battery staple",
+            "GitHub token: abc def ghi",
+            "Chave de API: abc def ghi",
+            "credenciais: usuario admin senha forte",
+            "password: `correct horse battery staple`",
+            "password: correct horse battery staple # rotated",
+            "- **Password:**\n  - correct horse battery staple",
+            "Senha:\n\ncavalo correto bateria grampo",
+            "2. Token: GitHub → Settings → create a token",
+            "pass\u{200B}phrase: correct horse battery staple",
+        ] {
+            assert!(e.content_excluded(text), "should exclude {text:?}");
+        }
+        for text in [
+            // Placeholders.
+            "password:",
+            "password: <your password>",
+            "password: [[Router login]]",
+            "password: {{password}}",
+            "password: xxx",
+            "password: ***",
+            "password: ...",
+            "Password: see vault",
+            "senha: no cofre",
+            "token: in 1password",
+            "password: stored in the password manager",
+            "pin: true",
+            "password: n/a",
+            "password: TBD # later",
+            "Password:\n\n## Next section",
+            // Labels that only mention a secret, with prose values.
+            "Reset de senha: fluxo com e-mail e link temporário.",
+            "Password policy: 12 characters minimum",
+            "Senha forte: pelo menos 12 caracteres",
+            "Access token lifetime: 3600",
+            "Token type: bearer",
+        ] {
+            assert!(!e.content_excluded(text), "should keep {text:?}");
+        }
+    }
+
+    /// Detector changes rebuild existing indexes: the version is part of
+    /// the fingerprint.
+    #[test]
+    fn detector_version_is_in_the_fingerprint() {
+        assert!(ex(&[]).fingerprint().starts_with("credential-detector-v3\n"));
     }
 
     #[test]
