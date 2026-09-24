@@ -14,6 +14,7 @@
 //! - [`runlog`] — per-agent run-log index over Claude transcripts (ADR-016).
 //! - [`skills`] — shared SKILL.md discovery/parse/validate (ADR-008/017).
 //! - [`timestamp`] — the canonical sortable text form for stored timestamps.
+//! - [`vault`] — vault search index and vault check over the Obsidian vault (ADR-035).
 
 pub mod agent_msg;
 pub mod agents;
@@ -33,6 +34,7 @@ pub mod session_index;
 pub mod session_profile;
 pub mod skills;
 pub mod timestamp;
+pub mod vault;
 
 pub fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};

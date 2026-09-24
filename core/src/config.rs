@@ -21,6 +21,8 @@ pub struct Settings {
     pub gmail: GmailConfig,
     pub reminders: RemindersConfig,
     pub session_search: SessionSearchConfig,
+    pub vault_search: VaultSearchConfig,
+    pub vault_check: VaultCheckConfig,
     pub ports: PortsConfig,
 }
 
@@ -287,6 +289,147 @@ impl Default for SessionSearchConfig {
     }
 }
 
+/// ADR-035 vault search. `exclude` ADDS to the built-in exclusion floor in
+/// `nucleus_core::vault::exclude` (dot folders, credential-like names, the
+/// homelab credentials area); it can never remove an entry from that floor.
+/// Globs are vault-relative and case-insensitive; a pattern without `/`
+/// matches any single path component.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VaultSearchConfig {
+    #[serde(default = "default_vault_exclude")]
+    pub exclude: Vec<String>,
+    /// Case-insensitive, multi-line regex. A note whose text matches is
+    /// treated as a credential note: never indexed, never returned, never
+    /// touched by `vault-check`. Empty disables the content check (the path
+    /// floor still applies).
+    #[serde(default = "default_credential_content_regex")]
+    pub credential_content_regex: String,
+}
+
+impl Default for VaultSearchConfig {
+    fn default() -> Self {
+        Self {
+            exclude: default_vault_exclude(),
+            credential_content_regex: default_credential_content_regex(),
+        }
+    }
+}
+
+fn default_vault_exclude() -> Vec<String> {
+    vec![
+        "**/attachments/**".to_string(),
+        "**/_attachments/**".to_string(),
+        "**/assets/**".to_string(),
+    ]
+}
+
+/// A line that assigns a value to a credential-like key (`password: x`,
+/// `senha = x`, `api_key: x`, `- **Token:** x`), or a PEM private key.
+pub fn default_credential_content_regex() -> String {
+    r"^[ \t>*-]*\**(password|passwd|passphrase|senha|api[ _-]?key|secret|client[ _-]?secret|access[ _-]?token|token|pin)\**[ \t]*[:=][ \t]*\**[ \t]*\S|-----BEGIN [A-Z ]*PRIVATE KEY-----".to_string()
+}
+
+/// ADR-035 weekly vault check. All defaulted, so a nucleus.toml without a
+/// `[vault_check]` table loads.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VaultCheckConfig {
+    /// When `nucleus vault-check --scheduled` is due (5-field cron in
+    /// `NUCLEUS_TZ`). The launchd job wakes hourly; this decides whether a
+    /// wake runs the check. Default: Sunday 20:00.
+    #[serde(default = "default_vault_check_cron")]
+    pub cron: String,
+    /// 0-Inbox notes older than this are reported.
+    #[serde(default = "default_inbox_max_age_days")]
+    pub inbox_max_age_days: i64,
+    /// Frontmatter keys every note must carry (CLAUDE.md Rule 9.7).
+    #[serde(default = "default_required_frontmatter")]
+    pub required_frontmatter: Vec<String>,
+    /// Allowed `source:` values. An entry ending in `*` is a prefix. A value
+    /// joined with `+` (`a+b`) is valid when every part is.
+    #[serde(default = "default_source_vocabulary")]
+    pub source_vocabulary: Vec<String>,
+    /// Notes never reported as orphans (hubs, journals, inbox, archive).
+    #[serde(default = "default_orphan_exempt")]
+    pub orphan_exempt: Vec<String>,
+    /// Notes never reported for missing frontmatter or unknown source.
+    #[serde(default = "default_frontmatter_exempt")]
+    pub frontmatter_exempt: Vec<String>,
+    /// Apply the safe fixes on scheduled runs. Manual runs use `--apply`.
+    #[serde(default)]
+    pub scheduled_apply: bool,
+    /// Enqueue the WhatsApp summary on scheduled runs.
+    #[serde(default = "default_true_bool")]
+    pub notify: bool,
+}
+
+impl Default for VaultCheckConfig {
+    fn default() -> Self {
+        Self {
+            cron: default_vault_check_cron(),
+            inbox_max_age_days: default_inbox_max_age_days(),
+            required_frontmatter: default_required_frontmatter(),
+            source_vocabulary: default_source_vocabulary(),
+            orphan_exempt: default_orphan_exempt(),
+            frontmatter_exempt: default_frontmatter_exempt(),
+            scheduled_apply: false,
+            notify: true,
+        }
+    }
+}
+
+fn default_vault_check_cron() -> String {
+    "0 20 * * 0".to_string()
+}
+fn default_inbox_max_age_days() -> i64 {
+    14
+}
+fn default_required_frontmatter() -> Vec<String> {
+    vec!["created".to_string(), "source".to_string()]
+}
+/// The writers Nucleus itself ships plus the generic manual origins.
+/// Operators add their own writers in nucleus.toml.
+pub fn default_source_vocabulary() -> Vec<String> {
+    [
+        "whatsapp-braindump",
+        "alfred-braindump",
+        "chat-braindump",
+        "distiller-contemplation",
+        "obsidian-chat",
+        "whatsapp-docstore",
+        "whatsapp-chat",
+        "nucleus-chat*",
+        "nucleus-session",
+        "claude-code*",
+        "claude-session*",
+        "voice-dictation",
+        "deep-research",
+        "research",
+        "manual",
+        "import",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+fn default_orphan_exempt() -> Vec<String> {
+    [
+        "README.md",
+        "index.md",
+        "Home.md",
+        "_*",
+        "0-Inbox/**",
+        "1-Main-Notes/**",
+        "2-Daily-Notes/**",
+        "7-Archives/**",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+fn default_frontmatter_exempt() -> Vec<String> {
+    ["README.md", "Home.md"].iter().map(|s| s.to_string()).collect()
+}
+
 fn default_reminder_channels() -> Vec<String> {
     vec!["discord-home".to_string()]
 }
@@ -321,6 +464,10 @@ struct TomlConfig {
     reminders: RemindersConfig,
     #[serde(default)]
     session_search: SessionSearchConfig,
+    #[serde(default)]
+    vault_search: VaultSearchConfig,
+    #[serde(default)]
+    vault_check: VaultCheckConfig,
     ports: PortsConfig,
 }
 
@@ -380,6 +527,8 @@ impl Settings {
             gmail,
             reminders: toml.reminders,
             session_search: toml.session_search,
+            vault_search: toml.vault_search,
+            vault_check: toml.vault_check,
             ports: toml.ports,
         })
     }
