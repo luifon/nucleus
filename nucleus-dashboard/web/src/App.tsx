@@ -101,6 +101,7 @@ export default function App() {
               <Route path="/reminders" element={<RemindersPage />} />
               <Route path="/agents" element={<AgentsPage />} />
               <Route path="/vault" element={<VaultPage />} />
+              <Route path="/vault/:tab" element={<VaultPage />} />
               <Route path="/chat" element={<ChatPage />} />
               <Route path="/gallery" element={<GalleryPage />} />
               <Route path="/documents" element={<DocumentsPage />} />
