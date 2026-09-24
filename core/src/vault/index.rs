@@ -12,8 +12,9 @@
 //! under rules it loaded earlier. The index is derived data. Loss or
 //! corruption is repaired by deleting the file; the next call rebuilds it.
 //!
-//! The design follows ADR-023's session index: incremental update by
-//! (mtime, size) before every query, bm25 ranking, `snippet()` excerpts,
+//! The design follows ADR-023's session index: incremental update by file
+//! identity (device, inode, size, nanosecond mtime and ctime) before every
+//! query, bm25 ranking, `snippet()` excerpts,
 //! porter stemming. Differences: the unit is a note, not a turn; columns
 //! are weighted (title > headings/tags > path > frontmatter > body);
 //! diacritics are folded so `orcamento` finds `orçamento`; a change to the
@@ -69,6 +70,18 @@ const MIGRATIONS: &[crate::migrate::Migration] = &[crate::migrate::Migration {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         )",
+    ),
+},
+// Full file identity ([`scan::IndexIdentity`]). Existing rows get zeros,
+// which match no real file, so every note is re-read once.
+crate::migrate::Migration {
+    version: 2,
+    name: "adr035-vault-index-file-identity",
+    step: crate::migrate::Step::Sql(
+        "ALTER TABLE notes ADD COLUMN dev INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE notes ADD COLUMN ino INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE notes ADD COLUMN mtime_ns INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE notes ADD COLUMN ctime_ns INTEGER NOT NULL DEFAULT 0",
     ),
 }];
 
@@ -150,8 +163,9 @@ pub struct UpdateStats {
     pub rebuilt: bool,
 }
 
-/// Bring the index in line with the vault: (re)index notes whose (mtime,
-/// size) changed, drop rows for notes that were deleted or are now
+/// Bring the index in line with the vault: (re)index notes whose file
+/// identity ([`scan::IndexIdentity`]: device, inode, size, nanosecond mtime
+/// and ctime) changed, drop rows for notes that were deleted or are now
 /// excluded. Unchanged notes are not read.
 ///
 /// The whole update runs in one `BEGIN IMMEDIATE` transaction; readers are
@@ -198,18 +212,22 @@ async fn update_locked(
         stats.rebuilt = fp.is_some();
     }
 
-    let existing: Vec<(i64, String, i64, i64)> =
-        sqlx::query_as("SELECT id, path, mtime, size FROM notes").fetch_all(&mut *conn).await?;
-    let known: std::collections::HashMap<String, (i64, i64, i64)> = existing
+    let existing: Vec<(i64, String, i64, i64, i64, i64, i64)> =
+        sqlx::query_as("SELECT id, path, dev, ino, size, mtime_ns, ctime_ns FROM notes")
+            .fetch_all(&mut *conn)
+            .await?;
+    let known: std::collections::HashMap<String, (i64, scan::IndexIdentity)> = existing
         .into_iter()
-        .map(|(id, p, m, s)| (p, (id, m, s)))
+        .map(|(id, p, dev, ino, size, mtime_ns, ctime_ns)| {
+            (p, (id, scan::IndexIdentity { dev, ino, size, mtime_ns, ctime_ns }))
+        })
         .collect();
 
     let mut present: HashSet<String> = HashSet::new();
     for f in walk.files.iter().filter(|f| f.is_markdown()) {
         stats.scanned += 1;
-        if let Some(&(_, m, s)) = known.get(&f.rel) {
-            if m == f.mtime && s == f.size as i64 {
+        if let Some(&(_, stored)) = known.get(&f.rel) {
+            if stored == f.identity() {
                 present.insert(f.rel.clone());
                 stats.unchanged += 1;
                 continue;
@@ -228,7 +246,7 @@ async fn update_locked(
             // Unreadable (permissions, invalid UTF-8): treated as absent.
             Err(_) => continue,
         };
-        if let Some(&(id, _, _)) = known.get(&f.rel) {
+        if let Some(&(id, _)) = known.get(&f.rel) {
             delete_row(conn, id).await?;
         }
         present.insert(f.rel.clone());
@@ -238,19 +256,25 @@ async fn update_locked(
         }
         let n = note::parse(&f.rel, &text);
         let tags = n.tags.join(" ");
+        let ident = f.identity();
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO notes (path, mtime, size, title, bucket, created, source, tags, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) RETURNING id",
+            "INSERT INTO notes (path, mtime, size, title, bucket, created, source, tags, indexed_at,
+                                dev, ino, mtime_ns, ctime_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) RETURNING id",
         )
         .bind(&f.rel)
         .bind(f.mtime)
-        .bind(f.size as i64)
+        .bind(ident.size)
         .bind(&n.title)
         .bind(bucket_of(&f.rel))
         .bind(n.created())
         .bind(n.source())
         .bind(&tags)
         .bind(chrono::Utc::now().to_rfc3339())
+        .bind(ident.dev)
+        .bind(ident.ino)
+        .bind(ident.mtime_ns)
+        .bind(ident.ctime_ns)
         .fetch_one(&mut *conn)
         .await?;
         sqlx::query(
@@ -270,7 +294,7 @@ async fn update_locked(
     }
 
     // Deleted, renamed away, or newly excluded.
-    for (path, (id, _, _)) in &known {
+    for (path, (id, _)) in &known {
         if !present.contains(path) {
             delete_row(conn, *id).await?;
             stats.removed += 1;
@@ -600,7 +624,6 @@ mod tests {
         assert_eq!((r.mode.as_str(), r.hits.len()), ("all", 2));
 
         // Edit → reindexed; delete → removed; credential added → removed.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         write(&vault, "6-Slipbox/deciding-under-uncertainty.md", "# Deciding\n\nNew body about kayaks.\n");
         fs::remove_file(vault.join("3-Projects/Beta/index.md")).unwrap();
         write(&vault, "3-Projects/Alpha/engine-notes.md", "# Engine\n\napi_key = abc123\n");
@@ -615,6 +638,48 @@ mod tests {
         let (s, ex2) = w.update(&vault).await.unwrap();
         assert!(s.rebuilt);
         assert!(search(pool, "kayaks", &opts, &ex2).await.unwrap().hits.is_empty());
+    }
+
+    /// Round 3, item 3: an edit in the same second that keeps the size is
+    /// reindexed (nanosecond mtime and ctime), and so is an edit whose
+    /// mtime a program set back (ctime), and a file replaced by another
+    /// with the same size and mtime (inode).
+    #[tokio::test]
+    async fn same_second_same_size_edits_are_reindexed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        write(&vault, "0-Inbox/n.md", "# N\nalpha\n");
+        set_rules(&tmp.path().join("ws"), &[]);
+        let w = writer(tmp.path()).await;
+        let (_, ex) = w.update(&vault).await.unwrap();
+        let hits = |q: &'static str| {
+            let (pool, ex) = (w.pool().clone(), ex.clone());
+            async move { search(&pool, q, &SearchOpts { bucket: None, limit: 10 }, &ex).await.unwrap().hits.len() }
+        };
+        assert_eq!(hits("alpha").await, 1);
+
+        // Same length, immediately (same second), no sleep.
+        let p = vault.join("0-Inbox/n.md");
+        fs::write(&p, "# N\nbravo\n").unwrap();
+        let (s, _) = w.update(&vault).await.unwrap();
+        assert_eq!(s.indexed, 1, "{s:?}");
+        assert_eq!((hits("alpha").await, hits("bravo").await), (0, 1));
+
+        // Same length and the old mtime restored: ctime still differs.
+        let mtime = fs::metadata(&p).unwrap().modified().unwrap();
+        fs::write(&p, "# N\ncharl\n").unwrap();
+        fs::File::options().write(true).open(&p).unwrap().set_modified(mtime).unwrap();
+        let (s, _) = w.update(&vault).await.unwrap();
+        assert_eq!(s.indexed, 1, "{s:?}");
+        assert_eq!(hits("charl").await, 1);
+
+        // Replaced by a different file (new inode) with the same size.
+        let other = vault.join("0-Inbox/other.tmp");
+        fs::write(&other, "# N\ndelta\n").unwrap();
+        fs::rename(&other, &p).unwrap();
+        let (s, _) = w.update(&vault).await.unwrap();
+        assert_eq!(s.indexed, 1, "{s:?}");
+        assert_eq!(hits("delta").await, 1);
     }
 
     /// `%` and `_` in a bucket filter match only themselves.

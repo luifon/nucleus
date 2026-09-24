@@ -1209,6 +1209,15 @@ pub async fn record(pool: &SqlitePool, r: &CheckReport) -> Result<i64> {
     Ok(id)
 }
 
+/// The `check_runs` columns the readers use, named explicitly. With
+/// `SELECT *`, a connection whose schema cache predates the `oversized`
+/// migration prepares the statement with the old column list; SQLite
+/// re-prepares it with one more column at the first step, and sqlx then
+/// indexes past its cached column list and panics.
+const RUN_COLUMNS: &str = "id, started_at, finished_at, trigger, applied, notes_scanned, files_excluded,
+    duration_ms, duplicates, broken_links, orphans, stale_inbox, missing_frontmatter, unknown_source,
+    empty_files, oversized, fixed";
+
 fn counts_from_row(r: &sqlx::sqlite::SqliteRow) -> CheckCounts {
     CheckCounts {
         duplicates: r.get("duplicates"),
@@ -1225,7 +1234,7 @@ fn counts_from_row(r: &sqlx::sqlite::SqliteRow) -> CheckCounts {
 
 /// Most recent runs, newest first.
 pub async fn runs(pool: &SqlitePool, limit: i64) -> Result<Vec<CheckRunSummary>> {
-    let rows = sqlx::query("SELECT * FROM check_runs ORDER BY id DESC LIMIT ?1")
+    let rows = sqlx::query(&format!("SELECT {RUN_COLUMNS} FROM check_runs ORDER BY id DESC LIMIT ?1"))
         .bind(limit)
         .fetch_all(pool)
         .await?;
@@ -1245,7 +1254,7 @@ pub async fn runs(pool: &SqlitePool, limit: i64) -> Result<Vec<CheckRunSummary>>
 
 /// The latest run with its findings.
 pub async fn latest(pool: &SqlitePool) -> Result<Option<CheckReport>> {
-    let Some(r) = sqlx::query("SELECT * FROM check_runs ORDER BY id DESC LIMIT 1")
+    let Some(r) = sqlx::query(&format!("SELECT {RUN_COLUMNS} FROM check_runs ORDER BY id DESC LIMIT 1"))
         .fetch_optional(pool)
         .await?
     else {

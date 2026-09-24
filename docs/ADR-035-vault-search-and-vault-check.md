@@ -35,7 +35,11 @@ files. Two consequences followed:
   remove_diacritics 2` tokenizer, so `orcamento` finds `orçamento` and
   `deciding` finds `decided`.
 - **Incremental.** Each call walks the vault and re-reads only notes whose
-  (mtime, size) changed; deleted or newly excluded notes are removed. A
+  file identity changed: device, inode, size, and modification and
+  status-change times with nanoseconds. An edit within the same second that
+  keeps the size changes the nanosecond times; an mtime set back by a
+  program still changes the ctime; a file replaced by another changes the
+  inode; deleted or newly excluded notes are removed. A
   change to the exclusion rules (or to the credential detector version)
   rebuilds the index. A note larger than 2 MiB (`MAX_NOTE_BYTES`) is
   skipped and counted, not read. The index is derived data: deleting the
@@ -49,8 +53,8 @@ files. Two consequences followed:
   index: before a search it runs `nucleus vault-search --reindex` as a
   subprocess and then opens the file read-only. At most one such update
   runs at a time. The dashboard takes a vault watermark before each search
-  (a hash of every walked note's path, size, nanosecond mtime and inode,
-  plus the exclusion rules' fingerprint; no content is read). Searches that
+  (a hash of every walked note's path and file identity, plus the
+  exclusion rules' fingerprint; no content is read). Searches that
   arrive while an update runs for the same watermark wait for that update's
   result instead of starting another; a search whose watermark differs
   waits for it to end and then starts the next one. No update runs when

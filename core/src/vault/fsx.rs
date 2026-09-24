@@ -28,6 +28,10 @@ pub struct Ident {
     pub size: u64,
     /// Modification time in nanoseconds since the epoch.
     pub mtime_ns: i128,
+    /// Status-change time in nanoseconds since the epoch. Changes on every
+    /// write, rename or metadata change, and cannot be set by a program
+    /// (unlike mtime).
+    pub ctime_ns: i128,
     /// Birth time in unix seconds, where the filesystem records it.
     pub birthtime: Option<i64>,
 }
@@ -61,6 +65,7 @@ impl Ident {
             ino: st.st_ino as u64,
             size: st.st_size as u64,
             mtime_ns: st.st_mtime as i128 * 1_000_000_000 + st.st_mtime_nsec as i128,
+            ctime_ns: st.st_ctime as i128 * 1_000_000_000 + st.st_ctime_nsec as i128,
             birthtime,
         }
     }

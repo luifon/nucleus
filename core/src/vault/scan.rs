@@ -23,6 +23,8 @@ pub struct VaultFile {
     pub mtime: i64,
     /// Modification time with nanoseconds, for the pre-fix identity check.
     pub mtime_ns: i128,
+    /// Status-change time with nanoseconds ([`Ident::ctime_ns`]).
+    pub ctime_ns: i128,
     /// Creation (birth) time, unix seconds, when the filesystem records it.
     pub birthtime: Option<i64>,
     /// Device and inode at scan time. A fix acts only on the same file.
@@ -39,6 +41,7 @@ impl VaultFile {
             size: id.size,
             mtime: id.mtime_ns.div_euclid(1_000_000_000) as i64,
             mtime_ns: id.mtime_ns,
+            ctime_ns: id.ctime_ns,
             birthtime: id.birthtime,
             dev: id.dev,
             ino: id.ino,
@@ -56,6 +59,17 @@ impl VaultFile {
             && id.mtime_ns == self.mtime_ns
     }
 
+    /// What the search index stores to decide whether a note changed.
+    pub fn identity(&self) -> IndexIdentity {
+        IndexIdentity {
+            dev: self.dev as i64,
+            ino: self.ino as i64,
+            size: self.size as i64,
+            mtime_ns: self.mtime_ns as i64,
+            ctime_ns: self.ctime_ns as i64,
+        }
+    }
+
     pub fn is_markdown(&self) -> bool {
         self.rel.to_lowercase().ends_with(".md")
     }
@@ -63,6 +77,21 @@ impl VaultFile {
     pub fn file_name(&self) -> &str {
         self.rel.rsplit('/').next().unwrap_or(&self.rel)
     }
+}
+
+/// A note's file identity as the search index stores it. The index
+/// re-reads a note when any field differs from the stored row: a new file
+/// at the same path (device, inode), a write (size, mtime, ctime) even
+/// within the same second and at the same length, or an mtime set back by a
+/// program (ctime). Stored as SQLite integers; nanosecond times fit `i64`
+/// until 2262.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IndexIdentity {
+    pub dev: i64,
+    pub ino: i64,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
 }
 
 #[derive(Debug)]
@@ -142,8 +171,7 @@ pub fn walk(root: &Path, ex: &Exclusions) -> Result<Walk> {
 }
 
 /// A value that changes when the search index would change: every walked
-/// file's path, size, nanosecond mtime and inode, and the exclusion rules'
-/// fingerprint. Reads no file content. Comparable only within one process
+/// file's path and [`IndexIdentity`], and the exclusion rules' fingerprint. Reads no file content. Comparable only within one process
 /// (the hash is not stable across builds).
 pub fn watermark(root: &Path, ex: &Exclusions) -> Result<u64> {
     use std::hash::{Hash, Hasher};
@@ -151,7 +179,7 @@ pub fn watermark(root: &Path, ex: &Exclusions) -> Result<u64> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ex.fingerprint().hash(&mut h);
     for f in &w.files {
-        (&f.rel, f.size, f.mtime_ns, f.dev, f.ino).hash(&mut h);
+        (&f.rel, f.identity()).hash(&mut h);
     }
     Ok(h.finish())
 }
