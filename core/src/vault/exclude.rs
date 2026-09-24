@@ -125,7 +125,7 @@ impl Exclusions {
 
 /// Bumped whenever [`looks_like_credentials`] changes, so existing indexes
 /// are rebuilt under the new rule.
-const DETECTOR_VERSION: &str = "credential-detector-v5";
+const DETECTOR_VERSION: &str = "credential-detector-v6";
 
 /// Unicode compatibility normalization (NFKC) with every
 /// Default_Ignorable_Code_Point removed. NFKC turns full-width and other
@@ -404,10 +404,16 @@ pub fn is_placeholder(v: &str) -> bool {
     let raw = v.trim();
     let lower = raw.to_lowercase();
     // `[[note link]]` and `{{template}}` are references, not values.
-    if (lower.starts_with("[[") && lower.ends_with("]]"))
-        || (lower.starts_with("{{") && lower.ends_with("}}"))
-    {
-        return true;
+    // Only a single, un-nested `[[…]]` / `{{…}}` counts: `[[a]] hunter2
+    // [[b]]` or `[[[[hunter2]]]]` are values.
+    for (open, close) in [("[[", "]]"), ("{{", "}}")] {
+        if lower.len() > 4 && lower.starts_with(open) && lower.ends_with(close) {
+            let inner = &lower[2..lower.len() - 2];
+            let (o, c) = (open.chars().next().unwrap(), close.chars().next().unwrap());
+            if !inner.is_empty() && !inner.contains(o) && !inner.contains(c) {
+                return true;
+            }
+        }
     }
     // Peel at most MAX_WRAP bracket layers, iteratively. A wrapped value is a
     // placeholder only when its content is itself a bare placeholder, an
@@ -798,6 +804,9 @@ mod tests {
             "password: [my-password-2024]",
             "password: [secret sauce 7]",
             "password: ((((hunter2))))",
+            "password: [[note]] hunter2 [[backup]]",
+            "password: [[[[hunter2]]]]",
+            "password: {{a}} hunter2 {{b}}",
             "password: [your 7 horses]",
         ] {
             assert!(e.content_excluded(text), "should exclude {text:?}");
@@ -812,6 +821,7 @@ mod tests {
             "password: [redacted]",
             "token: [TOKEN]",
             "password: [[[redacted]]]",
+            "password: ([redacted])",
             "password: [[Router login]]",
             "password: {{password}}",
             "password: xxx",
@@ -840,7 +850,7 @@ mod tests {
     /// the fingerprint.
     #[test]
     fn detector_version_is_in_the_fingerprint() {
-        assert!(ex(&[]).fingerprint().starts_with("credential-detector-v5\n"));
+        assert!(ex(&[]).fingerprint().starts_with("credential-detector-v6\n"));
     }
 
     #[test]
