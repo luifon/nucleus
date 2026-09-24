@@ -125,7 +125,7 @@ impl Exclusions {
 
 /// Bumped whenever [`looks_like_credentials`] changes, so existing indexes
 /// are rebuilt under the new rule.
-const DETECTOR_VERSION: &str = "credential-detector-v4";
+const DETECTOR_VERSION: &str = "credential-detector-v5";
 
 /// Unicode compatibility normalization (NFKC) with every
 /// Default_Ignorable_Code_Point removed. NFKC turns full-width and other
@@ -401,32 +401,75 @@ fn is_heading(line: &str) -> bool {
 /// as a passphrase is accepted (`see the vault now`); the lead-plus-store
 /// requirement keeps that set small.
 pub fn is_placeholder(v: &str) -> bool {
-    let t = v.trim().to_lowercase();
+    let raw = v.trim();
+    let lower = raw.to_lowercase();
+    // `[[note link]]` and `{{template}}` are references, not values.
+    if (lower.starts_with("[[") && lower.ends_with("]]"))
+        || (lower.starts_with("{{") && lower.ends_with("}}"))
+    {
+        return true;
+    }
+    // Peel at most MAX_WRAP bracket layers, iteratively. A wrapped value is a
+    // placeholder only when its content is itself a bare placeholder, an
+    // uppercase template name (`<YOUR_PASSWORD>`, `[TOKEN]`), or a template
+    // phrase that starts with a lead word and has only template words
+    // (`<your password>`, `(sua senha)`). Any other wrapped literal —
+    // `(hunter2)`, `[my secret key]`, `[correct horse battery staple]` — is
+    // a value, so its note stays excluded.
+    const MAX_WRAP: usize = 3;
+    let mut inner = raw;
+    let mut wrapped = false;
+    for _ in 0..MAX_WRAP {
+        let Some((open, close)) = [('<', '>'), ('[', ']'), ('{', '}'), ('(', ')')]
+            .into_iter()
+            .find(|(o, c)| inner.len() >= 2 && inner.starts_with(*o) && inner.ends_with(*c))
+        else {
+            break;
+        };
+        inner = inner[open.len_utf8()..inner.len() - close.len_utf8()].trim();
+        wrapped = true;
+    }
+    if wrapped {
+        let starts_bracket = inner.starts_with(['<', '[', '{', '(']);
+        return !starts_bracket
+            && (is_bare_placeholder(&inner.to_lowercase())
+                || is_template_name(inner)
+                || is_template_phrase(&inner.to_lowercase()));
+    }
+    is_bare_placeholder(&lower)
+}
+
+/// `YOUR_PASSWORD`, `API_KEY`, `TOKEN`: uppercase letters, digits and `_`,
+/// at least one letter, containing a template word.
+fn is_template_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && s.chars().any(|c| c.is_ascii_uppercase())
+        && s.to_lowercase().split('_').any(|w| TEMPLATE_WORDS.contains(&w))
+}
+
+/// `your password`, `insert api key here`, `sua senha`: a lead word
+/// followed only by template words.
+fn is_template_phrase(s: &str) -> bool {
+    let words: Vec<&str> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.len() >= 2
+        && TEMPLATE_LEADS.contains(&words[0])
+        && words.iter().all(|w| TEMPLATE_WORDS.contains(w) || TEMPLATE_LEADS.contains(w))
+}
+
+/// Placeholders without brackets: empty, mask characters, a short list of
+/// words, or a reference to where the secret is stored.
+fn is_bare_placeholder(t: &str) -> bool {
     if t.is_empty() {
         return true;
-    }
-    // A wrapped value is a placeholder only when its content says so: a
-    // wiki link or template variable, an inner placeholder, or a template
-    // name such as `<YOUR_PASSWORD>` / `[api key here]`. A literal wrapped
-    // in brackets (`(hunter2)`, `[correct horse battery staple]`) is still a
-    // credential.
-    if (t.starts_with("[[") && t.ends_with("]]")) || (t.starts_with("{{") && t.ends_with("}}")) {
-        return true;
-    }
-    for (open, close) in [('<', '>'), ('[', ']'), ('{', '}'), ('(', ')')] {
-        if t.len() >= 2 && t.starts_with(open) && t.ends_with(close) {
-            let inner = t[open.len_utf8()..t.len() - close.len_utf8()].trim();
-            return is_placeholder(inner)
-                || inner
-                    .split(|c: char| !c.is_alphanumeric())
-                    .filter(|w| !w.is_empty())
-                    .any(|w| TEMPLATE_WORDS.contains(&w));
-        }
     }
     if t.chars().all(|c| matches!(c, 'x' | '*' | '.' | '-' | '_' | '•' | '…' | '?' | '#' | ' ')) {
         return true;
     }
-    if PLACEHOLDER_WORDS.contains(&t.as_str()) {
+    if PLACEHOLDER_WORDS.contains(&t) {
         return true;
     }
     let words: Vec<&str> = t
@@ -446,9 +489,14 @@ const PLACEHOLDER_WORDS: &[&str] = &[
 
 /// Words that mark bracketed content as a template slot rather than a value.
 const TEMPLATE_WORDS: &[&str] = &[
-    "your", "my", "here", "insert", "enter", "example", "sample", "placeholder", "redacted",
-    "password", "passphrase", "passcode", "pin", "secret", "token", "key", "apikey", "value",
-    "seu", "sua", "aqui", "inserir", "exemplo", "senha", "chave", "valor", "segredo",
+    "here", "example", "sample", "placeholder", "redacted", "the", "a", "an", "of", "for",
+    "password", "passphrase", "passcode", "pin", "secret", "token", "key", "api", "apikey",
+    "value", "aqui", "exemplo", "senha", "chave", "valor", "segredo", "de", "da", "do",
+];
+
+/// First word of a bracketed template phrase (`<your password>`).
+const TEMPLATE_LEADS: &[&str] = &[
+    "your", "insert", "enter", "put", "seu", "sua", "insira", "inserir", "coloque", "digite",
 ];
 
 const REFERENCE_LEADS: &[&str] = &[
@@ -711,6 +759,12 @@ mod tests {
     /// credential. Before detector v3 the one-token requirement let every
     /// multi-word passphrase through.
     #[test]
+    fn deeply_nested_brackets_are_bounded() {
+        let deep = format!("password: {}hunter2{}", "(".repeat(200_000), ")".repeat(200_000));
+        assert!(ex(&[]).content_excluded(&deep));
+    }
+
+    #[test]
     fn multi_word_values_under_a_secret_label_are_credentials() {
         let e = ex(&[]);
         for text in [
@@ -740,6 +794,11 @@ mod tests {
             "password: [correct horse battery staple]",
             "senha: {cavalo correto bateria}",
             "token: <ab12cd34ef56>",
+            "password: [my secret key]",
+            "password: [my-password-2024]",
+            "password: [secret sauce 7]",
+            "password: ((((hunter2))))",
+            "password: [your 7 horses]",
         ] {
             assert!(e.content_excluded(text), "should exclude {text:?}");
         }
@@ -748,9 +807,11 @@ mod tests {
             "password:",
             "password: <your password>",
             "password: <YOUR_PASSWORD>",
-            "api key: [api key here]",
+            "api key: [insert api key here]",
             "senha: (sua senha)",
             "password: [redacted]",
+            "token: [TOKEN]",
+            "password: [[[redacted]]]",
             "password: [[Router login]]",
             "password: {{password}}",
             "password: xxx",
@@ -779,7 +840,7 @@ mod tests {
     /// the fingerprint.
     #[test]
     fn detector_version_is_in_the_fingerprint() {
-        assert!(ex(&[]).fingerprint().starts_with("credential-detector-v4\n"));
+        assert!(ex(&[]).fingerprint().starts_with("credential-detector-v5\n"));
     }
 
     #[test]

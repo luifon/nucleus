@@ -113,10 +113,13 @@ dashboard. Two layers, shared by search, check and the dashboard:
     battery staple`); when the line has no value, the next non-empty line
     that is not a heading is the value. Placeholders are an empty value,
     `[[note links]]` and `{{template}}` variables, a value wrapped in
-    `<>`, `[]`, `{}` or `()` only when its content is itself a placeholder
-    or names a template slot (`<YOUR_PASSWORD>`, `[api key here]`,
-    `(sua senha)`) — a literal wrapped in brackets such as `(hunter2)` is
-    still a credential — mask characters only (`xxx`, `***`, `...`), a short
+    `<>`, `[]`, `{}` or `()` (at most three layers) only when its content
+    is itself a bare placeholder, an uppercase template name
+    (`<YOUR_PASSWORD>`, `[TOKEN]`), or a phrase that starts with a lead word
+    such as `your`/`insert`/`sua` and contains only template words
+    (`<your password>`, `(sua senha)`); any other wrapped literal, such as
+    `(hunter2)` or `[my secret key]`, is still a credential — mask
+    characters only (`xxx`, `***`, `...`), a short
     list of words (`none`, `n/a`, `tbd`, `redacted`, `true`, `false`, …),
     and a reference of at most six words that starts with a word such as
     `see`/`in`/`no`/`veja` and names a store (`see vault`, `in 1password`,
