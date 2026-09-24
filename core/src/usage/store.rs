@@ -58,7 +58,11 @@ pub struct FileState {
     pub dev: i64,
     pub ino: i64,
     pub size: i64,
-    pub mtime: i64,
+    /// Modification and status-change times in nanoseconds since the epoch.
+    /// Together with (dev, ino, size) they are the metadata that lets a
+    /// refresh skip a file without reading it.
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
     pub offset: i64,
     pub carry: String,
     pub fingerprint: Fingerprint,
@@ -77,7 +81,8 @@ struct FileRow {
     dev: i64,
     ino: i64,
     size: i64,
-    mtime: i64,
+    mtime_ns: i64,
+    ctime_ns: i64,
     offset: i64,
     carry: Option<String>,
     head_len: i64,
@@ -90,7 +95,7 @@ struct FileRow {
 
 pub async fn load_file_state(pool: &SqlitePool, path: &str) -> Result<Option<FileState>> {
     let row: Option<FileRow> = sqlx::query_as(
-        "SELECT vendor, session_id, subagent_id, dev, ino, size, mtime, offset, carry, head_len,
+        "SELECT vendor, session_id, subagent_id, dev, ino, size, mtime_ns, ctime_ns, offset, carry, head_len,
                 head_hash, tail_hash, first_ts_ms, malformed_lines, oversized_lines
            FROM source_files WHERE path = ?1",
     )
@@ -105,7 +110,8 @@ pub async fn load_file_state(pool: &SqlitePool, path: &str) -> Result<Option<Fil
         dev: r.dev,
         ino: r.ino,
         size: r.size,
-        mtime: r.mtime,
+        mtime_ns: r.mtime_ns,
+        ctime_ns: r.ctime_ns,
         offset: r.offset,
         carry: r.carry.unwrap_or_default(),
         fingerprint: Fingerprint { head_len: r.head_len, head_hash: r.head_hash, tail_hash: r.tail_hash },
@@ -340,13 +346,14 @@ pub async fn finish_file(tx: &mut Transaction<'_, Sqlite>, state: &FileState, fa
     }
     sqlx::query(
         "INSERT INTO source_files
-           (path, vendor, session_id, subagent_id, dev, ino, size, mtime, offset, carry, head_len,
-            head_hash, tail_hash, first_ts_ms, malformed_lines, oversized_lines, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+           (path, vendor, session_id, subagent_id, dev, ino, size, mtime_ns, ctime_ns, offset, carry,
+            head_len, head_hash, tail_hash, first_ts_ms, malformed_lines, oversized_lines, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(path) DO UPDATE SET
            vendor = excluded.vendor, session_id = excluded.session_id,
            subagent_id = excluded.subagent_id, dev = excluded.dev, ino = excluded.ino,
-           size = excluded.size, mtime = excluded.mtime, offset = excluded.offset,
+           size = excluded.size, mtime_ns = excluded.mtime_ns,
+           ctime_ns = excluded.ctime_ns, offset = excluded.offset,
            carry = excluded.carry, head_len = excluded.head_len, head_hash = excluded.head_hash,
            tail_hash = excluded.tail_hash, first_ts_ms = excluded.first_ts_ms,
            malformed_lines = excluded.malformed_lines, oversized_lines = excluded.oversized_lines,
@@ -359,7 +366,8 @@ pub async fn finish_file(tx: &mut Transaction<'_, Sqlite>, state: &FileState, fa
     .bind(state.dev)
     .bind(state.ino)
     .bind(state.size)
-    .bind(state.mtime)
+    .bind(state.mtime_ns)
+    .bind(state.ctime_ns)
     .bind(state.offset)
     .bind(&state.carry)
     .bind(state.fingerprint.head_len)

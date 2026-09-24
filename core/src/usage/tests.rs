@@ -6,6 +6,7 @@
 use super::*;
 use crate::config::UsageConfig;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 
 fn assistant(id: &str, ts: &str, model: &str, input: i64, cw1h: i64, cr: i64, out: i64, cwd: Option<&str>) -> String {
     let cwd = cwd.map(|c| format!(r#""cwd":"{c}","#)).unwrap_or_default();
@@ -592,6 +593,55 @@ async fn incremental_refresh_equals_full_through_rewrites_forks_and_resets() {
     assert_eq!(dump(&ws_full).await, incremental, "fresh --full differs from the incremental history");
     refresh(&ws_inc, &cfg, RefreshOptions { full: true }).await.unwrap();
     assert_eq!(dump(&ws_inc).await, incremental, "--full over the incremental DB changed it");
+}
+
+/// A same-length rewrite in place that keeps the file's mtime (set back to
+/// the exact previous value, as a tool that preserves timestamps would, or
+/// as two writes within one timestamp tick look) is still re-read: ctime
+/// moved, so the fingerprint is re-verified.
+#[tokio::test]
+async fn same_size_rewrite_with_the_same_mtime_is_reread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let repo = base.join("code/delta");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let repo_s = repo.to_string_lossy().into_owned();
+    let projects = base.join("claude");
+    let main = projects.join(project::encode_cwd(&repo_s)).join("s-same.jsonl");
+    let (ws_inc, ws_full) = (base.join("ws-inc"), base.join("ws-full"));
+    for ws in [&ws_inc, &ws_full] {
+        std::fs::create_dir_all(ws.join("memory")).unwrap();
+    }
+    let cfg = UsageConfig {
+        claude_projects_dir: projects.to_string_lossy().into_owned(),
+        codex_sessions_dir: base.join("codex").to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let a = |out: i64| assistant("n1", "2026-09-06T08:01:00Z", "claude-opus-5", 10, 100, 1000, out, None);
+    write_text(&main, &lines(&[user("2026-09-06T08:00:00Z", &repo_s), a(300)]));
+    refresh(&ws_inc, &cfg, RefreshOptions::default()).await.unwrap();
+
+    let before = std::fs::metadata(&main).unwrap();
+    let text = std::fs::read_to_string(&main).unwrap();
+    let rewritten = text.replace(r#""output_tokens":300,"#, r#""output_tokens":900,"#);
+    assert_eq!(rewritten.len(), text.len());
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open(&main).unwrap();
+        f.write_all(rewritten.as_bytes()).unwrap();
+        f.set_modified(before.modified().unwrap()).unwrap();
+    }
+    let after = std::fs::metadata(&main).unwrap();
+    assert_eq!((after.ino(), after.len(), after.modified().unwrap()), (before.ino(), before.len(), before.modified().unwrap()));
+
+    let s = refresh(&ws_inc, &cfg, RefreshOptions::default()).await.unwrap();
+    assert_eq!(s.files_read, 1, "the rewrite must not take the unchanged fast path");
+    {
+        let pool = open(&ws_inc).await.unwrap();
+        assert_eq!(scalar_i(&pool, "SELECT output FROM usage_rows WHERE key='claude:n1'").await, 900);
+        pool.close().await;
+    }
+    refresh(&ws_full, &cfg, RefreshOptions { full: true }).await.unwrap();
+    assert_eq!(dump(&ws_full).await, dump(&ws_inc).await, "incremental differs from --full");
 }
 
 // ─── partial refresh ────────────────────────────────────────────────────────

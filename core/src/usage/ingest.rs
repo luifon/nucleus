@@ -3,7 +3,8 @@
 //! Per file, a refresh decides between three plans from the stored read
 //! state and the file on disk:
 //!
-//! - **skip** — same identity (device, inode), size and mtime as stored;
+//! - **skip** — same identity (device, inode), size, mtime and ctime as
+//!   stored, compared to the nanosecond;
 //! - **append** — same identity, not shorter than the stored offset, and the
 //!   content fingerprint of the part already read still matches: read from
 //!   the stored offset with the stored parser carry;
@@ -242,10 +243,7 @@ enum Msg {
 
 /// Final state of a file that was read.
 struct Outcome {
-    dev: i64,
-    ino: i64,
-    size: i64,
-    mtime: i64,
+    meta: FileMeta,
     start: u64,
     offset: u64,
     carry: String,
@@ -260,21 +258,42 @@ struct Outcome {
     prior_oversized: i64,
 }
 
-fn mtime_secs(m: &std::fs::Metadata) -> i64 {
-    m.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+/// The metadata a refresh compares with the stored state: identity
+/// (device, inode), size, and nanosecond modification and status-change
+/// times. `ctime` cannot be set by a program: any write or `utimes` call
+/// moves it, so a rewrite that restores the size and the mtime still
+/// changes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMeta {
+    pub dev: i64,
+    pub ino: i64,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
 }
 
-/// Whether the stored state proves the file is unchanged, from metadata
-/// alone (no read).
-pub fn unchanged(prev: &FileState, meta: &std::fs::Metadata) -> bool {
-    prev.dev == meta.dev() as i64
-        && prev.ino == meta.ino() as i64
-        && prev.size == meta.len() as i64
-        && prev.mtime == mtime_secs(meta)
+impl FileMeta {
+    pub fn of(m: &std::fs::Metadata) -> Self {
+        let ns = |secs: i64, nsec: i64| secs.saturating_mul(1_000_000_000).saturating_add(nsec);
+        FileMeta {
+            dev: m.dev() as i64,
+            ino: m.ino() as i64,
+            size: m.len() as i64,
+            mtime_ns: ns(m.mtime(), m.mtime_nsec()),
+            ctime_ns: ns(m.ctime(), m.ctime_nsec()),
+        }
+    }
+}
+
+/// Whether the stored state proves the file is unchanged from metadata
+/// alone (no read): device, inode, size, mtime and ctime all equal, to the
+/// nanosecond. Anything else re-verifies the content fingerprint.
+pub fn unchanged(prev: &FileState, m: &FileMeta) -> bool {
+    prev.dev == m.dev
+        && prev.ino == m.ino
+        && prev.size == m.size
+        && prev.mtime_ns == m.mtime_ns
+        && prev.ctime_ns == m.ctime_ns
 }
 
 /// Parser-thread body: plan, read, and stream records. Returns `None` when
@@ -286,12 +305,11 @@ fn parse_file(
     send: tokio::sync::mpsc::Sender<Msg>,
 ) -> std::io::Result<Option<Outcome>> {
     let f = std::fs::File::open(&src.path)?;
-    let meta = f.metadata()?;
-    let (dev, ino, size, mtime) = (meta.dev() as i64, meta.ino() as i64, meta.len() as i64, mtime_secs(&meta));
+    let meta = FileMeta::of(&f.metadata()?);
 
     let append_from = match &prev {
-        Some(p) if !full && p.dev == dev && p.ino == ino && size >= p.offset => {
-            if p.size == size && p.mtime == mtime {
+        Some(p) if !full && p.dev == meta.dev && p.ino == meta.ino && meta.size >= p.offset => {
+            if unchanged(p, &meta) {
                 return Ok(None);
             }
             (fingerprint(&f, p.offset as u64)? == p.fingerprint).then_some(p)
@@ -356,10 +374,7 @@ fn parse_file(
     }
     let fingerprint = fingerprint(&f, read.offset)?;
     Ok(Some(Outcome {
-        dev,
-        ino,
-        size,
-        mtime,
+        meta,
         start,
         offset: read.offset,
         carry: carry_out,
@@ -398,7 +413,7 @@ pub async fn ingest_file(
     let prev = store::load_file_state(pool, &path_str).await?;
     if !full {
         if let (Some(p), Ok(m)) = (&prev, std::fs::metadata(&src.path)) {
-            if unchanged(p, &m) {
+            if unchanged(p, &FileMeta::of(&m)) {
                 return Ok(Ok(FileReport::default()));
             }
         }
@@ -437,10 +452,11 @@ pub async fn ingest_file(
         vendor: src.vendor,
         session_id: outcome.session_id.clone(),
         subagent_id: outcome.subagent_id.clone(),
-        dev: outcome.dev,
-        ino: outcome.ino,
-        size: outcome.size,
-        mtime: outcome.mtime,
+        dev: outcome.meta.dev,
+        ino: outcome.meta.ino,
+        size: outcome.meta.size,
+        mtime_ns: outcome.meta.mtime_ns,
+        ctime_ns: outcome.meta.ctime_ns,
         offset: outcome.offset as i64,
         carry: outcome.carry,
         fingerprint: outcome.fingerprint,
