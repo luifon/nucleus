@@ -130,27 +130,22 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     } else {
         PathBuf::from(vault_path_raw)
     };
-    // ADR-035 search: core's vault index. Tolerated-missing like the other
-    // DBs — a failure leaves /vault/api/search answering 503.
-    let vault_search = match nucleus_core::vault::exclude::Exclusions::from_config(&settings.vault_search) {
-        Ok(exclusions) => match nucleus_core::vault::index::open(&workspace_root).await {
-            Ok(pool) => Some(handlers::vault::VaultSearch {
-                pool,
-                exclusions,
-                update_lock: tokio::sync::Mutex::new(()),
-            }),
-            Err(e) => {
-                tracing::warn!("nucleus-dashboard: vault index not openable: {e:#} — search disabled");
-                None
-            }
-        },
+    // ADR-035 search: the index writer is the `vault-search` command, run
+    // as a subprocess before each search; this process only reads the index.
+    let vault_search = match handlers::vault::subprocess_reindex(workspace_root.clone()) {
+        Ok(reindex) => Some(handlers::vault::VaultSearch {
+            reindex,
+            index_db: workspace_root.join(nucleus_core::vault::index::DB_PATH),
+            reindex_lock: tokio::sync::Mutex::new(()),
+        }),
         Err(e) => {
-            tracing::warn!("nucleus-dashboard: [vault_search] config invalid: {e:#} — search disabled");
+            tracing::warn!("nucleus-dashboard: cannot locate the nucleus binary: {e:#} — vault search disabled");
             None
         }
     };
     let vault_state = Arc::new(handlers::vault::VaultState {
         root: vault_root.clone(),
+        workspace_root: workspace_root.clone(),
         search: vault_search,
         check_db: workspace_root.join(nucleus_core::vault::check::DB_PATH),
     });

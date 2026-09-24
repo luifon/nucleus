@@ -5,42 +5,100 @@
 //! Good enough for the operator's "what did the bot write?" question;
 //! see ADR-015 §"Scope" for the audit-log alternative.
 //!
-//! ADR-035 adds full-text search (`/search`, through core's vault index —
-//! the same code and DB the `vault-search` CLI uses) and the weekly vault
-//! check report (`/check/latest`, `/check/runs`, read-only from
+//! ADR-035 adds full-text search (`/search`) and the weekly vault check
+//! report (`/check/latest`, `/check/runs`, read-only from
 //! `memory/vault_check.db`, which only `vault-check` writes).
+//!
+//! Every route applies the vault exclusion rules as nucleus.toml states
+//! them at the time of the request ([`Exclusions::load`]): an excluded or
+//! credential note is never opened, listed, counted by name, or returned
+//! as a search hit. `/file` and `/recent` take and return vault-relative
+//! paths only.
+//!
+//! This process never writes `memory/vault_index.db` (ADR-020): before a
+//! search it runs the index writer, `nucleus vault-search --reindex`, as a
+//! subprocess, then reads the index read-only.
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Json, Response},
     routing::get,
     Router,
 };
+use futures::future::BoxFuture;
+use nucleus_core::vault::access::{self, AccessError};
 use nucleus_core::vault::check::{self, CheckReport, CheckRunSummary};
 use nucleus_core::vault::exclude::Exclusions;
 use nucleus_core::vault::index::{self, VaultSearchResult};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 pub struct VaultState {
     pub root: PathBuf,
-    /// Core's vault index (ADR-035). `None` when it could not be opened or
-    /// the exclusion config is invalid; `/search` then answers 503.
+    /// Where nucleus.toml lives; the exclusion rules are read from it on
+    /// every request.
+    pub workspace_root: PathBuf,
+    /// `None` disables `/search` (503).
     pub search: Option<VaultSearch>,
     /// `memory/vault_check.db`, opened read-only per request.
     pub check_db: PathBuf,
 }
 
+/// Brings the index up to date by running its writer.
+pub type Reindex = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
+
 pub struct VaultSearch {
-    pub pool: SqlitePool,
-    pub exclusions: Exclusions,
-    /// One update at a time from this process; other processes serialize
-    /// on SQLite's write lock inside `index::update`.
-    pub update_lock: tokio::sync::Mutex<()>,
+    pub reindex: Reindex,
+    /// `memory/vault_index.db`, opened read-only per request.
+    pub index_db: PathBuf,
+    /// One reindex subprocess at a time from this process.
+    pub reindex_lock: tokio::sync::Mutex<()>,
+}
+
+/// The production [`Reindex`]: `<this binary> vault-search --reindex`,
+/// run in the workspace root. Its output stays in this process's log; a
+/// client sees only that the update failed.
+pub fn subprocess_reindex(workspace_root: PathBuf) -> anyhow::Result<Reindex> {
+    let exe = std::env::current_exe()?;
+    Ok(Arc::new(move || {
+        let exe = exe.clone();
+        let ws = workspace_root.clone();
+        Box::pin(async move {
+            let run = tokio::process::Command::new(&exe)
+                .args(["vault-search", "--reindex"])
+                .current_dir(&ws)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output();
+            let out = tokio::time::timeout(std::time::Duration::from_secs(120), run)
+                .await
+                .map_err(|_| anyhow::anyhow!("vault-search --reindex timed out"))??;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "vault-search --reindex exited with {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(())
+        })
+    }))
+}
+
+impl VaultState {
+    /// The exclusion rules as they are now. Failing to load them fails the
+    /// request (closed), never falls back to weaker rules.
+    fn rules(&self) -> Result<Exclusions, VaultError> {
+        Exclusions::load(&self.workspace_root).map_err(|e| {
+            tracing::warn!("vault: exclusion rules not loadable: {e:#}");
+            VaultError::Unavailable("vault exclusion rules are not loadable".into())
+        })
+    }
 }
 
 pub fn router(state: Arc<VaultState>) -> Router {
@@ -54,6 +112,17 @@ pub fn router(state: Arc<VaultState>) -> Router {
         .with_state(state)
 }
 
+/// Responses carrying note content or paths are not cached.
+fn no_store(mut r: Response) -> Response {
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
+/// Run filesystem work off the async runtime.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, VaultError> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| VaultError::Io(format!("vault task: {e}")))
+}
+
 // ─── search (ADR-035) ───────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -65,25 +134,40 @@ struct SearchQ {
     limit: Option<i64>,
 }
 
-async fn search(
-    State(s): State<Arc<VaultState>>,
-    Query(q): Query<SearchQ>,
-) -> Result<Json<VaultSearchResult>, VaultError> {
+async fn search(State(s): State<Arc<VaultState>>, Query(q): Query<SearchQ>) -> Result<Response, VaultError> {
     let Some(vs) = &s.search else {
         return Err(VaultError::Unavailable("vault index is not available".into()));
     };
     {
-        let _guard = vs.update_lock.lock().await;
-        index::update(&vs.pool, &s.root, &vs.exclusions)
-            .await
-            .map_err(|e| VaultError::Io(format!("updating the vault index: {e:#}")))?;
+        let _guard = vs.reindex_lock.lock().await;
+        (vs.reindex)().await.map_err(|e| {
+            tracing::warn!("vault: index update failed: {e:#}");
+            VaultError::Unavailable("updating the vault index failed".into())
+        })?;
     }
+    // Rules loaded after the update: at least as new as the ones it used.
+    let ex = s.rules()?;
+    let Some(pool) = index::open_read_only_at(&vs.index_db)
+        .await
+        .map_err(|e| VaultError::Io(format!("opening the vault index: {e:#}")))?
+    else {
+        return Ok(no_store(Json(VaultSearchResult { hits: vec![], mode: "all".into() }).into_response()));
+    };
     let bucket = q.bucket.as_deref().filter(|b| !b.is_empty());
     let opts = index::SearchOpts { bucket, limit: q.limit.unwrap_or(20).clamp(1, 100) };
-    let result = index::search(&vs.pool, &q.q, &opts, &vs.exclusions)
+    let mut result = index::search(&pool, &q.q, &opts, &ex)
         .await
         .map_err(|e| VaultError::Io(format!("{e:#}")))?;
-    Ok(Json(result))
+    pool.close().await;
+    // Every hit must still be openable under the current rules: the same
+    // check `/file` makes, so a hit never names a note `/file` refuses.
+    let root = s.root.clone();
+    let hits = std::mem::take(&mut result.hits);
+    result.hits = blocking(move || {
+        hits.into_iter().filter(|h| access::open_note(&root, &ex, &h.path).is_ok()).collect()
+    })
+    .await?;
+    Ok(no_store(Json(result).into_response()))
 }
 
 // ─── vault check (ADR-035) ──────────────────────────────────────────────────
@@ -136,68 +220,22 @@ struct Bucket {
 }
 
 async fn list_buckets(State(s): State<Arc<VaultState>>) -> Result<Json<Vec<Bucket>>, VaultError> {
-    let mut out = Vec::new();
-    let mut entries = match tokio::fs::read_dir(&s.root).await {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Json(out)),
-        Err(e) => return Err(VaultError::Io(e.to_string())),
-    };
-    while let Some(dirent) = entries
-        .next_entry()
-        .await
-        .map_err(|e| VaultError::Io(e.to_string()))?
-    {
-        let path = dirent.path();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) if !skip_top_level(n) => n.to_string(),
-            _ => continue,
-        };
-        let ft = match dirent.file_type().await {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !ft.is_dir() {
-            continue;
-        }
-        let file_count = count_md_recursive(&path).await;
-        out.push(Bucket { name, file_count });
+    let ex = s.rules()?;
+    let root = s.root.clone();
+    if !root.exists() {
+        return Ok(Json(vec![]));
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(Json(out))
-}
-
-async fn count_md_recursive(dir: &Path) -> usize {
-    let mut count = 0;
-    let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&d).await {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        while let Ok(Some(dirent)) = entries.next_entry().await {
-            let path = dirent.path();
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
-                None => continue,
-            };
-            if skip_file_or_dir(name) {
-                continue;
-            }
-            match dirent.file_type().await {
-                Ok(ft) if ft.is_dir() => stack.push(path),
-                Ok(ft) if ft.is_file() && name.ends_with(".md") => count += 1,
-                _ => {}
-            }
-        }
-    }
-    count
+    let buckets = blocking(move || access::buckets(&root, &ex))
+        .await?
+        .map_err(|e| VaultError::Io(format!("{e:#}")))?;
+    Ok(Json(buckets.into_iter().map(|(name, file_count)| Bucket { name, file_count }).collect()))
 }
 
 // ─── recent ─────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
 struct RecentQ {
-    /// Restrict to one bucket (top-level folder name, e.g. `0-Inbox`).
+    /// Restrict to one bucket or folder (vault-relative, e.g. `0-Inbox`).
     bucket: Option<String>,
     /// How many entries to return. Defaults to 30, clamped to [1, 200].
     limit: Option<usize>,
@@ -206,7 +244,8 @@ struct RecentQ {
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export)]
 struct VaultFile {
-    /// Path relative to vault root (e.g. `3-Projects/Foo/index.md`).
+    /// Path relative to vault root (e.g. `3-Projects/Foo/index.md`). Pass it
+    /// to `/file` to fetch the body.
     relpath: String,
     /// Top-level bucket name (e.g. `3-Projects`). Empty for root-level files.
     bucket: String,
@@ -216,135 +255,77 @@ struct VaultFile {
     mtime_unix: i64,
     #[ts(type = "number")]
     bytes: u64,
-    /// Absolute path. Used to fetch the file body separately.
-    path: String,
+    /// Name of the vault folder, for `obsidian://open?vault=` links.
+    vault_name: String,
 }
 
-async fn list_recent(
-    State(s): State<Arc<VaultState>>,
-    Query(q): Query<RecentQ>,
-) -> Result<Json<Vec<VaultFile>>, VaultError> {
+/// Paths the recent feed leaves out although they may be opened: pipeline
+/// scratch files (`_pending.md`, `_original-capture.md`) and the home
+/// dashboard notes (ADR-014).
+pub fn hidden_from_feed(rel: &str) -> bool {
+    let file = rel.rsplit('/').next().unwrap_or(rel);
+    rel.split('/').any(|c| c.starts_with('_'))
+        || matches!(file, "Home.md" | "Home-projects.base" | "Home-areas.base")
+}
+
+/// Top-level bucket of a relative path, when it is a PARA bucket (`3-X`).
+pub fn bucket_label(rel: &str) -> String {
+    rel.split_once('/')
+        .map(|(top, _)| top)
+        .filter(|s| s.contains('-'))
+        .unwrap_or("")
+        .to_string()
+}
+
+async fn list_recent(State(s): State<Arc<VaultState>>, Query(q): Query<RecentQ>) -> Result<Response, VaultError> {
     let limit = q.limit.unwrap_or(30).clamp(1, 200);
-    let scan_root = match &q.bucket {
-        Some(b) => s.root.join(b),
-        None => s.root.clone(),
-    };
-
-    let mut files: Vec<VaultFile> = Vec::new();
-    let mut stack: Vec<PathBuf> = vec![scan_root];
-    while let Some(d) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&d).await {
-            Ok(e) => e,
-            Err(_) => continue,
+    let ex = s.rules()?;
+    let root = s.root.clone();
+    let vault_name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let bucket = q.bucket.filter(|b| !b.trim().is_empty());
+    let notes = blocking(move || -> Result<Vec<access::RecentNote>, VaultError> {
+        let folder = match bucket {
+            None => None,
+            Some(b) => match access::resolve_folder(&root, &ex, &b) {
+                Ok(f) => Some(f),
+                // An excluded folder looks like a missing one.
+                Err(AccessError::Excluded | AccessError::NotFound) => return Ok(vec![]),
+                Err(e) => return Err(e.into()),
+            },
         };
-        while let Ok(Some(dirent)) = entries.next_entry().await {
-            let path = dirent.path();
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
-                None => continue,
-            };
-            if skip_file_or_dir(name) {
-                continue;
-            }
-            let ft = match dirent.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !name.ends_with(".md") {
-                continue;
-            }
-            let meta = match dirent.metadata().await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let mtime_unix = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let relpath = path
-                .strip_prefix(&s.root)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
-            let bucket = relpath
-                .split('/')
-                .next()
-                .filter(|s| !s.is_empty() && s.contains('-'))
-                .unwrap_or("")
-                .to_string();
-            files.push(VaultFile {
-                relpath,
-                bucket,
-                mtime_unix,
-                bytes: meta.len(),
-                path: path.to_string_lossy().into_owned(),
-            });
-        }
-    }
-
-    files.sort_by(|a, b| b.mtime_unix.cmp(&a.mtime_unix));
-    files.truncate(limit);
-    Ok(Json(files))
+        access::recent(&root, &ex, folder.as_deref(), limit, hidden_from_feed)
+            .map_err(|e| VaultError::Io(format!("{e:#}")))
+    })
+    .await??;
+    let files: Vec<VaultFile> = notes
+        .into_iter()
+        .map(|n| VaultFile {
+            bucket: bucket_label(&n.rel),
+            relpath: n.rel,
+            mtime_unix: n.mtime,
+            bytes: n.size,
+            vault_name: vault_name.clone(),
+        })
+        .collect();
+    Ok(no_store(Json(files).into_response()))
 }
 
 // ─── file body ──────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct FileQ {
+    /// Vault-relative path.
     path: String,
 }
 
-async fn get_file(
-    State(s): State<Arc<VaultState>>,
-    Query(q): Query<FileQ>,
-) -> Result<String, VaultError> {
-    // Absolute (the recent feed) or vault-relative (search results).
-    let requested = PathBuf::from(&q.path);
-    let requested = if requested.is_relative() { s.root.join(requested) } else { requested };
-    let canonical = tokio::fs::canonicalize(&requested)
-        .await
-        .map_err(|e| VaultError::Io(format!("canonicalizing {}: {}", q.path, e)))?;
-    let canon_root = tokio::fs::canonicalize(&s.root)
-        .await
-        .map_err(|e| VaultError::Io(format!("canonicalizing root: {}", e)))?;
-    if !canonical.starts_with(&canon_root) {
-        return Err(VaultError::OutsideRoot);
-    }
-    if canonical.extension().and_then(|e| e.to_str()) != Some("md") {
-        return Err(VaultError::OutsideRoot);
-    }
-    tokio::fs::read_to_string(&canonical)
-        .await
-        .map_err(|e| VaultError::Io(format!("reading {}: {}", canonical.display(), e)))
-}
-
-// ─── filters ────────────────────────────────────────────────────────────────
-
-/// Skip top-level dirs that aren't user content: dot-dirs (`.obsidian`) and
-/// `node_modules`. Files are dropped by the is_dir gate in `list_buckets`.
-fn skip_top_level(name: &str) -> bool {
-    name.starts_with('.') || name == "node_modules"
-}
-
-/// Skip anything inside the vault we don't want to surface:
-/// dotfiles (including .obsidian/), pending-state files, and the
-/// home-dashboard markdown we built in ADR-014.
-fn skip_file_or_dir(name: &str) -> bool {
-    if name.starts_with('.') {
-        return true;
-    }
-    if name.starts_with('_') {
-        return true; // _pending.md, _original-capture.md, etc.
-    }
-    if name == "Home.md" || name == "Home-projects.base" || name == "Home-areas.base" {
-        return true; // dashboard scaffolding, not vault content
-    }
-    false
+async fn get_file(State(s): State<Arc<VaultState>>, Query(q): Query<FileQ>) -> Result<Response, VaultError> {
+    let ex = s.rules()?;
+    let root = s.root.clone();
+    let note = blocking(move || access::open_note(&root, &ex, &q.path)).await??;
+    let mut r = note.text.into_response();
+    r.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    Ok(no_store(r))
 }
 
 // ─── errors ─────────────────────────────────────────────────────────────────
@@ -352,8 +333,14 @@ fn skip_file_or_dir(name: &str) -> bool {
 #[derive(Debug)]
 pub enum VaultError {
     Io(String),
-    OutsideRoot,
+    Access(AccessError),
     Unavailable(String),
+}
+
+impl From<AccessError> for VaultError {
+    fn from(e: AccessError) -> Self {
+        Self::Access(e)
+    }
 }
 
 impl IntoResponse for VaultError {
@@ -361,12 +348,24 @@ impl IntoResponse for VaultError {
         let (code, msg) = match self {
             Self::Io(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             Self::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
-            Self::OutsideRoot => (
-                StatusCode::FORBIDDEN,
-                "path is not inside the vault root".to_string(),
-            ),
+            Self::Access(e) => {
+                let code = match &e {
+                    AccessError::Invalid => StatusCode::BAD_REQUEST,
+                    AccessError::Outside | AccessError::NotMarkdown => StatusCode::FORBIDDEN,
+                    // Same answer for excluded and missing notes.
+                    AccessError::Excluded | AccessError::NotFound => StatusCode::NOT_FOUND,
+                    AccessError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+                    AccessError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                // I/O error text can carry absolute paths; keep it in the log.
+                if let AccessError::Io(err) = &e {
+                    tracing::warn!("vault: {err}");
+                    return no_store((code, Json(serde_json::json!({ "error": "vault read failed" }))).into_response());
+                }
+                (code, e.to_string())
+            }
         };
-        (code, Json(serde_json::json!({ "error": msg }))).into_response()
+        no_store((code, Json(serde_json::json!({ "error": msg }))).into_response())
     }
 }
 
@@ -375,51 +374,74 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use std::path::Path;
     use tower::ServiceExt;
 
-    async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    async fn get_raw(app: &Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, String) {
         let res = app.clone().oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
         let status = res.status();
+        let headers = res.headers().clone();
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        (status, headers, String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// Synthetic vault; names and bodies are invented.
-    #[tokio::test]
-    async fn search_and_check_routes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("vault");
+    async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let (status, _, body) = get_raw(app, uri).await;
+        (status, serde_json::from_str(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    fn write(root: &Path, rel: &str, text: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    /// Synthetic vault and workspace; names and bodies are invented. The
+    /// reindex runs core's writer in-process (production runs it as a
+    /// subprocess).
+    fn app(tmp: &Path) -> (Router, PathBuf, PathBuf) {
+        let root = tmp.join("vault");
+        let ws = tmp.join("ws");
         for (rel, text) in [
             ("3-Projects/Alpha/index.md", "# Alpha\n\nrocket engine hub\n"),
             ("4-Areas/Homelab/router.md", "rocket router login\n"),
             ("6-Slipbox/keys.md", "rocket\napi_key: abc\n"),
+            ("6-Slipbox/idea.md", "# Idea\n\nrocket idea\n"),
+            ("0-Inbox/_pending.md", "rocket pending\n"),
         ] {
-            let p = root.join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, text).unwrap();
+            write(&root, rel, text);
         }
-        let exclusions = Exclusions::new(&[], "").unwrap();
-        let pool = index::open_at(&tmp.path().join("idx.db")).await.unwrap();
-        let check_db = tmp.path().join("check.db");
+        write(&ws, "nucleus.toml", "[vault_search]\nexclude = []\n");
+        let index_db = tmp.join("idx.db");
+        let (ws2, db2, lock, vault2) = (ws.clone(), index_db.clone(), tmp.join("idx.lock"), root.clone());
+        let reindex: Reindex = Arc::new(move || {
+            let (ws, db, lock, vault) = (ws2.clone(), db2.clone(), lock.clone(), vault2.clone());
+            Box::pin(async move {
+                let w = index::Writer::open_at(&ws, &db, &lock).await?;
+                w.update(&vault).await?;
+                w.pool().close().await;
+                Ok(())
+            })
+        });
         let state = Arc::new(VaultState {
             root: root.clone(),
-            search: Some(VaultSearch { pool, exclusions: exclusions.clone(), update_lock: Default::default() }),
-            check_db: check_db.clone(),
+            workspace_root: ws.clone(),
+            search: Some(VaultSearch { reindex, index_db, reindex_lock: Default::default() }),
+            check_db: tmp.join("check.db"),
         });
-        let app = router(state);
+        (router(state), root, ws)
+    }
+
+    #[tokio::test]
+    async fn search_and_check_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, root, _) = app(tmp.path());
 
         let (status, body) = get_json(&app, "/search?q=rocket").await;
         assert_eq!(status, StatusCode::OK);
-        let hits = body["hits"].as_array().unwrap();
-        assert_eq!(hits.len(), 1, "credential notes must not be returned: {body}");
-        assert_eq!(hits[0]["display"], "Alpha/index.md");
-        assert_eq!(hits[0]["bucket"], "3-Projects");
-
-        // A hit's relative path opens through /file; traversal is refused.
-        let (status, _) = get_json(&app, "/file?path=3-Projects/Alpha/index.md").await;
-        assert_eq!(status, StatusCode::OK);
-        let (status, _) = get_json(&app, "/file?path=../idx.db").await;
-        assert_ne!(status, StatusCode::OK);
+        let mut paths: Vec<&str> = body["hits"].as_array().unwrap().iter().map(|h| h["path"].as_str().unwrap()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["0-Inbox/_pending.md", "3-Projects/Alpha/index.md", "6-Slipbox/idea.md"], "{body}");
 
         // No run yet → null / empty.
         let (_, latest) = get_json(&app, "/check/latest").await;
@@ -428,14 +450,99 @@ mod tests {
         assert_eq!(runs, serde_json::json!([]));
 
         // After a recorded run the report comes back.
+        let ex = Exclusions::new(&[], "").unwrap();
         let opts = check::CheckOptions::from_config(&Default::default(), false, "manual").unwrap();
-        let report = check::run(&root, &exclusions, &opts).unwrap();
-        let wpool = check::open_at(&check_db).await.unwrap();
+        let report = check::run(&root, &ex, &opts).unwrap();
+        let wpool = check::open_at(&tmp.path().join("check.db")).await.unwrap();
         check::record(&wpool, &report).await.unwrap();
         let (_, latest) = get_json(&app, "/check/latest").await;
-        assert_eq!(latest["notes_scanned"], 1);
+        assert_eq!(latest["notes_scanned"], 3);
         assert_eq!(latest["trigger"], "manual");
         let (_, runs) = get_json(&app, "/check/runs?limit=5").await;
         assert_eq!(runs.as_array().unwrap().len(), 1);
+    }
+
+    /// H1: excluded notes cannot be opened or listed; paths are relative.
+    #[tokio::test]
+    async fn file_and_recent_apply_the_exclusions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, root, _) = app(tmp.path());
+
+        let (status, headers, body) = get_raw(&app, "/file?path=3-Projects/Alpha/index.md").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("rocket engine hub"));
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+
+        for (uri, code) in [
+            ("/file?path=4-Areas/Homelab/router.md", StatusCode::NOT_FOUND),
+            ("/file?path=6-Slipbox/keys.md", StatusCode::NOT_FOUND),
+            ("/file?path=6-Slipbox/missing.md", StatusCode::NOT_FOUND),
+            ("/file?path=../idx.db", StatusCode::BAD_REQUEST),
+            ("/file?path=3-Projects/../4-Areas/Homelab/router.md", StatusCode::BAD_REQUEST),
+        ] {
+            let (status, headers, body) = get_raw(&app, uri).await;
+            assert_eq!(status, code, "{uri}: {body}");
+            assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+            assert!(!body.contains("login") && !body.contains("abc"), "{uri}: {body}");
+        }
+        let abs = format!("/file?path={}", root.join("3-Projects/Alpha/index.md").display());
+        assert_eq!(get_raw(&app, &abs).await.0, StatusCode::BAD_REQUEST);
+
+        // A symlink with an innocent name pointing at an excluded note.
+        std::os::unix::fs::symlink(root.join("4-Areas/Homelab/router.md"), root.join("6-Slipbox/link.md")).unwrap();
+        assert_eq!(get_raw(&app, "/file?path=6-Slipbox/link.md").await.0, StatusCode::NOT_FOUND);
+
+        let (status, headers, body) = get_raw(&app, "/recent").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let files: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let mut rels: Vec<&str> = files.as_array().unwrap().iter().map(|f| f["relpath"].as_str().unwrap()).collect();
+        rels.sort();
+        assert_eq!(rels, vec!["3-Projects/Alpha/index.md", "6-Slipbox/idea.md"]);
+        assert!(!body.contains(&tmp.path().display().to_string()), "absolute path leaked: {body}");
+        assert_eq!(files[0]["vault_name"], "vault");
+
+        let (_, buckets) = get_json(&app, "/buckets").await;
+        let names: Vec<&str> = buckets.as_array().unwrap().iter().map(|b| b["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["0-Inbox", "3-Projects", "4-Areas", "6-Slipbox"]);
+    }
+
+    /// M: `/recent?bucket=` cannot leave the vault or open an excluded folder.
+    #[tokio::test]
+    async fn recent_bucket_is_confined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, _, _) = app(tmp.path());
+        write(tmp.path(), "outside/notes.md", "# outside\n");
+        for b in ["..", "../outside", "/", "/tmp", "3-Projects/../..", "./3-Projects"] {
+            let (status, body) = get_json(&app, &format!("/recent?bucket={b}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{b}: {body}");
+        }
+        let (status, body) = get_json(&app, "/recent?bucket=4-Areas/Homelab").await;
+        assert_eq!((status, body), (StatusCode::OK, serde_json::json!([])));
+        let (_, body) = get_json(&app, "/recent?bucket=6-Slipbox").await;
+        let rels: Vec<&str> = body.as_array().unwrap().iter().map(|f| f["relpath"].as_str().unwrap()).collect();
+        assert_eq!(rels, vec!["6-Slipbox/idea.md"]);
+    }
+
+    /// H2 (dashboard side): an exclusion added while the dashboard runs
+    /// applies at the next request, with no restart.
+    #[tokio::test]
+    async fn new_exclusions_apply_without_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, _, ws) = app(tmp.path());
+        assert_eq!(get_raw(&app, "/file?path=6-Slipbox/idea.md").await.0, StatusCode::OK);
+        let (_, body) = get_json(&app, "/search?q=idea").await;
+        assert_eq!(body["hits"].as_array().unwrap().len(), 1);
+
+        write(&ws, "nucleus.toml", "[vault_search]\nexclude = [\"6-Slipbox/**\"]\n");
+        assert_eq!(get_raw(&app, "/file?path=6-Slipbox/idea.md").await.0, StatusCode::NOT_FOUND);
+        let (_, body) = get_json(&app, "/search?q=idea").await;
+        assert!(body["hits"].as_array().unwrap().is_empty(), "{body}");
+        let (_, body) = get_json(&app, "/recent").await;
+        assert!(body.as_array().unwrap().iter().all(|f| !f["relpath"].as_str().unwrap().starts_with("6-Slipbox")));
+
+        // An unreadable config fails closed.
+        write(&ws, "nucleus.toml", "[vault_search\n");
+        assert_eq!(get_raw(&app, "/file?path=3-Projects/Alpha/index.md").await.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 }

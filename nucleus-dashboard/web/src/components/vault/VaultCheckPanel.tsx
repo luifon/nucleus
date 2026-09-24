@@ -53,7 +53,7 @@ function CountTiles({ report, runs }: { report: CheckReport; runs: CheckRunSumma
   // Deltas only make sense when the latest run is the newest summary.
   const aligned = runs.length > 0 && runs[0].id === report.run_id;
   return (
-    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-9">
       {COUNT_COLUMNS.map(({ key, label }) => {
         const value = report.counts[key];
         const delta = aligned ? countDelta(runs, key) : null;

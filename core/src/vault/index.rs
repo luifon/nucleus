@@ -1,8 +1,15 @@
 //! Vault search index (ADR-035): SQLite FTS5 over the vault's notes.
 //!
-//! Core owns `memory/vault_index.db` (ADR-020): only this module writes it,
-//! from whichever process calls it (the `vault-search` CLI, the dashboard's
-//! search endpoint, `vault-check`). The index is derived data. Loss or
+//! Writer (ADR-020 DB ownership): the `nucleus vault-search` command is the
+//! only program that writes `memory/vault_index.db`, through [`Writer`].
+//! Other processes read it: the dashboard runs `nucleus vault-search
+//! --reindex` as a subprocess before a search and then opens the file
+//! read-only ([`open_read_only`]). Invocations of the command that run at
+//! the same time serialize on an advisory lock (`vault_index.lock`) and,
+//! inside it, on SQLite's write lock. Each update reads the exclusion rules
+//! from nucleus.toml after it holds the lock, so an update always applies
+//! the rules that are current when it runs: no caller can write the index
+//! under rules it loaded earlier. The index is derived data. Loss or
 //! corruption is repaired by deleting the file; the next call rebuilds it.
 //!
 //! The design follows ADR-023's session index: incremental update by
@@ -19,9 +26,11 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const DB_PATH: &str = "memory/vault_index.db";
+/// Advisory lock that serializes writers across processes.
+pub const LOCK_PATH: &str = "memory/vault_index.lock";
 
 /// Snippet match markers (see [`VaultSearchHit::snippet`]).
 pub const MATCH_START: char = '\u{2}';
@@ -63,14 +72,65 @@ const MIGRATIONS: &[crate::migrate::Migration] = &[crate::migrate::Migration {
     ),
 }];
 
-pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
-    open_at(&workspace_root.join(DB_PATH)).await
+/// Open the index for reading. `Ok(None)` when it does not exist yet (no
+/// writer has run). Never creates or migrates the file.
+pub async fn open_read_only(workspace_root: &Path) -> Result<Option<SqlitePool>> {
+    open_read_only_at(&workspace_root.join(DB_PATH)).await
 }
 
-pub async fn open_at(db: &Path) -> Result<SqlitePool> {
-    let pool = crate::db::open(db).await?;
-    crate::migrate::migrate(&pool, MIGRATIONS).await?;
-    Ok(pool)
+pub async fn open_read_only_at(db: &Path) -> Result<Option<SqlitePool>> {
+    if !db.exists() {
+        return Ok(None);
+    }
+    Ok(Some(crate::db::open_read_only(db).await?))
+}
+
+/// The one write path into `vault_index.db`. See the module docs.
+pub struct Writer {
+    pool: SqlitePool,
+    lock_path: PathBuf,
+    workspace_root: PathBuf,
+}
+
+impl Writer {
+    pub async fn open(workspace_root: &Path) -> Result<Self> {
+        Self::open_at(workspace_root, &workspace_root.join(DB_PATH), &workspace_root.join(LOCK_PATH)).await
+    }
+
+    /// Explicit DB and lock paths (tests). The exclusion rules still come
+    /// from `<workspace_root>/nucleus.toml`.
+    pub async fn open_at(workspace_root: &Path, db: &Path, lock_path: &Path) -> Result<Self> {
+        let pool = crate::db::open(db).await?;
+        crate::migrate::migrate(&pool, MIGRATIONS).await?;
+        Ok(Self { pool, lock_path: lock_path.to_path_buf(), workspace_root: workspace_root.to_path_buf() })
+    }
+
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// Bring the index in line with the vault and with the exclusion rules
+    /// in nucleus.toml as they are now. Returns the stats and the rules the
+    /// update applied, which a search in the same process should use.
+    pub async fn update(&self, vault: &Path) -> Result<(UpdateStats, Exclusions)> {
+        let lock_path = self.lock_path.clone();
+        let _lock = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .with_context(|| format!("opening {}", lock_path.display()))?;
+            f.lock().with_context(|| format!("locking {}", lock_path.display()))?;
+            Ok(f)
+        })
+        .await
+        .context("vault index lock task")??;
+        // Rules are read only now, under the lock.
+        let ex = Exclusions::load(&self.workspace_root)?;
+        let stats = update(&self.pool, vault, &ex).await?;
+        Ok((stats, ex))
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -84,6 +144,8 @@ pub struct UpdateStats {
     pub content_excluded: usize,
     /// Files left out by a path glob (all types).
     pub path_excluded: usize,
+    /// Notes larger than [`super::MAX_NOTE_BYTES`], not read or indexed.
+    pub oversized: usize,
     /// True when the exclusion rules changed and the index was rebuilt.
     pub rebuilt: bool,
 }
@@ -92,11 +154,10 @@ pub struct UpdateStats {
 /// size) changed, drop rows for notes that were deleted or are now
 /// excluded. Unchanged notes are not read.
 ///
-/// The whole update runs in one `BEGIN IMMEDIATE` transaction, so two
-/// processes updating at once (a session's CLI call and the dashboard)
-/// serialize on SQLite's write lock instead of racing on the same rows;
-/// readers are not blocked (WAL).
-pub async fn update(pool: &SqlitePool, vault: &Path, ex: &Exclusions) -> Result<UpdateStats> {
+/// The whole update runs in one `BEGIN IMMEDIATE` transaction; readers are
+/// not blocked (WAL). Private: [`Writer::update`] is the entry point, so
+/// every update runs under the lock with the rules read inside it.
+async fn update(pool: &SqlitePool, vault: &Path, ex: &Exclusions) -> Result<UpdateStats> {
     let walk = scan::walk(vault, ex)?;
     let mut conn = pool.acquire().await?;
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
@@ -154,9 +215,18 @@ async fn update_locked(
                 continue;
             }
         }
-        let Ok(text) = std::fs::read_to_string(&f.abs) else {
-            // Unreadable (permissions, invalid UTF-8): treated as absent.
+        if f.size > super::MAX_NOTE_BYTES {
+            stats.oversized += 1;
             continue;
+        }
+        let text = match super::read_note_capped(&f.abs) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                stats.oversized += 1;
+                continue;
+            }
+            // Unreadable (permissions, invalid UTF-8): treated as absent.
+            Err(_) => continue,
         };
         if let Some(&(id, _, _)) = known.get(&f.rel) {
             delete_row(conn, id).await?;
@@ -193,7 +263,7 @@ async fn update_locked(
         .bind(&tags)
         .bind(path_words(&f.rel))
         .bind(&n.meta_text)
-        .bind(&n.body)
+        .bind(n.body(&text))
         .execute(&mut *conn)
         .await?;
         stats.indexed += 1;
@@ -312,6 +382,19 @@ fn looks_like_fts_syntax(q: &str) -> bool {
         || q.split_whitespace().any(|w| matches!(w, "OR" | "AND" | "NOT" | "NEAR"))
 }
 
+/// Escape a backslash, `%` and `_` for a `LIKE` pattern with a backslash
+/// escape character.
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 async fn run_match(
     pool: &SqlitePool,
     fts: &str,
@@ -320,13 +403,15 @@ async fn run_match(
     ex: &Exclusions,
 ) -> Result<Vec<VaultSearchHit>> {
     let prefix = bucket.map(|b| b.trim_matches('/').to_string()).filter(|b| !b.is_empty());
+    // The prefix is literal: `%` and `_` in it match only themselves.
+    let like = prefix.as_deref().map(|p| format!("{}/%", like_escape(p)));
     let sql = format!(
         "SELECT n.path, n.title, n.bucket, n.created, n.source,
                 snippet(notes_fts, -1, char(2), char(3), ' … ', 14) AS snip,
                 bm25(notes_fts, {BM25_WEIGHTS}) AS score
            FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid
           WHERE notes_fts MATCH ?1
-            AND (?2 IS NULL OR n.path = ?2 OR n.path LIKE ?2 || '/%')
+            AND (?2 IS NULL OR n.path = ?2 OR n.path LIKE ?4 ESCAPE '\\')
           ORDER BY score
           LIMIT ?3"
     );
@@ -334,6 +419,7 @@ async fn run_match(
         .bind(fts)
         .bind(prefix)
         .bind(limit)
+        .bind(like)
         .fetch_all(pool)
         .await
         .context("vault search query failed")?;
@@ -363,14 +449,20 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn ex() -> Exclusions {
-        Exclusions::new(&["**/attachments/**".into()], "").unwrap()
-    }
-
     fn write(root: &Path, rel: &str, text: &str) {
         let p = root.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, text).unwrap();
+    }
+
+    /// Workspace whose nucleus.toml adds `extra` to the exclusion floor.
+    fn set_rules(ws: &Path, extra: &[&str]) {
+        let list = extra.iter().map(|g| format!("{g:?}")).collect::<Vec<_>>().join(", ");
+        write(ws, "nucleus.toml", &format!("[vault_search]\nexclude = [{list}]\n"));
+    }
+
+    async fn writer(tmp: &Path) -> Writer {
+        Writer::open_at(&tmp.join("ws"), &tmp.join("idx.db"), &tmp.join("idx.lock")).await.unwrap()
     }
 
     /// Synthetic vault: every name and body here is invented.
@@ -398,72 +490,113 @@ mod tests {
         write(root, ".obsidian/workspace.md", "rocket");
     }
 
-    /// Two writers (a CLI call and the dashboard) updating at once both
+    /// Two writers (two `vault-search` processes) updating at once both
     /// succeed and leave one row per note.
     #[tokio::test]
     async fn concurrent_updates_serialize() {
         let tmp = tempfile::tempdir().unwrap();
         let vault = tmp.path().join("vault");
         fixture(&vault);
-        let db = tmp.path().join("idx.db");
-        let (a, b) = (open_at(&db).await.unwrap(), open_at(&db).await.unwrap());
-        let ex = ex();
-        let (ra, rb) = tokio::join!(update(&a, &vault, &ex), update(&b, &vault, &ex));
-        let (ra, rb) = (ra.unwrap(), rb.unwrap());
+        set_rules(&tmp.path().join("ws"), &["**/attachments/**"]);
+        let (a, b) = (writer(tmp.path()).await, writer(tmp.path()).await);
+        let (ra, rb) = tokio::join!(a.update(&vault), b.update(&vault));
+        let (ra, rb) = (ra.unwrap().0, rb.unwrap().0);
         assert_eq!(ra.indexed + rb.indexed, 5);
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes").fetch_one(&a).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes").fetch_one(a.pool()).await.unwrap();
         assert_eq!(n, 5);
+    }
+
+    /// H2 regression: two long-lived callers, one started before the
+    /// operator added an exclusion and one after. Neither can put the newly
+    /// excluded note back, because each update reads the rules under the
+    /// lock instead of using rules captured at start-up.
+    #[tokio::test]
+    async fn an_older_caller_cannot_restore_stale_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let vault = tmp.path().join("vault");
+        fixture(&vault);
+        set_rules(&ws, &["**/attachments/**"]);
+        let old_caller = writer(tmp.path()).await;
+        let (_, old_rules) = old_caller.update(&vault).await.unwrap();
+        let opts = SearchOpts { bucket: None, limit: 10 };
+        assert_eq!(search(old_caller.pool(), "kayaks OR decided", &opts, &old_rules).await.unwrap().hits.len(), 1);
+
+        // The operator excludes 6-Slipbox; a new caller rebuilds.
+        set_rules(&ws, &["**/attachments/**", "6-Slipbox/**"]);
+        let new_caller = writer(tmp.path()).await;
+        let (s, new_rules) = new_caller.update(&vault).await.unwrap();
+        assert!(s.rebuilt);
+        assert_ne!(old_rules.fingerprint(), new_rules.fingerprint());
+
+        // The old caller updates again, alone and concurrently with the new one.
+        let (ra, rb) = tokio::join!(old_caller.update(&vault), new_caller.update(&vault));
+        let (ra, rb) = (ra.unwrap(), rb.unwrap());
+        assert!(!ra.0.rebuilt && !rb.0.rebuilt, "no rebuild back to the old rules");
+        assert_eq!(ra.1.fingerprint(), new_rules.fingerprint());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes WHERE path LIKE '6-Slipbox/%'")
+            .fetch_one(old_caller.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        let fp: String = sqlx::query_scalar("SELECT value FROM index_meta WHERE key = 'exclusions'")
+            .fetch_one(old_caller.pool())
+            .await
+            .unwrap();
+        assert_eq!(fp, new_rules.fingerprint());
     }
 
     #[tokio::test]
     async fn index_search_incremental_and_deletes() {
         let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
         let vault = tmp.path().join("vault");
         fixture(&vault);
-        let pool = open_at(&tmp.path().join("idx.db")).await.unwrap();
-        let ex = ex();
+        set_rules(&ws, &["**/attachments/**"]);
+        let w = writer(tmp.path()).await;
+        let pool = w.pool();
 
-        let s = update(&pool, &vault, &ex).await.unwrap();
+        let (s, ex) = w.update(&vault).await.unwrap();
         assert_eq!(s.indexed, 5, "{s:?}");
         assert_eq!(s.content_excluded, 1);
         assert!(s.path_excluded >= 2); // homelab note + attachment
-        let again = update(&pool, &vault, &ex).await.unwrap();
+        let (again, _) = w.update(&vault).await.unwrap();
         assert_eq!((again.indexed, again.unchanged), (0, 5));
 
         let opts = SearchOpts { bucket: None, limit: 10 };
         // Title/tag weighting: the hub tagged `rocket` outranks the others.
-        let r = search(&pool, "rocket", &opts, &ex).await.unwrap();
+        let r = search(pool, "rocket", &opts, &ex).await.unwrap();
         assert_eq!(r.hits[0].path, "3-Projects/Alpha/index.md");
         assert_eq!(r.hits[0].display, "Alpha/index.md");
         assert_eq!(r.hits[0].title, "Alpha");
         assert!(r.hits.iter().all(|h| !h.path.contains("attachments")));
 
         // Diacritics folded, porter stemming.
-        let r = search(&pool, "orcamento", &opts, &ex).await.unwrap();
+        let r = search(pool, "orcamento", &opts, &ex).await.unwrap();
         assert_eq!(r.hits[0].path, "3-Projects/Alpha/engine-notes.md");
         assert!(r.hits[0].snippet.contains(MATCH_START) && r.hits[0].snippet.contains(MATCH_END));
-        let r = search(&pool, "decides", &opts, &ex).await.unwrap();
+        let r = search(pool, "decides", &opts, &ex).await.unwrap();
         assert_eq!(r.hits.len(), 1);
 
         // Credentials never come back: not by folder, not by content.
         for q in ["router login", "correct horse", "password", "wifi"] {
-            let r = search(&pool, q, &opts, &ex).await.unwrap();
+            let r = search(pool, q, &opts, &ex).await.unwrap();
             assert!(r.hits.is_empty(), "{q} returned {:?}", r.hits);
         }
 
         // Bucket filter + fallback to any-term.
-        let r = search(&pool, "project hub", &SearchOpts { bucket: Some("3-Projects/Beta"), limit: 5 }, &ex)
+        let r = search(pool, "project hub", &SearchOpts { bucket: Some("3-Projects/Beta"), limit: 5 }, &ex)
             .await
             .unwrap();
         assert_eq!(r.hits.len(), 1);
         assert_eq!(r.hits[0].bucket, "3-Projects");
-        let r = search(&pool, "turbopump irrigation", &opts, &ex).await.unwrap();
+        let r = search(pool, "turbopump irrigation", &opts, &ex).await.unwrap();
         assert_eq!(r.mode, "any");
         assert_eq!(r.hits.len(), 2);
 
         // Punctuation is safe; FTS syntax passes through.
-        assert!(search(&pool, "engine-notes: (x", &opts, &ex).await.is_ok());
-        let r = search(&pool, "turbopump OR irrigation", &opts, &ex).await.unwrap();
+        assert!(search(pool, "engine-notes: (x", &opts, &ex).await.is_ok());
+        let r = search(pool, "turbopump OR irrigation", &opts, &ex).await.unwrap();
         assert_eq!((r.mode.as_str(), r.hits.len()), ("all", 2));
 
         // Edit → reindexed; delete → removed; credential added → removed.
@@ -471,16 +604,59 @@ mod tests {
         write(&vault, "6-Slipbox/deciding-under-uncertainty.md", "# Deciding\n\nNew body about kayaks.\n");
         fs::remove_file(vault.join("3-Projects/Beta/index.md")).unwrap();
         write(&vault, "3-Projects/Alpha/engine-notes.md", "# Engine\n\napi_key = abc123\n");
-        let s = update(&pool, &vault, &ex).await.unwrap();
+        let (s, _) = w.update(&vault).await.unwrap();
         assert_eq!((s.indexed, s.removed, s.content_excluded), (1, 1, 2), "{s:?}");
-        assert_eq!(search(&pool, "kayaks", &opts, &ex).await.unwrap().hits.len(), 1);
-        assert!(search(&pool, "irrigation", &opts, &ex).await.unwrap().hits.is_empty());
-        assert!(search(&pool, "engine", &opts, &ex).await.unwrap().hits.iter().all(|h| h.path != "3-Projects/Alpha/engine-notes.md"));
+        assert_eq!(search(pool, "kayaks", &opts, &ex).await.unwrap().hits.len(), 1);
+        assert!(search(pool, "irrigation", &opts, &ex).await.unwrap().hits.is_empty());
+        assert!(search(pool, "engine", &opts, &ex).await.unwrap().hits.iter().all(|h| h.path != "3-Projects/Alpha/engine-notes.md"));
 
         // Changing the exclusion rules rebuilds and drops the newly excluded.
-        let ex2 = Exclusions::new(&["6-Slipbox/**".into()], "").unwrap();
-        let s = update(&pool, &vault, &ex2).await.unwrap();
+        set_rules(&ws, &["6-Slipbox/**"]);
+        let (s, ex2) = w.update(&vault).await.unwrap();
         assert!(s.rebuilt);
-        assert!(search(&pool, "kayaks", &opts, &ex2).await.unwrap().hits.is_empty());
+        assert!(search(pool, "kayaks", &opts, &ex2).await.unwrap().hits.is_empty());
+    }
+
+    /// `%` and `_` in a bucket filter match only themselves.
+    #[tokio::test]
+    async fn bucket_filter_is_literal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        write(&vault, "3-Projects/Alpha/a.md", "# A\nrocket\n");
+        write(&vault, "3_Projects/b.md", "# B\nrocket\n");
+        write(&vault, "30-Other/c.md", "# C\nrocket\n");
+        set_rules(&tmp.path().join("ws"), &[]);
+        let w = writer(tmp.path()).await;
+        let (_, ex) = w.update(&vault).await.unwrap();
+        let hits = |b: &'static str| {
+            let pool = w.pool().clone();
+            let ex = ex.clone();
+            async move {
+                let r = search(&pool, "rocket", &SearchOpts { bucket: Some(b), limit: 10 }, &ex).await.unwrap();
+                let mut p: Vec<String> = r.hits.into_iter().map(|h| h.path).collect();
+                p.sort();
+                p
+            }
+        };
+        assert!(hits("3%").await.is_empty());
+        assert!(hits("%").await.is_empty());
+        assert_eq!(hits("3_Projects").await, vec!["3_Projects/b.md"]);
+        assert_eq!(hits("3-Projects").await, vec!["3-Projects/Alpha/a.md"]);
+    }
+
+    /// A note over the size ceiling is counted and never read or indexed.
+    #[tokio::test]
+    async fn oversized_notes_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        write(&vault, "0-Inbox/small.md", "# Small\nrocket\n");
+        let big = format!("# Big\nrocket\n{}", "x".repeat(super::super::MAX_NOTE_BYTES as usize));
+        write(&vault, "0-Inbox/big.md", &big);
+        set_rules(&tmp.path().join("ws"), &[]);
+        let w = writer(tmp.path()).await;
+        let (s, ex) = w.update(&vault).await.unwrap();
+        assert_eq!((s.indexed, s.oversized), (1, 1), "{s:?}");
+        let r = search(w.pool(), "rocket", &SearchOpts { bucket: None, limit: 10 }, &ex).await.unwrap();
+        assert_eq!(r.hits.len(), 1);
     }
 }

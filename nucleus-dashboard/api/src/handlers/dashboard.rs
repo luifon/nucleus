@@ -206,7 +206,7 @@ struct ChatGlance {
 async fn glances(State(s): State<Arc<DashboardState>>) -> Json<Glances> {
     Json(Glances {
         next_fire: glance_next_fire(&s.reminders_pool).await,
-        latest_vault: glance_latest_vault(&s.vault_path).await,
+        latest_vault: glance_latest_vault(&s.workspace_root, &s.vault_path).await,
         latest_diary: glance_latest_diary(&s.diary_root).await,
         top_news: glance_top_news(&s.news_pool).await,
         latest_chat: glance_latest_chat(&s.chat_pool).await,
@@ -242,60 +242,20 @@ async fn glance_next_fire(pool: &Option<SqlitePool>) -> Option<NextFireGlance> {
     })
 }
 
-async fn glance_latest_vault(vault: &std::path::Path) -> Option<VaultGlance> {
-    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
-    let mut stack = vec![vault.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&d).await {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        while let Ok(Some(dirent)) = entries.next_entry().await {
-            let path = dirent.path();
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
-                None => continue,
-            };
-            if name.starts_with('.') || name.starts_with('_') || name == "Home.md" {
-                continue;
-            }
-            let ft = match dirent.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !name.ends_with(".md") {
-                continue;
-            }
-            if let Ok(meta) = dirent.metadata().await {
-                if let Ok(mtime) = meta.modified() {
-                    best = match best {
-                        Some((_, bt)) if mtime <= bt => best,
-                        _ => Some((path, mtime)),
-                    };
-                }
-            }
-        }
-    }
-    let (path, mtime) = best?;
-    let relpath = path
-        .strip_prefix(vault)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.to_string_lossy().into_owned());
-    let bucket = relpath
-        .split('/')
-        .next()
-        .filter(|s| s.contains('-'))
-        .unwrap_or("")
-        .to_string();
-    let mtime_unix = mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    Some(VaultGlance { relpath, bucket, mtime_unix })
+/// The most recently changed note, under the same exclusion rules as the
+/// vault page (ADR-035): an excluded or credential note is never named.
+async fn glance_latest_vault(workspace_root: &std::path::Path, vault: &std::path::Path) -> Option<VaultGlance> {
+    let ex = nucleus_core::vault::exclude::Exclusions::load(workspace_root).ok()?;
+    let vault = vault.to_path_buf();
+    let latest = tokio::task::spawn_blocking(move || {
+        nucleus_core::vault::access::recent(&vault, &ex, None, 1, super::vault::hidden_from_feed)
+    })
+    .await
+    .ok()?
+    .ok()?
+    .into_iter()
+    .next()?;
+    Some(VaultGlance { bucket: super::vault::bucket_label(&latest.rel), relpath: latest.rel, mtime_unix: latest.mtime })
 }
 
 async fn glance_latest_diary(diary_root: &std::path::Path) -> Option<DiaryGlance> {

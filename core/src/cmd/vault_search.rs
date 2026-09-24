@@ -12,8 +12,12 @@
 //! FTS5 syntax (`OR`, `NOT`, `"exact phrase"`, `prefix*`) is honored.
 //! Porter stemming and accent folding are on (`orcamento` finds `orçamento`).
 //! Credential notes and excluded folders are never indexed or returned.
+//!
+//! This command is the only writer of `memory/vault_index.db` (ADR-020,
+//! ADR-035). The dashboard runs `nucleus vault-search --reindex` before a
+//! search and reads the index read-only.
 
-use crate::vault::{exclude::Exclusions, index};
+use crate::vault::index;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
@@ -46,20 +50,22 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     let settings = crate::config::Settings::load().context("loading settings")?;
     let workspace_root = settings.workspace_root()?;
     let vault = settings.obsidian.vault_dir();
-    let ex = Exclusions::from_config(&settings.vault_search)?;
-    let pool = index::open(&workspace_root).await?;
+    let writer = index::Writer::open(&workspace_root).await?;
 
     let t0 = std::time::Instant::now();
-    let stats = index::update(&pool, &vault, &ex).await?;
+    // The rules come back from the update: they are the ones it applied,
+    // read from nucleus.toml under the index lock.
+    let (stats, ex) = writer.update(&vault).await?;
     if cli.reindex || stats.indexed + stats.removed > 0 {
         eprintln!(
-            "index: {} notes scanned, {} (re)indexed, {} removed, {} unchanged, {} excluded by path, {} excluded as credentials ({} ms)",
+            "index: {} notes scanned, {} (re)indexed, {} removed, {} unchanged, {} excluded by path, {} excluded as credentials, {} over the size limit ({} ms)",
             stats.scanned,
             stats.indexed,
             stats.removed,
             stats.unchanged,
             stats.path_excluded,
             stats.content_excluded,
+            stats.oversized,
             t0.elapsed().as_millis()
         );
     }
@@ -72,7 +78,7 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     }
 
     let opts = index::SearchOpts { bucket: cli.bucket.as_deref(), limit: cli.limit };
-    let mut result = index::search(&pool, &query, &opts, &ex).await?;
+    let mut result = index::search(writer.pool(), &query, &opts, &ex).await?;
     // Terminal and session output mark matches with brackets.
     for h in &mut result.hits {
         h.snippet = h.snippet.replace(index::MATCH_START, "[").replace(index::MATCH_END, "]");

@@ -118,7 +118,7 @@ export default function VaultPage() {
           ) : (
             <ul className="space-y-1.5">
               {files.data.map((f) => (
-                <li key={f.path}>
+                <li key={f.relpath}>
                   <VaultFileRow file={f} />
                 </li>
               ))}

@@ -28,7 +28,8 @@ export const listVaultBuckets = () => jsonGet<VaultBucket[]>("/vault/api/buckets
 export const listRecentVault = (opts: { bucket?: string; limit?: number } = {}) =>
   jsonGet<VaultFile[]>(`/vault/api/recent${qs({ bucket: opts.bucket, limit: opts.limit })}`);
 
-/** `path` is absolute (recent feed) or vault-relative (search hits). */
+/** `path` is vault-relative (`VaultFile.relpath`, `VaultSearchHit.path`).
+ *  Excluded and credential notes answer 404, like missing ones. */
 export const getVaultFile = (path: string) =>
   fetch(`/vault/api/file${qs({ path })}`).then(async (r) => {
     if (!r.ok) throw new Error(`/vault/api/file → ${r.status}`);
