@@ -29,10 +29,13 @@
 //!      category above this run's. The latest such run (largest total) is
 //!      the one continued. `D` = its totals (background calls included:
 //!      they are the same records of the same counter), plus the carried
-//!      responses its window does not hold; `D`'s dollars = its `costUSD`
+//!      responses its window does not hold, capped at what the counter holds
+//!      beyond both; `D`'s dollars = its `costUSD`
 //!      plus the extra responses' price share of the remaining dollars;
 //!    - otherwise the counter restarted: `D` = the carried responses'
-//!      tokens (capped at the run's counter), and `D`'s dollars = the run's
+//!      tokens, capped per category at `C − O_own` (the run's own responses
+//!      are reserved first: they happened inside this counter, while a
+//!      carried response may predate its reset), and `D`'s dollars = the run's
 //!      `costUSD` times `D`'s share of the run's table price (token share
 //!      for a model without a price). An earlier run's background tokens
 //!      are never subtracted here: nothing shows they are in this counter.
@@ -353,16 +356,22 @@ pub fn reconcile_model(runs: &[RunInput], price: Option<&ModelPrice>) -> Vec<Run
                 add(&mut extra, t);
             }
         }
+        // The run's own responses are in its counter (they happened in this
+        // run's window and no earlier run holds them), so they are reserved
+        // first: carried responses can only be deducted from what the
+        // counter holds beyond them. A counter reset that dropped a carried
+        // response then leaves the owned part intact.
+        let own_c = Counter::of(&own);
         let (d, d_usd) = match cont {
             Some(p) => {
                 let base = c.min(runs[p].counter);
                 let base_usd = runs[p].cost_usd.min(run.cost_usd);
                 let rest = c.minus(base);
-                let more = rest.min(Counter::of(&extra));
+                let more = rest.minus(own_c).min(Counter::of(&extra));
                 (base.plus(more), base_usd + share_usd(more, rest, run.cost_usd - base_usd, &window))
             }
             None => {
-                let d = c.min(Counter::of(&extra));
+                let d = c.minus(own_c).min(Counter::of(&extra));
                 (d, share_usd(d, c, run.cost_usd, &window))
             }
         };
@@ -709,6 +718,45 @@ mod tests {
         assert_eq!(out[2].residual.total(), 0);
         assert!((out[2].new_cost_usd - 1.0).abs() < 1e-12, "{}", out[2].new_cost_usd);
         assert!((total_usd(&runs, &out, None, &[r1, r3]) - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reset_counter_without_the_carried_response_keeps_the_owned_part() {
+        // A owns R1. B's window holds R1 and the new R2, but B's counter
+        // was reset after R1 and holds only R2. B owns R2: its tokens and
+        // its dollars must survive the carried-overlap deduction.
+        let r1 = tok(1000, 100);
+        let r2 = tok(1000, 100);
+        let runs = vec![
+            run("s-a", 1, 10, (1000, 100), 1.0, &[("r1", r1)]),
+            run("s-b", 5, 20, (1000, 100), 1.2, &[("r1", r1), ("r2", r2)]),
+        ];
+        // Unpriced: B's whole estimate comes from its adjustment.
+        let out = reconcile_model(&runs, None);
+        assert!(out[1].carried);
+        assert!((out[1].new_cost_usd - 1.2).abs() < 1e-12, "{}", out[1].new_cost_usd);
+        assert!((out[1].adjustment - 1.2).abs() < 1e-12);
+        assert!((total_usd(&runs, &out, None, &[r1, r2]) - 2.2).abs() < 1e-12);
+
+        // Priced, with drift: table price of R2 is $0.015, B's estimate $0.018.
+        let price = ModelPrice {
+            input: 10.0,
+            output: 50.0,
+            cache_read: 1.0,
+            cache_write_5m: 12.5,
+            cache_write_1h: 20.0,
+            long_context: None,
+        };
+        let runs = vec![
+            run("s-a", 1, 10, (1000, 100), 0.015, &[("r1", r1)]),
+            run("s-b", 5, 20, (1000, 100), 0.018, &[("r1", r1), ("r2", r2)]),
+        ];
+        let out = reconcile_model(&runs, Some(&price));
+        assert!((out[1].new_cost_usd - 0.018).abs() < 1e-12, "{}", out[1].new_cost_usd);
+        assert!((out[1].adjustment - 0.003).abs() < 1e-12, "B keeps its drift");
+        assert_eq!(out[1].residual.total(), 0);
+        let total = total_usd(&runs, &out, Some(&price), &[r1, r2]);
+        assert!((total - 0.033).abs() < 1e-12, "total {total}");
     }
 
     #[test]
