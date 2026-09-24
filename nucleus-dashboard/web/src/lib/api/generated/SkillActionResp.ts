@@ -6,30 +6,30 @@ import type { SkillTier } from "./SkillTier";
 /**
  * Result of a successful write.
  */
-export type SkillActionResp = { action: SkillAction, 
+export type SkillActionResp = { action: SkillAction,
 /**
  * Tier the skill was in before the action.
  */
-from: SkillTier, 
+from: SkillTier,
 /**
  * Directory name before the action.
  */
-dir_name: string, 
+dir_name: string,
 /**
  * Tier after the action; null for `delete`.
  */
-to: SkillTier | null, 
+to: SkillTier | null,
 /**
  * Directory name after the action; null for `delete`. Differs from
  * `dir_name` when archive added a date suffix or restore used the
  * skill's `restore_name`.
  */
-new_dir_name: string | null, 
+new_dir_name: string | null,
 /**
  * SKILL.md path after the action (usable with `/body`); null for
  * `delete`.
  */
-path: string | null, git: GitOutcome, 
+path: string | null, git: GitOutcome,
 /**
  * Extra information for the operator, for example whether a delete can
  * be recovered.

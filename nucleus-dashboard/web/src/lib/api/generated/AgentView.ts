@@ -3,39 +3,39 @@ import type { AgentClass } from "./AgentClass";
 import type { Capability } from "./Capability";
 import type { Launch } from "./Launch";
 
-export type AgentView = { name: string, class: AgentClass, launch: Launch, runtime: string | null, schedule: string | null, diary_key: string | null, persona_venue: string | null, 
+export type AgentView = { name: string, class: AgentClass, launch: Launch, runtime: string | null, schedule: string | null, diary_key: string | null, persona_venue: string | null,
 /**
  * Resolved persona name (ADR-009) for conversational agents, if any.
  */
-persona_display_name: string | null, capabilities: Array<Capability>, tmux_session: string | null, launchd_label: string | null, 
+persona_display_name: string | null, capabilities: Array<Capability>, tmux_session: string | null, launchd_label: string | null,
 /**
  * running | idle | errored | hosted | stopped | unknown
  */
-status: string, 
+status: string,
 /**
  * PID for launchd jobs currently running.
  */
-pid: number | null, 
+pid: number | null,
 /**
  * Last exit code for launchd-cron jobs (0 clean; negative = signal).
  */
-last_exit: number | null, 
+last_exit: number | null,
 /**
  * Live tmux windows matching this agent's session (prefix match).
  */
-live_windows: number, 
+live_windows: number,
 /**
  * Most recent tmux window activity (epoch secs), if any live window.
  */
-last_activity_unix: number | null, 
+last_activity_unix: number | null,
 /**
  * `started_at` of the most recent run-log row (tmux agents).
  */
-last_run_started: string | null, 
+last_run_started: string | null,
 /**
  * Count of indexed runs (tmux agents).
  */
-run_count: number, 
+run_count: number,
 /**
  * `tmux attach -t <session>` convenience for the live ones.
  */

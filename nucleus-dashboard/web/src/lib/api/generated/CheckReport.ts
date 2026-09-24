@@ -2,11 +2,11 @@
 import type { CheckCounts } from "./CheckCounts";
 import type { Finding } from "./Finding";
 
-export type CheckReport = { run_id: number | null, started_at: string, finished_at: string, 
+export type CheckReport = { run_id: number | null, started_at: string, finished_at: string,
 /**
  * `manual` or `scheduled`.
  */
-trigger: string, applied: boolean, notes_scanned: number, 
+trigger: string, applied: boolean, notes_scanned: number,
 /**
  * Files skipped by the exclusion rules (paths and credential notes).
  */
