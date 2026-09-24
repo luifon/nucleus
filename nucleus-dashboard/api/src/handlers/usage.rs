@@ -3,8 +3,13 @@
 //!
 //! Read-only over `memory/usage.db`, whose single writer is
 //! `nucleus usage refresh` (ADR-020 ownership). `POST /refresh` spawns that
-//! command as a child process instead of writing from this process; the
-//! refresh's lock file makes a second request a 409.
+//! command as a child process instead of writing from this process.
+//!
+//! Concurrency: at most one refresh child per server. A POST takes an
+//! in-process gate, answers 409 when this server's child is still running
+//! or another process holds the refresh lock (`flock` on
+//! `memory/usage-refresh.lock`, e.g. the distiller), and only then spawns.
+//! Simultaneous POSTs therefore start one child, not one each.
 //!
 //!   GET  /usage/api/status              data span, last refresh, prices
 //!   POST /usage/api/refresh             start a refresh (202 / 409)
@@ -29,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 
 pub struct UsageState {
@@ -37,11 +43,40 @@ pub struct UsageState {
     /// the recurring jobs besides cron reminders.
     pub scheduled_agents: Vec<String>,
     pool: Mutex<Option<SqlitePool>>,
+    /// Program and arguments of the refresh child. Default: this binary
+    /// with `usage refresh`.
+    refresh_cmd: (PathBuf, Vec<String>),
+    /// Held while a POST checks and spawns (the single-flight gate).
+    spawn_gate: Mutex<()>,
+    /// True from spawn until this server's refresh child exits.
+    child_running: Arc<AtomicBool>,
 }
 
 impl UsageState {
     pub fn new(workspace_root: PathBuf, scheduled_agents: Vec<String>) -> Self {
-        Self { workspace_root, scheduled_agents, pool: Mutex::new(None) }
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nucleus"));
+        Self::with_refresh_command(workspace_root, scheduled_agents, exe, vec!["usage".into(), "refresh".into()])
+    }
+
+    /// Same as [`Self::new`] with an explicit refresh command (tests).
+    pub fn with_refresh_command(
+        workspace_root: PathBuf,
+        scheduled_agents: Vec<String>,
+        program: PathBuf,
+        args: Vec<String>,
+    ) -> Self {
+        Self {
+            workspace_root,
+            scheduled_agents,
+            pool: Mutex::new(None),
+            refresh_cmd: (program, args),
+            spawn_gate: Mutex::new(()),
+            child_running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn refreshing(&self) -> bool {
+        self.child_running.load(Ordering::SeqCst) || usage::refresh_running(&self.workspace_root)
     }
 
     /// The read-only pool, opened on first use: the DB does not exist until
@@ -113,7 +148,10 @@ fn internal(e: anyhow::Error) -> UsageError {
 
 async fn status(State(s): State<Arc<UsageState>>) -> Result<Json<query::UsageStatus>, UsageError> {
     let pool = s.pool().await?;
-    Ok(Json(query::status(pool.as_ref(), &s.workspace_root).await.map_err(internal)?))
+    let mut st = query::status(pool.as_ref(), &s.workspace_root).await.map_err(internal)?;
+    // Covers the moments between spawn and the child taking the lock.
+    st.refreshing = st.refreshing || s.child_running.load(Ordering::SeqCst);
+    Ok(Json(st))
 }
 
 #[derive(Serialize, ts_rs::TS)]
@@ -127,10 +165,14 @@ struct RefreshStarted {
 /// Spawn `nucleus usage refresh` from the same binary this server runs as.
 /// Output goes to `memory/usage-refresh.log`.
 async fn refresh(State(s): State<Arc<UsageState>>) -> Result<(StatusCode, Json<RefreshStarted>), UsageError> {
-    if usage::refresh_running(&s.workspace_root) {
+    // Single flight: a concurrent POST finds the gate taken and gets 409
+    // instead of spawning a second child.
+    let Ok(_gate) = s.spawn_gate.try_lock() else {
+        return Err(UsageError::Busy);
+    };
+    if s.refreshing() {
         return Err(UsageError::Busy);
     }
-    let exe = std::env::current_exe().map_err(|e| UsageError::Internal(e.to_string()))?;
     let log_path = s.workspace_root.join("memory/usage-refresh.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -138,8 +180,9 @@ async fn refresh(State(s): State<Arc<UsageState>>) -> Result<(StatusCode, Json<R
         .open(&log_path)
         .map_err(|e| UsageError::Internal(format!("{}: {e}", log_path.display())))?;
     let err_log = log.try_clone().map_err(|e| UsageError::Internal(e.to_string()))?;
-    let mut child = tokio::process::Command::new(exe)
-        .args(["usage", "refresh"])
+    let (program, args) = &s.refresh_cmd;
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
         .current_dir(&s.workspace_root)
         .stdin(std::process::Stdio::null())
         .stdout(log)
@@ -147,9 +190,12 @@ async fn refresh(State(s): State<Arc<UsageState>>) -> Result<(StatusCode, Json<R
         .spawn()
         .map_err(|e| UsageError::Internal(format!("spawning usage refresh: {e}")))?;
     let pid = child.id();
-    // Reap the child so it does not linger as a zombie.
+    s.child_running.store(true, Ordering::SeqCst);
+    let running = s.child_running.clone();
+    // Reap the child and clear the flag when it exits.
     tokio::spawn(async move {
         let _ = child.wait().await;
+        running.store(false, Ordering::SeqCst);
     });
     Ok((StatusCode::ACCEPTED, Json(RefreshStarted { started: true, pid })))
 }
@@ -205,4 +251,49 @@ async fn sessions(
     let pool = s.require_pool().await?;
     let limit = q.limit.unwrap_or(25).clamp(1, 200);
     Ok(Json(query::sessions(&pool, q.days, limit, q.vendor).await.map_err(internal)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn post() -> Request<Body> {
+        Request::builder().method("POST").uri("/refresh").body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn simultaneous_refresh_posts_spawn_one_child() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let state = Arc::new(UsageState::with_refresh_command(
+            dir.path().to_path_buf(),
+            vec![],
+            PathBuf::from("/bin/sleep"),
+            vec!["2".into()],
+        ));
+        let app = router(state.clone());
+        let calls = (0..16).map(|_| app.clone().oneshot(post()));
+        let codes: Vec<StatusCode> = futures::future::join_all(calls).await.into_iter().map(|r| r.unwrap().status()).collect();
+        assert_eq!(codes.iter().filter(|c| **c == StatusCode::ACCEPTED).count(), 1, "{codes:?}");
+        assert_eq!(codes.iter().filter(|c| **c == StatusCode::CONFLICT).count(), 15);
+        // While the child runs, a later POST is refused as well.
+        assert_eq!(app.clone().oneshot(post()).await.unwrap().status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn refresh_is_refused_while_another_process_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = usage::RefreshLock::acquire(dir.path()).await.unwrap();
+        let state = Arc::new(UsageState::with_refresh_command(
+            dir.path().to_path_buf(),
+            vec![],
+            PathBuf::from("/bin/sleep"),
+            vec!["0".into()],
+        ));
+        let res = router(state).oneshot(post()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
 }

@@ -6,7 +6,16 @@ import type { UsageRateReading } from "./UsageRateReading";
 import type { UsageSeriesPoint } from "./UsageSeriesPoint";
 import type { UsageVendorTotals } from "./UsageVendorTotals";
 
-export type UsageSummary = { days: number, today: string, by_vendor: Array<UsageVendorTotals>, day: UsageCompare, week: UsageCompare, range: UsageCompare, daily: Array<UsageSeriesPoint>, weekly: Array<UsageSeriesPoint>, models: Array<UsageModelRow>, heatmap: Array<UsageHeatCell>, 
+export type UsageSummary = { days: number, 
+/**
+ * Today in the operator's timezone (`NUCLEUS_TZ`).
+ */
+today: string, 
+/**
+ * First local day of the range: `today − (days − 1)`, or for all time
+ * the first day with data under the tool filter (today when none).
+ */
+range_from: string, by_vendor: Array<UsageVendorTotals>, day: UsageCompare, week: UsageCompare, range: UsageCompare, daily: Array<UsageSeriesPoint>, weekly: Array<UsageSeriesPoint>, models: Array<UsageModelRow>, heatmap: Array<UsageHeatCell>, 
 /**
  * Latest Codex rate-limit readings (one per slot), as recorded in the
  * Codex logs. No equivalent exists for Claude.

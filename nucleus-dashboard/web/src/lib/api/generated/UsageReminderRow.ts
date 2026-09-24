@@ -5,4 +5,12 @@ export type UsageReminderRow = { reminder_id: number, title: string | null, cron
 /**
  * Fire sessions in the selected range.
  */
-sessions: number, cost_30d: number, sessions_30d: number, last_day: string | null, };
+sessions: number, cost_30d: number, 
+/**
+ * Tokens in the last 30 days without a price (not in `cost_30d`).
+ */
+unpriced_tokens_30d: number, 
+/**
+ * Part of `cost_30d` priced from a third-party estimate.
+ */
+third_party_usd_30d: number, sessions_30d: number, last_day: string | null, };

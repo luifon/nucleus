@@ -7,6 +7,11 @@ export type UsageTotals = { input: number, cache_write: number, cache_read: numb
  */
 unpriced_tokens: number, 
 /**
+ * Dollars in `cost_usd` priced from a third-party estimate (a model
+ * whose vendor publishes no price; see the price listing).
+ */
+third_party_usd: number, 
+/**
  * Number of API responses (Claude) / turn deltas (Codex).
  */
 responses: number, };

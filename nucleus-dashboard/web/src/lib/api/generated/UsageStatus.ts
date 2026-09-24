@@ -4,9 +4,20 @@ import type { UsageRefreshRun } from "./UsageRefreshRun";
 
 export type UsageStatus = { has_data: boolean, refreshing: boolean, last_refresh: UsageRefreshRun | null, first_day: string | null, last_day: string | null, timezone: string, prices_as_of: string, prices: Array<UsagePrice>, sessions: number, 
 /**
- * Sum of Claude Code's own cost-state estimates.
+ * Sum of Claude Code's own cost-state estimates, each counter counted
+ * once (see `reconcile.rs`).
  */
 cost_state_usd: number, 
+/**
+ * Cost-state runs whose window repeated responses of an earlier run.
+ */
+cost_state_carried_runs: number, 
+/**
+ * Over every stored file: relevant lines skipped as malformed or
+ * oversized. Unlike `last_refresh`, these stay until the file is
+ * rewritten, so they report data missing from the store now.
+ */
+malformed_lines_total: number, oversized_lines_total: number, 
 /**
  * Sum of `costUSD − table price` over all cost-state runs: how far the
  * price table is from Claude Code's prices on the covered tokens.

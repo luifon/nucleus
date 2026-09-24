@@ -1,0 +1,3 @@
+# ts-rs output (Rule 12): generated, never hand-edited. ts-rs writes a
+# trailing space after each field doc comment; exempt it from whitespace checks.
+nucleus-dashboard/web/src/lib/api/generated/*.ts -whitespace
