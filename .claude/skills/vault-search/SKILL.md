@@ -24,7 +24,7 @@ notify_on_failure: []
 
 Any time you need a note that already exists in the vault: before filing a
 capture (to append instead of duplicating), before linking siblings, or to
-answer a question from the operator's notes. The vault is several hundred
+answer a question from the operator's notes. A vault holds hundreds of
 notes; a folder listing shows names only, and many notes share generic names
 (`index.md`, `README.md`). Search first, then Read the few notes that matter.
 

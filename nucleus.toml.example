@@ -107,7 +107,9 @@ prune_max_age_days = 14
 # removed: dot folders, credential-like names (*password*, *senha*,
 # *credential*, *secret*, *api-key*, *.pem, *.key) and any `homelab` folder.
 # A pattern without `/` matches any single path component. Excluded notes
-# are never indexed, returned, reported by vault-check, or modified.
+# are never indexed, returned, reported by vault-check, modified, or opened
+# or listed by the dashboard. Changes apply at the next search or request,
+# without a restart.
 # Credentials reach the operator only through the authenticated DM, never
 # through a search result.
 [vault_search]
@@ -140,8 +142,9 @@ source_vocabulary = [
 orphan_exempt = ["README.md", "index.md", "Home.md", "_*", "0-Inbox/**", "1-Main-Notes/**", "2-Daily-Notes/**", "7-Archives/**"]
 # Never reported for frontmatter or source.
 frontmatter_exempt = ["README.md", "Home.md"]
-# Scheduled runs: apply the safe fixes (delete empty `Untitled*` files that
-# nothing links to; add a missing `created` from the file's birth time).
+# Scheduled runs: apply the safe fixes (move empty `Untitled*` files that
+# nothing links to into memory/vault-quarantine/; add a missing `created`
+# from the file's birth time, keeping a copy of the original there).
 # Leave false until a few weekly reports look right. Manual runs use --apply.
 scheduled_apply = false
 # Scheduled runs: enqueue the one-line summary to the operator's WhatsApp DM.
