@@ -124,6 +124,23 @@ pub fn open_note(vault: &Path, ex: &Exclusions, requested: &str) -> Result<Opene
     Ok(OpenedNote { rel, text })
 }
 
+/// Whether a vault-relative path taken from a stored record (a vault-check
+/// finding) may be shown under `ex`. The path rules decide first. A
+/// markdown note that exists is then opened like [`open_note`] and its text
+/// checked by the credential detector. A note that no longer exists (a
+/// fixed or deleted note; a symlink in its place, which is never followed)
+/// and a note over the size ceiling cannot be checked by content and are
+/// judged by the path rules alone, as the check did when it reported them.
+/// A folder or non-markdown path is judged by the path rules. A read error
+/// hides the path (fail closed).
+pub fn may_show(vault: &Path, ex: &Exclusions, rel: &str) -> bool {
+    match open_note(vault, ex, rel) {
+        Ok(_) => true,
+        Err(AccessError::NotFound | AccessError::TooLarge | AccessError::NotMarkdown) => true,
+        Err(AccessError::Excluded | AccessError::Invalid | AccessError::Io(_)) => false,
+    }
+}
+
 /// The vault-relative folder for a bucket/folder filter. An excluded
 /// folder is refused; a missing one, a file, or a path through a symlink
 /// is `NotFound`.

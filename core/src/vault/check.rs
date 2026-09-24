@@ -1283,6 +1283,81 @@ pub async fn latest(pool: &SqlitePool) -> Result<Option<CheckReport>> {
     }))
 }
 
+/// A stored report reduced to what may be shown now. A report is written
+/// under the exclusion rules of its run; a note excluded since then (a new
+/// glob, or a credential written into it) must not stay visible through
+/// it. `allowed` answers for one vault-relative path under the current
+/// rules ([`super::access::may_show`] in the dashboard).
+///
+/// - A finding about a path that is not allowed is dropped.
+/// - A path that is not allowed is removed from `related`. A group finding
+///   left with too few members to be a group is dropped; its detail is
+///   rewritten with the new member count, so the count does not reveal
+///   that a hidden member exists.
+/// - The counts are recomputed from the findings that remain.
+pub fn visible_report(mut r: CheckReport, mut allowed: impl FnMut(&str) -> bool) -> CheckReport {
+    let mut out = Vec::with_capacity(r.findings.len());
+    for mut f in std::mem::take(&mut r.findings) {
+        if f.path.as_deref().is_some_and(|p| !allowed(p)) {
+            continue;
+        }
+        let before = f.related.len();
+        f.related.retain(|p| allowed(p));
+        let after = f.related.len();
+        if after < before {
+            let min = match f.kind.as_str() {
+                KIND_DUPLICATE_NAME | KIND_SIMILAR_TITLE | KIND_DUPLICATE_CONTENT => 2,
+                KIND_DATED_SERIES => DATED_SERIES_MIN,
+                KIND_UNKNOWN_SOURCE => 1,
+                // A broken link's `related` is an optional folder hint.
+                _ => 0,
+            };
+            if after < min {
+                continue;
+            }
+            f.detail = recount_detail(&f.detail, before, after);
+        }
+        out.push(f);
+    }
+    r.findings = out;
+    r.counts = counts_of(&r.findings);
+    r
+}
+
+/// Replace the member count a group finding's detail starts with (`3 notes
+/// share …`, `3 dated notes …`) or carries (`(3 notes)`).
+fn recount_detail(detail: &str, before: usize, after: usize) -> String {
+    if let Some(rest) = detail.strip_prefix(&format!("{before} ")) {
+        return format!("{after} {rest}");
+    }
+    detail.replacen(&format!("({before} notes)"), &format!("({after} notes)"), 1)
+}
+
+/// The counts a report's findings add up to, the way [`analyze`] and
+/// [`apply`] count them.
+pub fn counts_of(findings: &[Finding]) -> CheckCounts {
+    let mut c = CheckCounts::default();
+    for f in findings {
+        match f.kind.as_str() {
+            KIND_DUPLICATE_NAME | KIND_SIMILAR_TITLE | KIND_DATED_SERIES | KIND_DUPLICATE_CONTENT => {
+                c.duplicates += 1
+            }
+            KIND_BROKEN_LINK => c.broken_links += 1,
+            KIND_ORPHAN => c.orphans += 1,
+            KIND_STALE_INBOX => c.stale_inbox += 1,
+            KIND_FRONTMATTER => c.missing_frontmatter += 1,
+            KIND_UNKNOWN_SOURCE => c.unknown_source += f.related.len() as i64,
+            KIND_EMPTY_FILE => c.empty_files += 1,
+            KIND_OVERSIZED => c.oversized += 1,
+            _ => {}
+        }
+        if f.fixed {
+            c.fixed += 1;
+        }
+    }
+    c
+}
+
 // ─── scheduled occurrences ──────────────────────────────────────────────────
 
 /// Result of [`claim_occurrence`].
@@ -1935,6 +2010,58 @@ mod tests {
             claim_occurrence(&b, "2026-09-27T20:00:00+00:00", later + stale * 3, stale).await.unwrap(),
             Claim::Completed
         );
+    }
+
+    /// The counts a report stores are the ones its findings add up to, so
+    /// [`visible_report`] can recompute them after filtering.
+    #[test]
+    fn counts_of_matches_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path());
+        let r = run(tmp.path(), &ex(), &opts(false)).unwrap();
+        assert!(!r.findings.is_empty());
+        assert_eq!(counts_of(&r.findings), r.counts);
+    }
+
+    /// A hidden path leaves the findings and the group member lists; a
+    /// group left too small is dropped; details and counts follow.
+    #[test]
+    fn visible_report_drops_hidden_paths() {
+        let f = |kind: &str, path: Option<&str>, detail: &str, related: &[&str]| Finding {
+            kind: kind.into(),
+            path: path.map(str::to_string),
+            detail: detail.into(),
+            related: related.iter().map(|s| s.to_string()).collect(),
+            fixed: false,
+            fix_action: None,
+        };
+        let findings = vec![
+            f(KIND_ORPHAN, Some("a/hidden.md"), "no other note links here", &[]),
+            f(KIND_ORPHAN, Some("a/shown.md"), "no other note links here", &[]),
+            f(KIND_DUPLICATE_NAME, None, "3 notes share the name \"x\"", &["a/x.md", "b/x.md", "a/hidden.md"]),
+            f(KIND_SIMILAR_TITLE, None, "2 notes with near-identical titles", &["a/shown.md", "a/hidden.md"]),
+            f(KIND_UNKNOWN_SOURCE, None, "source: q (2 notes) is not in [vault_check] source_vocabulary", &["a/hidden.md", "a/shown.md"]),
+        ];
+        let report = CheckReport {
+            run_id: Some(1),
+            started_at: String::new(),
+            finished_at: String::new(),
+            trigger: "manual".into(),
+            applied: false,
+            notes_scanned: 5,
+            files_excluded: 0,
+            duration_ms: 0,
+            counts: counts_of(&findings),
+            findings,
+        };
+        let v = visible_report(report, |p| p != "a/hidden.md");
+        assert!(v.findings.iter().all(|f| f.path.as_deref() != Some("a/hidden.md")
+            && !f.related.iter().any(|r| r == "a/hidden.md")));
+        let kinds: Vec<&str> = v.findings.iter().map(|f| f.kind.as_str()).collect();
+        assert_eq!(kinds, vec![KIND_ORPHAN, KIND_DUPLICATE_NAME, KIND_UNKNOWN_SOURCE]);
+        assert_eq!(v.findings[1].detail, "2 notes share the name \"x\"");
+        assert!(v.findings[2].detail.contains("(1 notes)"), "{}", v.findings[2].detail);
+        assert_eq!((v.counts.orphans, v.counts.duplicates, v.counts.unknown_source), (1, 1, 1));
     }
 
     #[tokio::test]

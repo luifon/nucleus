@@ -301,13 +301,26 @@ async fn open_check_db(s: &VaultState) -> Result<Option<SqlitePool>, VaultError>
         .map_err(|e| VaultError::Io(format!("opening vault_check.db: {e:#}")))
 }
 
-/// The latest report with its findings; `null` before the first run.
-async fn check_latest(
-    State(s): State<Arc<VaultState>>,
-) -> Result<Json<Option<CheckReport>>, VaultError> {
-    let Some(pool) = open_check_db(&s).await? else { return Ok(Json(None)) };
+/// The latest report with its findings; `null` before the first run. The
+/// stored report is filtered through the exclusion rules as they are at
+/// this request ([`check::visible_report`]): a note excluded after the run
+/// (by a new glob or by a credential written into it) is not named.
+async fn check_latest(State(s): State<Arc<VaultState>>) -> Result<Response, VaultError> {
+    let ex = s.rules()?;
+    let Some(pool) = open_check_db(&s).await? else { return Ok(no_store(Json(None::<CheckReport>).into_response())) };
     let r = check::latest(&pool).await.map_err(|e| VaultError::Io(format!("{e:#}")))?;
-    Ok(Json(r))
+    pool.close().await;
+    let root = s.root.clone();
+    let r = blocking(move || {
+        r.map(|r| {
+            let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+            check::visible_report(r, |p| {
+                *seen.entry(p.to_string()).or_insert_with(|| access::may_show(&root, &ex, p))
+            })
+        })
+    })
+    .await?;
+    Ok(no_store(Json(r).into_response()))
 }
 
 #[derive(Deserialize)]
@@ -316,16 +329,17 @@ struct RunsQ {
     limit: Option<i64>,
 }
 
-/// Run counts, newest first — the trend.
-async fn check_runs(
-    State(s): State<Arc<VaultState>>,
-    Query(q): Query<RunsQ>,
-) -> Result<Json<Vec<CheckRunSummary>>, VaultError> {
-    let Some(pool) = open_check_db(&s).await? else { return Ok(Json(vec![])) };
+/// Run counts, newest first — the trend. Counts only, no paths: the counts
+/// are the ones each run recorded, under the rules of that run.
+async fn check_runs(State(s): State<Arc<VaultState>>, Query(q): Query<RunsQ>) -> Result<Response, VaultError> {
+    let Some(pool) = open_check_db(&s).await? else {
+        return Ok(no_store(Json(Vec::<CheckRunSummary>::new()).into_response()));
+    };
     let runs = check::runs(&pool, q.limit.unwrap_or(26).clamp(1, 200))
         .await
         .map_err(|e| VaultError::Io(format!("{e:#}")))?;
-    Ok(Json(runs))
+    pool.close().await;
+    Ok(no_store(Json(runs).into_response()))
 }
 
 // ─── buckets ────────────────────────────────────────────────────────────────
@@ -596,6 +610,40 @@ mod tests {
         assert_eq!(latest["trigger"], "manual");
         let (_, runs) = get_json(&app, "/check/runs?limit=5").await;
         assert_eq!(runs.as_array().unwrap().len(), 1);
+    }
+
+    /// Round 3, item 2: the stored report is filtered through the rules at
+    /// request time. A note excluded after the run (by a glob, or by a
+    /// credential written into it) disappears from `/check/latest` at the
+    /// next request, with its count; both check routes are `no-store`.
+    #[tokio::test]
+    async fn check_latest_applies_current_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, root, ws) = app(tmp.path());
+        let ex = Exclusions::new(&[], "").unwrap();
+        let opts = check::CheckOptions::from_config(&Default::default(), false, "manual").unwrap();
+        let wpool = check::open_at(&tmp.path().join("check.db")).await.unwrap();
+        check::record(&wpool, &check::run(&root, &ex, &opts).unwrap()).await.unwrap();
+
+        let (status, headers, body) = get_raw(&app, "/check/latest").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert!(body.contains("6-Slipbox/idea.md") && body.contains("3-Projects/Alpha/index.md"), "{body}");
+        let orphans = |b: &str| serde_json::from_str::<serde_json::Value>(b).unwrap()["counts"]["orphans"].as_i64().unwrap();
+        let before = orphans(&body);
+
+        write(&ws, "nucleus.toml", "[vault_search]\nexclude = [\"6-Slipbox/**\"]\n");
+        let (_, _, body) = get_raw(&app, "/check/latest").await;
+        assert!(!body.contains("6-Slipbox/idea.md"), "{body}");
+        assert!(body.contains("3-Projects/Alpha/index.md"), "{body}");
+        assert_eq!(orphans(&body), before - 1);
+
+        write(&root, "3-Projects/Alpha/index.md", "# Alpha\n\npassword: correct horse battery staple\n");
+        let (_, _, body) = get_raw(&app, "/check/latest").await;
+        assert!(!body.contains("3-Projects/Alpha/index.md"), "{body}");
+
+        let (_, headers, _) = get_raw(&app, "/check/runs").await;
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
     }
 
     /// H1: excluded notes cannot be opened or listed; paths are relative.
