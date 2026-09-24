@@ -1,4 +1,4 @@
-# Nucleus
+See ADR-015/016/034. |# Nucleus
 
 A personal-assistant stack that wires the Claude Code CLI into your Discord,
 WhatsApp, and a unified operator dashboard.
@@ -15,7 +15,7 @@ brain is your existing Claude subscription — no separate API billing.
 | **Discord bot** (Jerry Lewis) | DM or @-mention → wakes Claude → replies with per-channel session continuity. Slash commands: `/status`, `/news`, `/remember`, `/forget`. |
 | **WhatsApp bot** (Alfred) | Self-only group, voice memos transcribed locally via whisper.cpp, brain-dump classified and routed (TODOs → tasks, facts → memory, etc.). Iron-tight allowlist scoping. |
 | **News pipeline** | 09:00 + 19:00 feed pull (HN, lobste.rs, Simon Willison, Pragmatic Engineer, Latent Space, Julia Evans) → freshness and duplicate filtering → Claude ranks each item against a prose profile of the reader you keep in your vault → `news.json` for the macOS notch widget. Votes (with an optional reason) and click-throughs come back through the widget's outboxes; the fetcher keeps downvoted items out of the day's brief, and the votes feed a monthly profile review. Nothing is posted to Discord. See ADR-031. |
-| **nucleus-dashboard** | Single operator app subsuming dashboard widgets, chat against your PARA vault, the public news API, and every admin surface (agents, skills, diary, reminders, vault writes) at `nucleus.<your-domain>`. See ADR-015/016. |
+| **nucleus-dashboard** | Single operator app subsuming dashboard widgets, chat against your PARA vault, the public news API, and every admin surface (agents, skills, diary, reminders, vault writes, usage) at `nucleus.<your-domain>`. See ADR-015/016/034. |
 | **Distiller** | Single daily 4am pass (consolidated per ADR-016; absorbed the old preference learner) that promotes diary observations to long-term memory (PROMOTE / MERGE / ARCHIVE / DROP, Mem0-style ops). |
 | **Reminders** | Ask either bot "remind me at 16:45 about dentist" → Claude schedules via the `reminders` CLI. Once-per-minute polling delivers to one or more channels (`discord-home`, `whatsapp-dm` via the bot-drained outbound queue, `calendar`). Supports `--at` (one-shot) and `--cron` (recurring) with pause/resume + per-channel retry. |
 
@@ -489,6 +489,7 @@ nucleus/
 - `docs/ADR-026-heartbeat.md` — HEARTBEAT.md checklist sweep + reply-gated silent fires
 - `docs/ADR-027-adapter-circuit-breaker.md` — WhatsApp connection supervisor: close-reason taxonomy, backoff ladder, open-circuit alerts (proposed)
 - `docs/ADR-032-repo-private-skills-tree.md` — operator-private skills in the gitignored `.nucleus/.claude/skills/`, loaded via `--add-dir`; rejected alternatives
+- `docs/ADR-034-usage-accounting.md` — token and estimated-cost accounting for every Claude Code and Codex session: parsing and dedupe rules, cost-state reconciliation, price table, project and Nucleus attribution, `/usage` surface
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
@@ -552,6 +553,11 @@ tmux kill-window -t nucleus-discord:<window-prefix>
 # Search past session transcripts (ADR-023; index refreshes on every run)
 ./target/release/nucleus session-search "what did we decide about X" --days 30
 ./target/release/nucleus session-search --prune            # junk-transcript report (dry-run)
+
+# Token and estimated-cost accounting, Claude Code + Codex (ADR-034).
+# The distiller refreshes daily; the dashboard /usage page refreshes on demand.
+./target/release/nucleus usage refresh                     # incremental; --full re-reads everything
+./target/release/nucleus usage report --days 30            # --vendor claude|codex, --top N
 ./target/release/nucleus reminders cancel <id>
 
 # One-shot WhatsApp send (uses the paired session)

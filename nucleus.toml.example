@@ -113,3 +113,21 @@ prune_max_age_days = 14
 # window_ms = 900000
 # probe_ms = 300000
 # alert_after_outage_ms = 1800000
+
+# ADR-034 usage accounting (`nucleus usage refresh`, dashboard /usage). Every
+# value is optional; the defaults read the standard transcript locations.
+# Dollar figures are estimates at API list price. The built-in price table
+# (core/src/usage/pricing.rs) lists every model seen in Claude Code and Codex
+# logs with its source and the date it was read; add or override a model here
+# in USD per million tokens, keyed by model id or id prefix. A model with no
+# price is shown on the page as "tokens without a price", never as $0.
+# [usage]
+# claude_projects_dir = "~/.claude/projects"
+# codex_sessions_dir = "~/.codex/sessions"
+# worktree_markers = ["/.claude/worktrees/", "/.worktrees/"]
+# [usage.prices."some-new-model"]
+# input = 3.0
+# output = 15.0
+# cache_read = 0.3
+# cache_write_5m = 3.75
+# cache_write_1h = 6.0

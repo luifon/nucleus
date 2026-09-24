@@ -496,4 +496,10 @@ JSON-parsed numbers.
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `docs/ADR-*.md` — architecture decisions and why (especially ADR-005 for the vault, ADR-008 for skills)
 - `README.md` — setup + operating cheatsheet
+- `docs/ADR-034-usage-accounting.md` — token and estimated-cost questions
+  ("how much did X cost", "which reminder is expensive"): answer from
+  `nucleus usage report --days N [--vendor claude|codex]` or the dashboard
+  `/usage` page. `memory/usage.db` has one writer, `nucleus usage refresh`;
+  never write to it directly. Dollar figures are estimates at API list
+  price, not billing.
 - `$NUCLEUS_TIER2_DIR/MEMORY.md` (typically `~/.claude/projects/<cwd-encoded>/memory/MEMORY.md`) — Tier 2 shared facts (auto-loaded; check the index there for what's already known about the user)
