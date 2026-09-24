@@ -87,33 +87,54 @@ pub struct UpdateStats {
 /// Bring the index in line with the vault: (re)index notes whose (mtime,
 /// size) changed, drop rows for notes that were deleted or are now
 /// excluded. Unchanged notes are not read.
+///
+/// The whole update runs in one `BEGIN IMMEDIATE` transaction, so two
+/// processes updating at once (a session's CLI call and the dashboard)
+/// serialize on SQLite's write lock instead of racing on the same rows;
+/// readers are not blocked (WAL).
 pub async fn update(pool: &SqlitePool, vault: &Path, ex: &Exclusions) -> Result<UpdateStats> {
-    let mut stats = UpdateStats::default();
     let walk = scan::walk(vault, ex)?;
-    stats.path_excluded = walk.excluded.len();
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    match update_locked(&mut conn, &walk, ex).await {
+        Ok(stats) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok(stats)
+        }
+        Err(e) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(e)
+        }
+    }
+}
+
+async fn update_locked(
+    conn: &mut sqlx::SqliteConnection,
+    walk: &scan::Walk,
+    ex: &Exclusions,
+) -> Result<UpdateStats> {
+    let mut stats = UpdateStats { path_excluded: walk.excluded.len(), ..Default::default() };
 
     // Exclusion rules changed → rebuild from scratch.
     let fp: Option<String> =
         sqlx::query_scalar("SELECT value FROM index_meta WHERE key = 'exclusions'")
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
     if fp.as_deref() != Some(ex.fingerprint()) {
-        let mut tx = pool.begin().await?;
-        sqlx::query("DELETE FROM notes_fts").execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM notes").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM notes_fts").execute(&mut *conn).await?;
+        sqlx::query("DELETE FROM notes").execute(&mut *conn).await?;
         sqlx::query(
             "INSERT INTO index_meta (key, value) VALUES ('exclusions', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
         .bind(ex.fingerprint())
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-        tx.commit().await?;
         stats.rebuilt = fp.is_some();
     }
 
     let existing: Vec<(i64, String, i64, i64)> =
-        sqlx::query_as("SELECT id, path, mtime, size FROM notes").fetch_all(pool).await?;
+        sqlx::query_as("SELECT id, path, mtime, size FROM notes").fetch_all(&mut *conn).await?;
     let known: std::collections::HashMap<String, (i64, i64, i64)> = existing
         .into_iter()
         .map(|(id, p, m, s)| (p, (id, m, s)))
@@ -133,14 +154,11 @@ pub async fn update(pool: &SqlitePool, vault: &Path, ex: &Exclusions) -> Result<
             // Unreadable (permissions, invalid UTF-8): treated as absent.
             continue;
         };
-        let mut tx = pool.begin().await?;
         if let Some(&(id, _, _)) = known.get(&f.rel) {
-            sqlx::query("DELETE FROM notes_fts WHERE rowid = ?1").bind(id).execute(&mut *tx).await?;
-            sqlx::query("DELETE FROM notes WHERE id = ?1").bind(id).execute(&mut *tx).await?;
+            delete_row(conn, id).await?;
         }
+        present.insert(f.rel.clone());
         if ex.content_excluded(&text) {
-            tx.commit().await?;
-            present.insert(f.rel.clone());
             stats.content_excluded += 1;
             continue;
         }
@@ -159,7 +177,7 @@ pub async fn update(pool: &SqlitePool, vault: &Path, ex: &Exclusions) -> Result<
         .bind(n.source())
         .bind(&tags)
         .bind(chrono::Utc::now().to_rfc3339())
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *conn)
         .await?;
         sqlx::query(
             "INSERT INTO notes_fts (rowid, title, headings, tags, path, meta, body)
@@ -172,24 +190,25 @@ pub async fn update(pool: &SqlitePool, vault: &Path, ex: &Exclusions) -> Result<
         .bind(path_words(&f.rel))
         .bind(&n.meta_text)
         .bind(&n.body)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-        tx.commit().await?;
-        present.insert(f.rel.clone());
         stats.indexed += 1;
     }
 
     // Deleted, renamed away, or newly excluded.
-    let mut tx = pool.begin().await?;
     for (path, (id, _, _)) in &known {
         if !present.contains(path) {
-            sqlx::query("DELETE FROM notes_fts WHERE rowid = ?1").bind(id).execute(&mut *tx).await?;
-            sqlx::query("DELETE FROM notes WHERE id = ?1").bind(id).execute(&mut *tx).await?;
+            delete_row(conn, *id).await?;
             stats.removed += 1;
         }
     }
-    tx.commit().await?;
     Ok(stats)
+}
+
+async fn delete_row(conn: &mut sqlx::SqliteConnection, id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM notes_fts WHERE rowid = ?1").bind(id).execute(&mut *conn).await?;
+    sqlx::query("DELETE FROM notes WHERE id = ?1").bind(id).execute(&mut *conn).await?;
+    Ok(())
 }
 
 /// The path as words (`3-Projects/Alpha/api-notes.md` → `3 Projects Alpha
@@ -371,6 +390,23 @@ mod tests {
         write(root, "4-Areas/Home/wifi.md", "# Wifi\n\n- **Password:** correct-horse\n");
         write(root, "3-Projects/Alpha/attachments/spec.md", "# Spec\nrocket attachment\n");
         write(root, ".obsidian/workspace.md", "rocket");
+    }
+
+    /// Two writers (a CLI call and the dashboard) updating at once both
+    /// succeed and leave one row per note.
+    #[tokio::test]
+    async fn concurrent_updates_serialize() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        fixture(&vault);
+        let db = tmp.path().join("idx.db");
+        let (a, b) = (open_at(&db).await.unwrap(), open_at(&db).await.unwrap());
+        let ex = ex();
+        let (ra, rb) = tokio::join!(update(&a, &vault, &ex), update(&b, &vault, &ex));
+        let (ra, rb) = (ra.unwrap(), rb.unwrap());
+        assert_eq!(ra.indexed + rb.indexed, 5);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes").fetch_one(&a).await.unwrap();
+        assert_eq!(n, 5);
     }
 
     #[tokio::test]
