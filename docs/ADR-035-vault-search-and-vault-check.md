@@ -112,8 +112,11 @@ dashboard. Two layers, shared by search, check and the dashboard:
     senha`). The value may contain spaces (`password: correct horse
     battery staple`); when the line has no value, the next non-empty line
     that is not a heading is the value. Placeholders are an empty value,
-    a value wrapped in `<>`, `[]`, `{}` or `()` (template slots and
-    `[[note links]]`), mask characters only (`xxx`, `***`, `...`), a short
+    `[[note links]]` and `{{template}}` variables, a value wrapped in
+    `<>`, `[]`, `{}` or `()` only when its content is itself a placeholder
+    or names a template slot (`<YOUR_PASSWORD>`, `[api key here]`,
+    `(sua senha)`) — a literal wrapped in brackets such as `(hunter2)` is
+    still a credential — mask characters only (`xxx`, `***`, `...`), a short
     list of words (`none`, `n/a`, `tbd`, `redacted`, `true`, `false`, …),
     and a reference of at most six words that starts with a word such as
     `see`/`in`/`no`/`veja` and names a store (`see vault`, `in 1password`,

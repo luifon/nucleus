@@ -125,7 +125,7 @@ impl Exclusions {
 
 /// Bumped whenever [`looks_like_credentials`] changes, so existing indexes
 /// are rebuilt under the new rule.
-const DETECTOR_VERSION: &str = "credential-detector-v3";
+const DETECTOR_VERSION: &str = "credential-detector-v4";
 
 /// Unicode compatibility normalization (NFKC) with every
 /// Default_Ignorable_Code_Point removed. NFKC turns full-width and other
@@ -405,9 +405,22 @@ pub fn is_placeholder(v: &str) -> bool {
     if t.is_empty() {
         return true;
     }
+    // A wrapped value is a placeholder only when its content says so: a
+    // wiki link or template variable, an inner placeholder, or a template
+    // name such as `<YOUR_PASSWORD>` / `[api key here]`. A literal wrapped
+    // in brackets (`(hunter2)`, `[correct horse battery staple]`) is still a
+    // credential.
+    if (t.starts_with("[[") && t.ends_with("]]")) || (t.starts_with("{{") && t.ends_with("}}")) {
+        return true;
+    }
     for (open, close) in [('<', '>'), ('[', ']'), ('{', '}'), ('(', ')')] {
         if t.len() >= 2 && t.starts_with(open) && t.ends_with(close) {
-            return true;
+            let inner = t[open.len_utf8()..t.len() - close.len_utf8()].trim();
+            return is_placeholder(inner)
+                || inner
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|w| !w.is_empty())
+                    .any(|w| TEMPLATE_WORDS.contains(&w));
         }
     }
     if t.chars().all(|c| matches!(c, 'x' | '*' | '.' | '-' | '_' | '•' | '…' | '?' | '#' | ' ')) {
@@ -429,6 +442,13 @@ const PLACEHOLDER_WORDS: &[&str] = &[
     "none", "n/a", "na", "nil", "null", "tbd", "todo", "redacted", "removed", "hidden",
     "omitted", "placeholder", "empty", "true", "false", "yes", "no", "sim", "não", "nao",
     "nenhum", "nenhuma", "vazio",
+];
+
+/// Words that mark bracketed content as a template slot rather than a value.
+const TEMPLATE_WORDS: &[&str] = &[
+    "your", "my", "here", "insert", "enter", "example", "sample", "placeholder", "redacted",
+    "password", "passphrase", "passcode", "pin", "secret", "token", "key", "apikey", "value",
+    "seu", "sua", "aqui", "inserir", "exemplo", "senha", "chave", "valor", "segredo",
 ];
 
 const REFERENCE_LEADS: &[&str] = &[
@@ -715,6 +735,11 @@ mod tests {
             "Senha:\n\ncavalo correto bateria grampo",
             "2. Token: GitHub → Settings → create a token",
             "pass\u{200B}phrase: correct horse battery staple",
+            // A literal wrapped in brackets is still a value.
+            "password: (hunter2)",
+            "password: [correct horse battery staple]",
+            "senha: {cavalo correto bateria}",
+            "token: <ab12cd34ef56>",
         ] {
             assert!(e.content_excluded(text), "should exclude {text:?}");
         }
@@ -722,6 +747,10 @@ mod tests {
             // Placeholders.
             "password:",
             "password: <your password>",
+            "password: <YOUR_PASSWORD>",
+            "api key: [api key here]",
+            "senha: (sua senha)",
+            "password: [redacted]",
             "password: [[Router login]]",
             "password: {{password}}",
             "password: xxx",
@@ -750,7 +779,7 @@ mod tests {
     /// the fingerprint.
     #[test]
     fn detector_version_is_in_the_fingerprint() {
-        assert!(ex(&[]).fingerprint().starts_with("credential-detector-v3\n"));
+        assert!(ex(&[]).fingerprint().starts_with("credential-detector-v4\n"));
     }
 
     #[test]
