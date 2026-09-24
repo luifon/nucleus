@@ -1577,6 +1577,7 @@ dependencies = [
  "libc",
  "regex",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",

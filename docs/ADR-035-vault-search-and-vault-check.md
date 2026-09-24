@@ -110,18 +110,31 @@ rules.
 **Dashboard surfaces** (`nucleus_core::vault::access`):
 
 - `/vault/api/file` takes a vault-relative path only. An absolute path, `..`,
-  `.` or an empty component is refused (400). The path is resolved, symlinks
-  included, and must stay inside the canonical vault root. The path rules
-  are checked on both the requested and the resolved relative path, then the
-  size limit, then the content detector on the text. An excluded note and a
-  missing note both answer 404. Responses carry `Cache-Control: no-store`.
+  `.` or an empty component is refused (400), then the path rules are
+  checked on the path. The note is opened relative to a descriptor of the
+  vault root, one component at a time with `O_NOFOLLOW`
+  (`nucleus_core::vault::fsx`), so a symlink anywhere below the root is
+  refused and answers 404, like a missing note. The opened descriptor is
+  checked with `fstat` to be a regular file, and the text is read from that
+  descriptor; the path is never opened a second time, so a file or folder
+  swapped for a symlink between the check and the read cannot point the
+  read outside the vault. Then the size limit, then the content detector on
+  the text. An excluded note and a missing note both answer 404. Responses
+  carry `Cache-Control: no-store`.
 - `/vault/api/recent` lists notes from the exclusion-aware walk and checks
-  each returned note's text. Its `bucket` filter is parsed and resolved like
+  each returned note's text. Its `bucket` filter is parsed and opened like
   `/file`; an excluded folder returns an empty list. It returns relative
   paths and the vault folder name, never an absolute path.
 - `/vault/api/buckets` and the home-page "latest vault write" glance use the
   same walk. `/vault/api/search` drops any hit that `/file` would refuse
   under the current rules.
+
+The walk shared by the index, the check and the dashboard (`vault::scan`)
+uses the same descriptor access: each folder is opened from the root
+without following symlinks and listed from its descriptor, entries are
+read with `fstatat(.., AT_SYMLINK_NOFOLLOW)`, and each note is read through
+the root descriptor. A symlink in the vault is never listed, indexed or
+followed.
 
 ### 3. The weekly vault check
 

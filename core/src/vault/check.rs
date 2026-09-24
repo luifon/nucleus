@@ -231,7 +231,9 @@ impl Analysis {
 /// Markdown notes the check may read, and what it left out.
 struct Loaded {
     notes: Vec<Note>,
-    others: Vec<VaultFile>,
+    /// The non-markdown files that are empty (0 bytes, or a canvas with
+    /// no nodes), decided when the file was read.
+    empty_others: Vec<VaultFile>,
     /// Every path a link may resolve to, excluded files included.
     targets: Vec<String>,
     /// Paths that may appear in a finding (not excluded).
@@ -242,9 +244,10 @@ struct Loaded {
 
 fn load(vault: &Path, ex: &Exclusions) -> Result<Loaded> {
     let walk = scan::walk(vault, ex)?;
+    let root = &walk.root;
     let mut l = Loaded {
         notes: Vec::new(),
-        others: Vec::new(),
+        empty_others: Vec::new(),
         // A link to an excluded note is not broken. Paths only; excluded
         // files are not read, and their paths are used for nothing else.
         targets: walk.excluded.clone(),
@@ -252,11 +255,13 @@ fn load(vault: &Path, ex: &Exclusions) -> Result<Loaded> {
         oversized: Vec::new(),
         files_excluded: walk.excluded.len() as i64,
     };
-    for f in walk.files {
+    for f in walk.files.iter().cloned() {
         l.targets.push(f.rel.clone());
         if !f.is_markdown() {
             l.reportable.push(f.rel.clone());
-            l.others.push(f);
+            if f.size == 0 || other_is_empty(root, &f) {
+                l.empty_others.push(f);
+            }
             continue;
         }
         if f.size > super::MAX_NOTE_BYTES {
@@ -264,7 +269,7 @@ fn load(vault: &Path, ex: &Exclusions) -> Result<Loaded> {
             l.oversized.push(f);
             continue;
         }
-        let text = match super::read_note_capped(&f.abs) {
+        let text = match root.read_note(&f.raw_rel) {
             Ok(Some(t)) => t,
             Ok(None) => {
                 l.reportable.push(f.rel.clone());
@@ -304,7 +309,7 @@ fn inbound_counts(notes: &[Note], resolver: &Resolver) -> HashMap<String, usize>
 pub fn analyze(vault: &Path, ex: &Exclusions, opts: &CheckOptions) -> Result<Analysis> {
     let started = std::time::Instant::now();
     let started_at = crate::timestamp::now();
-    let Loaded { notes, others, targets, reportable, oversized, files_excluded } = load(vault, ex)?;
+    let Loaded { notes, empty_others, targets, reportable, oversized, files_excluded } = load(vault, ex)?;
     // Excluded paths resolve links, but only reportable paths name the
     // folder in a broken-link hint.
     let resolver = Resolver::new(&targets, &reportable);
@@ -428,7 +433,7 @@ pub fn analyze(vault: &Path, ex: &Exclusions, opts: &CheckOptions) -> Result<Ana
         .iter()
         .filter(|n| n.file.size == 0 || note_is_empty(&n.text))
         .map(|n| &n.file)
-        .chain(others.iter().filter(|f| f.size == 0 || other_is_empty(f)));
+        .chain(empty_others.iter());
     for f in empties {
         counts.empty_files += 1;
         findings.push(simple(KIND_EMPTY_FILE, &f.rel, if f.size == 0 { "0 bytes".into() } else { "no content".into() }));
@@ -497,11 +502,11 @@ const EMPTY_PROBE_BYTES: u64 = 4096;
 
 /// A canvas with no nodes (`{}` or `{"nodes":[]}`); other non-markdown
 /// files count as empty only at 0 bytes.
-fn other_is_empty(f: &VaultFile) -> bool {
+fn other_is_empty(root: &super::fsx::Root, f: &VaultFile) -> bool {
     if !f.rel.to_lowercase().ends_with(".canvas") || f.size > EMPTY_PROBE_BYTES {
         return false;
     }
-    let Ok(text) = std::fs::read_to_string(&f.abs) else { return false };
+    let Ok(Some(text)) = root.read_note(&f.raw_rel) else { return false };
     canvas_is_empty(&text)
 }
 
@@ -610,6 +615,11 @@ fn purge_quarantine(quarantine: &Path, now: chrono::DateTime<chrono::Utc>) {
     }
 }
 
+fn path_ident(p: &Path) -> std::io::Result<super::fsx::Ident> {
+    let dir = std::fs::File::open(p.parent().unwrap_or(Path::new(".")))?;
+    super::fsx::stat_at(&dir, p.file_name().unwrap_or_default())
+}
+
 fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)
@@ -625,7 +635,7 @@ fn open_same(f: &VaultFile) -> Result<Option<std::fs::File>> {
         }
         Err(e) => return Err(e.into()),
     };
-    Ok(f.same_file(&file.metadata()?).then_some(file))
+    Ok(f.same_file(&super::fsx::Ident::of(&file)?).then_some(file))
 }
 
 /// Move an empty file into the quarantine after checking, on the open file,
@@ -645,7 +655,7 @@ fn quarantine_empty(f: &VaultFile, run_dir: &Path) -> Result<Outcome> {
     let dest = run_dir.join("deleted").join(&f.rel);
     std::fs::create_dir_all(dest.parent().context("quarantine path")?)?;
     // The path must still name the verified file right before the rename.
-    if !std::fs::symlink_metadata(&f.abs).is_ok_and(|m| f.same_file(&m)) {
+    if !path_ident(&f.abs).is_ok_and(|m| f.same_file(&m)) {
         return Ok(Outcome::Skipped("changed since the scan"));
     }
     if let Err(e) = std::fs::rename(&f.abs, &dest) {
@@ -654,7 +664,7 @@ fn quarantine_empty(f: &VaultFile, run_dir: &Path) -> Result<Outcome> {
         }
         return Err(e.into());
     }
-    if std::fs::symlink_metadata(&dest).is_ok_and(|m| f.same_file(&m)) {
+    if path_ident(&dest).is_ok_and(|m| f.same_file(&m)) {
         return Ok(Outcome::Done("moved to the vault-check quarantine".into()));
     }
     // Another file took the path between the check and the rename: put it

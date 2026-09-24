@@ -351,7 +351,7 @@ impl IntoResponse for VaultError {
             Self::Access(e) => {
                 let code = match &e {
                     AccessError::Invalid => StatusCode::BAD_REQUEST,
-                    AccessError::Outside | AccessError::NotMarkdown => StatusCode::FORBIDDEN,
+                    AccessError::NotMarkdown => StatusCode::FORBIDDEN,
                     // Same answer for excluded and missing notes.
                     AccessError::Excluded | AccessError::NotFound => StatusCode::NOT_FOUND,
                     AccessError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,

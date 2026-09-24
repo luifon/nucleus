@@ -219,7 +219,7 @@ async fn update_locked(
             stats.oversized += 1;
             continue;
         }
-        let text = match super::read_note_capped(&f.abs) {
+        let text = match walk.read_note(f) {
             Ok(Some(t)) => t,
             Ok(None) => {
                 stats.oversized += 1;

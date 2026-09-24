@@ -26,6 +26,7 @@
 pub mod access;
 pub mod check;
 pub mod exclude;
+pub mod fsx;
 pub mod index;
 pub mod note;
 pub mod scan;
@@ -36,15 +37,10 @@ pub mod scan;
 /// open it.
 pub const MAX_NOTE_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Read a note of at most [`MAX_NOTE_BYTES`]. `Ok(None)` when the file is
-/// larger (checked before and while reading, so a file that grows is
-/// still capped); an error when it cannot be read or is not UTF-8.
-pub fn read_note_capped(path: &std::path::Path) -> std::io::Result<Option<String>> {
-    let file = std::fs::File::open(path)?;
-    read_capped(file)
-}
-
-/// [`read_note_capped`] on an open file.
+/// Read an open note of at most [`MAX_NOTE_BYTES`]. `Ok(None)` when the
+/// file is larger (checked before and while reading, so a file that grows
+/// is still capped); an error when it cannot be read or is not UTF-8.
+/// Notes are opened through [`fsx::Root`], never by path.
 pub fn read_capped(mut file: std::fs::File) -> std::io::Result<Option<String>> {
     use std::io::Read;
     if file.metadata()?.len() > MAX_NOTE_BYTES {

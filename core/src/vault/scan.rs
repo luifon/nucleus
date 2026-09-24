@@ -4,15 +4,19 @@
 //! pull foreign files into the index or into the check's fix scope.
 
 use super::exclude::Exclusions;
+use super::fsx::{self, Ident, Kind, Root};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone)]
 pub struct VaultFile {
     /// Vault-relative path with `/` separators, NFC-normalized.
     pub rel: String,
+    /// Vault-relative path as the names are stored on disk. Opened through
+    /// [`Root`], never joined to the root and opened by path.
+    pub raw_rel: PathBuf,
+    /// Absolute path, for messages and tests. Not used to open the file.
     pub abs: PathBuf,
     pub size: u64,
     /// Modification time, unix seconds.
@@ -27,29 +31,29 @@ pub struct VaultFile {
 }
 
 impl VaultFile {
-    pub fn from_meta(rel: String, abs: PathBuf, meta: &std::fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt;
+    pub fn from_ident(rel: String, raw_rel: PathBuf, abs: PathBuf, id: &Ident) -> Self {
         Self {
             rel,
+            raw_rel,
             abs,
-            size: meta.len(),
-            mtime: unix(meta.modified().ok()),
-            mtime_ns: mtime_ns(meta),
-            birthtime: meta.created().ok().map(|t| unix(Some(t))),
-            dev: meta.dev(),
-            ino: meta.ino(),
+            size: id.size,
+            mtime: id.mtime_ns.div_euclid(1_000_000_000) as i64,
+            mtime_ns: id.mtime_ns,
+            birthtime: id.birthtime,
+            dev: id.dev,
+            ino: id.ino,
         }
     }
 
-    /// True when `meta` describes the same file, unchanged, as this scan
-    /// entry: same device and inode, same size, same nanosecond mtime.
-    pub fn same_file(&self, meta: &std::fs::Metadata) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        meta.is_file()
-            && meta.dev() == self.dev
-            && meta.ino() == self.ino
-            && meta.len() == self.size
-            && mtime_ns(meta) == self.mtime_ns
+    /// True when `id` describes the same file, unchanged, as this scan
+    /// entry: a regular file with the same device and inode, size and
+    /// nanosecond mtime.
+    pub fn same_file(&self, id: &Ident) -> bool {
+        id.kind == Kind::File
+            && id.dev == self.dev
+            && id.ino == self.ino
+            && id.size == self.size
+            && id.mtime_ns == self.mtime_ns
     }
 
     pub fn is_markdown(&self) -> bool {
@@ -61,8 +65,11 @@ impl VaultFile {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Walk {
+    /// The vault root the walk opened. Read the files through it
+    /// ([`Root::read_note`] with [`VaultFile::raw_rel`]).
+    pub root: Root,
     /// Files not excluded by a path glob, sorted by path.
     pub files: Vec<VaultFile>,
     /// Paths of files excluded by a path glob, outside dot folders. Kept
@@ -71,49 +78,62 @@ pub struct Walk {
     pub excluded: Vec<String>,
 }
 
-/// Walk `root`, applying the path exclusions. Content exclusion happens
-/// later, once a note has been read.
-pub fn walk(root: &Path, ex: &Exclusions) -> Result<Walk> {
-    let meta = std::fs::metadata(root)
-        .with_context(|| format!("cannot read the vault at {}", root.display()))?;
-    if !meta.is_dir() {
-        anyhow::bail!("vault path {} is not a directory", root.display());
+impl Walk {
+    /// Read a walked note through the root descriptor (no symlink is
+    /// followed; see [`fsx`]).
+    pub fn read_note(&self, f: &VaultFile) -> std::io::Result<Option<String>> {
+        self.root.read_note(&f.raw_rel)
     }
-    let mut out = Walk::default();
-    let mut stack = vec![PathBuf::new()];
-    while let Some(rel_dir) = stack.pop() {
-        let dir = root.join(&rel_dir);
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("listing {}", dir.display()))?;
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().nfc().collect::<String>();
+}
+
+/// Walk `root`, applying the path exclusions. Content exclusion happens
+/// later, once a note has been read. Every folder is opened relative to
+/// the root descriptor without following symlinks, and entries are listed
+/// from the opened folder, so a folder swapped for a symlink during the
+/// walk is skipped rather than followed.
+pub fn walk(root: &Path, ex: &Exclusions) -> Result<Walk> {
+    let dir = Root::open(root).with_context(|| format!("cannot read the vault at {}", root.display()))?;
+    let mut out = Walk { root: dir, files: Vec::new(), excluded: Vec::new() };
+    // (raw relative folder, NFC relative folder)
+    let mut stack: Vec<(PathBuf, PathBuf)> = vec![(PathBuf::new(), PathBuf::new())];
+    while let Some((raw_dir, rel_dir)) = stack.pop() {
+        let entries = match out.root.open_dir(&raw_dir).and_then(fsx::list) {
+            Ok(e) => e,
+            // The root itself must be listable; a sub-folder that became a
+            // symlink or vanished since it was listed is skipped.
+            Err(e) if raw_dir.as_os_str().is_empty() => {
+                return Err(e).with_context(|| format!("listing {}", root.display()));
+            }
+            Err(_) => continue,
+        };
+        for (raw_name, id) in entries {
+            let name = raw_name.to_string_lossy().nfc().collect::<String>();
             let rel_path = rel_dir.join(&name);
+            let raw_path = raw_dir.join(&raw_name);
             let rel = rel_path.to_string_lossy().replace('\\', "/");
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_symlink() {
+            // Symlinks are never followed; dot entries are never content
+            // (and never valid link targets).
+            if id.kind == Kind::Symlink || name.starts_with('.') {
                 continue;
             }
-            // Dot entries are never content (and never valid link targets).
-            if name.starts_with('.') {
-                continue;
-            }
-            if ft.is_dir() {
-                if ex.path_excluded(&rel) {
-                    collect_excluded(root, &rel_path, &mut out.excluded);
-                } else {
-                    stack.push(rel_path);
+            match id.kind {
+                Kind::Dir => {
+                    if ex.path_excluded(&rel) {
+                        collect_excluded(&out.root, &raw_path, &rel_path, &mut out.excluded);
+                    } else {
+                        stack.push((raw_path, rel_path));
+                    }
                 }
-                continue;
+                Kind::File => {
+                    if ex.path_excluded(&rel) {
+                        out.excluded.push(rel);
+                    } else {
+                        let abs = root.join(&raw_path);
+                        out.files.push(VaultFile::from_ident(rel, raw_path, abs, &id));
+                    }
+                }
+                _ => {}
             }
-            if !ft.is_file() {
-                continue;
-            }
-            if ex.path_excluded(&rel) {
-                out.excluded.push(rel);
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            out.files.push(VaultFile::from_meta(rel, entry.path(), &meta));
         }
     }
     out.files.sort_by(|a, b| a.rel.cmp(&b.rel));
@@ -122,34 +142,63 @@ pub fn walk(root: &Path, ex: &Exclusions) -> Result<Walk> {
 }
 
 /// Record the file paths under an excluded folder (names only).
-fn collect_excluded(root: &Path, rel_dir: &Path, out: &mut Vec<String>) {
-    let mut stack = vec![rel_dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(root.join(&d)) else { continue };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().nfc().collect::<String>();
+fn collect_excluded(root: &Root, raw_dir: &Path, rel_dir: &Path, out: &mut Vec<String>) {
+    let mut stack = vec![(raw_dir.to_path_buf(), rel_dir.to_path_buf())];
+    while let Some((raw, rel)) = stack.pop() {
+        let Ok(entries) = root.open_dir(&raw).and_then(fsx::list) else { continue };
+        for (raw_name, id) in entries {
+            let name = raw_name.to_string_lossy().nfc().collect::<String>();
             if name.starts_with('.') {
                 continue;
             }
-            let Ok(ft) = entry.file_type() else { continue };
-            let rel = d.join(&name);
-            if ft.is_dir() {
-                stack.push(rel);
-            } else if ft.is_file() {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
+            match id.kind {
+                Kind::Dir => stack.push((raw.join(&raw_name), rel.join(&name))),
+                Kind::File => out.push(rel.join(&name).to_string_lossy().replace('\\', "/")),
+                _ => {}
             }
         }
     }
 }
 
-/// Modification time in nanoseconds since the epoch.
-pub fn mtime_ns(meta: &std::fs::Metadata) -> i128 {
-    use std::os::unix::fs::MetadataExt;
-    meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
 
-fn unix(t: Option<std::time::SystemTime>) -> i64 {
-    t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    fn write(root: &Path, rel: &str, text: &str) {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, text).unwrap();
+    }
+
+    /// A note or folder swapped for a symlink after the walk listed it is
+    /// not read through the symlink: the read goes through the root
+    /// descriptor with `O_NOFOLLOW` at every component.
+    #[test]
+    fn swap_after_walk_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        write(&vault, "a/n.md", "inside\n");
+        write(&vault, "b/m.md", "inside\n");
+        write(tmp.path(), "out/n.md", "OUTSIDE\n");
+        write(tmp.path(), "out/m.md", "OUTSIDE\n");
+        std::os::unix::fs::symlink(tmp.path().join("out"), vault.join("linked")).unwrap();
+        let ex = Exclusions::new(&[], "").unwrap();
+        let w = walk(&vault, &ex).unwrap();
+        let rels: Vec<&str> = w.files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, vec!["a/n.md", "b/m.md"], "symlinked folder listed");
+        assert_eq!(w.read_note(&w.files[0]).unwrap().as_deref(), Some("inside\n"));
+
+        // File swapped for a symlink to an outside file.
+        fs::remove_file(vault.join("a/n.md")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("out/n.md"), vault.join("a/n.md")).unwrap();
+        let e = w.read_note(&w.files[0]).unwrap_err();
+        assert!(fsx::is_symlink_refusal(&e), "{e}");
+
+        // Folder swapped for a symlink to an outside folder.
+        fs::rename(vault.join("b"), vault.join("b-real")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("out"), vault.join("b")).unwrap();
+        let e = w.read_note(&w.files[1]).unwrap_err();
+        assert!(fsx::is_symlink_refusal(&e), "{e}");
+    }
 }
