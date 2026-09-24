@@ -62,9 +62,9 @@ files. Two consequences followed:
   the search arrived; otherwise it waits for it and shares the next one
   with every search that arrived in the meantime. A burst of searches
   costs at most two walks and, while no note changes, one update. A
-  search waits at most
-  `dashboard_reindex_wait_secs` (20), walk included, and then answers 503;
-  the refresh keeps running and the next search uses it.
+  search waits at most `dashboard_reindex_wait_secs` (20), walk included,
+  and then answers 503; the refresh keeps running and the next search
+  uses it.
 - **Query.** Plain words must all match (each word is quoted, so
   punctuation cannot break the FTS5 syntax). When no note has every word,
   the search falls back to notes with any word and reports `mode: any`. A
@@ -201,8 +201,10 @@ its finding (`not applied: <reason>` when a check below fails): move an
 empty file whose name starts with `Untitled` (Obsidian's default name) and
 that nothing links to into the quarantine. The steps:
 
-1. Re-read every note's links; a note written since the analysis may link
-   to the file.
+1. Recompute the inbound links right before this file's move (not once for
+   all moves): walk the vault and re-read every note whose file identity
+   changed since the previous candidate. A note written since the analysis,
+   or since an earlier move, may link to the file.
 2. Open the file's folder once, relative to the vault root descriptor
    without following symlinks.
 3. Check the entry with `fstatat(.., AT_SYMLINK_NOFOLLOW)` against the scan:
@@ -222,6 +224,23 @@ that nothing links to into the quarantine. The steps:
 
 Where the platform or the filesystem has no exclusive rename, the fix is
 not applied and the file is only reported.
+
+**Residual window.** Two changes can happen between the last check and the
+rename and are not detected by it:
+
+- A link to the file written after step 1. The empty file is moved; the
+  new link is broken until the file is restored from the quarantine run
+  folder (a move back) or the note is re-created. Nothing is lost, because
+  the moved file was empty.
+- A write to the file, or a replacement of it, after the second check in
+  step 3. Step 5 detects it and moves the file back; when the path was
+  created again in the meantime, the newer file stays where it is and is
+  never overwritten, and the moved file stays in the quarantine, where it
+  can be recovered.
+
+No step can remove these windows without a lock that editors and sync
+clients also take, and none exists. Both outcomes are recoverable, and
+neither replaces a newer file.
 
 The check never writes into a note. A missing or empty `created:` key is a
 `frontmatter` finding that the operator resolves. An earlier version of this

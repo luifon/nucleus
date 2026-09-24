@@ -295,15 +295,86 @@ fn load(vault: &Path, ex: &Exclusions) -> Result<Loaded> {
 fn inbound_counts(notes: &[Note], resolver: &Resolver) -> HashMap<String, usize> {
     let mut inbound: HashMap<String, usize> = HashMap::new();
     for n in notes {
-        let wiki = n.parsed.links.iter().filter_map(|l| resolver.resolve(&l.target, &n.file.rel));
-        let md = n.parsed.md_links.iter().filter_map(|m| resolver.resolve_relative(m, &n.file.rel));
-        for t in wiki.chain(md) {
-            if t != n.file.rel {
-                *inbound.entry(t).or_default() += 1;
-            }
-        }
+        let wiki = n.parsed.links.iter().map(|l| l.target.as_str());
+        add_inbound(&mut inbound, resolver, &n.file.rel, wiki, n.parsed.md_links.iter().map(String::as_str));
     }
     inbound
+}
+
+/// Count the links of the note at `from` into `inbound`.
+fn add_inbound<'a>(
+    inbound: &mut HashMap<String, usize>,
+    resolver: &Resolver,
+    from: &str,
+    wiki: impl Iterator<Item = &'a str>,
+    md: impl Iterator<Item = &'a str>,
+) {
+    let wiki = wiki.filter_map(|t| resolver.resolve(t, from));
+    let md = md.filter_map(|m| resolver.resolve_relative(m, from));
+    for t in wiki.chain(md) {
+        if t != from {
+            *inbound.entry(t).or_default() += 1;
+        }
+    }
+}
+
+/// The link targets of one note, as [`LinkIndex`] keeps them.
+struct NoteLinks {
+    wiki: Vec<String>,
+    md: Vec<String>,
+}
+
+/// Inbound links of the vault as it is at each call. A call walks the
+/// vault (stat only) and re-reads only the notes whose file identity
+/// changed since the previous call, so `apply` can recompute the links
+/// right before every quarantine move without re-reading the whole vault
+/// each time. The notes counted are the ones [`load`] reads: markdown,
+/// within the size limit, readable, and not excluded by the rules.
+#[derive(Default)]
+struct LinkIndex {
+    /// Vault-relative path → identity at the last read, and its links;
+    /// `None` for a note that is not counted.
+    notes: HashMap<String, (scan::IndexIdentity, Option<NoteLinks>)>,
+}
+
+impl LinkIndex {
+    fn inbound(&mut self, vault: &Path, ex: &Exclusions) -> Result<HashMap<String, usize>> {
+        let walk = scan::walk(vault, ex)?;
+        let mut targets = walk.excluded.clone();
+        let mut present: HashSet<&str> = HashSet::new();
+        for f in &walk.files {
+            targets.push(f.rel.clone());
+            if !f.is_markdown() {
+                continue;
+            }
+            present.insert(&f.rel);
+            let id = f.identity();
+            if self.notes.get(&f.rel).is_some_and(|(known, _)| *known == id) {
+                continue;
+            }
+            let links = if f.size > super::MAX_NOTE_BYTES {
+                None
+            } else {
+                match walk.read_note(f) {
+                    Ok(Some(text)) if !ex.content_excluded(&text) => {
+                        let p = note::parse(&f.rel, &text);
+                        Some(NoteLinks { wiki: p.links.into_iter().map(|l| l.target).collect(), md: p.md_links })
+                    }
+                    _ => None,
+                }
+            };
+            self.notes.insert(f.rel.clone(), (id, links));
+        }
+        self.notes.retain(|rel, _| present.contains(rel.as_str()));
+        let resolver = Resolver::new(&targets, &[]);
+        let mut inbound = HashMap::new();
+        for (rel, (_, links)) in &self.notes {
+            if let Some(l) = links {
+                add_inbound(&mut inbound, &resolver, rel, l.wiki.iter().map(String::as_str), l.md.iter().map(String::as_str));
+            }
+        }
+        Ok(inbound)
+    }
 }
 
 /// Read the vault and build the report, without changing anything.
@@ -561,6 +632,18 @@ enum Outcome {
 }
 
 fn apply(a: &mut Analysis, vault: &Path, ex: &Exclusions, opts: &CheckOptions) -> Result<()> {
+    apply_with(a, vault, ex, opts, &mut |_| {})
+}
+
+/// [`apply`] with a hook called with each candidate's path before its links
+/// are rechecked (tests change the vault there).
+fn apply_with(
+    a: &mut Analysis,
+    vault: &Path,
+    ex: &Exclusions,
+    opts: &CheckOptions,
+    before_candidate: &mut dyn FnMut(&str),
+) -> Result<()> {
     if a.deletes.is_empty() {
         return Ok(());
     }
@@ -571,14 +654,15 @@ fn apply(a: &mut Analysis, vault: &Path, ex: &Exclusions, opts: &CheckOptions) -
     purge_quarantine(quarantine, chrono::Utc::now());
     let run_dir = quarantine.join(format!("{}-{}", chrono::Utc::now().format(RUN_DIR_FORMAT), std::process::id()));
 
-    // Inbound links as they are now, not as they were at analysis time: a
-    // note written since then may link to a candidate.
-    let inbound_now = {
-        let l = load(vault, ex)?;
-        inbound_counts(&l.notes, &Resolver::new(&l.targets, &l.reportable))
-    };
+    // Inbound links as they are right before each move, not as they were
+    // at analysis time or before the first move: a note written since then
+    // may link to a candidate. A link written between this check and the
+    // rename is not seen (see ADR-035, "Residual window").
+    let mut links = LinkIndex::default();
     let root = Root::open(vault).with_context(|| format!("opening the vault at {}", vault.display()))?;
     for c in std::mem::take(&mut a.deletes) {
+        before_candidate(&c.file.rel);
+        let inbound_now = links.inbound(vault, ex)?;
         let outcome = if inbound_now.get(&c.file.rel).copied().unwrap_or(0) > 0 {
             Ok(Outcome::Skipped("a note links to it now"))
         } else {
@@ -1865,6 +1949,33 @@ mod tests {
         let f = r.findings.iter().find(|f| f.kind == KIND_EMPTY_FILE).unwrap();
         assert_eq!(f.fix_action.as_deref(), Some("not applied: a note links to it now"));
         assert_eq!(r.counts.fixed, 0);
+    }
+
+    /// Low (round 3): links are rechecked right before each move, not once
+    /// before all of them. A note that links to the second candidate,
+    /// written after the first candidate moved, keeps the second in place.
+    #[test]
+    fn links_are_rechecked_before_each_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = &tmp.path().join("vault");
+        write(vault, "Untitled 6.md", "");
+        write(vault, "Untitled 7.md", "");
+        write(vault, "6-Slipbox/other.md", &format!("{}# Other\n", fm("2026-01-01", "manual")));
+        let o = apply_opts(&tmp.path().join("q"));
+        let mut a = analyze(vault, &ex(), &o).unwrap();
+        assert_eq!(a.deletes.len(), 2);
+        let v = vault.clone();
+        apply_with(&mut a, vault, &ex(), &o, &mut |rel| {
+            if rel == "Untitled 7.md" {
+                // Edited in place, same second: the link index must see it.
+                write(&v, "6-Slipbox/other.md", &format!("{}# Other\n[[Untitled 7]]\n", fm("2026-01-01", "manual")));
+            }
+        })
+        .unwrap();
+        assert!(!vault.join("Untitled 6.md").exists());
+        assert!(vault.join("Untitled 7.md").exists());
+        let r = a.into_report(&o);
+        assert_eq!(r.counts.fixed, 1);
     }
 
     /// Replace the file at `p` by a new inode holding `text` (the way an
