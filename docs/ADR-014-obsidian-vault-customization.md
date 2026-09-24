@@ -166,6 +166,12 @@ configuration, not the locked palette.
   (2026-05-21).
 - **Sync configuration.** Obsidian Sync is already enabled
   (`core-plugins.json`) and outside this ADR's scope.
+- **Vault search and hygiene.** Moved to [[ADR-035]] (2026-09-24): full-text
+  search from sessions and the dashboard, and a weekly structural check. The
+  check's safe fixes (deleting empty `Untitled*` files, adding a missing
+  `created`) change vault files outside Obsidian; `Home.md` and bucket
+  `README.md` files are exempt from the frontmatter and orphan rules, and
+  `.obsidian/` is never read.
 
 ## Implementation steps
 

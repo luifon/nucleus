@@ -488,6 +488,7 @@ nucleus/
 - `docs/ADR-025-pre-rotation-memory-flush.md` — persist-before-recycle DURABLE section in the rotation ask
 - `docs/ADR-026-heartbeat.md` — HEARTBEAT.md checklist sweep + reply-gated silent fires
 - `docs/ADR-027-adapter-circuit-breaker.md` — WhatsApp connection supervisor: close-reason taxonomy, backoff ladder, open-circuit alerts (proposed)
+- `docs/ADR-035-vault-search-and-vault-check.md` — FTS5 vault search (`vault-search` CLI, dashboard search, credential exclusions) and the weekly deterministic `vault-check` report
 - `docs/ADR-032-repo-private-skills-tree.md` — operator-private skills in the gitignored `.nucleus/.claude/skills/`, loaded via `--add-dir`; rejected alternatives
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
@@ -553,6 +554,11 @@ tmux kill-window -t nucleus-discord:<window-prefix>
 ./target/release/nucleus session-search "what did we decide about X" --days 30
 ./target/release/nucleus session-search --prune            # junk-transcript report (dry-run)
 ./target/release/nucleus reminders cancel <id>
+
+# Find vault notes by content (ADR-035; the index refreshes on every run)
+./target/release/nucleus vault-search "weekly review" --bucket 3-Projects
+# Structural vault report; --apply also runs the safe fixes
+./target/release/nucleus vault-check
 
 # One-shot WhatsApp send (uses the paired session)
 cd messaging/whatsapp && npm run send -- <phone-or-jid> "<message>"

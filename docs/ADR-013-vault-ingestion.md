@@ -39,6 +39,10 @@ from a knowledge-shaped document into the vault proper.
   `[ingest] notify_channels` — no new daemon at all.
 - Embeddings / vector search — still rejected (ADR-002: incompatible with
   the Claude Max billing principle). `find()` is tiered lexical matching.
+  (ADR-035, 2026-09-24: imported notes under `5-Resources/Imported/` are
+  ordinary vault markdown, so `nucleus vault-search` finds them by content;
+  the document library's `find()` is unchanged and still searches the
+  documents themselves.)
 
 ## Decision — three capabilities on ONE new primitive
 
