@@ -269,7 +269,12 @@ for every run, which is what the trend needs.
 **Output.** The command prints a grouped report (or `--json`). The
 dashboard vault page has a check tab at `/vault/check` with count tiles
 (and the change since the previous run), findings grouped by kind, and the
-run history. A scheduled run enqueues one line to the operator's WhatsApp
+run history. `/vault/api/check/latest` filters the stored report through
+the exclusion rules at request time: a finding about a note excluded since
+the run (by a new glob, or by a credential written into it) is dropped,
+the note is removed from group members, and the counts are recomputed from
+what remains. `/check/runs` returns counts only, as each run recorded them.
+Both answer with `Cache-Control: no-store`. A scheduled run enqueues one line to the operator's WhatsApp
 DM through the reminders outbound-queue path (`store::enqueue_whatsapp`,
 target = first entry of `WHATSAPP_ALLOWED_DM_JIDS`, ADR-005b), for example
 `🗂️ vault check: 3 duplicates, 5 broken links, 2 fixed — <NUCLEUS_PUBLIC_URL>/vault/check`.
