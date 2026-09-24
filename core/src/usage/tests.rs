@@ -644,6 +644,62 @@ async fn same_size_rewrite_with_the_same_mtime_is_reread() {
     assert_eq!(dump(&ws_full).await, dump(&ws_inc).await, "incremental differs from --full");
 }
 
+/// A same-length edit in the middle of a transcript longer than both
+/// fingerprint windows together, touching neither window, is re-read: the
+/// file did not grow, so the append plan is not taken.
+#[tokio::test]
+async fn same_size_edit_between_the_fingerprint_windows_is_reread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let repo = base.join("code/epsilon");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let repo_s = repo.to_string_lossy().into_owned();
+    let projects = base.join("claude");
+    let main = projects.join(project::encode_cwd(&repo_s)).join("s-mid.jsonl");
+    let (ws_inc, ws_full) = (base.join("ws-inc"), base.join("ws-full"));
+    for ws in [&ws_inc, &ws_full] {
+        std::fs::create_dir_all(ws.join("memory")).unwrap();
+    }
+    let cfg = UsageConfig {
+        claude_projects_dir: projects.to_string_lossy().into_owned(),
+        codex_sessions_dir: base.join("codex").to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let mut ls = vec![user("2026-09-07T08:00:00Z", &repo_s)];
+    for i in 0..600 {
+        let ts = format!("2026-09-07T{:02}:{:02}:{:02}Z", 9 + i / 3600, (i / 60) % 60, i % 60);
+        ls.push(assistant(&format!("m{i:03}"), &ts, "claude-opus-5", 10, 100, 1000, 300, None));
+    }
+    let text = lines(&ls);
+    let window = crate::usage::ingest::FINGERPRINT_BYTES as usize;
+    assert!(text.len() > 2 * window, "the file must be longer than both windows");
+    write_text(&main, &text);
+    refresh(&ws_inc, &cfg, RefreshOptions::default()).await.unwrap();
+
+    // Edit one response in the middle, outside both windows, same length.
+    let target = r#""id":"m300","#;
+    let at = text.find(target).unwrap();
+    assert!(at > window && at + 1000 < text.len() - window, "edit lies between the windows");
+    let line_end = at + text[at..].find('\n').unwrap();
+    let edited_line = text[at..line_end].replace(r#""output_tokens":300,"#, r#""output_tokens":900,"#);
+    let rewritten = format!("{}{}{}", &text[..at], edited_line, &text[line_end..]);
+    assert_eq!(rewritten.len(), text.len());
+    rewrite_in_place(&main, &rewritten, 5);
+
+    let s = refresh(&ws_inc, &cfg, RefreshOptions::default()).await.unwrap();
+    assert_eq!(s.files_read, 1);
+    {
+        let pool = open(&ws_inc).await.unwrap();
+        assert_eq!(scalar_i(&pool, "SELECT output FROM usage_rows WHERE key='claude:m300'").await, 900);
+        pool.close().await;
+    }
+    // A further incremental refresh finds nothing to do and changes nothing.
+    let again = refresh(&ws_inc, &cfg, RefreshOptions::default()).await.unwrap();
+    assert_eq!(again.files_read, 0);
+    refresh(&ws_full, &cfg, RefreshOptions { full: true }).await.unwrap();
+    assert_eq!(dump(&ws_full).await, dump(&ws_inc).await, "incremental differs from --full");
+}
+
 /// A transcript swapped after discovery — for a link out of the root, for a
 /// directory link on its path, or for another file — is refused, and
 /// nothing outside the root is read.

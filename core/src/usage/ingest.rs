@@ -5,18 +5,30 @@
 //!
 //! - **skip** — same identity (device, inode), size, mtime and ctime as
 //!   stored, compared to the nanosecond;
-//! - **append** — same identity, not shorter than the stored offset, and the
-//!   content fingerprint of the part already read still matches: read from
-//!   the stored offset with the stored parser carry;
-//! - **re-read** — anything else (new file, `--full`, different identity,
-//!   truncated below the offset, or a changed fingerprint = rewritten in
-//!   place): delete every observation of the path and read from byte 0 with
-//!   an empty carry, in the same transaction.
+//! - **append** — same identity, grown past both the stored size and the
+//!   stored offset, and the content fingerprint of the part already read
+//!   still matches: read from the stored offset with the stored parser
+//!   carry;
+//! - **re-read** — anything else: delete every observation of the path and
+//!   read from byte 0 with an empty carry, in the same transaction. This
+//!   covers a new file, `--full`, a different identity, a file that did not
+//!   grow but whose mtime or ctime moved (rewritten in place, at any
+//!   position), and a grown file whose fingerprint changed.
 //!
 //! The fingerprint covers the first [`FINGERPRINT_BYTES`] bytes and the
-//! [`FINGERPRINT_BYTES`] bytes that end at the stored offset. An in-place
-//! edit that leaves the size unchanged and touches neither window is not
+//! [`FINGERPRINT_BYTES`] bytes that end at the stored offset. It is only
+//! trusted for a file that grew: an in-place edit that falls between the
+//! two windows of a file that also grew in the same interval is not
 //! detected; `nucleus usage refresh --full` re-reads everything.
+//!
+//! A read covers the bytes up to the size `fstat` reported before it. After
+//! the read the descriptor is `fstat`ed again: when the identity, mtime or
+//! ctime changed and the file did not grow (an in-place write during the
+//! read), the file's batch is discarded (its transaction rolls back and the
+//! stored state stays as it was), and the file is reported as not read. The
+//! next refresh sees metadata that differs from the stored state and plans
+//! again. Growth during the read is an append by the writer and is kept:
+//! the bytes past the read size are left for the next refresh.
 //!
 //! Opening: discovery records each regular file's (device, inode) without
 //! following links. A file is then opened relative to a descriptor of its
@@ -296,13 +308,15 @@ pub struct ReadResult {
     pub oversized: i64,
 }
 
-/// Read complete lines from `start`, handing each to `each`. A trailing line
-/// without its newline is left for the next refresh. A line longer than
-/// `max_line` is not buffered: its bytes are discarded up to its newline and
-/// it is counted in `oversized`. `each` returns `false` to stop early.
+/// Read complete lines in `[start, end)`, handing each to `each`. A
+/// trailing line without its newline is left for the next refresh, as is
+/// everything at or past `end`. A line longer than `max_line` is not
+/// buffered: its bytes are discarded up to its newline and it is counted in
+/// `oversized`. `each` returns `false` to stop early.
 pub fn read_lines<R: Read + Seek>(
     reader: R,
     start: u64,
+    end: u64,
     max_line: usize,
     mut each: impl FnMut(&[u8]) -> bool,
 ) -> std::io::Result<ReadResult> {
@@ -315,6 +329,7 @@ pub fn read_lines<R: Read + Seek>(
     let mut oversized = 0i64;
     loop {
         let avail = r.fill_buf()?;
+        let avail = &avail[..avail.len().min(end.saturating_sub(pos) as usize)];
         if avail.is_empty() {
             break;
         }
@@ -410,6 +425,14 @@ impl FileMeta {
     }
 }
 
+/// Whether a read that started with metadata `before` and ended with
+/// `after` saw consistent content: nothing changed, or the file only grew
+/// (an append by the writer; the read stopped at `before.size`). Any other
+/// change is an in-place write during the read.
+pub fn consistent_read(before: &FileMeta, after: &FileMeta) -> bool {
+    before == after || (before.dev, before.ino) == (after.dev, after.ino) && after.size > before.size
+}
+
 /// Whether the stored state proves the file is unchanged from metadata
 /// alone (no read): device, inode, size, mtime and ctime all equal, to the
 /// nanosecond. Anything else re-verifies the content fingerprint.
@@ -433,11 +456,16 @@ fn parse_file(
 ) -> std::io::Result<Option<Outcome>> {
 
     let append_from = match &prev {
-        Some(p) if !full && p.dev == meta.dev && p.ino == meta.ino && meta.size >= p.offset => {
+        Some(p) if !full && p.dev == meta.dev && p.ino == meta.ino => {
             if unchanged(p, &meta) {
                 return Ok(None);
             }
-            (fingerprint(&f, p.offset as u64)? == p.fingerprint).then_some(p)
+            // Only growth continues from the stored offset. A file that did
+            // not grow but whose times moved was written in place; the
+            // fingerprint cannot see an edit between its windows, so the
+            // whole file is re-read.
+            let grown = meta.size > p.size.max(p.offset);
+            (grown && fingerprint(&f, p.offset as u64)? == p.fingerprint).then_some(p)
         }
         _ => None,
     };
@@ -463,7 +491,7 @@ fn parse_file(
         Vendor::Claude => {
             let ctx = src.claude_ctx.clone().expect("claude source has a ctx");
             let mut c: claude::Carry = serde_json::from_str(&carry).unwrap_or_default();
-            let read = read_lines(&f, start, MAX_LINE_BYTES, |line| {
+            let read = read_lines(&f, start, meta.size as u64, MAX_LINE_BYTES, |line| {
                 if claude::parse_line(line, &ctx, &mut c, &mut records) == LineStatus::Malformed {
                     malformed += 1;
                 }
@@ -478,7 +506,7 @@ fn parse_file(
         }
         Vendor::Codex => {
             let mut c: codex::Carry = serde_json::from_str(&carry).unwrap_or_default();
-            let read = read_lines(&f, start, MAX_LINE_BYTES, |line| {
+            let read = read_lines(&f, start, meta.size as u64, MAX_LINE_BYTES, |line| {
                 if codex::parse_line(line, &mut c, &mut records) == LineStatus::Malformed {
                     malformed += 1;
                 }
@@ -498,6 +526,12 @@ fn parse_file(
         return Err(closed());
     }
     let fingerprint = fingerprint(&f, read.offset)?;
+    if !consistent_read(&meta, &FileMeta::of(&f.metadata()?)) {
+        // The batch is discarded: the writer rolls the transaction back and
+        // the stored state keeps the old metadata, so the next refresh
+        // plans this file again.
+        return Err(std::io::Error::other("changed in place while being read; read again on the next refresh"));
+    }
     Ok(Some(Outcome {
         meta,
         start,
@@ -618,7 +652,7 @@ mod tests {
 
     fn lines_of(data: &[u8], start: u64, max: usize) -> (Vec<String>, ReadResult) {
         let mut out = Vec::new();
-        let r = read_lines(Cursor::new(data.to_vec()), start, max, |l| {
+        let r = read_lines(Cursor::new(data.to_vec()), start, u64::MAX, max, |l| {
             out.push(String::from_utf8_lossy(l).into_owned());
             true
         })
@@ -655,6 +689,35 @@ mod tests {
         let (l, r) = lines_of(&data, 0, 1024);
         assert_eq!(l, vec!["ok"]);
         assert_eq!(r.oversized, 1);
+    }
+
+    #[test]
+    fn a_read_stops_at_the_size_seen_before_it() {
+        let data = b"a\nbb\nccc\n";
+        let mut out = Vec::new();
+        let r = read_lines(Cursor::new(data.to_vec()), 0, 6, 100, |l| {
+            out.push(String::from_utf8_lossy(l).into_owned());
+            true
+        })
+        .unwrap();
+        assert_eq!(out, vec!["a", "bb"], "bytes past the end are left for the next refresh");
+        assert_eq!(r.offset, 5);
+    }
+
+    #[test]
+    fn a_read_is_consistent_only_when_unchanged_or_grown() {
+        let before = FileMeta { dev: 1, ino: 2, size: 1000, mtime_ns: 10, ctime_ns: 10 };
+        assert!(consistent_read(&before, &before));
+        let grown = FileMeta { size: 1200, mtime_ns: 11, ctime_ns: 11, ..before };
+        assert!(consistent_read(&before, &grown), "an append during the read is kept");
+        let rewritten = FileMeta { mtime_ns: 11, ctime_ns: 11, ..before };
+        assert!(!consistent_read(&before, &rewritten), "same size, times moved: in-place write");
+        let ctime_only = FileMeta { ctime_ns: 11, ..before };
+        assert!(!consistent_read(&before, &ctime_only));
+        let shrunk = FileMeta { size: 900, mtime_ns: 11, ctime_ns: 11, ..before };
+        assert!(!consistent_read(&before, &shrunk));
+        let replaced = FileMeta { ino: 3, size: 1200, ..before };
+        assert!(!consistent_read(&before, &replaced));
     }
 
     #[test]

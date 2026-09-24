@@ -121,8 +121,9 @@ pub struct RefreshOptions {
 pub struct RefreshStats {
     pub files_seen: usize,
     pub files_read: usize,
-    /// Files that could not be read (permissions, I/O errors). Their data
-    /// is missing from this refresh; the next one retries them.
+    /// Files that could not be read (permissions, I/O errors, or written in
+    /// place while being read). Their data is missing from this refresh;
+    /// the next one retries them.
     pub files_failed: usize,
     pub bytes_read: u64,
     pub records: usize,
