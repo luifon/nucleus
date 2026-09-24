@@ -31,6 +31,7 @@ export type { UsageRatePoint } from "./generated/UsageRatePoint";
 export type { UsageRateReading } from "./generated/UsageRateReading";
 export type { UsageSessionRow } from "./generated/UsageSessionRow";
 export type { UsagePrice } from "./generated/UsagePrice";
+export type { UsageRefreshRun } from "./generated/UsageRefreshRun";
 
 export const getUsageStatus = (signal?: AbortSignal) => jsonGet<UsageStatus>("/usage/api/status", signal);
 

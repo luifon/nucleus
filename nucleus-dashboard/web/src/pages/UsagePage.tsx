@@ -15,6 +15,7 @@ import {
 } from "@/components/usage/charts";
 import {
   CopyText,
+  CostNotes,
   Loading,
   MetricValue,
   NotApplicable,
@@ -22,7 +23,7 @@ import {
   Scope,
   Segmented,
   Table,
-  UnpricedNote,
+  ThirdPartySources,
   faint,
 } from "@/components/usage/ui";
 import { useFetch } from "@/lib/hooks";
@@ -39,8 +40,10 @@ import {
   type UsageSummary,
 } from "@/lib/api/usage";
 import {
-  addDays,
+  basisLabel,
   cacheHitRatio,
+  claudeRetentionWarning,
+  dayRange,
   deltaPct,
   formatMetric,
   formatTokens,
@@ -48,8 +51,10 @@ import {
   heatGrid,
   metricOf,
   parseVendor,
+  partialRefreshNote,
   pivotSeries,
   scopeLabel,
+  thirdPartySources,
   unpricedNote,
   weekStart,
   type Metric,
@@ -58,7 +63,8 @@ import {
 
 // ADR-034 — usage accounting. Every Claude Code and Codex session on the
 // machine, per project, model, Nucleus agent and reminder. Dollar figures
-// are estimates at API list price; nothing here is an invoice.
+// are estimates at API prices — vendor list prices, except where a figure
+// is marked as including a third-party estimate; nothing here is an invoice.
 //
 // Page state (tab, range, metric, tool filter) lives in the URL so a reload
 // or a shared link shows the same view. The tool filter is sent to the API
@@ -112,7 +118,7 @@ export default function UsagePage() {
           usage <span className={faint}>/ claude code + codex</span>
         </>
       }
-      subtitle="Tokens per project, model, agent and reminder. Dollar figures are estimates at API list price; the subscriptions are not billed per token."
+      subtitle="Tokens per project, model, agent and reminder. Dollar figures are estimates at API prices: vendor list prices, except where a figure is marked as including a third-party estimate. The subscriptions are not billed per token."
       actions={<RefreshControl state={refresh} />}
     >
       <div className="mb-5 flex flex-wrap items-center gap-x-6 gap-y-3 text-xs">
@@ -147,6 +153,7 @@ export default function UsagePage() {
         value={url.tab}
         onChange={(t) => url.set("tab", t, "overview")}
       />
+      <ThirdPartySources.Provider value={thirdPartySources(refresh.status?.prices ?? [])}>
       {refresh.status && !refresh.status.has_data ? (
         <div className={`text-sm ${faint}`}>
           No usage data yet. {refresh.status.refreshing ? "The first refresh is running." : "Start a refresh."}
@@ -161,6 +168,7 @@ export default function UsagePage() {
           {url.tab === "sessions" && <Sessions view={view} />}
         </>
       )}
+      </ThirdPartySources.Provider>
     </PageShell>
   );
 }
@@ -232,11 +240,30 @@ function useRefresh(onDone: () => void): RefreshState {
 function RefreshControl({ state }: { state: RefreshState }) {
   const s = state.status;
   const last = s?.last_refresh?.finished_at;
+  const partial = s?.last_refresh?.error ? null : partialRefreshNote(s?.last_refresh ?? null);
+  const warnings = (() => {
+    try {
+      return (JSON.parse(s?.last_refresh?.warnings ?? "[]") as string[]).join("\n");
+    } catch {
+      return "";
+    }
+  })();
+  const skippedTotal = (s?.malformed_lines_total ?? 0) + (s?.oversized_lines_total ?? 0);
   return (
     <div className="flex items-center gap-3 text-xs">
       <span className={faint}>
         {!s ? "…" : s.refreshing ? "refreshing…" : last ? `data as of ${new Date(last).toLocaleString()}` : "never refreshed"}
         {s?.last_refresh?.error && <span className="ml-2 text-[var(--color-status-down)]">[REFRESH FAILED]</span>}
+        {partial && (
+          <span className="ml-2 text-[var(--color-status-warn)]" title={warnings}>
+            [PARTIAL: {partial}]
+          </span>
+        )}
+        {!partial && skippedTotal > 0 && (
+          <span className="ml-2 text-[var(--color-status-warn)]" title="lines skipped in stored transcripts; they stay skipped until the file changes">
+            [{skippedTotal} transcript line{skippedTotal > 1 ? "s" : ""} skipped]
+          </span>
+        )}
         {state.error && <span className="ml-2 text-[var(--color-status-down)]">{state.error}</span>}
       </span>
       <button
@@ -294,12 +321,16 @@ function OverviewBody({ d, view, completeSince }: { d: UsageSummary; view: View;
   const { days, metric, vendor } = view;
   const all = d.range.current;
   const hit = cacheHitRatio(all);
-  const from = days === 0 ? (d.daily[0]?.bucket ?? d.today) : addDays(d.today, -(days - 1));
+  const from = d.range_from;
   const daily = pivotSeries(d.daily, metric, from, d.today);
   const weeklyFrom = d.weekly[0]?.bucket ?? weekStart(d.today);
   const weekly = pivotSeries(d.weekly, metric, weeklyFrom, weekStart(d.today), 7);
-  const reachesBack =
-    vendor !== "codex" && [d.range.previous_from, from, weeklyFrom].some((x) => x && completeSince && x < completeSince);
+  const reachesBack = claudeRetentionWarning({
+    vendor,
+    days,
+    from: [d.range.previous_from, from, weeklyFrom],
+    completeSince,
+  });
   const quota = d.codex_quota.find((q) => q.slot === "primary");
   const legend = vendorLegend(vendor);
   return (
@@ -336,8 +367,7 @@ function OverviewBody({ d, view, completeSince }: { d: UsageSummary; view: View;
               <span className={`ml-auto ${faint}`}>{days === 0 ? "all time" : `last ${days} days`}</span>
             </div>
             <div className="text-lg">
-              {formatUsd(v.totals.cost_usd)}
-              {unpricedNote(v.totals) && <UnpricedNote text={unpricedNote(v.totals)!} />}
+              <MetricValue metric="cost" totals={v.totals} />
               <span className={faint}> · {formatTokens(v.totals.tokens)} tokens</span>
             </div>
             <div className={faint}>
@@ -410,9 +440,13 @@ function Projects({ view }: { view: View }) {
             { value: claudeV(r), color: COLOR.claude, label: `claude ${formatMetric(metric, claudeV(r))}` },
             { value: codexV(r), color: COLOR.codex, label: `codex ${formatMetric(metric, codexV(r))}` },
           ].filter((s) => vendor === "all" || s.label.startsWith(vendor)),
-          value: formatMetric(metric, metricOf(metric, r.totals)) + (metric === "cost" && r.totals.unpriced_tokens > 0 ? " *" : ""),
+          value:
+            formatMetric(metric, metricOf(metric, r.totals)) +
+            (metric === "cost" && r.totals.unpriced_tokens > 0 ? " *" : "") +
+            (metric === "cost" && r.totals.third_party_usd > 0 ? " †" : ""),
         }));
         const anyUnpriced = rows.some((r) => r.totals.unpriced_tokens > 0);
+        const anyThirdParty = rows.some((r) => r.totals.third_party_usd > 0);
         return (
           <>
             <Panel label={`by project · ${scopeLabel(vendor)}`} hint="repository root; worktrees and subdirectories fold into their repo">
@@ -424,6 +458,9 @@ function Projects({ view }: { view: View }) {
               <BarList rows={bars} />
               {metric === "cost" && anyUnpriced && (
                 <div className={`mt-2 text-xs ${faint}`}>* includes tokens without a price; see the table.</div>
+              )}
+              {metric === "cost" && anyThirdParty && (
+                <div className={`mt-1 text-xs ${faint}`}>† includes dollars at a third-party estimate, not an API list price; see the table.</div>
               )}
             </Panel>
             <Panel label="table">
@@ -486,19 +523,36 @@ function Nucleus({ view }: { view: View }) {
               schedule: r.cron ?? "",
               runs: r.sessions_30d,
               cost: r.cost_30d,
+              unpriced: r.unpriced_tokens_30d,
+              thirdParty: r.third_party_usd_30d,
             })),
           ...agents
             .filter((a) => scheduled.has(a.agent))
-            .map((a) => ({ key: `a${a.agent}`, name: a.agent, kind: "agent", schedule: "launchd", runs: a.sessions_30d, cost: a.cost_30d })),
+            .map((a) => ({
+              key: `a${a.agent}`,
+              name: a.agent,
+              kind: "agent",
+              schedule: "launchd",
+              runs: a.sessions_30d,
+              cost: a.cost_30d,
+              unpriced: a.unpriced_tokens_30d,
+              thirdParty: a.third_party_usd_30d,
+            })),
         ]
           .filter((r) => r.runs > 0)
           .sort((a, b) => b.cost - a.cost);
         const monthly = recurring.reduce((a, r) => a + r.cost, 0);
+        const monthlyUnpriced = recurring.reduce((a, r) => a + r.unpriced, 0);
+        const monthlyThirdParty = recurring.reduce((a, r) => a + r.thirdParty, 0);
+        const agentsUnpriced = agents.some((a) => a.totals.unpriced_tokens > 0);
+        const agentsThirdParty = agents.some((a) => a.totals.third_party_usd > 0);
         return (
           <>
             <Panel label="recurring jobs" hint="actual cost over the last 30 days">
               <div className="mb-3 text-sm">
-                {formatUsd(monthly)} <span className={faint}>per 30 days across {recurring.length} recurring jobs</span>{" "}
+                {formatUsd(monthly)}
+                <CostNotes unpriced={monthlyUnpriced} thirdParty={monthlyThirdParty} />{" "}
+                <span className={faint}>per 30 days across {recurring.length} recurring jobs</span>{" "}
                 <Scope vendor="claude" />
               </div>
               <Table
@@ -510,7 +564,10 @@ function Nucleus({ view }: { view: View }) {
                   <code className={faint}>{r.schedule}</code>,
                   r.runs,
                   formatUsd(r.runs ? r.cost / r.runs : 0),
-                  formatUsd(r.cost),
+                  <span>
+                    {formatUsd(r.cost)}
+                    <CostNotes unpriced={r.unpriced} thirdParty={r.thirdParty} />
+                  </span>,
                 ])}
               />
             </Panel>
@@ -521,9 +578,24 @@ function Nucleus({ view }: { view: View }) {
                   label: a.agent,
                   sub: `${a.sessions} sessions · last ${a.last_day ?? "—"}${a.agent === "unlabeled" ? " · interactive, or a bot session whose label rotated out" : ""}`,
                   segments: [{ value: metricOf(metric, a.totals), color: COLOR.claude, label: formatMetric(metric, metricOf(metric, a.totals)) }],
-                  value: formatMetric(metric, metricOf(metric, a.totals)),
+                  value:
+                    formatMetric(metric, metricOf(metric, a.totals)) +
+                    (metric === "cost" && a.totals.unpriced_tokens > 0 ? " *" : "") +
+                    (metric === "cost" && a.totals.third_party_usd > 0 ? " †" : ""),
                 }))}
               />
+              {metric === "cost" && agentsUnpriced && (
+                <div className={`mt-2 text-xs ${faint}`}>
+                  * includes tokens without a price:{" "}
+                  {agents
+                    .filter((a) => a.totals.unpriced_tokens > 0)
+                    .map((a) => `${a.agent} ${unpricedNote(a.totals)}`)
+                    .join("; ")}
+                </div>
+              )}
+              {metric === "cost" && agentsThirdParty && (
+                <div className={`mt-1 text-xs ${faint}`}>† includes dollars at a third-party estimate, not an API list price.</div>
+              )}
             </Panel>
             <Panel label="by reminder" hint="skill-fire sessions">
               <Table
@@ -537,7 +609,10 @@ function Nucleus({ view }: { view: View }) {
                   r.sessions,
                   <MetricValue metric="cost" totals={r.totals} />,
                   r.sessions_30d,
-                  formatUsd(r.cost_30d),
+                  <span>
+                    {formatUsd(r.cost_30d)}
+                    <CostNotes unpriced={r.unpriced_tokens_30d} thirdParty={r.third_party_usd_30d} />
+                  </span>,
                   r.last_day ?? "—",
                 ])}
               />
@@ -600,24 +675,59 @@ function Models({ view, status }: { view: View; status: UsageStatus | null }) {
         )}
       </Loading>
       {status && (
-        <Panel label="price table" hint={`USD per million tokens · built-in prices as of ${status.prices_as_of}`}>
+        <Panel label="price table" hint={`USD per million tokens · built-in prices read ${status.prices_as_of}`}>
           <Table
-            head={["model", "priced as", "source", "input", "output", "cache read", "write 5m", "write 1h"]}
-            align={["l", "l", "l", "r", "r", "r", "r", "r"]}
+            head={["model", "priced as", "basis", "input", "output", "cache read", "write 5m", "write 1h", "above context size"]}
+            align={["l", "l", "l", "r", "r", "r", "r", "r", "l"]}
             rows={status.prices.map((p) => [
               p.model,
               p.matched_key ?? <span className="text-[var(--color-status-warn)]">[NO PRICE]</span>,
-              <span className={faint}>{p.source ?? "—"}</span>,
+              <span className={p.basis === "third-party-estimate" ? "text-[var(--color-status-warn)]" : faint}>
+                {basisLabel(p.basis)}
+                {p.source_url && (
+                  <>
+                    {" · "}
+                    <a href={p.source_url} target="_blank" rel="noreferrer" className="underline">
+                      source
+                    </a>
+                  </>
+                )}
+                {p.retrieved && ` · read ${p.retrieved}`}
+              </span>,
               p.input ?? "—",
               p.output ?? "—",
-              p.cache_read ?? "—",
-              p.cache_write_5m ?? "—",
-              p.cache_write_1h ?? "—",
+              <span>
+                {p.cache_read ?? "—"}
+                {p.cache_read_inferred && <span className={faint}> (inferred)</span>}
+              </span>,
+              <span>
+                {p.cache_write_5m ?? "—"}
+                {p.cache_write_inferred && <span className={faint}> (inferred)</span>}
+              </span>,
+              <span>
+                {p.cache_write_1h ?? "—"}
+                {p.cache_write_inferred && <span className={faint}> (inferred)</span>}
+              </span>,
+              p.long_context_above !== null ? (
+                <span className={faint}>
+                  &gt; {formatTokens(p.long_context_above)} input: in {p.lc_input} · out {p.lc_output} · cache read {p.lc_cache_read} · write {p.lc_cache_write}
+                </span>
+              ) : (
+                "—"
+              ),
             ])}
           />
           <p className={`mt-3 max-w-3xl text-xs leading-relaxed ${faint}`}>
+            "API list price" rates come from the vendor's pricing page. A "third-party estimate" is used where the vendor
+            publishes no price; every dollar figure that includes one says so. "Inferred" rates are not listed by the source
+            and are derived from the vendor's ratios for its listed models. Above the context size, the whole request is
+            billed at the listed long-context rates (OpenAI); each response is priced on its own before any sum.
+          </p>
+          <p className={`mt-3 max-w-3xl text-xs leading-relaxed ${faint}`}>
             Claude sessions: where Claude Code recorded its own cost estimate (cost-state), that estimate is used, and the
-            table prices only the tokens it did not cover. Claude Code estimates total {formatUsd(status.cost_state_usd)};
+            table prices only the tokens it did not cover. A response repeated by a fork or resume is counted once, and a
+            counter that continues an earlier run counts only its new part ({status.cost_state_carried_runs} runs). Claude
+            Code estimates total {formatUsd(status.cost_state_usd)};
             the table differs from them by {formatUsd(status.cost_state_adjustment_usd)} on the same tokens. Cost-state also
             counted {formatTokens(status.residual_tokens)} tokens that no transcript line records (background calls); they
             are included. A model without a price is counted in tokens and flagged next to every dollar figure it belongs
@@ -649,15 +759,14 @@ function Limits({ view }: { view: View }) {
   return (
     <Loading state={l}>
       {(d) => {
-        const today = new Date().toLocaleDateString("en-CA");
-        const firstEvent = d.events.length ? d.events[d.events.length - 1].day : today;
-        const from = days === 0 ? firstEvent : addDays(today, -(days - 1));
-        const dayList: string[] = [];
-        for (let x = from; x <= today; x = addDays(x, 1)) dayList.push(x);
+        // Day bounds come from the server in NUCLEUS_TZ; times are shown in
+        // the same zone, so an event is never outside the day it is listed on.
+        const dayList = dayRange(d.from, d.to);
+        const at = (iso: string) => new Date(iso).toLocaleString("en-CA", { timeZone: d.timezone });
         const weekly = d.codex_daily.filter((p) => p.slot === "primary").map((p) => ({ day: p.day, value: p.max_used_percent }));
         return (
           <>
-            <Panel label={`limit and error timeline · ${scopeLabel(vendor)}`} hint={`${d.events.length} events`}>
+            <Panel label={`limit and error timeline · ${scopeLabel(vendor)}`} hint={`${d.events.length} events · ${d.timezone}`}>
               <Timeline
                 days={dayList}
                 lanes={LANES}
@@ -667,7 +776,7 @@ function Limits({ view }: { view: View }) {
                   lane: laneOf(e.kind, e.status),
                   body: (
                     <span>
-                      {new Date(e.ts).toLocaleTimeString()} · {e.vendor} · {e.project ?? "?"}
+                      {new Date(e.ts).toLocaleTimeString("en-CA", { timeZone: d.timezone })} · {e.vendor} · {e.project ?? "?"}
                       {e.limit_type && ` · ${e.limit_type}`}
                     </span>
                   ),
@@ -688,14 +797,14 @@ function Limits({ view }: { view: View }) {
                 head={["time", "tool", "project", "agent", "kind", "status", "limit", "resets", "message"]}
                 align={["l", "l", "l", "l", "l", "r", "l", "l", "l"]}
                 rows={d.events.map((e) => [
-                  new Date(e.ts).toLocaleString(),
+                  at(e.ts),
                   e.vendor,
                   e.project ?? "—",
                   e.agent ?? "—",
                   e.kind,
                   e.status ?? "—",
                   e.limit_type ?? "—",
-                  e.resets_at ? new Date(e.resets_at).toLocaleString() : "—",
+                  e.resets_at ? at(e.resets_at) : "—",
                   <span className={faint}>{e.message ?? ""}</span>,
                 ])}
               />

@@ -1,8 +1,8 @@
-import { useState, type ReactNode } from "react";
+import { createContext, useContext, useState, type ReactNode } from "react";
 import { Copy, Check } from "lucide-react";
 import SectionHeader from "@/components/SectionHeader";
 import type { UsageTotals } from "@/lib/api/usage";
-import { formatMetric, metricOf, scopeLabel, unpricedNote, type Metric, type VendorChoice } from "@/lib/usage";
+import { formatMetric, metricOf, scopeLabel, thirdPartyNote, unpricedNote, type Metric, type VendorChoice } from "@/lib/usage";
 
 // Small building blocks of the usage surface (ADR-034).
 
@@ -49,22 +49,50 @@ export function Scope({ vendor }: { vendor: VendorChoice }) {
   return <span className={`text-[10px] ${faint}`}>[{scopeLabel(vendor)}]</span>;
 }
 
+/** Tooltip text naming every third-party price source (model, URL,
+ *  retrieval date); provided once by the page from the price listing. */
+export const ThirdPartySources = createContext<string>("");
+
 /** A metric value; for dollars, followed by the unpriced-token note when
- *  some tokens in the total have no price. */
+ *  some tokens in the total have no price, and the third-party note when
+ *  part of it is priced from a third-party estimate. */
 export function MetricValue({
   metric,
   totals,
   className = "",
 }: {
   metric: Metric;
-  totals: Pick<UsageTotals, "cost_usd" | "tokens" | "unpriced_tokens">;
+  totals: Pick<UsageTotals, "cost_usd" | "tokens" | "unpriced_tokens" | "third_party_usd">;
   className?: string;
 }) {
   const note = metric === "cost" ? unpricedNote(totals) : null;
+  const third = metric === "cost" ? thirdPartyNote(totals) : null;
   return (
     <span className={className}>
       {formatMetric(metric, metricOf(metric, totals))}
       {note && <UnpricedNote text={note} />}
+      {third && <ThirdPartyNote text={third} />}
+    </span>
+  );
+}
+
+/** Dollar notes for a figure built from separate fields (30-day columns). */
+export function CostNotes({ unpriced, thirdParty }: { unpriced: number; thirdParty: number }) {
+  const note = unpricedNote({ unpriced_tokens: unpriced });
+  const third = thirdPartyNote({ third_party_usd: thirdParty });
+  return (
+    <>
+      {note && <UnpricedNote text={note} />}
+      {third && <ThirdPartyNote text={third} />}
+    </>
+  );
+}
+
+export function ThirdPartyNote({ text }: { text: string }) {
+  const sources = useContext(ThirdPartySources);
+  return (
+    <span className={`ml-2 whitespace-nowrap align-middle text-[10px] ${faint}`} title={sources || "see models › price table"}>
+      [{text}]
     </span>
   );
 }

@@ -1,7 +1,7 @@
 // Pure helpers for the usage surface (ADR-034): number formatting, period
 // deltas, gap-filled series, heatmap grid. No React here, so vitest covers it.
 
-import type { UsageHeatCell, UsageSeriesPoint, UsageTotals } from "@/lib/api/usage";
+import type { UsageHeatCell, UsagePrice, UsageRefreshRun, UsageSeriesPoint, UsageTotals } from "@/lib/api/usage";
 
 export type Metric = "cost" | "tokens";
 
@@ -143,4 +143,59 @@ export function scopeLabel(v: VendorChoice): string {
  *  dollar figure; say so next to it instead of showing a lower number. */
 export function unpricedNote(t: Pick<UsageTotals, "unpriced_tokens">): string | null {
   return t.unpriced_tokens > 0 ? `+ ${formatTokens(t.unpriced_tokens)} tokens without a price` : null;
+}
+
+/** Part of a dollar figure priced from a third-party estimate (a model
+ *  whose vendor publishes no price) instead of an API list price. */
+export function thirdPartyNote(t: Pick<UsageTotals, "third_party_usd">): string | null {
+  return t.third_party_usd > 0 ? `incl. ${formatUsd(t.third_party_usd)} at a third-party estimate` : null;
+}
+
+/** Tooltip naming each third-party source: model, URL, retrieval date. */
+export function thirdPartySources(prices: UsagePrice[]): string {
+  return prices
+    .filter((p) => p.basis === "third-party-estimate")
+    .map((p) => `${p.model}: third-party estimate, not an API list price. Source ${p.source_url ?? "?"}, retrieved ${p.retrieved ?? "?"}`)
+    .join("\n");
+}
+
+/** Label of a price's basis in the price table. */
+export function basisLabel(basis: string | null): string {
+  if (basis === "list-price") return "API list price";
+  if (basis === "third-party-estimate") return "third-party estimate";
+  if (basis === "nucleus.toml") return "nucleus.toml";
+  return "—";
+}
+
+/** Whether a range needs the "Claude data before X is incomplete" note.
+ *  All time always reaches back to before the first refresh, so the note
+ *  shows whenever Claude is in scope; a bounded range shows it when its
+ *  first day (or its comparison period) starts before `completeSince`. */
+export function claudeRetentionWarning(opts: {
+  vendor: VendorChoice;
+  days: number;
+  from: (string | null | undefined)[];
+  completeSince: string | null;
+}): boolean {
+  if (opts.vendor === "codex" || !opts.completeSince) return false;
+  if (opts.days === 0) return true;
+  return opts.from.some((x) => !!x && x < opts.completeSince!);
+}
+
+/** Every local day from `from` to `to`, inclusive (server-computed bounds). */
+export function dayRange(from: string, to: string): string[] {
+  const out: string[] = [];
+  if (!from || !to || from > to) return out;
+  for (let d = from; d <= to; d = addDays(d, 1)) out.push(d);
+  return out;
+}
+
+/** A finished refresh that left data out; the text for the page, or null. */
+export function partialRefreshNote(run: Pick<UsageRefreshRun, "files_failed" | "malformed_lines" | "oversized_lines"> | null): string | null {
+  if (!run) return null;
+  const parts: string[] = [];
+  if (run.files_failed > 0) parts.push(`${run.files_failed} file${run.files_failed > 1 ? "s" : ""} not read`);
+  if (run.malformed_lines > 0) parts.push(`${run.malformed_lines} malformed usage line${run.malformed_lines > 1 ? "s" : ""}`);
+  if (run.oversized_lines > 0) parts.push(`${run.oversized_lines} oversized line${run.oversized_lines > 1 ? "s" : ""}`);
+  return parts.length ? parts.join(", ") : null;
 }

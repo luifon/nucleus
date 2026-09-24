@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  basisLabel,
   cacheHitRatio,
+  claudeRetentionWarning,
+  dayRange,
+  partialRefreshNote,
+  thirdPartyNote,
+  thirdPartySources,
   deltaPct,
   formatTokens,
   formatTick,
@@ -105,5 +111,68 @@ describe("niceTicks", () => {
   it("covers the max with clean steps", () => {
     expect(niceTicks(87)).toEqual([0, 25, 50, 75, 100]);
     expect(niceTicks(0)).toEqual([0]);
+  });
+});
+
+describe("price provenance", () => {
+  it("marks dollars priced from a third-party estimate", () => {
+    expect(thirdPartyNote({ third_party_usd: 0 })).toBeNull();
+    expect(thirdPartyNote({ third_party_usd: 1.2 })).toBe("incl. $1.20 at a third-party estimate");
+  });
+  it("names the source URL and retrieval date of each estimate", () => {
+    const base = {
+      matched_key: "m",
+      input: 1,
+      output: 1,
+      cache_read: 1,
+      cache_write_5m: 1,
+      cache_write_1h: 1,
+      cache_write_inferred: true,
+      cache_read_inferred: true,
+      long_context_above: null,
+      lc_input: null,
+      lc_output: null,
+      lc_cache_read: null,
+      lc_cache_write: null,
+    };
+    const tip = thirdPartySources([
+      { ...base, model: "review-model", basis: "third-party-estimate", source_url: "https://example.com/p", retrieved: "2026-09-24" },
+      { ...base, model: "listed", basis: "list-price", source_url: "https://example.com/l", retrieved: "2026-09-24" },
+    ]);
+    expect(tip).toContain("review-model");
+    expect(tip).toContain("https://example.com/p");
+    expect(tip).toContain("2026-09-24");
+    expect(tip).not.toContain("listed");
+  });
+  it("keeps list prices and estimates apart in wording", () => {
+    expect(basisLabel("list-price")).toBe("API list price");
+    expect(basisLabel("third-party-estimate")).toBe("third-party estimate");
+  });
+});
+
+describe("range bounds and retention", () => {
+  it("always warns for all time when Claude is in scope", () => {
+    // The first bucket being after completeSince must not hide it.
+    expect(claudeRetentionWarning({ vendor: "all", days: 0, from: ["2026-09-20"], completeSince: "2026-08-25" })).toBe(true);
+    expect(claudeRetentionWarning({ vendor: "claude", days: 0, from: [], completeSince: "2026-08-25" })).toBe(true);
+    expect(claudeRetentionWarning({ vendor: "codex", days: 0, from: [], completeSince: "2026-08-25" })).toBe(false);
+  });
+  it("warns for a bounded range only when it reaches before completeness", () => {
+    expect(claudeRetentionWarning({ vendor: "all", days: 7, from: ["2026-09-18"], completeSince: "2026-08-25" })).toBe(false);
+    expect(claudeRetentionWarning({ vendor: "all", days: 90, from: ["2026-06-27"], completeSince: "2026-08-25" })).toBe(true);
+  });
+  it("lists the server's day bounds without the browser timezone", () => {
+    expect(dayRange("2026-09-22", "2026-09-24")).toEqual(["2026-09-22", "2026-09-23", "2026-09-24"]);
+    expect(dayRange("2026-09-25", "2026-09-24")).toEqual([]);
+  });
+});
+
+describe("partial refresh", () => {
+  it("states what a finished refresh left out", () => {
+    expect(partialRefreshNote(null)).toBeNull();
+    expect(partialRefreshNote({ files_failed: 0, malformed_lines: 0, oversized_lines: 0 })).toBeNull();
+    expect(partialRefreshNote({ files_failed: 2, malformed_lines: 1, oversized_lines: 0 })).toBe(
+      "2 files not read, 1 malformed usage line",
+    );
   });
 });
