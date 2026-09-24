@@ -313,6 +313,27 @@ impl Default for VaultSearchConfig {
     }
 }
 
+/// `[vault_search]` as `<workspace_root>/nucleus.toml` states it now, read
+/// on its own so a long-running process (the dashboard) can apply a changed
+/// exclusion without a restart. A missing file or table means the defaults;
+/// an unreadable file or invalid TOML is an error, so a caller fails closed
+/// instead of falling back to weaker rules.
+pub fn load_vault_search(workspace_root: &Path) -> Result<VaultSearchConfig> {
+    #[derive(Deserialize)]
+    struct Partial {
+        #[serde(default)]
+        vault_search: VaultSearchConfig,
+    }
+    let path = workspace_root.join("nucleus.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(VaultSearchConfig::default()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let partial: Partial = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(partial.vault_search)
+}
+
 fn default_vault_exclude() -> Vec<String> {
     vec![
         "**/attachments/**".to_string(),

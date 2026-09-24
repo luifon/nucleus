@@ -22,6 +22,9 @@
 use crate::config::VaultSearchConfig;
 use anyhow::{Context, Result};
 use regex::Regex;
+use std::borrow::Cow;
+use std::path::Path;
+use unicode_normalization::UnicodeNormalization;
 
 /// Always excluded, whatever nucleus.toml says.
 pub const FLOOR: &[&str] = &[
@@ -60,6 +63,16 @@ impl Exclusions {
         Self::new(&cfg.exclude, &cfg.credential_content_regex)
     }
 
+    /// The rules as `<workspace_root>/nucleus.toml` states them now. Every
+    /// consumer that decides what may be shown or indexed calls this at the
+    /// moment of the decision, so an exclusion the operator adds takes
+    /// effect at the next request of a process that is already running.
+    /// A missing file means the defaults; an unreadable or invalid file is
+    /// an error (fail closed).
+    pub fn load(workspace_root: &Path) -> Result<Self> {
+        Self::from_config(&crate::config::load_vault_search(workspace_root)?)
+    }
+
     pub fn new(extra: &[String], content_regex: &str) -> Result<Self> {
         let mut globs = Vec::new();
         let mut patterns: Vec<String> = FLOOR.iter().map(|s| s.to_string()).collect();
@@ -83,14 +96,26 @@ impl Exclusions {
     /// True when a vault-relative path (forward slashes) is excluded by a
     /// glob. Directories are tested with the same function, so a walk can
     /// skip a whole excluded folder.
+    ///
+    /// The path is compared in its [`fold`]ed form, so a name written with
+    /// full-width letters or with an invisible character inside a floor
+    /// word (`pass\u{200B}word.md`) is excluded like the plain spelling.
     pub fn path_excluded(&self, rel: &str) -> bool {
-        let rel = rel.trim_start_matches('/');
+        let folded = fold(rel);
+        let rel = folded.trim_start_matches('/');
         self.globs.iter().any(|g| g.matches(rel))
     }
 
-    /// True when a note's text looks like it holds credentials.
+    /// True when a note's text looks like it holds credentials. The
+    /// configured regex is tried on the text as written and on its folded
+    /// form.
     pub fn content_excluded(&self, text: &str) -> bool {
-        looks_like_credentials(text) || self.content.as_ref().is_some_and(|re| re.is_match(text))
+        let folded = fold(text);
+        looks_like_credentials(&folded)
+            || self
+                .content
+                .as_ref()
+                .is_some_and(|re| re.is_match(text) || re.is_match(&folded))
     }
 
     pub fn fingerprint(&self) -> &str {
@@ -100,7 +125,46 @@ impl Exclusions {
 
 /// Bumped whenever [`looks_like_credentials`] changes, so existing indexes
 /// are rebuilt under the new rule.
-const DETECTOR_VERSION: &str = "credential-detector-v1";
+const DETECTOR_VERSION: &str = "credential-detector-v2";
+
+/// Unicode compatibility normalization (NFKC) with every
+/// Default_Ignorable_Code_Point removed. NFKC turns full-width and other
+/// compatibility letters into their plain forms (`ｐａｓｓｗｏｒｄ` →
+/// `password`); removing the ignorable characters (zero-width space and
+/// joiners, soft hyphen, bidi controls, variation selectors, tag
+/// characters) joins a word that an invisible character split. Both
+/// changes make text that looks the same to a reader compare the same
+/// here. Returns the input unchanged when it is ASCII.
+pub fn fold(s: &str) -> Cow<'_, str> {
+    if s.is_ascii() {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(s.nfkc().filter(|c| !is_default_ignorable(*c)).collect())
+}
+
+/// Unicode `Default_Ignorable_Code_Point` (DerivedCoreProperties.txt).
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x034F
+            | 0x061C
+            | 0x115F..=0x1160
+            | 0x17B4..=0x17B5
+            | 0x180B..=0x180F
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0x3164
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xFFA0
+            | 0xFFF0..=0xFFF8
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE0FFF
+    )
+}
 
 /// Words that name a secret when they label a value.
 const SECRET_WORDS: &[&str] = &[
@@ -145,14 +209,19 @@ fn known_key_re() -> &'static Regex {
 ///    markdown removed, is exactly a secret word or pair (`password: x`,
 ///    `- **Senha:** x`, `API_KEY=x`) and the value is one token of 3 or
 ///    more characters; or
-/// 3. the label has at most five words and contains a secret word or pair
-///    (`API key on file:`, `senha do roteador:`), and the value — on the same
-///    line, or on the next non-empty line when the same line has none — is a
-///    single token of 6 or more characters with both letters and digits.
+/// 3. the label, of any length, contains a secret word or pair (`API key on
+///    file:`, `senha do roteador:`), and the value — on the same line, or on
+///    the next non-empty line when the same line has none — is a single
+///    token of 6 or more characters with both letters and digits.
 ///
-/// Rule 3 keeps prose such as `Token budget: 5000 per call` or
+/// A value loses a trailing comment before it is judged: a YAML comment
+/// (` # prod`), an HTML comment (`<!-- -->`) or an Obsidian comment
+/// (`%% %%`). Rule 3 keeps prose such as `Token budget: 5000 per call` or
 /// `Max tokens: 4096` searchable, and still catches a key written on the
 /// line below its label.
+///
+/// The caller folds the text first ([`fold`]); [`Exclusions::content_excluded`]
+/// does.
 pub fn looks_like_credentials(text: &str) -> bool {
     if known_key_re().is_match(text) {
         return true;
@@ -193,7 +262,9 @@ fn label_value_is_secret(raw_label: &str, raw_value: &str, following: &[&str]) -
     if exact && value.chars().count() >= 3 && !value.chars().any(char::is_whitespace) {
         return true;
     }
-    if words.len() > 5 || !mentions_secret(&words) {
+    // No limit on the label's length: a long label that names a secret and
+    // is followed by a strong token is still a credential.
+    if !mentions_secret(&words) {
         return false;
     }
     let value = if value.is_empty() {
@@ -224,12 +295,38 @@ fn mentions_secret(words: &[&str]) -> bool {
         || words.windows(2).any(|p| SECRET_PAIRS.contains(&(p[0], p[1])))
 }
 
-/// The value with list markers, emphasis, quotes and backticks removed.
+/// The value with a trailing comment, list markers, emphasis, quotes and
+/// backticks removed.
 fn clean_value(raw: &str) -> String {
-    raw.trim()
+    strip_trailing_comment(raw)
+        .trim()
         .trim_start_matches(['-', '*', '>', '+', ' ', '\t'])
         .trim_matches(['*', '`', '"', '\'', ' ', '\t'])
         .to_string()
+}
+
+/// Cut a value at the first comment that follows it: `<!--` (HTML), `%%`
+/// (Obsidian), or `#` preceded by whitespace (YAML). A `#` inside a token
+/// (`abc#1`) or at the start of the value (`#abc123`) is part of the value.
+fn strip_trailing_comment(raw: &str) -> &str {
+    let mut cut = raw.len();
+    for marker in ["<!--", "%%"] {
+        if let Some(i) = raw.find(marker) {
+            cut = cut.min(i);
+        }
+    }
+    let bytes = raw.as_bytes();
+    for (i, b) in bytes.iter().enumerate().take(cut) {
+        if *b == b'#'
+            && i > 0
+            && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t')
+            && !raw[..i].trim().is_empty()
+        {
+            cut = i;
+            break;
+        }
+    }
+    &raw[..cut]
 }
 
 fn is_secret_token(v: &str) -> bool {
@@ -404,6 +501,60 @@ mod tests {
         ] {
             assert!(!e.content_excluded(text), "should keep {text:?}");
         }
+    }
+
+    /// Text that looks like a credential to a reader but is written to
+    /// slip past a plain string comparison.
+    #[test]
+    fn detector_resists_evasion() {
+        let e = ex(&[]);
+        for text in [
+            // Zero-width space, soft hyphen, word joiner inside the label.
+            "pass\u{200B}word: hunter2",
+            "pass\u{00AD}word: hunter2",
+            "se\u{2060}nha: abc123",
+            // Full-width letters (NFKC folds them).
+            "\u{FF50}\u{FF41}\u{FF53}\u{FF53}\u{FF57}\u{FF4F}\u{FF52}\u{FF44}: hunter2",
+            // Trailing YAML, HTML and Obsidian comments after the value.
+            "password: hunter2 # prod",
+            "password: hunter2   # rotated in May",
+            "- **Senha:** abc123 <!-- office -->",
+            "token: k3yv4lue %% old %%",
+            // A long label naming a secret, followed by a strong token.
+            "the shared password for the office printer on the second floor: Xk29abcQ",
+            "we keep the api key for the staging billing service here: abcd1234efgh",
+            // Zero-width characters inside a known key format.
+            "ghp_abcdefghijklmnopqrstu\u{200B}vwxyz0123456789",
+        ] {
+            assert!(e.content_excluded(text), "should exclude {text:?}");
+        }
+        for text in [
+            // Comments do not turn prose into a secret.
+            "password: see the manager # prod",
+            "Token budget: 5000 per call # rough",
+            // A long label without a strong token stays searchable.
+            "the discussion about password managers in the team meeting: useful",
+        ] {
+            assert!(!e.content_excluded(text), "should keep {text:?}");
+        }
+        // A `#` that starts the value, or sits inside it, is the value.
+        assert!(e.content_excluded("password: #Xk29abc"));
+        assert!(e.content_excluded("password: abc#123"));
+    }
+
+    #[test]
+    fn path_floor_resists_evasion() {
+        let e = ex(&[]);
+        for rel in [
+            "0-Inbox/pass\u{200B}word-list.md",
+            "0-Inbox/pass\u{00AD}words.md",
+            "0-Inbox/\u{FF53}\u{FF45}\u{FF4E}\u{FF48}\u{FF41}.md",
+            "4-Areas/Home\u{200D}lab/router.md",
+            "\u{200B}.obsidian/app.json",
+        ] {
+            assert!(e.path_excluded(rel), "should exclude {rel:?}");
+        }
+        assert!(!e.path_excluded("3-Projects/Caf\u{e9}/index.md"));
     }
 
     #[test]
