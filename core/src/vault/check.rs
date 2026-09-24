@@ -67,7 +67,9 @@ pub struct Finding {
     /// The note the finding is about; `None` for group findings.
     pub path: Option<String>,
     pub detail: String,
-    /// Other notes involved (group members, link targets' candidates).
+    /// Other paths involved: the members of a group finding, the notes of
+    /// an unknown `source:` value, or, for a broken link, a folder whose
+    /// name equals the link target.
     pub related: Vec<String>,
     pub fixed: bool,
     /// What `--apply` did, when it did something.
@@ -1069,7 +1071,7 @@ pub fn summary_line(c: &CheckCounts, link: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{VaultCheckConfig, default_credential_content_regex};
+    use crate::config::VaultCheckConfig;
     use std::fs;
 
     fn write(root: &Path, rel: &str, text: &str) {
@@ -1138,7 +1140,7 @@ mod tests {
     }
 
     fn ex() -> Exclusions {
-        Exclusions::new(&[], &default_credential_content_regex()).unwrap()
+        Exclusions::new(&[], "").unwrap()
     }
 
     fn of<'a>(r: &'a CheckReport, kind: &str) -> Vec<&'a Finding> {

@@ -298,20 +298,18 @@ impl Default for SessionSearchConfig {
 pub struct VaultSearchConfig {
     #[serde(default = "default_vault_exclude")]
     pub exclude: Vec<String>,
-    /// Case-insensitive, multi-line regex. A note whose text matches is
-    /// treated as a credential note: never indexed, never returned, never
-    /// touched by `vault-check`. Empty disables the content check (the path
-    /// floor still applies).
-    #[serde(default = "default_credential_content_regex")]
+    /// Extra case-insensitive, multi-line regex for credential notes, added
+    /// to the built-in detector in `nucleus_core::vault::exclude` (which
+    /// cannot be turned off). A note whose text matches is never indexed,
+    /// never returned, and never touched by `vault-check`. Empty = only the
+    /// built-in detector.
+    #[serde(default)]
     pub credential_content_regex: String,
 }
 
 impl Default for VaultSearchConfig {
     fn default() -> Self {
-        Self {
-            exclude: default_vault_exclude(),
-            credential_content_regex: default_credential_content_regex(),
-        }
+        Self { exclude: default_vault_exclude(), credential_content_regex: String::new() }
     }
 }
 
@@ -321,12 +319,6 @@ fn default_vault_exclude() -> Vec<String> {
         "**/_attachments/**".to_string(),
         "**/assets/**".to_string(),
     ]
-}
-
-/// A line that assigns a value to a credential-like key (`password: x`,
-/// `senha = x`, `api_key: x`, `- **Token:** x`), or a PEM private key.
-pub fn default_credential_content_regex() -> String {
-    r"^[ \t>*-]*\**(password|passwd|passphrase|senha|api[ _-]?key|secret|client[ _-]?secret|access[ _-]?token|token|pin)\**[ \t]*[:=][ \t]*\**[ \t]*\S|-----BEGIN [A-Z ]*PRIVATE KEY-----".to_string()
 }
 
 /// ADR-035 weekly vault check. All defaulted, so a nucleus.toml without a
@@ -846,7 +838,7 @@ mod vault_config_tests {
     fn missing_tables_use_defaults() {
         let search: VaultSearchConfig = toml::from_str("").unwrap();
         let check: VaultCheckConfig = toml::from_str("").unwrap();
-        assert!(!search.credential_content_regex.is_empty());
+        assert!(search.credential_content_regex.is_empty());
         assert_eq!(check.cron, "0 20 * * 0");
         assert!(!check.scheduled_apply);
     }

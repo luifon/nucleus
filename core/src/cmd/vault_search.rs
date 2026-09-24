@@ -72,7 +72,11 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     }
 
     let opts = index::SearchOpts { bucket: cli.bucket.as_deref(), limit: cli.limit };
-    let result = index::search(&pool, &query, &opts, &ex).await?;
+    let mut result = index::search(&pool, &query, &opts, &ex).await?;
+    // Terminal and session output mark matches with brackets.
+    for h in &mut result.hits {
+        h.snippet = h.snippet.replace(index::MATCH_START, "[").replace(index::MATCH_END, "]");
+    }
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());

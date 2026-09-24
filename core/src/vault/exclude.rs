@@ -7,10 +7,11 @@
 //!    covers dot folders (`.obsidian/`, `.trash/`, `.git/`), file and
 //!    folder names that look like credential stores, and the homelab area,
 //!    where operators keep service logins.
-//! 2. **Content.** `[vault_search] credential_content_regex`: a note whose
-//!    text assigns a value to a credential-like key is excluded wherever it
-//!    lives, so a password pasted into an ordinary note still stays out of
-//!    search results.
+//! 2. **Content.** [`looks_like_credentials`], a built-in detector that
+//!    cannot be turned off, plus an optional extra regex from
+//!    `[vault_search] credential_content_regex`. A note that holds a secret
+//!    is excluded wherever it lives, so a password or API key pasted into an
+//!    ordinary note still stays out of search results.
 //!
 //! Glob syntax: `*` matches within one path component, `**` matches any
 //! number of components, `?` matches one character, `[...]` is a character
@@ -74,7 +75,8 @@ impl Exclusions {
                     .context("[vault_search] credential_content_regex")?,
             )
         };
-        let fingerprint = format!("{}\n{}", patterns.join("\n"), content_regex);
+        let fingerprint =
+            format!("{DETECTOR_VERSION}\n{}\n{}", patterns.join("\n"), content_regex);
         Ok(Self { globs, content, fingerprint })
     }
 
@@ -88,12 +90,153 @@ impl Exclusions {
 
     /// True when a note's text looks like it holds credentials.
     pub fn content_excluded(&self, text: &str) -> bool {
-        self.content.as_ref().is_some_and(|re| re.is_match(text))
+        looks_like_credentials(text) || self.content.as_ref().is_some_and(|re| re.is_match(text))
     }
 
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
+}
+
+/// Bumped whenever [`looks_like_credentials`] changes, so existing indexes
+/// are rebuilt under the new rule.
+const DETECTOR_VERSION: &str = "credential-detector-v1";
+
+/// Words that name a secret when they label a value.
+const SECRET_WORDS: &[&str] = &[
+    "password", "passwords", "passwd", "passphrase", "senha", "senhas", "secret",
+    "token", "apikey", "pin", "credential", "credentials", "credencial", "credenciais",
+];
+
+/// Two-word labels that name a secret (`chave de API` is folded to
+/// `chave api` by [`normalize_label`]).
+const SECRET_PAIRS: &[(&str, &str)] = &[
+    ("api", "key"),
+    ("api", "keys"),
+    ("chave", "api"),
+    ("access", "key"),
+    ("private", "key"),
+    ("client", "secret"),
+    ("access", "token"),
+];
+
+/// Well-known API key formats and PEM private keys, matched anywhere.
+fn known_key_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+            r"|\bsk-[A-Za-z0-9_-]{20,}",
+            r"|\bgh[pousr]_[A-Za-z0-9]{30,}",
+            r"|\bgithub_pat_[A-Za-z0-9_]{30,}",
+            r"|\bglpat-[A-Za-z0-9_-]{20,}",
+            r"|\bxox[abprs]-[A-Za-z0-9-]{10,}",
+            r"|\bAKIA[0-9A-Z]{16}\b",
+            r"|\bAIza[0-9A-Za-z_-]{35}",
+        ))
+        .unwrap()
+    })
+}
+
+/// Built-in credential detector. A note is a credential note when:
+///
+/// 1. it contains a well-known key format or a PEM private key; or
+/// 2. a line is `label: value` (or `label = value`) where the label, with
+///    markdown removed, is exactly a secret word or pair (`password: x`,
+///    `- **Senha:** x`, `API_KEY=x`) and the value is one token of 3 or
+///    more characters; or
+/// 3. the label has at most five words and contains a secret word or pair
+///    (`API key on file:`, `senha do roteador:`), and the value — on the same
+///    line, or on the next non-empty line when the same line has none — is a
+///    single token of 6 or more characters with both letters and digits.
+///
+/// Rule 3 keeps prose such as `Token budget: 5000 per call` or
+/// `Max tokens: 4096` searchable, and still catches a key written on the
+/// line below its label.
+pub fn looks_like_credentials(text: &str) -> bool {
+    if known_key_re().is_match(text) {
+        return true;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        // Every `:` / `=` is a candidate separator. Its label is the text
+        // since the previous separator or sentence end, so
+        // `Status: registered. API key on file:` yields the label
+        // `API key on file`.
+        let seps: Vec<usize> = line.match_indices([':', '=']).map(|(k, _)| k).collect();
+        for &sep in &seps {
+            let start = line[..sep].rfind([':', '=', '.', ';', ',']).map(|k| k + 1).unwrap_or(0);
+            if label_value_is_secret(&line[start..sep], &line[sep + 1..], &lines[i + 1..]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Rules 2 and 3 for one `label: value` candidate. `following` is the text
+/// after the line, for a value written on the next non-empty line.
+fn label_value_is_secret(raw_label: &str, raw_value: &str, following: &[&str]) -> bool {
+    let label = normalize_label(raw_label);
+    if label.is_empty() {
+        return false;
+    }
+    let words: Vec<&str> = label.split_whitespace().collect();
+    let value = clean_value(raw_value);
+    let exact = match words.as_slice() {
+        [w] => SECRET_WORDS.contains(w),
+        [a, b] => SECRET_PAIRS.contains(&(*a, *b)),
+        _ => false,
+    };
+    // One token: `password: hunter2`. Prose after the label (`Token: create
+    // one under Settings`) is instructions, not a secret.
+    if exact && value.chars().count() >= 3 && !value.chars().any(char::is_whitespace) {
+        return true;
+    }
+    if words.len() > 5 || !mentions_secret(&words) {
+        return false;
+    }
+    let value = if value.is_empty() {
+        following.iter().map(|l| clean_value(l)).find(|v| !v.is_empty()).unwrap_or_default()
+    } else {
+        value
+    };
+    is_secret_token(&value)
+}
+
+/// Lowercase label words with markdown and punctuation removed; filler
+/// words (`de`, `do`, `da`, `of`, `the`, `my`, `meu`, `minha`) dropped so
+/// `chave de API` reads as `chave api`.
+fn normalize_label(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    let mut words: Vec<&str> = Vec::new();
+    for w in lower.split(|c: char| !c.is_alphanumeric()) {
+        if w.is_empty() || matches!(w, "de" | "do" | "da" | "of" | "the" | "my" | "meu" | "minha") {
+            continue;
+        }
+        words.push(w);
+    }
+    words.join(" ")
+}
+
+fn mentions_secret(words: &[&str]) -> bool {
+    words.iter().any(|w| SECRET_WORDS.contains(w))
+        || words.windows(2).any(|p| SECRET_PAIRS.contains(&(p[0], p[1])))
+}
+
+/// The value with list markers, emphasis, quotes and backticks removed.
+fn clean_value(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches(['-', '*', '>', '+', ' ', '\t'])
+        .trim_matches(['*', '`', '"', '\'', ' ', '\t'])
+        .to_string()
+}
+
+fn is_secret_token(v: &str) -> bool {
+    v.chars().count() >= 6
+        && !v.chars().any(char::is_whitespace)
+        && v.chars().any(|c| c.is_ascii_alphabetic())
+        && v.chars().any(|c| c.is_ascii_digit())
 }
 
 impl Glob {
@@ -180,11 +323,10 @@ impl GlobSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::default_credential_content_regex;
 
     fn ex(extra: &[&str]) -> Exclusions {
         let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        Exclusions::new(&extra, &default_credential_content_regex()).unwrap()
+        Exclusions::new(&extra, "").unwrap()
     }
 
     #[test]
@@ -228,15 +370,21 @@ mod tests {
     }
 
     #[test]
-    fn content_regex_catches_credential_lines() {
+    fn detector_catches_credentials() {
         let e = ex(&[]);
         for text in [
             "# Router\n\npassword: hunter2\n",
             "- **Password:** hunter2",
             "- **Senha**: abc",
             "api_key = sk-123",
-            "API-KEY: x",
+            "API-KEY: xyz",
             "> token: abc",
+            "Senha do roteador: abc12345",
+            "- **API key on file:**\n  - `0123456789abcdef0123456789abcdef`",
+            "- **Status:** registered. API key on file:\n  - `0123456789abcdef0123456789abcdef`",
+            "Chave de API:\n\n`k3y-with-digits-42`",
+            "export KEY=sk-abcdefghijklmnopqrstuvwxyz012345",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
             "-----BEGIN OPENSSH PRIVATE KEY-----",
         ] {
             assert!(e.content_excluded(text), "should exclude {text:?}");
@@ -244,11 +392,25 @@ mod tests {
         for text in [
             "We discussed password managers today.",
             "Token budget: 5000 per call",
+            "Max tokens: 4096",
             "## Passwords\n\nUse a manager.",
             "The secret of the method is repetition.",
             "password:\n",
+            "Token type: bearer",
+            "2. Token: GitHub → Settings → create a token",
+            "Password: use the manager",
+            "O modelo processa tokens: unidade real de processamento.",
+            "Reset de senha: fluxo com e-mail e link temporário.",
         ] {
             assert!(!e.content_excluded(text), "should keep {text:?}");
         }
+    }
+
+    #[test]
+    fn configured_regex_adds_to_the_detector() {
+        let e = Exclusions::new(&[], r"^wifi:").unwrap();
+        assert!(e.content_excluded("wifi: guest network"));
+        assert!(e.content_excluded("password: hunter2"));
+        assert!(!e.content_excluded("nothing here"));
     }
 }

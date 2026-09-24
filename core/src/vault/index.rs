@@ -23,6 +23,10 @@ use std::path::Path;
 
 pub const DB_PATH: &str = "memory/vault_index.db";
 
+/// Snippet match markers (see [`VaultSearchHit::snippet`]).
+pub const MATCH_START: char = '\u{2}';
+pub const MATCH_END: char = '\u{3}';
+
 /// bm25 column weights, in `notes_fts` column order:
 /// title, headings, tags, path, meta, body.
 const BM25_WEIGHTS: &str = "12.0, 4.0, 4.0, 3.0, 1.5, 1.0";
@@ -234,7 +238,10 @@ pub struct VaultSearchHit {
     /// Frontmatter `created`, verbatim.
     pub created: Option<String>,
     pub source: Option<String>,
-    /// Best-matching excerpt; matched terms wrapped in `[` `]`.
+    /// Best-matching excerpt. Matched terms are wrapped in U+0002 … U+0003
+    /// ([`MATCH_START`] / [`MATCH_END`]), characters that never occur in
+    /// note text, so a client can highlight them without confusing them
+    /// with the brackets of a `[[link]]`.
     pub snippet: String,
     /// Relevance, higher is better (negated bm25).
     pub score: f64,
@@ -315,7 +322,7 @@ async fn run_match(
     let prefix = bucket.map(|b| b.trim_matches('/').to_string()).filter(|b| !b.is_empty());
     let sql = format!(
         "SELECT n.path, n.title, n.bucket, n.created, n.source,
-                snippet(notes_fts, -1, '[', ']', ' … ', 14) AS snip,
+                snippet(notes_fts, -1, char(2), char(3), ' … ', 14) AS snip,
                 bm25(notes_fts, {BM25_WEIGHTS}) AS score
            FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid
           WHERE notes_fts MATCH ?1
@@ -354,11 +361,10 @@ async fn run_match(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::default_credential_content_regex;
     use std::fs;
 
     fn ex() -> Exclusions {
-        Exclusions::new(&["**/attachments/**".into()], &default_credential_content_regex()).unwrap()
+        Exclusions::new(&["**/attachments/**".into()], "").unwrap()
     }
 
     fn write(root: &Path, rel: &str, text: &str) {
@@ -435,7 +441,7 @@ mod tests {
         // Diacritics folded, porter stemming.
         let r = search(&pool, "orcamento", &opts, &ex).await.unwrap();
         assert_eq!(r.hits[0].path, "3-Projects/Alpha/engine-notes.md");
-        assert!(r.hits[0].snippet.contains('['));
+        assert!(r.hits[0].snippet.contains(MATCH_START) && r.hits[0].snippet.contains(MATCH_END));
         let r = search(&pool, "decides", &opts, &ex).await.unwrap();
         assert_eq!(r.hits.len(), 1);
 
@@ -472,7 +478,7 @@ mod tests {
         assert!(search(&pool, "engine", &opts, &ex).await.unwrap().hits.iter().all(|h| h.path != "3-Projects/Alpha/engine-notes.md"));
 
         // Changing the exclusion rules rebuilds and drops the newly excluded.
-        let ex2 = Exclusions::new(&["6-Slipbox/**".into()], &default_credential_content_regex()).unwrap();
+        let ex2 = Exclusions::new(&["6-Slipbox/**".into()], "").unwrap();
         let s = update(&pool, &vault, &ex2).await.unwrap();
         assert!(s.rebuilt);
         assert!(search(&pool, "kayaks", &opts, &ex2).await.unwrap().hits.is_empty());

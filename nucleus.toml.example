@@ -112,10 +112,12 @@ prune_max_age_days = 14
 # through a search result.
 [vault_search]
 exclude = ["**/attachments/**", "**/_attachments/**", "**/assets/**"]
-# A note whose text matches this (case-insensitive, per line) is treated as
-# a credential note wherever it lives. The default matches lines such as
-# `password: x`, `- **Senha:** x`, `api_key = x`, and PEM private keys.
-# credential_content_regex = "..."
+# Notes that hold a secret are excluded wherever they live. A built-in
+# detector (always on) catches `password: x`, `- **Senha:** x`,
+# `API_KEY=x`, a key written under a label such as `API key on file:`,
+# well-known key formats and PEM private keys. This optional regex
+# (case-insensitive, multi-line) adds your own patterns on top.
+credential_content_regex = ""
 
 # ADR-035 weekly vault check (`nucleus vault-check`). launchd wakes the job
 # hourly (tools/launchd/vault-check.plist.example); it runs when this cron
