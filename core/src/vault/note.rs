@@ -36,8 +36,16 @@ impl Frontmatter {
         (!s.is_empty()).then_some(s)
     }
 
+    /// The key holds a non-empty value.
     pub fn has_key(&self, key: &str) -> bool {
         self.get_str(key).is_some()
+    }
+
+    /// The mapping contains the key, whatever its value (`created:` with
+    /// nothing after it counts). A fix that inserts a key checks this, so
+    /// it never writes a second copy of a key that is present but empty.
+    pub fn contains_key(&self, key: &str) -> bool {
+        matches!(self, Frontmatter::Valid(map) if map.contains_key(Value::String(key.to_string())))
     }
 }
 
@@ -76,8 +84,10 @@ pub struct ParsedNote {
     pub headings: Vec<String>,
     /// Frontmatter `tags`/`tag` plus inline `#tags`, without `#`, deduplicated.
     pub tags: Vec<String>,
-    /// Text after the frontmatter block.
-    pub body: String,
+    /// Byte offset in the note text where the body (the text after the
+    /// frontmatter block) starts; see [`ParsedNote::body`]. An offset, not a
+    /// copy, so a large note is not held twice.
+    pub body_start: usize,
     /// Flattened `key: value` lines of the frontmatter, for full-text search.
     pub meta_text: String,
     pub links: Vec<Link>,
@@ -87,6 +97,11 @@ pub struct ParsedNote {
 }
 
 impl ParsedNote {
+    /// The body of `text`, which must be the text this note was parsed from.
+    pub fn body<'t>(&self, text: &'t str) -> &'t str {
+        text.get(self.body_start..).unwrap_or("")
+    }
+
     pub fn created(&self) -> Option<String> {
         self.frontmatter.get_str("created")
     }
@@ -223,9 +238,16 @@ fn link_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(!?)\[\[([^\[\]\n]+?)\]\]").unwrap())
 }
 
+/// `[text](target.md)`, `[text](target.md#h "title")`, and the
+/// angle-bracket form `[text](<target with spaces.md>)`.
 fn md_link_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\]\(([^)\s]+\.md)(?:#[^)]*)?\)").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"\]\((?:<([^<>\n]+?\.md)(?:#[^<>\n]*)?>|([^)\s<>]+\.md)(?:#[^)\s]*)?)(?:[ \t]+"[^"\n]*")?\)"#,
+        )
+        .unwrap()
+    })
 }
 
 fn heading_re() -> &'static Regex {
@@ -263,6 +285,14 @@ pub fn extract_links(visible: &str) -> Vec<Link> {
             continue;
         }
         for cap in link_re().captures_iter(line) {
+            // `\[[x]]` is literal text in Obsidian: an odd number of
+            // backslashes right before the `[[` escapes it. (`\![[x]]`
+            // escapes only the `!`, so it is still a link.)
+            let bracket = cap.get(0).unwrap().start() + cap[1].len();
+            let backslashes = line[..bracket].bytes().rev().take_while(|b| *b == b'\\').count();
+            if backslashes % 2 == 1 {
+                continue;
+            }
             if let Some(target) = link_target(&cap[2]) {
                 out.push(Link { target, embed: &cap[1] == "!", line: idx + 1 });
             }
@@ -287,7 +317,7 @@ pub fn parse(rel: &str, text: &str) -> ParsedNote {
     let links = extract_links(&visible);
     let md_links = md_link_re()
         .captures_iter(&visible)
-        .map(|c| c[1].to_string())
+        .filter_map(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string()))
         .filter(|t| !t.contains("://"))
         .collect();
 
@@ -347,7 +377,7 @@ pub fn parse(rel: &str, text: &str) -> ParsedNote {
         title,
         headings,
         tags,
-        body: body.to_string(),
+        body_start: text.len() - body.len(),
         meta_text,
         links,
         md_links,
@@ -382,7 +412,7 @@ mod tests {
         assert_eq!(n.source().as_deref(), Some("manual"));
         assert_eq!(n.title, "Title");
         assert_eq!(n.tags, vec!["inline", "a", "b"]);
-        assert!(n.body.starts_with("# Title"));
+        assert!(n.body(text).starts_with("# Title"));
     }
 
     #[test]
@@ -437,5 +467,29 @@ mod tests {
     fn markdown_links_collected() {
         let n = parse("a/b.md", "[x](other.md) [y](https://e.com/z.md) [z](../up/note.md#h)");
         assert_eq!(n.md_links, vec!["other.md", "../up/note.md"]);
+    }
+
+    #[test]
+    fn angle_bracket_and_titled_markdown_links() {
+        let n = parse(
+            "a/b.md",
+            "[x](<other note.md>) [y](<../up/with space.md#h>) [z](plain.md \"Title\") [w](<not md.png>)",
+        );
+        assert_eq!(n.md_links, vec!["other note.md", "../up/with space.md", "plain.md"]);
+    }
+
+    #[test]
+    fn escaped_wiki_links_are_text() {
+        let text = "\\[[Literal]] \\\\[[Real After Escaped Backslash]] \\![[Still Link]] ok [[Plain]]\n";
+        let targets: Vec<String> = extract_links(&strip_code(text)).into_iter().map(|l| l.target).collect();
+        assert_eq!(targets, vec!["Real After Escaped Backslash", "Still Link", "Plain"]);
+    }
+
+    #[test]
+    fn empty_key_is_present_but_not_set() {
+        let n = parse("a.md", "---\ncreated:\nsource: \"\"\n---\nx");
+        assert!(n.frontmatter.contains_key("created") && !n.frontmatter.has_key("created"));
+        assert!(n.frontmatter.contains_key("source") && !n.frontmatter.has_key("source"));
+        assert!(!n.frontmatter.contains_key("tags"));
     }
 }

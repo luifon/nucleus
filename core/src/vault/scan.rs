@@ -17,11 +17,41 @@ pub struct VaultFile {
     pub size: u64,
     /// Modification time, unix seconds.
     pub mtime: i64,
+    /// Modification time with nanoseconds, for the pre-fix identity check.
+    pub mtime_ns: i128,
     /// Creation (birth) time, unix seconds, when the filesystem records it.
     pub birthtime: Option<i64>,
+    /// Device and inode at scan time. A fix acts only on the same file.
+    pub dev: u64,
+    pub ino: u64,
 }
 
 impl VaultFile {
+    pub fn from_meta(rel: String, abs: PathBuf, meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            rel,
+            abs,
+            size: meta.len(),
+            mtime: unix(meta.modified().ok()),
+            mtime_ns: mtime_ns(meta),
+            birthtime: meta.created().ok().map(|t| unix(Some(t))),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+
+    /// True when `meta` describes the same file, unchanged, as this scan
+    /// entry: same device and inode, same size, same nanosecond mtime.
+    pub fn same_file(&self, meta: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        meta.is_file()
+            && meta.dev() == self.dev
+            && meta.ino() == self.ino
+            && meta.len() == self.size
+            && mtime_ns(meta) == self.mtime_ns
+    }
+
     pub fn is_markdown(&self) -> bool {
         self.rel.to_lowercase().ends_with(".md")
     }
@@ -83,13 +113,7 @@ pub fn walk(root: &Path, ex: &Exclusions) -> Result<Walk> {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
-            out.files.push(VaultFile {
-                rel,
-                abs: entry.path(),
-                size: meta.len(),
-                mtime: unix(meta.modified().ok()),
-                birthtime: meta.created().ok().map(|t| unix(Some(t))),
-            });
+            out.files.push(VaultFile::from_meta(rel, entry.path(), &meta));
         }
     }
     out.files.sort_by(|a, b| a.rel.cmp(&b.rel));
@@ -116,6 +140,12 @@ fn collect_excluded(root: &Path, rel_dir: &Path, out: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Modification time in nanoseconds since the epoch.
+pub fn mtime_ns(meta: &std::fs::Metadata) -> i128 {
+    use std::os::unix::fs::MetadataExt;
+    meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128
 }
 
 fn unix(t: Option<std::time::SystemTime>) -> i64 {
