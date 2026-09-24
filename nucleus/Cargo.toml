@@ -14,6 +14,7 @@ nucleus-core = { workspace = true }
 reminders = { workspace = true }
 distiller = { path = "../chores/distiller" }
 skill-gap-learner = { path = "../chores/skill-gap-learner" }
+vault-check = { path = "../chores/vault-check" }
 discord = { path = "../messaging/discord" }
 gmail = { path = "../messaging/gmail" }
 news-fetcher = { path = "../news/fetcher" }

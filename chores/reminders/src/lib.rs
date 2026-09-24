@@ -1286,7 +1286,7 @@ async fn deliver(
             discord_sdk::send_announcement(&settings.discord.home_channel_id, &body).await
         }
         store::CHANNEL_WHATSAPP_DM => {
-            let target = first_csv_entry("WHATSAPP_ALLOWED_DM_JIDS").ok_or_else(|| {
+            let target = operator_whatsapp_dm().ok_or_else(|| {
                 anyhow!(
                     "channel {:?} requires WHATSAPP_ALLOWED_DM_JIDS to be set with at least one entry",
                     channel
@@ -1591,6 +1591,13 @@ fn alert_cooldown_active(last_alerted_at: Option<&str>, now: DateTime<Utc>) -> b
         return false;
     };
     (now - prev.with_timezone(&Utc)).num_seconds() < ALERT_COOLDOWN_SECS
+}
+
+/// The operator's WhatsApp DM target (ADR-005b): the first entry of
+/// `WHATSAPP_ALLOWED_DM_JIDS`. The one definition every enqueuer uses for
+/// "send this to the operator's DM" (reminders, vault-check).
+pub fn operator_whatsapp_dm() -> Option<String> {
+    first_csv_entry("WHATSAPP_ALLOWED_DM_JIDS")
 }
 
 /// First non-empty entry from a comma-separated env var. Used to pick

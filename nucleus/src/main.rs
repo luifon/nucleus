@@ -25,11 +25,13 @@ Services (run by launchd):
   skill-gap-learner     skill review + curator (learn|review)
   discord               Discord bot daemon
   gmail-metabolism      daily inbox sweep
+  vault-check           weekly structural check of the Obsidian vault
   news-fetcher          feed pull + profile ranking → widget feed
   dashboard             web dashboard + API
 
 Operator tools:
   session-search        FTS5 search over session transcripts
+  vault-search          FTS5 search over the Obsidian vault
   session-send          send a message into another agent session
 
 Every command accepts --help.
@@ -87,6 +89,8 @@ async fn main() -> Result<()> {
         "skill-gap-learner" => skill_gap_learner::run(sub).await,
         "gmail-metabolism" => gmail::run(sub).await,
         "session-search" => nucleus_core::cmd::session_search::run(sub).await,
+        "vault-search" => nucleus_core::cmd::vault_search::run(sub).await,
+        "vault-check" => vault_check::run(sub).await,
         "session-send" => nucleus_core::cmd::session_send::run(sub).await,
         "-h" | "--help" | "help" => {
             print!("{USAGE}");

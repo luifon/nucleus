@@ -821,6 +821,38 @@ mod workspace_root_tests {
 }
 
 #[cfg(test)]
+mod vault_config_tests {
+    use super::*;
+
+    /// The documented example and the code defaults must not drift.
+    #[test]
+    fn example_vault_tables_match_defaults() {
+        let example: toml::Value = toml::from_str(include_str!("../../nucleus.toml.example")).unwrap();
+        let search: VaultSearchConfig = example["vault_search"].clone().try_into().unwrap();
+        let check: VaultCheckConfig = example["vault_check"].clone().try_into().unwrap();
+        let (ds, dc) = (VaultSearchConfig::default(), VaultCheckConfig::default());
+        assert_eq!(search.exclude, ds.exclude);
+        assert_eq!(search.credential_content_regex, ds.credential_content_regex);
+        assert_eq!(check.cron, dc.cron);
+        assert_eq!(check.inbox_max_age_days, dc.inbox_max_age_days);
+        assert_eq!(check.required_frontmatter, dc.required_frontmatter);
+        assert_eq!(check.source_vocabulary, dc.source_vocabulary);
+        assert_eq!(check.orphan_exempt, dc.orphan_exempt);
+        assert_eq!(check.frontmatter_exempt, dc.frontmatter_exempt);
+        assert_eq!((check.scheduled_apply, check.notify), (dc.scheduled_apply, dc.notify));
+    }
+
+    #[test]
+    fn missing_tables_use_defaults() {
+        let search: VaultSearchConfig = toml::from_str("").unwrap();
+        let check: VaultCheckConfig = toml::from_str("").unwrap();
+        assert!(!search.credential_content_regex.is_empty());
+        assert_eq!(check.cron, "0 20 * * 0");
+        assert!(!check.scheduled_apply);
+    }
+}
+
+#[cfg(test)]
 mod distiller_config_tests {
     use super::*;
 
