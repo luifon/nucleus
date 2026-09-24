@@ -51,18 +51,20 @@ files. Two consequences followed:
   an update always applies the rules that are current when it runs; no
   caller can pass rules it loaded earlier. The dashboard does not write the
   index: before a search it runs `nucleus vault-search --reindex` as a
-  subprocess and then opens the file read-only. At most one such update
-  runs at a time. The dashboard takes a vault watermark before each search
-  (a hash of every walked note's path and file identity, plus the
-  exclusion rules' fingerprint; no content is read). Searches that
-  arrive while an update runs for the same watermark wait for that update's
-  result instead of starting another; a search whose watermark differs
-  waits for it to end and then starts the next one. No update runs when
-  the last successful one started less than
-  `[vault_search] dashboard_reindex_fresh_secs` (30) ago and the watermark
-  is unchanged. A search waits at most `dashboard_reindex_wait_secs` (20)
-  and then answers 503; the update keeps running as its own task, and the
-  next search uses it.
+  subprocess and then opens the file read-only. A search does not walk
+  the vault itself. One refresh runs at a time, as its own task: it takes
+  the vault watermark (a hash of every walked note's path and file
+  identity, plus the exclusion rules' fingerprint; a stat-only walk that
+  reads no content) and then runs the update, unless the last successful
+  update started less than `[vault_search] dashboard_reindex_fresh_secs`
+  (30) ago and the watermark is unchanged. A search that arrives while a
+  refresh runs takes that refresh's result when the refresh started after
+  the search arrived; otherwise it waits for it and shares the next one
+  with every search that arrived in the meantime. A burst of searches
+  costs at most two walks and, while no note changes, one update. A
+  search waits at most
+  `dashboard_reindex_wait_secs` (20), walk included, and then answers 503;
+  the refresh keeps running and the next search uses it.
 - **Query.** Plain words must all match (each word is quoted, so
   punctuation cannot break the FTS5 syntax). When no note has every word,
   the search falls back to notes with any word and reports `mode: any`. A
@@ -305,10 +307,9 @@ takeover reruns the check but cannot queue a second summary.
   subprocess and reads the file read-only); `vault_check.db` has one writer,
   the `vault-check` command; the dashboard reads it read-only. See the
   ADR-020 amendment for concurrent invocations of one writer command.
-- A dashboard search costs a stat-only walk of the vault (the watermark)
+- A dashboard search shares a stat-only walk of the vault (the watermark)
   and, when a note changed or the freshness window has passed, one short
-  subprocess (the incremental update) shared with every concurrent
-  search.
+  subprocess (the incremental update) with every concurrent search.
 - The dashboard chat surface runs a Claude session with the vault as an
   added directory; the exclusion rules here do not restrict what that
   session can read.

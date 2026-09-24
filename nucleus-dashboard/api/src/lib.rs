@@ -137,6 +137,7 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
             index_db: workspace_root.join(nucleus_core::vault::index::DB_PATH),
             refresh: handlers::vault::IndexRefresh::new(
                 reindex,
+                handlers::vault::vault_watermark(vault_root.clone(), workspace_root.clone()),
                 std::time::Duration::from_secs(settings.vault_search.dashboard_reindex_fresh_secs),
                 std::time::Duration::from_secs(settings.vault_search.dashboard_reindex_wait_secs),
             ),
