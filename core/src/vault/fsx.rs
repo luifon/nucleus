@@ -41,6 +41,9 @@ pub enum Kind {
 }
 
 impl Ident {
+    // `stat` field types differ between platforms; the casts are needed on
+    // some of them.
+    #[allow(clippy::unnecessary_cast)]
     fn from_stat(st: &rustix::fs::Stat) -> Self {
         let kind = match FileType::from_raw_mode(st.st_mode as _) {
             FileType::RegularFile => Kind::File,
@@ -152,6 +155,39 @@ pub fn open_file_at(dir: impl AsFd, name: &OsStr) -> std::io::Result<(std::fs::F
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
     }
     Ok((std::fs::File::from(fd), id))
+}
+
+/// Rename `from` in `from_dir` to `to` in `to_dir` only if `to` does not
+/// exist: `renameatx_np(.., RENAME_EXCL)` on macOS, `renameat2(..,
+/// RENAME_NOREPLACE)` on Linux. The check and the rename are one system
+/// call, so an entry created at `to` is never replaced. Fails with
+/// `EEXIST` when `to` exists; see [`is_unsupported`] for platforms and
+/// filesystems without the call.
+pub fn rename_exclusive(
+    from_dir: impl AsFd,
+    from: &OsStr,
+    to_dir: impl AsFd,
+    to: &OsStr,
+) -> std::io::Result<()> {
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    {
+        rustix::fs::renameat_with(from_dir, from, to_dir, to, rustix::fs::RenameFlags::NOREPLACE)?;
+        Ok(())
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    {
+        let _ = (from_dir, from, to_dir, to);
+        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+}
+
+/// True when [`rename_exclusive`] failed because the platform or the
+/// filesystem does not provide an exclusive rename.
+pub fn is_unsupported(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::ENOTSUP) | Some(libc::EOPNOTSUPP)
+    )
 }
 
 /// Names in the folder `dir`, without `.` and `..`, with each entry's

@@ -32,6 +32,7 @@
 //! for findings, never listed, and never modified.
 
 use super::exclude::{Exclusions, GlobSet};
+use super::fsx::{self, Root};
 use super::note::{self, Frontmatter, ParsedNote};
 use super::scan::{self, VaultFile};
 use crate::config::VaultCheckConfig;
@@ -540,9 +541,10 @@ fn bytes_are_empty(rel: &str, bytes: &[u8]) -> bool {
 // ─── fixes ──────────────────────────────────────────────────────────────────
 //
 // The fix acts on a file only when it is still the file the analysis read:
-// the same device and inode, size, and nanosecond mtime, opened without
+// the same device and inode, size, and nanosecond mtime, reached without
 // following a symlink. Nothing is unlinked: an empty file is renamed into
-// the quarantine. The quarantine is `memory/vault-quarantine/<run>/` in the workspace
+// the quarantine with an exclusive rename (see [`quarantine_empty`]). The
+// quarantine is `memory/vault-quarantine/<run>/` in the workspace
 // (Nucleus-owned, outside the vault, so Obsidian and its sync never see
 // it); run folders older than [`QUARANTINE_RETENTION_DAYS`] are removed at
 // the start of the next applying run.
@@ -575,11 +577,12 @@ fn apply(a: &mut Analysis, vault: &Path, ex: &Exclusions, opts: &CheckOptions) -
         let l = load(vault, ex)?;
         inbound_counts(&l.notes, &Resolver::new(&l.targets, &l.reportable))
     };
+    let root = Root::open(vault).with_context(|| format!("opening the vault at {}", vault.display()))?;
     for c in std::mem::take(&mut a.deletes) {
         let outcome = if inbound_now.get(&c.file.rel).copied().unwrap_or(0) > 0 {
             Ok(Outcome::Skipped("a note links to it now"))
         } else {
-            quarantine_empty(&c.file, &run_dir)
+            quarantine_empty(&root, &c.file, &run_dir, &mut |_| {})
         };
         record_outcome(&mut a.findings[c.finding], &mut a.counts, outcome);
     }
@@ -615,65 +618,98 @@ fn purge_quarantine(quarantine: &Path, now: chrono::DateTime<chrono::Utc>) {
     }
 }
 
-fn path_ident(p: &Path) -> std::io::Result<super::fsx::Ident> {
-    let dir = std::fs::File::open(p.parent().unwrap_or(Path::new(".")))?;
-    super::fsx::stat_at(&dir, p.file_name().unwrap_or_default())
+/// The two points in [`quarantine_empty`] where another process can
+/// change the vault. Tests act there; production does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// After the last identity check, before the move.
+    BeforeMove,
+    /// After a mismatched move, before the move back.
+    BeforeRestore,
 }
 
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)
-}
-
-/// Open `f` for a fix: no symlink, still the scanned file. `None` when it
-/// is not.
-fn open_same(f: &VaultFile) -> Result<Option<std::fs::File>> {
-    let file = match open_no_follow(&f.abs) {
-        Ok(file) => file,
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) || e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None);
+/// Move an empty file into the quarantine, never displacing another file.
+///
+/// The file's folder is opened once, relative to the vault root without
+/// following symlinks. The entry is checked with `fstatat(..,
+/// AT_SYMLINK_NOFOLLOW)` against the scanned identity (device, inode, size,
+/// nanosecond mtime), opened with `O_NOFOLLOW` and read to confirm it is
+/// still empty, and checked again right before the move. The move is an
+/// exclusive rename ([`fsx::rename_exclusive`]) from the folder descriptor
+/// into the quarantine, which never replaces an existing entry. The moved
+/// entry's identity is then checked in the quarantine: when another
+/// process replaced or wrote to the file after the last check, the moved
+/// entry is not the scanned file, and it is moved back with the same
+/// exclusive rename. If the path was recreated in the meantime, the move
+/// back fails instead of replacing the new file, and the moved file stays
+/// in the quarantine run folder (reported as an error). Without an
+/// exclusive rename on this platform or filesystem, the fix is not
+/// applied.
+fn quarantine_empty(root: &Root, f: &VaultFile, run_dir: &Path, hook: &mut dyn FnMut(Stage)) -> Result<Outcome> {
+    use std::io::Read;
+    const CHANGED: &str = "changed since the scan";
+    let name = f.raw_rel.file_name().context("vault file has no name")?;
+    let src_dir = match root.open_dir(f.raw_rel.parent().unwrap_or(Path::new(""))) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || fsx::is_symlink_refusal(&e) => {
+            return Ok(Outcome::Skipped(CHANGED));
         }
         Err(e) => return Err(e.into()),
     };
-    Ok(f.same_file(&super::fsx::Ident::of(&file)?).then_some(file))
-}
-
-/// Move an empty file into the quarantine after checking, on the open file,
-/// that it is the scanned file and still empty. After the rename the moved
-/// file's identity is checked again; a different file is moved back.
-fn quarantine_empty(f: &VaultFile, run_dir: &Path) -> Result<Outcome> {
-    use std::io::Read;
-    let Some(file) = open_same(f)? else { return Ok(Outcome::Skipped("changed since the scan")) };
+    let same_at = |dir: &std::os::fd::OwnedFd| fsx::stat_at(dir, name).is_ok_and(|id| f.same_file(&id));
+    if !same_at(&src_dir) {
+        return Ok(Outcome::Skipped(CHANGED));
+    }
     if f.size > EMPTY_PROBE_BYTES {
         return Ok(Outcome::Skipped("no longer empty"));
+    }
+    let (file, id) = match fsx::open_file_at(&src_dir, name) {
+        Ok(opened) => opened,
+        Err(_) => return Ok(Outcome::Skipped(CHANGED)),
+    };
+    if !f.same_file(&id) {
+        return Ok(Outcome::Skipped(CHANGED));
     }
     let mut bytes = Vec::new();
     (&file).take(EMPTY_PROBE_BYTES + 1).read_to_end(&mut bytes)?;
     if !bytes_are_empty(&f.rel, &bytes) {
         return Ok(Outcome::Skipped("no longer empty"));
     }
+
     let dest = run_dir.join("deleted").join(&f.rel);
-    std::fs::create_dir_all(dest.parent().context("quarantine path")?)?;
-    // The path must still name the verified file right before the rename.
-    if !path_ident(&f.abs).is_ok_and(|m| f.same_file(&m)) {
-        return Ok(Outcome::Skipped("changed since the scan"));
+    let dest_parent = dest.parent().context("quarantine path")?;
+    std::fs::create_dir_all(dest_parent)?;
+    let dest_dir = Root::open(dest_parent)?;
+    let dest_dir = dest_dir.fd();
+
+    // Last check, then the move.
+    if !same_at(&src_dir) {
+        return Ok(Outcome::Skipped(CHANGED));
     }
-    if let Err(e) = std::fs::rename(&f.abs, &dest) {
-        if e.kind() == std::io::ErrorKind::CrossesDevices {
-            anyhow::bail!("the quarantine is on another filesystem than the vault");
-        }
-        return Err(e.into());
+    hook(Stage::BeforeMove);
+    if let Err(e) = fsx::rename_exclusive(&src_dir, name, dest_dir, name) {
+        return match e.raw_os_error() {
+            _ if fsx::is_unsupported(&e) => {
+                Ok(Outcome::Skipped("this filesystem has no exclusive rename; reported only"))
+            }
+            Some(libc::EXDEV) => anyhow::bail!("the quarantine is on another filesystem than the vault"),
+            Some(libc::ENOENT) => Ok(Outcome::Skipped(CHANGED)),
+            _ => Err(e.into()),
+        };
     }
-    if path_ident(&dest).is_ok_and(|m| f.same_file(&m)) {
+    if same_at(dest_dir) {
         return Ok(Outcome::Done("moved to the vault-check quarantine".into()));
     }
-    // Another file took the path between the check and the rename: put it
-    // back. `hard_link` fails if something was created at the path since.
-    if std::fs::hard_link(&dest, &f.abs).is_ok() {
-        let _ = std::fs::remove_file(&dest);
-        return Ok(Outcome::Skipped("changed during the move; restored"));
+    // Not the scanned file: another process replaced or wrote to it after
+    // the last check. Move it back without replacing anything.
+    hook(Stage::BeforeRestore);
+    match fsx::rename_exclusive(dest_dir, name, &src_dir, name) {
+        Ok(()) => Ok(Outcome::Skipped("changed during the move; moved back")),
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => anyhow::bail!(
+            "changed during the move and the path was recreated; the moved file is kept in the quarantine run folder"
+        ),
+        Err(e) => Err(anyhow::Error::from(e).context("moving a changed file back from the quarantine")),
     }
-    anyhow::bail!("changed during the move; left in the quarantine run folder")
 }
 
 // ─── link resolution ────────────────────────────────────────────────────────
@@ -1364,6 +1400,8 @@ mod tests {
     use super::*;
     use crate::config::VaultCheckConfig;
     use std::fs;
+    use std::io::Write;
+    use std::path::PathBuf;
 
     fn write(root: &Path, rel: &str, text: &str) {
         let p = root.join(rel);
@@ -1710,7 +1748,7 @@ mod tests {
         let mtime = fs::metadata(&f.abs).unwrap().modified().unwrap();
         fs::write(&f.abs, "abc\n").unwrap();
         fs::File::options().write(true).open(&f.abs).unwrap().set_modified(mtime).unwrap();
-        assert!(matches!(quarantine_empty(&f, &run_dir).unwrap(), Outcome::Skipped("no longer empty")));
+        assert!(matches!(quarantine_empty(&Root::open(vault).unwrap(), &f, &run_dir, &mut |_| {}).unwrap(), Outcome::Skipped("no longer empty")));
         assert_eq!(fs::read_to_string(&f.abs).unwrap(), "abc\n");
 
         // Replaced by another file (new inode).
@@ -1718,7 +1756,7 @@ mod tests {
         let f = scanned(vault, "Untitled 3.md");
         fs::remove_file(&f.abs).unwrap();
         write(vault, "Untitled 3.md", "");
-        assert!(matches!(quarantine_empty(&f, &run_dir).unwrap(), Outcome::Skipped(_)));
+        assert!(matches!(quarantine_empty(&Root::open(vault).unwrap(), &f, &run_dir, &mut |_| {}).unwrap(), Outcome::Skipped(_)));
         assert!(f.abs.exists());
 
         // Replaced by a symlink.
@@ -1727,7 +1765,7 @@ mod tests {
         let f = scanned(vault, "Untitled 4.md");
         fs::remove_file(&f.abs).unwrap();
         std::os::unix::fs::symlink(tmp.path().join("outside.md"), &f.abs).unwrap();
-        assert!(matches!(quarantine_empty(&f, &run_dir).unwrap(), Outcome::Skipped(_)));
+        assert!(matches!(quarantine_empty(&Root::open(vault).unwrap(), &f, &run_dir, &mut |_| {}).unwrap(), Outcome::Skipped(_)));
         assert!(tmp.path().join("outside.md").exists());
 
         // Linked after the analysis: the apply step re-reads the links.
@@ -1743,6 +1781,119 @@ mod tests {
         let f = r.findings.iter().find(|f| f.kind == KIND_EMPTY_FILE).unwrap();
         assert_eq!(f.fix_action.as_deref(), Some("not applied: a note links to it now"));
         assert_eq!(r.counts.fixed, 0);
+    }
+
+    /// Replace the file at `p` by a new inode holding `text` (the way an
+    /// editor or a sync client saves: write a temporary file, rename over).
+    fn replace_file(p: &Path, text: &str) {
+        let tmp = p.with_extension("replace-tmp");
+        fs::write(&tmp, text).unwrap();
+        fs::rename(&tmp, p).unwrap();
+    }
+
+    /// The quarantine move never displaces a file another process put at
+    /// the path, at either point where that process can act.
+    #[test]
+    fn quarantine_move_never_displaces_a_recreated_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = &tmp.path().join("vault");
+        let run_dir = tmp.path().join("q/run");
+        let root = || Root::open(vault).unwrap();
+        let moved = |rel: &str| run_dir.join("deleted").join(rel);
+
+        // No interference: moved.
+        write(vault, "Untitled 1.md", "");
+        let f = scanned(vault, "Untitled 1.md");
+        assert!(matches!(quarantine_empty(&root(), &f, &run_dir, &mut |_| {}).unwrap(), Outcome::Done(_)));
+        assert!(!f.abs.exists() && moved("Untitled 1.md").exists());
+
+        // Replaced by a new file after the last check: the new file is
+        // moved, found not to be the scanned one, and moved back.
+        write(vault, "Untitled 2.md", "");
+        let f = scanned(vault, "Untitled 2.md");
+        let p = f.abs.clone();
+        let out = quarantine_empty(&root(), &f, &run_dir, &mut |s| {
+            if s == Stage::BeforeMove {
+                replace_file(&p, "typed on another device\n");
+            }
+        })
+        .unwrap();
+        assert!(matches!(out, Outcome::Skipped("changed during the move; moved back")));
+        assert_eq!(fs::read_to_string(&f.abs).unwrap(), "typed on another device\n");
+        assert!(!moved("Untitled 2.md").exists());
+
+        // Written in place (same inode) after the last check: moved back.
+        write(vault, "Untitled 3.md", "");
+        let f = scanned(vault, "Untitled 3.md");
+        let p = f.abs.clone();
+        let out = quarantine_empty(&root(), &f, &run_dir, &mut |s| {
+            if s == Stage::BeforeMove {
+                fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(b"x").unwrap();
+            }
+        })
+        .unwrap();
+        assert!(matches!(out, Outcome::Skipped("changed during the move; moved back")));
+        assert_eq!(fs::read_to_string(&f.abs).unwrap(), "x");
+
+        // Replaced after the last check, and the path recreated again
+        // before the move back: the move back fails instead of replacing
+        // the newest file; the moved file stays in the quarantine.
+        write(vault, "Untitled 4.md", "");
+        let f = scanned(vault, "Untitled 4.md");
+        let p = f.abs.clone();
+        let out = quarantine_empty(&root(), &f, &run_dir, &mut |s| match s {
+            Stage::BeforeMove => replace_file(&p, "second\n"),
+            Stage::BeforeRestore => fs::write(&p, "third\n").unwrap(),
+        });
+        let err = out.err().expect("the move back must refuse to replace").to_string();
+        assert!(err.contains("recreated"), "{err}");
+        assert_eq!(fs::read_to_string(&f.abs).unwrap(), "third\n");
+        assert_eq!(fs::read_to_string(moved("Untitled 4.md")).unwrap(), "second\n");
+    }
+
+    /// Another thread saves a file over the path at a varying moment while
+    /// the quarantine moves it. Whatever the interleaving, the saved file
+    /// ends at the path and the quarantine holds only the scanned (empty)
+    /// file.
+    #[test]
+    fn concurrent_recreation_is_never_quarantined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = &tmp.path().join("vault");
+        let run_dir = tmp.path().join("q/run");
+        let root = Root::open({
+            fs::create_dir_all(vault).unwrap();
+            vault
+        })
+        .unwrap();
+        let (mut moved, mut kept) = (0, 0);
+        for i in 0..300 {
+            let rel = format!("Untitled {i}.md");
+            write(vault, &rel, "");
+            let id = fsx::stat_at(root.fd(), std::ffi::OsStr::new(&rel)).unwrap();
+            let f = VaultFile::from_ident(rel.clone(), PathBuf::from(&rel), vault.join(&rel), &id);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let (b2, p) = (barrier.clone(), f.abs.clone());
+            let spin = (i % 30) * 2_000;
+            let t = std::thread::spawn(move || {
+                b2.wait();
+                for _ in 0..spin {
+                    std::hint::spin_loop();
+                }
+                replace_file(&p, "saved\n");
+            });
+            barrier.wait();
+            let out = quarantine_empty(&root, &f, &run_dir, &mut |_| {});
+            t.join().unwrap();
+            assert_eq!(fs::read_to_string(&f.abs).unwrap(), "saved\n", "iteration {i}: {:?}", out.as_ref().err());
+            let q = run_dir.join("deleted").join(&rel);
+            if q.exists() {
+                assert_eq!(fs::read_to_string(&q).unwrap(), "", "iteration {i}: the saved file was quarantined");
+                moved += 1;
+            } else {
+                kept += 1;
+            }
+        }
+        assert_eq!(moved + kept, 300);
     }
 
     #[test]

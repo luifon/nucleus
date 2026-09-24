@@ -161,13 +161,30 @@ Findings:
 
 One safe fix, only with `--apply` (or `scheduled_apply = true`), recorded on
 its finding (`not applied: <reason>` when a check below fails): move an
-empty file whose name starts with `Untitled` (Obsidian's default
-  name) and that nothing links to into the quarantine. Just before the move
-  the check re-reads every note's links (a note written since the analysis
-  may link to it), opens the file without following symlinks, and requires
-  the same device and inode, size and nanosecond mtime as the scan and
-  content that is still empty. After the rename the moved file's identity is
-  checked again; a different file is moved back.
+empty file whose name starts with `Untitled` (Obsidian's default name) and
+that nothing links to into the quarantine. The steps:
+
+1. Re-read every note's links; a note written since the analysis may link
+   to the file.
+2. Open the file's folder once, relative to the vault root descriptor
+   without following symlinks.
+3. Check the entry with `fstatat(.., AT_SYMLINK_NOFOLLOW)` against the scan:
+   the same device and inode, size and nanosecond mtime. Open it with
+   `O_NOFOLLOW` and confirm that its content is still empty. Check the entry
+   again.
+4. Move it with an exclusive rename from the folder descriptor into the
+   quarantine: `renameatx_np(.., RENAME_EXCL)` on macOS,
+   `renameat2(.., RENAME_NOREPLACE)` on Linux. An exclusive rename never
+   replaces an existing entry.
+5. Check the moved entry against the scan. If another process replaced or
+   wrote to the file between step 3 and step 4, it does not match, and it
+   is moved back with the same exclusive rename. If the path was created
+   again before the move back, the move back fails instead of replacing
+   that file; the moved file stays in the quarantine run folder and the
+   finding reports the error.
+
+Where the platform or the filesystem has no exclusive rename, the fix is
+not applied and the file is only reported.
 
 The check never writes into a note. A missing or empty `created:` key is a
 `frontmatter` finding that the operator resolves. An earlier version of this
@@ -178,8 +195,8 @@ replacing rename, and the rename then discards that write.
 
 **Quarantine.** `memory/vault-quarantine/<UTC time>-<pid>/`, in the
 workspace and outside the vault, so Obsidian and its sync do not see it:
-`deleted/<path>` holds moved files. Restoring is a move back. Run folders older than 30 days
-are removed at the start of the next applying run. The quarantine must be
+`deleted/<path>` holds moved files. Restoring is a move back. Run folders
+older than 30 days are removed at the start of the next applying run. The quarantine must be
 on the same filesystem as the vault (a rename); otherwise the fix is
 reported as not applied.
 
