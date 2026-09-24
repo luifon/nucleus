@@ -117,7 +117,7 @@ export interface InterpretResult {
   note?: string;
 }
 
-interface ClaudePlan {
+export interface ClaudePlan {
   ops: CaptureOp[];
   summary: string;
   confidence: number;
@@ -733,7 +733,7 @@ haven't, then emit the JSON and nothing else.`;
 /** parsePlan that returns null instead of throwing — used so a serialization
  *  slip routes into the retry / fallback path rather than dropping the
  *  capture entirely. */
-function safeParsePlan(raw: string | undefined): ClaudePlan | null {
+export function safeParsePlan(raw: string | undefined): ClaudePlan | null {
   if (!raw || !raw.trim()) return null;
   try {
     return parsePlan(raw);
@@ -746,7 +746,7 @@ function safeParsePlan(raw: string | undefined): ClaudePlan | null {
  *  verbatim capture into 0-Inbox as a single create op so the operator's
  *  normal review/apply flow preserves it. Low confidence flags that the
  *  decomposition is the operator's to do by hand. */
-function buildFallbackPlan(
+export function buildFallbackPlan(
   text: string,
   inputKind: "text" | "voice",
   today: string,
@@ -872,7 +872,7 @@ function parseOpPatches(raw: any, opCount: number): OpPatch[] {
   return out;
 }
 
-function parseInterpretResponse(raw: string, opCount: number): InterpretResult {
+export function parseInterpretResponse(raw: string, opCount: number): InterpretResult {
   const cleaned = extractJsonBlock(raw);
   let obj: any;
   try {
