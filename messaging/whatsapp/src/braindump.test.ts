@@ -3,7 +3,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { localToday, applyPlan, type CaptureOp } from "./braindump.js";
+import {
+  localToday,
+  applyPlan,
+  buildPlanPrompt,
+  VAULT_SEARCH_CMD,
+  VAULT_SEARCH_TOOL,
+  type CaptureOp,
+} from "./braindump.js";
 import { ChatSessionStore, PendingPlansStore } from "./db.js";
 import type { Config } from "./config.js";
 
@@ -108,4 +115,12 @@ test("empty patches behaves exactly like plain apply", () => {
   assert.equal(outcome.ops[0].resultPath, "0-Inbox/plain.md");
 
   fs.rmSync(vault, { recursive: true, force: true });
+});
+
+test("plan prompt points the planner at vault search before CREATE (ADR-035)", () => {
+  const prompt = buildPlanPrompt("capture text", "text", "/vault", "/vault/\n  0-Inbox/", "2026-01-01");
+  assert.ok(prompt.includes(`${VAULT_SEARCH_CMD} <2-4 distinctive words>`));
+  assert.ok(prompt.includes("VAULT STRUCTURE (truncated"));
+  // The pre-approval covers exactly the command the prompt names.
+  assert.equal(VAULT_SEARCH_TOOL, `Bash(${VAULT_SEARCH_CMD}:*)`);
 });

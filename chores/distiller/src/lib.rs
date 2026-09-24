@@ -27,6 +27,9 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 const AGENT_NAME: &str = "distiller";
+/// ADR-035 vault search, run by the contemplation session from the
+/// workspace root to find a note to append to.
+const VAULT_SEARCH_CMD: &str = "./target/release/nucleus vault-search";
 
 /// Days of diary one metabolism ask covers: yesterday plus today, the shape
 /// the daily pass has always pasted. A catch-up after failed nights walks the
@@ -355,6 +358,9 @@ async fn contemplation(workspace_root: &Path, diary_root: &Path, settings: &Sett
     })
     .add_dirs(vec![vault_path.clone()])
     .window_name("contemplation")
+    // Each ask may now run vault searches (ADR-035) before answering; the
+    // utility profile's 180 s ceiling was sized for a single JSON reply.
+    .max_wait(std::time::Duration::from_secs(360))
     .daily_session(AGENT_NAME)
     .spawn()
     .await
@@ -420,8 +426,18 @@ ARCHIVE rules (CLAUDE.md Rule 9 — read it if you haven't):
   5. `filename` is a leaf filename like "2026-W19-discord-routing.md"; the
      distiller writes it under `bucket/`. If None, defaults to
      `YYYY-Www-<agent>.md`.
+  6. Prefer APPEND over a new note (CLAUDE.md Rule 9.4). Before choosing a
+     new filename, search the vault for the theme:
+       {vault_search} <2-4 distinctive words> [--bucket <bucket>]
+     Each result prints a note's vault-relative path. If one already covers
+     the theme, set `bucket` to its folder and `filename` to its file name:
+     the distiller then appends your body to that note under a separator
+     (leading frontmatter in the body is dropped when appending). Several
+     dated notes on one theme in one folder mean the theme already has a
+     note; append to the most recent one.
 
-Vault structure right now (so you can pick a real `bucket` and link real siblings):
+Vault structure right now (truncated folder tree; use the search above to find
+notes by content):
 {vault_summary}
 
 PROMOTE / MERGE bodies are plain markdown: no YAML frontmatter (the distiller
@@ -451,6 +467,7 @@ PENDING CANDIDATES:
 ---"#,
             vault = vault_path,
             vault_summary = vault_summary,
+            vault_search = VAULT_SEARCH_CMD,
             retain_days = settings.diary.retain_days,
             body = body,
             pending = pending,
@@ -602,6 +619,9 @@ fn archive_to_para(
         .create(true)
         .append(true)
         .open(&path)?;
+    // Appending to an existing note: the note already has its frontmatter,
+    // so a second block in the middle of the file would be plain text.
+    let body = if exists { strip_leading_frontmatter(body) } else { body };
     if exists {
         writeln!(f, "\n---\n")?;  // separator between appended sessions
     }
@@ -742,4 +762,40 @@ fn strip_code_fence(s: &str) -> String {
     let t = s.trim();
     let t = t.trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
     t.to_string()
+}
+
+/// The body without a leading `---` frontmatter block.
+fn strip_leading_frontmatter(body: &str) -> &str {
+    let trimmed = body.trim_start();
+    match nucleus_core::vault::note::split_frontmatter(trimmed) {
+        (Some(_), rest, _) => rest,
+        (None, _, _) => body,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_appends_without_a_second_frontmatter() {
+        let tmp = std::env::temp_dir().join(format!("distiller-archive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("6-Slipbox")).unwrap();
+        let first = "---\ncreated: 2026-01-01\nsource: distiller-contemplation\n---\n# Idea\n\nFirst.";
+        let p = archive_to_para("a", &tmp, Some("6-Slipbox"), Some("idea.md"), first).unwrap();
+        let second = "---\ncreated: 2026-01-08\nsource: distiller-contemplation\n---\nSecond.";
+        archive_to_para("a", &tmp, Some("6-Slipbox"), Some("idea.md"), second).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.matches("created:").count(), 1, "{text}");
+        assert!(text.starts_with("---\ncreated: 2026-01-01"));
+        assert!(text.trim_end().ends_with("Second."));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn strip_leading_frontmatter_keeps_plain_bodies() {
+        assert_eq!(strip_leading_frontmatter("plain\n---\nnot fm"), "plain\n---\nnot fm");
+        assert_eq!(strip_leading_frontmatter("---\na: b\n---\nbody"), "body");
+    }
 }
