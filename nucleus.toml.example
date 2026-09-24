@@ -120,6 +120,13 @@ exclude = ["**/attachments/**", "**/_attachments/**", "**/assets/**"]
 # well-known key formats and PEM private keys. This optional regex
 # (case-insensitive, multi-line) adds your own patterns on top.
 credential_content_regex = ""
+# Dashboard search updates the index before it searches. Concurrent searches
+# share one update; the update is skipped when the last one started less than
+# this many seconds ago and no note changed since.
+dashboard_reindex_fresh_secs = 30
+# A search waits at most this long for the update, then answers 503 (the
+# update keeps running and the next search uses it).
+dashboard_reindex_wait_secs = 20
 
 # ADR-035 weekly vault check (`nucleus vault-check`). launchd wakes the job
 # hourly (tools/launchd/vault-check.plist.example); it runs when this cron

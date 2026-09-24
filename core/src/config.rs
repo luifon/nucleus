@@ -305,12 +305,36 @@ pub struct VaultSearchConfig {
     /// built-in detector.
     #[serde(default)]
     pub credential_content_regex: String,
+    /// Dashboard search: skip the index update when the last successful
+    /// update started less than this many seconds ago and the vault's
+    /// watermark (every note's path, size, mtime and inode, plus the
+    /// exclusion rules) has not changed since.
+    #[serde(default = "default_reindex_fresh_secs")]
+    pub dashboard_reindex_fresh_secs: u64,
+    /// Dashboard search: the longest a request waits for an index update
+    /// before it answers 503. The update keeps running; later requests
+    /// share it.
+    #[serde(default = "default_reindex_wait_secs")]
+    pub dashboard_reindex_wait_secs: u64,
 }
 
 impl Default for VaultSearchConfig {
     fn default() -> Self {
-        Self { exclude: default_vault_exclude(), credential_content_regex: String::new() }
+        Self {
+            exclude: default_vault_exclude(),
+            credential_content_regex: String::new(),
+            dashboard_reindex_fresh_secs: default_reindex_fresh_secs(),
+            dashboard_reindex_wait_secs: default_reindex_wait_secs(),
+        }
     }
+}
+
+fn default_reindex_fresh_secs() -> u64 {
+    30
+}
+
+fn default_reindex_wait_secs() -> u64 {
+    20
 }
 
 /// `[vault_search]` as `<workspace_root>/nucleus.toml` states it now, read
@@ -846,6 +870,8 @@ mod vault_config_tests {
         let (ds, dc) = (VaultSearchConfig::default(), VaultCheckConfig::default());
         assert_eq!(search.exclude, ds.exclude);
         assert_eq!(search.credential_content_regex, ds.credential_content_regex);
+        assert_eq!(search.dashboard_reindex_fresh_secs, ds.dashboard_reindex_fresh_secs);
+        assert_eq!(search.dashboard_reindex_wait_secs, ds.dashboard_reindex_wait_secs);
         assert_eq!(check.cron, dc.cron);
         assert_eq!(check.inbox_max_age_days, dc.inbox_max_age_days);
         assert_eq!(check.required_frontmatter, dc.required_frontmatter);

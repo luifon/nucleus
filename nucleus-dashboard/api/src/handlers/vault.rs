@@ -16,8 +16,11 @@
 //! paths only.
 //!
 //! This process never writes `memory/vault_index.db` (ADR-020): before a
-//! search it runs the index writer, `nucleus vault-search --reindex`, as a
-//! subprocess, then reads the index read-only.
+//! search it brings the index up to date by running the index writer,
+//! `nucleus vault-search --reindex`, as a subprocess, then reads the index
+//! read-only. [`IndexRefresh`] limits that to one subprocess at a time,
+//! shared by every search that arrives while it runs, and skips it while
+//! the index is known to be current.
 
 use axum::{
     extract::{Query, State},
@@ -26,7 +29,7 @@ use axum::{
     routing::get,
     Router,
 };
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use nucleus_core::vault::access::{self, AccessError};
 use nucleus_core::vault::check::{self, CheckReport, CheckRunSummary};
 use nucleus_core::vault::exclude::Exclusions;
@@ -34,7 +37,8 @@ use nucleus_core::vault::index::{self, VaultSearchResult};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub struct VaultState {
     pub root: PathBuf,
@@ -51,11 +55,122 @@ pub struct VaultState {
 pub type Reindex = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
 pub struct VaultSearch {
-    pub reindex: Reindex,
     /// `memory/vault_index.db`, opened read-only per request.
     pub index_db: PathBuf,
-    /// One reindex subprocess at a time from this process.
-    pub reindex_lock: tokio::sync::Mutex<()>,
+    pub refresh: IndexRefresh,
+}
+
+/// A vault watermark ([`nucleus_core::vault::scan::watermark`]).
+type Watermark = u64;
+
+/// Result of one index update, shared by every search waiting on it. The
+/// error is logged once, by the update task.
+type UpdateResult = Result<(), ()>;
+
+/// One running index update.
+#[derive(Clone)]
+struct Flight {
+    /// The vault watermark taken just before the update started.
+    watermark: Watermark,
+    done: Shared<BoxFuture<'static, UpdateResult>>,
+}
+
+#[derive(Default)]
+struct RefreshState {
+    in_flight: Option<Flight>,
+    /// Start time and watermark of the last update that succeeded.
+    last_ok: Option<(Instant, Watermark)>,
+}
+
+/// Why a search could not get a current index.
+#[derive(Debug)]
+pub enum RefreshError {
+    /// An update is running and did not finish within the wait bound.
+    Busy,
+    /// The update failed (logged by the update task).
+    Failed,
+}
+
+/// Keeps the index current for searches with at most one update running.
+///
+/// - **Single flight.** An update runs as its own task. A search that
+///   arrives while an update runs for the same vault watermark waits on
+///   that update's result instead of starting another. A search whose
+///   watermark differs (a note changed after the update started) waits for
+///   it to finish and then starts the next one.
+/// - **Bounded wait.** A search waits at most `max_wait` in total, then
+///   gets [`RefreshError::Busy`]. The update keeps running; it is never
+///   cancelled by a client that gave up, and later searches share it.
+/// - **Freshness.** No update runs when the last successful one started
+///   less than `fresh_for` ago and the watermark has not changed since.
+pub struct IndexRefresh {
+    reindex: Reindex,
+    fresh_for: Duration,
+    max_wait: Duration,
+    state: Arc<Mutex<RefreshState>>,
+}
+
+impl IndexRefresh {
+    pub fn new(reindex: Reindex, fresh_for: Duration, max_wait: Duration) -> Self {
+        Self { reindex, fresh_for, max_wait, state: Default::default() }
+    }
+
+    /// Return once the index reflects the vault at `watermark`.
+    pub async fn ensure_current(&self, watermark: Watermark) -> Result<(), RefreshError> {
+        let deadline = tokio::time::Instant::now() + self.max_wait;
+        loop {
+            let flight = {
+                let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some((at, w)) = st.last_ok {
+                    if w == watermark && at.elapsed() < self.fresh_for {
+                        return Ok(());
+                    }
+                }
+                match &st.in_flight {
+                    Some(f) => f.clone(),
+                    None => {
+                        let f = self.start(watermark);
+                        st.in_flight = Some(f.clone());
+                        f
+                    }
+                }
+            };
+            let result = tokio::time::timeout_at(deadline, flight.done.clone())
+                .await
+                .map_err(|_| RefreshError::Busy)?;
+            if flight.watermark == watermark {
+                return result.map_err(|()| RefreshError::Failed);
+            }
+            // That update started before the vault reached this state; check
+            // again, which starts the next update if none is running.
+        }
+    }
+
+    fn start(&self, watermark: Watermark) -> Flight {
+        let reindex = self.reindex.clone();
+        let state = self.state.clone();
+        let started = Instant::now();
+        let task = tokio::spawn(async move {
+            let result: UpdateResult = reindex().await.map_err(|e| {
+                tracing::warn!("vault: index update failed: {e:#}");
+            });
+            let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+            st.in_flight = None;
+            if result.is_ok() {
+                st.last_ok = Some((started, watermark));
+            }
+            result
+        });
+        let done = async move {
+            task.await.unwrap_or_else(|e| {
+                tracing::warn!("vault: index update task failed: {e}");
+                Err(())
+            })
+        }
+        .boxed()
+        .shared();
+        Flight { watermark, done }
+    }
 }
 
 /// The production [`Reindex`]: `<this binary> vault-search --reindex`,
@@ -138,13 +253,17 @@ async fn search(State(s): State<Arc<VaultState>>, Query(q): Query<SearchQ>) -> R
     let Some(vs) = &s.search else {
         return Err(VaultError::Unavailable("vault index is not available".into()));
     };
-    {
-        let _guard = vs.reindex_lock.lock().await;
-        (vs.reindex)().await.map_err(|e| {
-            tracing::warn!("vault: index update failed: {e:#}");
-            VaultError::Unavailable("updating the vault index failed".into())
+    let (root, ex) = (s.root.clone(), s.rules()?);
+    let watermark = blocking(move || nucleus_core::vault::scan::watermark(&root, &ex))
+        .await?
+        .map_err(|e| {
+            tracing::warn!("vault: reading the vault for the index watermark: {e:#}");
+            VaultError::Io("reading the vault failed".into())
         })?;
-    }
+    vs.refresh.ensure_current(watermark).await.map_err(|e| match e {
+        RefreshError::Busy => VaultError::Unavailable("the vault index is being updated; try again shortly".into()),
+        RefreshError::Failed => VaultError::Unavailable("updating the vault index failed".into()),
+    })?;
     // Rules loaded after the update: at least as new as the ones it used.
     let ex = s.rules()?;
     let Some(pool) = index::open_read_only_at(&vs.index_db)
@@ -375,6 +494,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use std::path::Path;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     async fn get_raw(app: &Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, String) {
@@ -400,6 +520,18 @@ mod tests {
     /// reindex runs core's writer in-process (production runs it as a
     /// subprocess).
     fn app(tmp: &Path) -> (Router, PathBuf, PathBuf) {
+        let (app, root, ws, _) = app_with(tmp, Duration::ZERO, Duration::from_secs(60), Duration::from_secs(30));
+        (app, root, ws)
+    }
+
+    /// [`app`] with the refresh settings and an update delay; also returns
+    /// the number of updates that started.
+    fn app_with(
+        tmp: &Path,
+        delay: Duration,
+        fresh_for: Duration,
+        max_wait: Duration,
+    ) -> (Router, PathBuf, PathBuf, Arc<std::sync::atomic::AtomicUsize>) {
         let root = tmp.join("vault");
         let ws = tmp.join("ws");
         for (rel, text) in [
@@ -414,9 +546,13 @@ mod tests {
         write(&ws, "nucleus.toml", "[vault_search]\nexclude = []\n");
         let index_db = tmp.join("idx.db");
         let (ws2, db2, lock, vault2) = (ws.clone(), index_db.clone(), tmp.join("idx.lock"), root.clone());
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = started.clone();
         let reindex: Reindex = Arc::new(move || {
             let (ws, db, lock, vault) = (ws2.clone(), db2.clone(), lock.clone(), vault2.clone());
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
+                tokio::time::sleep(delay).await;
                 let w = index::Writer::open_at(&ws, &db, &lock).await?;
                 w.update(&vault).await?;
                 w.pool().close().await;
@@ -426,10 +562,10 @@ mod tests {
         let state = Arc::new(VaultState {
             root: root.clone(),
             workspace_root: ws.clone(),
-            search: Some(VaultSearch { reindex, index_db, reindex_lock: Default::default() }),
+            search: Some(VaultSearch { index_db, refresh: IndexRefresh::new(reindex, fresh_for, max_wait) }),
             check_db: tmp.join("check.db"),
         });
-        (router(state), root, ws)
+        (router(state), root, ws, started)
     }
 
     #[tokio::test]
@@ -522,6 +658,83 @@ mod tests {
         let (_, body) = get_json(&app, "/recent?bucket=6-Slipbox").await;
         let rels: Vec<&str> = body.as_array().unwrap().iter().map(|f| f["relpath"].as_str().unwrap()).collect();
         assert_eq!(rels, vec!["6-Slipbox/idea.md"]);
+    }
+
+    fn updates(n: &std::sync::atomic::AtomicUsize) -> usize {
+        n.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A burst of concurrent searches runs one index update and every
+    /// search gets its result; a second burst on an unchanged vault runs
+    /// none; a changed note runs exactly one more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn search_burst_shares_one_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, root, _, started) =
+            app_with(tmp.path(), Duration::from_millis(300), Duration::from_secs(60), Duration::from_secs(30));
+
+        let burst = |app: Router| async move {
+            let reqs = (0..25).map(|_| {
+                let app = app.clone();
+                tokio::spawn(async move { get_json(&app, "/search?q=rocket").await })
+            });
+            futures::future::join_all(reqs).await.into_iter().map(|r| r.unwrap()).collect::<Vec<_>>()
+        };
+        for (status, body) in burst(app.clone()).await {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["hits"].as_array().unwrap().len(), 3, "{body}");
+        }
+        assert_eq!(updates(&started), 1, "one update for the whole burst");
+
+        for (status, _) in burst(app.clone()).await {
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(updates(&started), 1, "fresh and unchanged: no update");
+
+        write(&root, "6-Slipbox/new.md", "# New\n\nrocket new\n");
+        let (status, body) = get_json(&app, "/search?q=rocket").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["hits"].as_array().unwrap().len(), 4, "{body}");
+        assert_eq!(updates(&started), 2, "a changed note: one more update");
+    }
+
+    /// With the freshness window elapsed, an unchanged vault is updated
+    /// again (the watermark alone does not skip forever).
+    #[tokio::test]
+    async fn stale_window_updates_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, _, _, started) = app_with(tmp.path(), Duration::ZERO, Duration::ZERO, Duration::from_secs(30));
+        for _ in 0..3 {
+            assert_eq!(get_json(&app, "/search?q=rocket").await.0, StatusCode::OK);
+        }
+        assert_eq!(updates(&started), 3);
+    }
+
+    /// A search waits at most the bound for a running update and answers
+    /// 503; the update keeps running (it is not started again by the
+    /// waiting searches) and the next search uses its result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn search_wait_is_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, _, _, started) =
+            app_with(tmp.path(), Duration::from_millis(800), Duration::from_secs(60), Duration::from_millis(100));
+        let t0 = std::time::Instant::now();
+        let reqs = (0..10).map(|_| {
+            let app = app.clone();
+            tokio::spawn(async move { get_json(&app, "/search?q=rocket").await })
+        });
+        for r in futures::future::join_all(reqs).await {
+            let (status, body) = r.unwrap();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert!(body["error"].as_str().unwrap().contains("being updated"), "{body}");
+        }
+        assert!(t0.elapsed() < Duration::from_millis(600), "waited {:?}", t0.elapsed());
+        assert_eq!(updates(&started), 1);
+
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let (status, body) = get_json(&app, "/search?q=rocket").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(updates(&started), 1, "the finished update is reused");
     }
 
     /// H2 (dashboard side): an exclusion added while the dashboard runs

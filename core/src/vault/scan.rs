@@ -141,6 +141,21 @@ pub fn walk(root: &Path, ex: &Exclusions) -> Result<Walk> {
     Ok(out)
 }
 
+/// A value that changes when the search index would change: every walked
+/// file's path, size, nanosecond mtime and inode, and the exclusion rules'
+/// fingerprint. Reads no file content. Comparable only within one process
+/// (the hash is not stable across builds).
+pub fn watermark(root: &Path, ex: &Exclusions) -> Result<u64> {
+    use std::hash::{Hash, Hasher};
+    let w = walk(root, ex)?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ex.fingerprint().hash(&mut h);
+    for f in &w.files {
+        (&f.rel, f.size, f.mtime_ns, f.dev, f.ino).hash(&mut h);
+    }
+    Ok(h.finish())
+}
+
 /// Record the file paths under an excluded folder (names only).
 fn collect_excluded(root: &Root, raw_dir: &Path, rel_dir: &Path, out: &mut Vec<String>) {
     let mut stack = vec![(raw_dir.to_path_buf(), rel_dir.to_path_buf())];
@@ -200,5 +215,23 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path().join("out"), vault.join("b")).unwrap();
         let e = w.read_note(&w.files[1]).unwrap_err();
         assert!(fsx::is_symlink_refusal(&e), "{e}");
+    }
+
+    #[test]
+    fn watermark_tracks_notes_and_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path();
+        write(vault, "a/n.md", "one\n");
+        let ex = Exclusions::new(&[], "").unwrap();
+        let w0 = watermark(vault, &ex).unwrap();
+        assert_eq!(watermark(vault, &ex).unwrap(), w0);
+        write(vault, "a/n.md", "one, edited\n");
+        let w1 = watermark(vault, &ex).unwrap();
+        assert_ne!(w1, w0);
+        write(vault, "b/new.md", "x\n");
+        let w2 = watermark(vault, &ex).unwrap();
+        assert_ne!(w2, w1);
+        let ex2 = Exclusions::new(&["b/**".to_string()], "").unwrap();
+        assert_ne!(watermark(vault, &ex2).unwrap(), w2);
     }
 }
