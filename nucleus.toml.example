@@ -142,9 +142,9 @@ source_vocabulary = [
 orphan_exempt = ["README.md", "index.md", "Home.md", "_*", "0-Inbox/**", "1-Main-Notes/**", "2-Daily-Notes/**", "7-Archives/**"]
 # Never reported for frontmatter or source.
 frontmatter_exempt = ["README.md", "Home.md"]
-# Scheduled runs: apply the safe fixes (move empty `Untitled*` files that
-# nothing links to into memory/vault-quarantine/; add a missing `created`
-# from the file's birth time, keeping a copy of the original there).
+# Scheduled runs: apply the safe fix (move empty `Untitled*` files that
+# nothing links to into memory/vault-quarantine/). The check never rewrites
+# a note; a missing `created` is only reported.
 # Leave false until a few weekly reports look right. Manual runs use --apply.
 scheduled_apply = false
 # Scheduled runs: enqueue the one-line summary to the operator's WhatsApp DM.

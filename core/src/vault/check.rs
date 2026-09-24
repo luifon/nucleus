@@ -1,5 +1,5 @@
 //! Vault check (ADR-035): a deterministic structural report over the vault,
-//! with a small set of safe fixes.
+//! with one safe fix.
 //!
 //! No Claude session is involved. The report covers:
 //!
@@ -20,19 +20,16 @@
 //! - **empty files** — 0-byte files, empty notes, canvases with no nodes.
 //! - **oversized** — notes over [`super::MAX_NOTE_BYTES`], skipped unread.
 //!
-//! Fixes (only with `apply`, each recorded on its finding; see the "fixes"
-//! section for the checks each one makes before it touches a file):
+//! The fix (only with `apply`, recorded on its finding; see the "fixes"
+//! section for the checks it makes before it touches a file): move an
+//! empty file whose name starts with `Untitled` (Obsidian's default name
+//! for a new note, canvas or base) and that nothing links to into the
+//! quarantine.
 //!
-//! - move an empty file whose name starts with `Untitled` (Obsidian's
-//!   default name for a new note, canvas or base) and that nothing links to
-//!   into the quarantine;
-//! - add `created: <date>` from the file's birth time to a note that has no
-//!   `created` key (valid or missing frontmatter only; the file's mtime is
-//!   kept).
-//!
-//! Notes are otherwise never moved or renamed. Excluded paths and
-//! credential notes are never read for findings, never listed, and never
-//! modified.
+//! The check never writes into a note. A missing or empty `created:` key
+//! is a `frontmatter` finding for the operator. Notes are otherwise never
+//! moved or renamed. Excluded paths and credential notes are never read
+//! for findings, never listed, and never modified.
 
 use super::exclude::{Exclusions, GlobSet};
 use super::note::{self, Frontmatter, ParsedNote};
@@ -157,9 +154,9 @@ pub struct CheckOptions {
     pub frontmatter_exempt: GlobSet,
     /// "Today" for age calculations (local date).
     pub today: chrono::NaiveDate,
-    /// Where fixes put removed files and recovery copies
-    /// (`<workspace>/`[`QUARANTINE_DIR`] for `vault-check`). Required when
-    /// `apply` is set and there is something to fix.
+    /// Where the fix puts moved files (`<workspace>/`[`QUARANTINE_DIR`]
+    /// for `vault-check`). Required when `apply` is set and there is
+    /// something to fix.
     pub quarantine_dir: Option<std::path::PathBuf>,
 }
 
@@ -194,12 +191,6 @@ struct DeleteCandidate {
     finding: usize,
 }
 
-/// A note that `apply` may give a `created:` key.
-struct CreatedCandidate {
-    note: usize,
-    finding: usize,
-}
-
 /// The result of reading the vault, before any fix.
 pub struct Analysis {
     notes: Vec<Note>,
@@ -207,7 +198,6 @@ pub struct Analysis {
     counts: CheckCounts,
     files_excluded: i64,
     deletes: Vec<DeleteCandidate>,
-    created: Vec<CreatedCandidate>,
     started: std::time::Instant,
     started_at: String,
 }
@@ -385,8 +375,7 @@ pub fn analyze(vault: &Path, ex: &Exclusions, opts: &CheckOptions) -> Result<Ana
 
     // Frontmatter + source vocabulary.
     let mut by_source: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut created: Vec<CreatedCandidate> = Vec::new();
-    for (i, n) in notes.iter().enumerate() {
+    for n in &notes {
         if opts.frontmatter_exempt.matches(&n.file.rel) {
             continue;
         }
@@ -396,7 +385,7 @@ pub fn analyze(vault: &Path, ex: &Exclusions, opts: &CheckOptions) -> Result<Ana
             Frontmatter::Invalid => Some("frontmatter is not a valid YAML mapping".to_string()),
             Frontmatter::Valid(_) => {
                 // Absent keys and keys present with no value are reported
-                // apart: only an absent key can be added by a fix.
+                // apart.
                 let (mut missing, mut empty) = (Vec::new(), Vec::new());
                 for k in opts.required_frontmatter.iter().filter(|k| !fm.has_key(k)) {
                     if fm.contains_key(k) { empty.push(k.as_str()) } else { missing.push(k.as_str()) }
@@ -413,14 +402,7 @@ pub fn analyze(vault: &Path, ex: &Exclusions, opts: &CheckOptions) -> Result<Ana
         };
         if let Some(detail) = detail {
             counts.missing_frontmatter += 1;
-            let needs_created = opts.required_frontmatter.iter().any(|k| k == "created")
-                && !matches!(fm, Frontmatter::Invalid)
-                && !fm.contains_key("created");
             findings.push(simple(KIND_FRONTMATTER, &n.file.rel, detail));
-            // Empty notes are reported as empty, not given frontmatter.
-            if needs_created && n.file.birthtime.is_some() && !note_is_empty(&n.text) {
-                created.push(CreatedCandidate { note: i, finding: findings.len() - 1 });
-            }
         }
         if let Some(src) = n.parsed.source() {
             if !source_known(&src, &opts.source_vocabulary) {
@@ -463,7 +445,7 @@ pub fn analyze(vault: &Path, ex: &Exclusions, opts: &CheckOptions) -> Result<Ana
         findings.push(g);
     }
 
-    Ok(Analysis { notes, findings, counts, files_excluded, deletes, created, started, started_at })
+    Ok(Analysis { notes, findings, counts, files_excluded, deletes, started, started_at })
 }
 
 fn simple(kind: &str, path: &str, detail: String) -> Finding {
@@ -552,11 +534,10 @@ fn bytes_are_empty(rel: &str, bytes: &[u8]) -> bool {
 
 // ─── fixes ──────────────────────────────────────────────────────────────────
 //
-// Both fixes act on a file only when it is still the file the analysis read:
+// The fix acts on a file only when it is still the file the analysis read:
 // the same device and inode, size, and nanosecond mtime, opened without
 // following a symlink. Nothing is unlinked: an empty file is renamed into
-// the quarantine, and a note that gets `created:` is first copied there.
-// The quarantine is `memory/vault-quarantine/<run>/` in the workspace
+// the quarantine. The quarantine is `memory/vault-quarantine/<run>/` in the workspace
 // (Nucleus-owned, outside the vault, so Obsidian and its sync never see
 // it); run folders older than [`QUARANTINE_RETENTION_DAYS`] are removed at
 // the start of the next applying run.
@@ -573,7 +554,7 @@ enum Outcome {
 }
 
 fn apply(a: &mut Analysis, vault: &Path, ex: &Exclusions, opts: &CheckOptions) -> Result<()> {
-    if a.deletes.is_empty() && a.created.is_empty() {
+    if a.deletes.is_empty() {
         return Ok(());
     }
     let quarantine = opts
@@ -585,9 +566,7 @@ fn apply(a: &mut Analysis, vault: &Path, ex: &Exclusions, opts: &CheckOptions) -
 
     // Inbound links as they are now, not as they were at analysis time: a
     // note written since then may link to a candidate.
-    let inbound_now = if a.deletes.is_empty() {
-        HashMap::new()
-    } else {
+    let inbound_now = {
         let l = load(vault, ex)?;
         inbound_counts(&l.notes, &Resolver::new(&l.targets, &l.reportable))
     };
@@ -597,28 +576,15 @@ fn apply(a: &mut Analysis, vault: &Path, ex: &Exclusions, opts: &CheckOptions) -
         } else {
             quarantine_empty(&c.file, &run_dir)
         };
-        record_outcome(&mut a.findings[c.finding], &mut a.counts, outcome, true);
-    }
-
-    for c in std::mem::take(&mut a.created) {
-        let n = &a.notes[c.note];
-        let Some(date) = n.file.birthtime.and_then(unix_to_local_date) else { continue };
-        let outcome = add_created(&n.file, &n.text, &n.parsed.frontmatter, date, &run_dir);
-        // The finding is closed only when `created` was its only problem.
-        let only_created = opts
-            .required_frontmatter
-            .iter()
-            .filter(|k| k.as_str() != "created")
-            .all(|k| n.parsed.frontmatter.has_key(k));
-        record_outcome(&mut a.findings[c.finding], &mut a.counts, outcome, only_created);
+        record_outcome(&mut a.findings[c.finding], &mut a.counts, outcome);
     }
     Ok(())
 }
 
-fn record_outcome(f: &mut Finding, counts: &mut CheckCounts, outcome: Result<Outcome>, closes: bool) {
+fn record_outcome(f: &mut Finding, counts: &mut CheckCounts, outcome: Result<Outcome>) {
     match outcome {
         Ok(Outcome::Done(action)) => {
-            f.fixed = closes;
+            f.fixed = true;
             f.fix_action = Some(action);
             counts.fixed += 1;
         }
@@ -698,93 +664,6 @@ fn quarantine_empty(f: &VaultFile, run_dir: &Path) -> Result<Outcome> {
         return Ok(Outcome::Skipped("changed during the move; restored"));
     }
     anyhow::bail!("changed during the move; left in the quarantine run folder")
-}
-
-/// Line ending of the note's first line (`\r\n` or `\n`).
-fn line_ending(text: &str) -> &'static str {
-    match text.find('\n') {
-        Some(i) if i > 0 && text.as_bytes()[i - 1] == b'\r' => "\r\n",
-        _ => "\n",
-    }
-}
-
-/// Insert `created: <date>` into a note that has no `created` key. The note
-/// is opened once without following symlinks and checked to be the scanned
-/// file with the analysed text; the original is copied to the quarantine;
-/// the new text is written to a temporary file in the same folder with the
-/// original's permissions and mtime, and renamed over the note after a
-/// final identity check. The note's line ending is kept. The rename gives
-/// the note a new inode, so its filesystem birth time becomes the time of
-/// the fix; the `created:` value keeps the original date.
-fn add_created(
-    f: &VaultFile,
-    text: &str,
-    fm: &Frontmatter,
-    date: chrono::NaiveDate,
-    run_dir: &Path,
-) -> Result<Outcome> {
-    use std::io::{Read, Write};
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    if text.starts_with('\u{feff}') {
-        return Ok(Outcome::Skipped("the note starts with a byte-order mark"));
-    }
-    if fm.contains_key("created") {
-        return Ok(Outcome::Skipped("the note already has a created key"));
-    }
-    let Some(file) = open_same(f)? else { return Ok(Outcome::Skipped("changed since the scan")) };
-    let mut current = String::new();
-    (&file).take(super::MAX_NOTE_BYTES + 1).read_to_string(&mut current)?;
-    if current != text {
-        return Ok(Outcome::Skipped("changed since the scan"));
-    }
-    let eol = line_ending(text);
-    let new_text = match fm {
-        Frontmatter::Valid(_) => {
-            let Some(nl) = text.find('\n') else { return Ok(Outcome::Skipped("no line after the frontmatter start")) };
-            format!("{}created: {date}{eol}{}", &text[..nl + 1], &text[nl + 1..])
-        }
-        Frontmatter::Missing => format!("---{eol}created: {date}{eol}---{eol}{text}"),
-        Frontmatter::Invalid => return Ok(Outcome::Skipped("invalid YAML")),
-    };
-
-    // Recovery copy.
-    let backup = run_dir.join("backup").join(&f.rel);
-    std::fs::create_dir_all(backup.parent().context("quarantine path")?)?;
-    std::fs::write(&backup, text)?;
-
-    let meta = file.metadata()?;
-    let dir = f.abs.parent().context("note has no parent folder")?;
-    let name = f.abs.file_name().context("note has no file name")?.to_string_lossy();
-    let tmp = dir.join(format!(".{name}.vault-check-{}.tmp", std::process::id()));
-    let written = (|| -> std::io::Result<()> {
-        let mut t = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        t.write_all(new_text.as_bytes())?;
-        t.set_permissions(std::fs::Permissions::from_mode(meta.permissions().mode() & 0o7777))?;
-        t.set_modified(meta.modified()?)?;
-        t.sync_all()
-    })();
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    // Final check: the open note was not written to, and the path still
-    // names it (no swap for another file or a symlink).
-    let unchanged = file.metadata().is_ok_and(|m| f.same_file(&m))
-        && std::fs::symlink_metadata(&f.abs).is_ok_and(|m| f.same_file(&m));
-    if !unchanged {
-        let _ = std::fs::remove_file(&tmp);
-        return Ok(Outcome::Skipped("changed during the fix"));
-    }
-    if let Err(e) = std::fs::rename(&tmp, &f.abs) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    Ok(Outcome::Done(format!("added created: {date}")))
 }
 
 // ─── link resolution ────────────────────────────────────────────────────────
@@ -1647,7 +1526,6 @@ mod tests {
         let vault = &tmp.path().join("vault");
         let quarantine = tmp.path().join("quarantine");
         fixture(vault);
-        let before = fs::metadata(vault.join("6-Slipbox/no-frontmatter.md")).unwrap().modified().unwrap();
         let r = run(vault, &ex(), &apply_opts(&quarantine)).unwrap();
 
         // Untitled empties moved to the quarantine; a linked placeholder is kept.
@@ -1657,18 +1535,9 @@ mod tests {
         let run_dir = fs::read_dir(&quarantine).unwrap().next().unwrap().unwrap().path();
         assert!(run_dir.join("deleted/Untitled.canvas").exists());
         assert!(run_dir.join("deleted/Untitled 1.md").exists());
-        // Recovery copy of the note that got `created`.
-        assert_eq!(
-            fs::read_to_string(run_dir.join("backup/6-Slipbox/no-frontmatter.md")).unwrap(),
-            "Just text [[Beta]].\n"
-        );
 
-        // `created` added, mtime preserved, invalid YAML left alone.
-        let text = fs::read_to_string(vault.join("6-Slipbox/no-frontmatter.md")).unwrap();
-        assert!(text.starts_with("---\ncreated: "), "{text}");
-        assert!(text.ends_with("---\nJust text [[Beta]].\n"));
-        let after = fs::metadata(vault.join("6-Slipbox/no-frontmatter.md")).unwrap().modified().unwrap();
-        assert_eq!(before, after);
+        // Notes are never rewritten: no frontmatter is added or repaired.
+        assert_eq!(fs::read_to_string(vault.join("6-Slipbox/no-frontmatter.md")).unwrap(), "Just text [[Beta]].\n");
         assert_eq!(fs::read_to_string(vault.join("6-Slipbox/broken-yaml.md")).unwrap(), "---\ncreated: [oops\n---\ntext\n");
 
         // Excluded files untouched.
@@ -1676,12 +1545,11 @@ mod tests {
 
         let fixed = applied(&r);
         assert_eq!(r.counts.fixed as usize, fixed.len());
-        assert_eq!(fixed.len(), 3, "{fixed:?}");
-        // The note still lacks `source`, so its finding stays open.
-        let nf = fixed.iter().find(|f| f.path.as_deref() == Some("6-Slipbox/no-frontmatter.md")).unwrap();
-        assert!(!nf.fixed);
+        assert_eq!(fixed.len(), 2, "{fixed:?}");
+        assert!(fixed.iter().all(|f| f.kind == KIND_EMPTY_FILE && f.fixed));
 
-        // A second pass finds nothing left to fix.
+        // A second pass finds nothing left to fix; the frontmatter finding
+        // is still there for the operator.
         let r2 = run(vault, &ex(), &apply_opts(&quarantine)).unwrap();
         assert_eq!(r2.counts.fixed, 0);
         let d = r2
@@ -1689,7 +1557,8 @@ mod tests {
             .iter()
             .find(|f| f.path.as_deref() == Some("6-Slipbox/no-frontmatter.md") && f.kind == KIND_FRONTMATTER)
             .unwrap();
-        assert_eq!(d.detail, "missing: source");
+        assert_eq!(d.detail, "no frontmatter block");
+        assert!(d.fix_action.is_none());
     }
 
     #[test]
@@ -1785,32 +1654,31 @@ mod tests {
         assert_eq!(of(&r, KIND_OVERSIZED)[0].path.as_deref(), Some("0-Inbox/huge.md"));
     }
 
-    /// `created:` present but empty is reported as empty and never gets a
-    /// second `created` key; a CRLF note keeps CRLF.
+    /// A missing or empty `created:` is reported (apart: `missing:` and
+    /// `empty:`), and `--apply` leaves the note byte-for-byte unchanged.
     #[test]
-    fn created_fix_respects_empty_keys_and_line_endings() {
+    fn created_is_reported_never_written() {
         let tmp = tempfile::tempdir().unwrap();
         let vault = &tmp.path().join("vault");
         let quarantine = tmp.path().join("q");
-        write(vault, "6-Slipbox/empty-created.md", "---\ncreated:\nsource: manual\n---\nText.\n");
-        write(vault, "6-Slipbox/quoted.md", "---\ncreated: \"\"\nsource: manual\n---\nText.\n");
-        write(vault, "6-Slipbox/crlf.md", "---\r\nsource: manual\r\n---\r\nText.\r\n");
-        write(vault, "6-Slipbox/crlf-bare.md", "Text.\r\nMore.\r\n");
-        let r = run(vault, &ex(), &apply_opts(&quarantine)).unwrap();
-        for p in ["6-Slipbox/empty-created.md", "6-Slipbox/quoted.md"] {
-            let f = r.findings.iter().find(|f| f.path.as_deref() == Some(p) && f.kind == KIND_FRONTMATTER).unwrap();
-            assert_eq!(f.detail, "empty: created");
-            assert!(f.fix_action.is_none());
+        let notes = [
+            ("6-Slipbox/empty-created.md", "---\ncreated:\nsource: manual\n---\nText.\n", "empty: created"),
+            ("6-Slipbox/quoted.md", "---\ncreated: \"\"\nsource: manual\n---\nText.\n", "empty: created"),
+            ("6-Slipbox/crlf.md", "---\r\nsource: manual\r\n---\r\nText.\r\n", "missing: created"),
+            ("6-Slipbox/bare.md", "Text.\r\nMore.\r\n", "no frontmatter block"),
+        ];
+        for (p, text, _) in notes {
+            write(vault, p, text);
         }
-        assert_eq!(fs::read_to_string(vault.join("6-Slipbox/empty-created.md")).unwrap(), "---\ncreated:\nsource: manual\n---\nText.\n");
-        let crlf = fs::read_to_string(vault.join("6-Slipbox/crlf.md")).unwrap();
-        assert!(crlf.starts_with("---\r\ncreated: ") && crlf.ends_with("\r\nsource: manual\r\n---\r\nText.\r\n"), "{crlf:?}");
-        assert!(!crlf.replace("\r\n", "").contains('\n'));
-        let bare = fs::read_to_string(vault.join("6-Slipbox/crlf-bare.md")).unwrap();
-        assert!(bare.starts_with("---\r\ncreated: ") && bare.ends_with("\r\n---\r\nText.\r\nMore.\r\n"), "{bare:?}");
-        // The rewritten note parses, with one created key.
-        let n = note::parse("x.md", &crlf);
-        assert!(n.frontmatter.has_key("created"));
+        let r = run(vault, &ex(), &apply_opts(&quarantine)).unwrap();
+        for (p, text, detail) in notes {
+            let f = r.findings.iter().find(|f| f.path.as_deref() == Some(p) && f.kind == KIND_FRONTMATTER).unwrap();
+            assert_eq!(f.detail, detail, "{p}");
+            assert!(f.fix_action.is_none() && !f.fixed, "{p}");
+            assert_eq!(fs::read_to_string(vault.join(p)).unwrap(), text, "{p}");
+        }
+        assert_eq!(r.counts.fixed, 0);
+        assert!(!quarantine.exists(), "nothing to move, so no quarantine run");
     }
 
     fn scanned(vault: &Path, rel: &str) -> VaultFile {
@@ -1865,47 +1733,6 @@ mod tests {
         let f = r.findings.iter().find(|f| f.kind == KIND_EMPTY_FILE).unwrap();
         assert_eq!(f.fix_action.as_deref(), Some("not applied: a note links to it now"));
         assert_eq!(r.counts.fixed, 0);
-    }
-
-    /// H5: the `created` fix never writes through a swapped path or over a
-    /// change made after the scan, and keeps the file mode.
-    #[test]
-    fn created_fix_is_atomic_and_rechecks() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let vault = &tmp.path().join("vault");
-        let run_dir = tmp.path().join("q/run");
-        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
-
-        // Mode kept; recovery copy written; no temp file left.
-        write(vault, "6-Slipbox/a.md", "Body.\n");
-        fs::set_permissions(vault.join("6-Slipbox/a.md"), fs::Permissions::from_mode(0o640)).unwrap();
-        let f = scanned(vault, "6-Slipbox/a.md");
-        let n = note::parse(&f.rel, "Body.\n");
-        assert!(matches!(add_created(&f, "Body.\n", &n.frontmatter, date, &run_dir).unwrap(), Outcome::Done(_)));
-        assert_eq!(fs::read_to_string(&f.abs).unwrap(), "---\ncreated: 2026-01-02\n---\nBody.\n");
-        assert_eq!(fs::metadata(&f.abs).unwrap().permissions().mode() & 0o7777, 0o640);
-        assert_eq!(fs::read_to_string(run_dir.join("backup/6-Slipbox/a.md")).unwrap(), "Body.\n");
-        let leftovers: Vec<_> = fs::read_dir(vault.join("6-Slipbox")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with('.')).collect();
-        assert!(leftovers.is_empty());
-
-        // Written after the scan: skipped, the new content survives.
-        write(vault, "6-Slipbox/b.md", "Body.\n");
-        let f = scanned(vault, "6-Slipbox/b.md");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        fs::write(&f.abs, "Body, edited on another device.\n").unwrap();
-        assert!(matches!(add_created(&f, "Body.\n", &n.frontmatter, date, &run_dir).unwrap(), Outcome::Skipped(_)));
-        assert_eq!(fs::read_to_string(&f.abs).unwrap(), "Body, edited on another device.\n");
-
-        // Swapped for a symlink to a file outside the vault: untouched.
-        write(tmp.path(), "outside.md", "Body.\n");
-        write(vault, "6-Slipbox/c.md", "Body.\n");
-        let f = scanned(vault, "6-Slipbox/c.md");
-        fs::remove_file(&f.abs).unwrap();
-        std::os::unix::fs::symlink(tmp.path().join("outside.md"), &f.abs).unwrap();
-        assert!(matches!(add_created(&f, "Body.\n", &n.frontmatter, date, &run_dir).unwrap(), Outcome::Skipped(_)));
-        assert_eq!(fs::read_to_string(tmp.path().join("outside.md")).unwrap(), "Body.\n");
-        assert!(fs::symlink_metadata(&f.abs).unwrap().file_type().is_symlink());
     }
 
     #[test]

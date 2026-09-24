@@ -146,38 +146,31 @@ Findings:
 | `empty_file` | A 0-byte file, a note with no text after its frontmatter, or a canvas with no nodes. |
 | `oversized` | A note larger than 2 MiB; it is not read or checked. |
 
-Safe fixes, only with `--apply` (or `scheduled_apply = true`), each recorded
-on its finding (`not applied: <reason>` when a check below fails):
-
-- move an empty file whose name starts with `Untitled` (Obsidian's default
+One safe fix, only with `--apply` (or `scheduled_apply = true`), recorded on
+its finding (`not applied: <reason>` when a check below fails): move an
+empty file whose name starts with `Untitled` (Obsidian's default
   name) and that nothing links to into the quarantine. Just before the move
   the check re-reads every note's links (a note written since the analysis
   may link to it), opens the file without following symlinks, and requires
   the same device and inode, size and nanosecond mtime as the scan and
   content that is still empty. After the rename the moved file's identity is
   checked again; a different file is moved back.
-- add `created: <date>` from the file's birth time to a note that has no
-  `created` key, when its frontmatter is valid or absent and the note is not
-  empty. The note is opened once without following symlinks and must be the
-  scanned file with the analysed text. The original is copied to the
-  quarantine; the new text goes to a temporary file in the same folder with
-  the original's permissions and mtime, and replaces the note by rename after
-  a final identity check. The note's line ending (LF or CRLF) is kept. A key
-  that is present with no value is reported and left for the operator; a
-  second `created` key is never written. The rename gives the note a new
-  inode, so its filesystem birth time becomes the time of the fix; the
-  `created:` value keeps the original date.
+
+The check never writes into a note. A missing or empty `created:` key is a
+`frontmatter` finding that the operator resolves. An earlier version of this
+ADR added `created:` automatically; that fix was removed, because replacing a
+note's content cannot be made conditional on the note being unchanged: an
+editor or a sync client can replace the file between the last check and the
+replacing rename, and the rename then discards that write.
 
 **Quarantine.** `memory/vault-quarantine/<UTC time>-<pid>/`, in the
 workspace and outside the vault, so Obsidian and its sync do not see it:
-`deleted/<path>` holds moved files, `backup/<path>` the originals of
-rewritten notes. Restoring is a move back. Run folders older than 30 days
+`deleted/<path>` holds moved files. Restoring is a move back. Run folders older than 30 days
 are removed at the start of the next applying run. The quarantine must be
 on the same filesystem as the vault (a rename); otherwise the fix is
 reported as not applied.
 
-Notes are otherwise never moved or renamed, and invalid YAML is never
-rewritten.
+Notes are otherwise never moved or renamed.
 
 **History.** Each run stores its counts in `check_runs` and its findings in
 `check_findings`. Findings are kept for the latest 26 runs; counts are kept

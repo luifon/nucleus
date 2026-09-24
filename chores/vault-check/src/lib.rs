@@ -1,13 +1,13 @@
 //! `vault-check` — the weekly vault check (ADR-035).
 //!
 //! A deterministic pass over the Obsidian vault: no Claude session. The
-//! analysis, the safe fixes and the run history live in
+//! analysis, the safe fix and the run history live in
 //! `nucleus_core::vault::check`; this crate is the command, the weekly
 //! schedule gate, and the WhatsApp summary.
 //!
 //! Examples:
 //!   nucleus vault-check                  # report only, recorded in history
-//!   nucleus vault-check --apply          # also apply the safe fixes
+//!   nucleus vault-check --apply          # also apply the safe fix
 //!   nucleus vault-check --json           # full report as JSON
 //!   nucleus vault-check --notify         # also enqueue the WhatsApp summary
 //!   nucleus vault-check --scheduled      # what launchd runs hourly
@@ -53,9 +53,8 @@ const STALE_CLAIM_MINUTES: i64 = 30;
     about = "Structural check of the Obsidian vault (ADR-035): duplicates, broken links, orphans, stale inbox, frontmatter, sources, empty files"
 )]
 struct Cli {
-    /// Apply the safe fixes (move empty untitled files nothing links to
-    /// into the quarantine; add missing `created` from the file's birth
-    /// time). Default: report only.
+    /// Apply the safe fix: move empty untitled files nothing links to into
+    /// the quarantine. Default: report only. Notes are never rewritten.
     #[arg(long)]
     apply: bool,
     /// Print the full report as JSON.

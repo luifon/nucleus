@@ -168,10 +168,9 @@ configuration, not the locked palette.
   (`core-plugins.json`) and outside this ADR's scope.
 - **Vault search and hygiene.** Moved to [[ADR-035]] (2026-09-24): full-text
   search from sessions and the dashboard, and a weekly structural check. The
-  check's safe fixes (moving empty `Untitled*` files to a quarantine
-  outside the vault, adding a missing `created`) change vault files outside
-  Obsidian; `Home.md` and bucket
-  `README.md` files are exempt from the frontmatter and orphan rules, and
+  check's one safe fix (moving empty `Untitled*` files to a quarantine
+  outside the vault) changes vault files outside Obsidian; the check never
+  rewrites a note. `Home.md` and bucket `README.md` files are exempt from the frontmatter and orphan rules, and
   `.obsidian/` is never read.
 
 ## Implementation steps

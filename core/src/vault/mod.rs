@@ -10,7 +10,7 @@
 //!   before every query.
 //! - [`check`] — a deterministic structural check (duplicates, broken
 //!   links, orphans, stale inbox, frontmatter, source vocabulary, empty
-//!   files) with a small set of safe fixes, and a run history at
+//!   files) with one safe fix (empty untitled files to a quarantine), and a run history at
 //!   `memory/vault_check.db` (also written only by this module).
 //!
 //! - [`access`] — what the dashboard may open and list.

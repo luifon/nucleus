@@ -557,7 +557,7 @@ tmux kill-window -t nucleus-discord:<window-prefix>
 
 # Find vault notes by content (ADR-035; the index refreshes on every run)
 ./target/release/nucleus vault-search "weekly review" --bucket 3-Projects
-# Structural vault report; --apply also runs the safe fixes
+# Structural vault report; --apply also moves empty Untitled files into the quarantine
 ./target/release/nucleus vault-check
 
 # One-shot WhatsApp send (uses the paired session)

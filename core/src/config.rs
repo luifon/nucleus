@@ -367,7 +367,7 @@ pub struct VaultCheckConfig {
     /// Notes never reported for missing frontmatter or unknown source.
     #[serde(default = "default_frontmatter_exempt")]
     pub frontmatter_exempt: Vec<String>,
-    /// Apply the safe fixes on scheduled runs. Manual runs use `--apply`.
+    /// Apply the safe fix on scheduled runs. Manual runs use `--apply`.
     #[serde(default)]
     pub scheduled_apply: bool,
     /// Enqueue the WhatsApp summary on scheduled runs.
