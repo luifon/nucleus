@@ -1,4 +1,4 @@
-See ADR-015/016/034. |# Nucleus
+# Nucleus
 
 A personal-assistant stack that wires the Claude Code CLI into your Discord,
 WhatsApp, and a unified operator dashboard.
@@ -553,12 +553,12 @@ tmux kill-window -t nucleus-discord:<window-prefix>
 # Search past session transcripts (ADR-023; index refreshes on every run)
 ./target/release/nucleus session-search "what did we decide about X" --days 30
 ./target/release/nucleus session-search --prune            # junk-transcript report (dry-run)
+./target/release/nucleus reminders cancel <id>
 
 # Token and estimated-cost accounting, Claude Code + Codex (ADR-034).
 # The distiller refreshes daily; the dashboard /usage page refreshes on demand.
 ./target/release/nucleus usage refresh                     # incremental; --full re-reads everything
 ./target/release/nucleus usage report --days 30            # --vendor claude|codex, --top N
-./target/release/nucleus reminders cancel <id>
 
 # One-shot WhatsApp send (uses the paired session)
 cd messaging/whatsapp && npm run send -- <phone-or-jid> "<message>"

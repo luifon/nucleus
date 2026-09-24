@@ -16,7 +16,7 @@ The operator runs Claude Code and Codex on subscriptions, in many repositories, 
 - **Claude Code** writes one JSONL transcript per session under `~/.claude/projects/<encoded-cwd>/`, one per subagent under `<session>/subagents/`, and deletes transcripts after about 30 days (`cleanupPeriodDays`).
 - **Codex** writes one JSONL log per thread under `~/.codex/sessions/YYYY/MM/DD/` and keeps them.
 
-Measured on the operator's machine at implementation: 2,862 files, 9.2 GB (Claude 2.2 GB in 1,133 main and 545 subagent files; Codex 6.5 GB in 1,195 files).
+A machine used daily with both tools holds thousands of such files and several gigabytes of logs; Codex logs are several times larger than Claude transcripts because they are never deleted.
 
 ## Decision
 
@@ -27,20 +27,30 @@ Measured on the operator's machine at implementation: 2,862 files, 9.2 GB (Claud
 - `nucleus usage refresh` — the dashboard's refresh button spawns this command as a child process (the dashboard itself never writes the DB);
 - the distiller's daily pass, after the session-index maintenance.
 
-A lock file (`memory/usage-refresh.lock`, touched after every file, stale after 5 minutes) serializes the two. A second refresh while one runs fails with "already running" (the dashboard answers 409). The dashboard opens the DB read-only and before the first refresh reports "no data".
+An exclusive advisory lock (`flock`) on `memory/usage-refresh.lock`, held through an open file descriptor for the whole refresh, serializes the two. The kernel releases it when the descriptor closes, also when the process dies, so there is no staleness timer that could expire under a healthy refresh and no lock file for a second process to delete. A second refresh while one runs fails with "already running". The dashboard adds an in-process single-flight gate: a POST takes the gate, answers 409 when its own child is still running or the lock is held, and only then spawns, so simultaneous requests start one child. The dashboard opens the DB read-only and before the first refresh reports "no data".
 
 The store keeps aggregates permanently: rows per API response (no content), per cost-state run, per limit event, per session. Transcript deletion does not remove anything from it. The first refresh backfills every file that still exists.
 
 ### 2. Incremental and idempotent
 
-`source_files` records, per file, the byte offset read so far, the file size and mtime, and the parser's carry state. A refresh skips unchanged files and reads only appended bytes; a half-written last line is left for the next refresh. Each file's records and its new offset commit in one transaction, so a crash leaves both or neither. Every row has a stable key and every write is an upsert, so `nucleus usage refresh --full` (re-read everything) converges on the same rows. The reader holds one line at a time: peak memory on the full 9.2 GB backfill was 76 MB. Timings on the operator's machine: first backfill 10–17 s, incremental refresh 0.3–4 s.
+`source_files` records, per file, its identity (device and inode), size, mtime, the byte offset read so far, the parser's carry state, and a fingerprint of the part already read: a hash of the first 64 KiB and of the 64 KiB that end at the offset. Per file a refresh:
+
+- **skips** it when identity, size and mtime are unchanged;
+- **appends** from the stored offset with the stored carry when the identity is the same, the file is not shorter than the offset, and the fingerprint still matches;
+- otherwise **re-reads** it from byte 0 with an empty carry (new file, `--full`, a different inode at the path, truncation below the offset, or content rewritten in place), deleting every observation of that path first.
+
+A half-written last line is left for the next refresh. Each file's deletions, records and new state commit in one transaction, so a crash leaves all or none of it. An in-place edit that keeps the size and touches neither fingerprint window is not detected; `--full` recovers it.
+
+The store has two layers. Per-file **observations** (`usage_obs`, `cost_runs`, `limit_events`, `rate_snapshots`, keyed by path) record what each file says. **Counted rows** (`usage_rows`) are derived from the observations of every file that contains a response: the observation with the largest output (the final line of a streamed response), then the file whose first line is oldest (the original session rather than a fork that copied it), then the path. Only the keys a refresh touched are re-derived; a key no file observes any more is removed. Every key is derived from content, never from a byte position, and the derivation depends only on the stored observations, so `nucleus usage refresh --full` produces exactly the rows of the incremental history. A test drives one fixture through appends, a same-size rewrite, truncate-and-regrow, a fork, a resume, Codex counter resets and a replace-by-rename, and compares every counted value against a fresh `--full` read.
+
+Memory is bounded: the reader holds one line of at most 32 MiB (a longer line is skipped and counted), and records reach the database in batches of 2,000 through a bounded channel inside the file's transaction. Files that cannot be read, relevant lines that are not valid JSON, and oversized lines are counted per refresh in `refresh_runs` (with the first warnings) and per file in `source_files`; the page shows a partial refresh as `[PARTIAL: …]`, and lines skipped in stored files stay reported until the file changes. Deleted-between-discovery-and-read files are not failures. Discovery never follows a symbolic link below the configured roots, so a link cycle or a link out of the root is never walked.
 
 ### 3. Claude Code parsing
 
 - **Responses.** Usage is on `type:"assistant"` lines (`message.usage`). One API response is written as several lines — one per content block, each repeating the usage — and a streamed response also writes partial lines (`output_tokens` 1, `stop_reason` null). The dedupe key is `message.id` (fallback `requestId`, then the line `uuid`); the line with the largest `output_tokens` wins, within a batch and across refreshes (the upsert only replaces a row when the new output is not smaller).
 - **Token categories** stored per row: uncached `input`, `cache_write_5m`, `cache_write_1h` (from `usage.cache_creation`; a missing split counts as 5-minute), `cache_read`, `output`, and `reasoning` (`output_tokens_details.thinking_tokens`, a subset of output, display only).
 - **Subagents.** `<session>/subagents/agent-<id>.jsonl` is not part of the main file. Its rows carry the parent session id and the subagent id; the agent type comes from `agent-<id>.meta.json`.
-- **Shared responses.** A resumed or forked session file repeats responses that another session file already recorded. The row is stored once (the first file processed owns it); `usage_keys` records every session whose files contain the key, which the reconciliation uses (§4).
+- **Shared responses.** A resumed or forked session file repeats responses that another session file already recorded. Each file's observation is kept; the counted row is derived once (§2), and the reconciliation uses the observations to know every session whose files contain the key (§4).
 - **Errors and limits.** Synthetic assistant lines (`isApiErrorMessage`, model `<synthetic>`) become limit events: usage limits (`error:"rate_limit"`, 429, `quotaLimits.rateLimitType`, `resetsAt`), overload (529 and other 5xx), `invalid_request` ("prompt is too long"), authentication failures.
 - **Titles and working directory** come from `ai-title` / `custom-title` lines and the first line carrying `cwd`.
 
@@ -49,25 +59,36 @@ The store keeps aggregates permanently: rows per API response (no content), per 
 Claude Code writes `type:"cost-state"` lines: per model, the running token totals of one process run (`startTime`) and its own dollar estimate `costUSD`. Two findings from the real data decide how it is used:
 
 1. It is not a session total. A resumed session starts a new run and the counter does not always carry the earlier run's totals, so long resumed sessions show cost-state totals far below their transcript.
-2. It counts calls that no assistant line records — background calls that reuse the session's context (cache reads with little output), title generation on a small model. On the operator's data this is about 3% of Claude tokens.
+2. It counts calls that no assistant line records — background calls that reuse the session's context (cache reads with little output), title generation on a small model. They are a small share of Claude tokens.
+3. Runs overlap. A fork or resume repeats responses of an earlier run inside its own window, and one process that hosts several sessions can carry its counter from one session into the next, keeping the original start time.
 
-Rule, per (session, run, model) over the run's window `[startTime, last timestamp before the snapshot]` and per token category, with `O` = observed responses whose key appears in the session's files and `C` = cost-state totals:
+Rule, per model, over each run's window `[startTime, last timestamp before the snapshot]`, with `O` = counted responses whose key appears in the session's files and `C` = cost-state totals:
 
-- **Tokens counted = max(O, C).** The responses, plus a derived **residual** row of `max(0, C − O)`.
-- **Dollars = costUSD for everything cost-state covers, and the price table for observed tokens beyond it.** Implemented as table prices on every response and residual row plus a derived **adjustment** row of `costUSD − table(C)`. The sum is `costUSD + table(max(0, O − C))`.
+1. **One owner per response.** Runs are ordered by (start, snapshot, session). A response in several runs' windows belongs to the first; later runs see it as carried.
+2. **New counter part.** A run with carried responses subtracts `D`, what its counter already holds from earlier runs. If its token total is at least that of the largest earlier run owning its carried responses, the counter continued that run: `D` = that run's totals and `D`'s dollars = that run's `costUSD`. Otherwise the counter restarted: `D` = the carried responses' tokens, with dollars in proportion to their table price (their token share for a model without a price). `C' = C − D`, `costUSD' = costUSD − D$`.
+3. **Tokens counted = the owned responses plus a derived residual row of `max(0, C' − O_own)`** per category.
+4. **Dollars = `costUSD'` for everything the run's new part covers, and the price table for owned responses beyond it.** Implemented as table prices on every response and residual row plus a derived **adjustment** row of `costUSD' − table(C')`. The sum is `costUSD' + table(max(0, O_own − C'))`.
 
-Nothing is counted twice: residual tokens are only the excess of `C` over `O`, and the adjustment replaces the table's price of `C` instead of adding to it. Cost-state records cache writes without the 5-minute/1-hour split; `C`'s split follows the window's responses (1-hour when the window has none). Residual and adjustment rows are deleted and recomputed on every refresh. The total adjustment is the price table's drift from Claude Code's own prices; on the operator's data it is −$0.37 over $3,654 of cost-state estimates (1,738 runs).
+Nothing is counted twice: each response has one owner, each counter's dollars are split by subtraction, residual tokens are only the excess of `C'` over `O_own`, and the adjustment replaces the table's price of `C'` instead of adding to it. For a model without a price, the dollars come from the adjustments alone, once per counter. Cost-state records cache writes without the 5-minute/1-hour split; the split follows the window's responses (1-hour when the window has none). Residual and adjustment rows are deleted and recomputed on every refresh. The total adjustment is the price table's drift from Claude Code's own prices; the models tab shows it next to the sum of `costUSD'`. A counter that continues an earlier run under a new start time holds none of the earlier responses in its window, so that overlap is not visible and is not subtracted.
 
 ### 5. Codex parsing
 
 - The first `session_meta` names the thread, its working directory and, for a subagent thread, the parent (`source.subagent.thread_spawn.parent_thread_id`); a subagent's usage is attributed to the parent session. `turn_context.model` sets the model for the following turns.
-- `event_msg` / `token_count` carries `info.total_token_usage` (cumulative for the thread) and `info.last_token_usage` (the response that produced the event). Codex re-emits an unchanged event after some turns, and a thread can restart its counter. Rule: an event whose total equals the previous event's total is a repeat and is skipped; every other event contributes its `last_token_usage`. This is also correct for a forked thread, whose first total includes the parent's history.
+- `event_msg` / `token_count` carries `info.total_token_usage` (cumulative for the thread) and `info.last_token_usage` (the response that produced the event). Codex re-emits an unchanged event after some turns, and a thread can restart its counter. Rule: an event whose cumulative totals equal the previous event's in every field (input, cached, cache writes, output, reasoning, total) is a repeat and is skipped; every other event contributes its `last_token_usage`. Comparing every field keeps a reset whose new total equals the old one from being taken for a repeat. This is also correct for a forked thread, whose first total includes the parent's history. The row key is the thread id, the event timestamp and the cumulative totals, so a re-read produces the same keys.
 - OpenAI counts cached tokens inside `input_tokens` and reasoning inside `output_tokens`; the row stores `input − cached` as input so categories do not overlap.
-- `rate_limits.primary/secondary` readings are stored (deduplicated per reset window and percentage); a non-null `rate_limit_reached_type` is a limit event, one per limit type and reset window.
+- `rate_limits.primary/secondary` readings are stored (deduplicated per reset window and percentage; a reading without a reset time uses a fixed placeholder key, so it deduplicates too); a non-null `rate_limit_reached_type` is a limit event, one per limit type and reset window.
 
 ### 6. Price table and the dollar estimate
 
-Every dollar figure is labelled "estimate at API list price". The built-in table (`core/src/usage/pricing.rs`) lists every model found in the Claude Code and Codex logs, in USD per million tokens (input, output, cache read, cache write 5-minute and 1-hour), with the source and the date it was read (`PRICES_AS_OF`). `[usage.prices]` in `nucleus.toml` overrides or extends it. A model matches by exact id, then by the longest table key that is a prefix at a `-` boundary; a `[1m]` suffix is ignored. Anthropic prices were checked against Claude Code's cost-state (§4). `codex-auto-review` (Codex's automatic approval-review model) is not on OpenAI's pricing page; its price comes from a third-party price aggregator and is marked as such in the table.
+Every dollar figure is an estimate at API prices, not billing. The built-in table (`core/src/usage/pricing.rs`) lists every model found in the Claude Code and Codex logs, in USD per million tokens (input, output, cache read, cache write 5-minute and 1-hour), and records per model its **basis**, source URL and retrieval date (`PRICES_AS_OF`):
+
+- **API list price** — read from the vendor's pricing page (Anthropic's and OpenAI's).
+- **Third-party estimate** — the vendor publishes no price. `codex-auto-review` (Codex's automatic approval-review model) is not on OpenAI's pricing page; its input and output rates come from a third-party price listing, whose URL and retrieval date the table stores. Every total carries `third_party_usd`, and the page marks each dollar figure that includes it ("incl. $X at a third-party estimate", with the source in the tooltip); the CLI report prints the source.
+- **Inferred** rates — a rate the source does not list is derived and marked: `codex-auto-review`'s cached-input and cache-write rates follow OpenAI's ratios for its listed models, and `gpt-5.3-codex`'s cache writes are billed like uncached input because OpenAI lists no cache-write price for it.
+
+OpenAI bills a request whose input (uncached + cached + cache writes) is more than 272,000 tokens at long-context rates for the whole request: 2 x input, cached input and cache writes, 1.5 x output, on the models the pricing page lists them for. The table carries those rates, and each response is priced on its own before any sum. Anthropic bills the full context of Claude 4.6 and later at the standard rates.
+
+`[usage.prices]` in `nucleus.toml` overrides or extends the table (basis "nucleus.toml", optional `long_context`). A model matches by exact id, then by the longest table key that is a prefix at a `-` boundary; a `[1m]` suffix is ignored. Anthropic prices agree with Claude Code's own cost-state estimates to within the drift the models tab reports (§4).
 
 A model without a price is counted in tokens and costs 0 in the sums; every total carries `unpriced_tokens`, and the page shows "+ N tokens without a price" next to any dollar figure that includes such tokens, so a missing price never reads as a lower cost. The price table and each model's match are listed on the page.
 
@@ -92,13 +113,17 @@ Labels, lowest priority first: venue DBs (`discord.db`, `whatsapp.db`, `chat.db`
 
 Charts are hand-rolled SVG with the locked palette: Claude = the amber accent, Codex = the neutral faint gray, heatmap = one amber ramp. The two-series pair fails the dataviz validator's lightness-band and chroma checks (the locked palette has one accent and neutrals) and passes the colorblind and normal-vision separation checks (ΔE 25.8 / 28.3); identity never relies on color alone — each two-series chart has a legend and every view has a table.
 
-Claude data before (first refresh − 30 days) is incomplete, because those transcripts were already deleted; the status endpoint returns that day and the page says so on any comparison that reaches before it. Codex history is complete.
+Claude data before (first refresh − 30 days) is incomplete, because those transcripts were already deleted; the status endpoint returns that day and the page says so on any range that reaches before it, and always on "all time" while Claude is in scope. Codex history is complete.
+
+Day bounds of every range (`range_from` in the summary, `from`/`to` of the limit events) are computed by the server in `NUCLEUS_TZ`; the page never derives a day from the browser's timezone, and it shows event times in `NUCLEUS_TZ` too. The Nucleus tab's 30-day figures (recurring jobs, agents, reminders) carry their own unpriced-token counts and third-party dollars, and every Nucleus dollar figure shows the same notes as the other tabs.
 
 API: `GET /usage/api/{status,summary,projects,nucleus,limits,sessions}`, `POST /usage/api/refresh`; wire types are ts-rs generated.
 
 ## Rejected alternatives
 
-- **Aggregating only daily rows.** Per-response rows are needed for exact dedupe across refreshes, the heatmap, largest sessions and reconciliation windows. They are small (no content): about 60,000 Claude responses and 38,000 Codex events for the whole corpus.
+- **Aggregating only daily rows.** Per-response rows are needed for exact dedupe across refreshes, the heatmap, largest sessions and reconciliation windows. They are small (no content): tens of thousands of rows for months of daily use.
+- **Byte offsets in keys.** A key built from a line's position changes when a file is rewritten, and the re-read then counts the same usage under a second key.
+- **A lock file with a staleness timer.** A long phase outlives any fixed timeout, and a second refresh then deletes the live lock. The kernel's advisory lock has no timeout to guess.
 - **Using cost-state as the Claude total.** It undercounts resumed sessions (§4, finding 1).
 - **Ignoring cost-state.** It would lose the background calls it alone records (§4, finding 2).
 - **Writing from the dashboard process.** Violates ADR-020's single-writer rule; the dashboard spawns the CLI instead.

@@ -116,11 +116,12 @@ prune_max_age_days = 14
 
 # ADR-034 usage accounting (`nucleus usage refresh`, dashboard /usage). Every
 # value is optional; the defaults read the standard transcript locations.
-# Dollar figures are estimates at API list price. The built-in price table
-# (core/src/usage/pricing.rs) lists every model seen in Claude Code and Codex
-# logs with its source and the date it was read; add or override a model here
-# in USD per million tokens, keyed by model id or id prefix. A model with no
-# price is shown on the page as "tokens without a price", never as $0.
+# Dollar figures are estimates at API prices, not billing. The built-in price
+# table (core/src/usage/pricing.rs) lists every model seen in Claude Code and
+# Codex logs with its basis (API list price or third-party estimate), source
+# URL and the date it was read; add or override a model here in USD per
+# million tokens, keyed by model id or id prefix. A model with no price is
+# shown on the page as "tokens without a price", never as $0.
 # [usage]
 # claude_projects_dir = "~/.claude/projects"
 # codex_sessions_dir = "~/.codex/sessions"
@@ -131,3 +132,10 @@ prune_max_age_days = 14
 # cache_read = 0.3
 # cache_write_5m = 3.75
 # cache_write_1h = 6.0
+# Optional whole-request rates above a prompt size (OpenAI long context):
+# [usage.prices."some-new-model".long_context]
+# above_input_tokens = 272000
+# input = 6.0
+# output = 22.5
+# cache_read = 0.6
+# cache_write = 7.5

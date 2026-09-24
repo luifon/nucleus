@@ -500,6 +500,6 @@ JSON-parsed numbers.
   ("how much did X cost", "which reminder is expensive"): answer from
   `nucleus usage report --days N [--vendor claude|codex]` or the dashboard
   `/usage` page. `memory/usage.db` has one writer, `nucleus usage refresh`;
-  never write to it directly. Dollar figures are estimates at API list
-  price, not billing.
+  never write to it directly. Dollar figures are estimates at API prices,
+  not billing; a figure that includes a third-party estimate says so.
 - `$NUCLEUS_TIER2_DIR/MEMORY.md` (typically `~/.claude/projects/<cwd-encoded>/memory/MEMORY.md`) — Tier 2 shared facts (auto-loaded; check the index there for what's already known about the user)
