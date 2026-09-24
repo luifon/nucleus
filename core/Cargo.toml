@@ -25,6 +25,7 @@ dotenvy = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
 memchr = "2"
+libc = "0.2"
 reqwest = { workspace = true }
 ts-rs = { workspace = true }
 

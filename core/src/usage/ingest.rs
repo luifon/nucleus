@@ -18,6 +18,14 @@
 //! edit that leaves the size unchanged and touches neither window is not
 //! detected; `nucleus usage refresh --full` re-reads everything.
 //!
+//! Opening: discovery records each regular file's (device, inode) without
+//! following links. A file is then opened relative to a descriptor of its
+//! discovery root, one component at a time with `O_NOFOLLOW`, and the
+//! descriptor is `fstat`ed: it must be a regular file with the discovered
+//! identity. All reads use that descriptor. A path swapped for a link out
+//! of the root, a directory link, or another file between discovery and
+//! reading is refused and reported as a failed file.
+//!
 //! Memory is bounded: the reader holds one line (at most
 //! [`MAX_LINE_BYTES`]; a longer line is skipped and counted) and records
 //! reach the database in batches of [`BATCH_RECORDS`] through a bounded
@@ -46,6 +54,14 @@ const MAX_DEPTH: usize = 12;
 #[derive(Debug, Clone)]
 pub struct Source {
     pub path: PathBuf,
+    /// The discovery root `path` lies under. The file is opened through a
+    /// descriptor of this directory, never by its full path (see
+    /// [`open_source`]).
+    pub root: PathBuf,
+    /// Identity (device, inode) of the regular file discovery saw at
+    /// `path`. The opened descriptor must refer to the same file.
+    pub dev: i64,
+    pub ino: i64,
     pub vendor: Vendor,
     /// Claude only: the file's attribution.
     pub claude_ctx: Option<claude::FileCtx>,
@@ -56,6 +72,100 @@ pub struct Source {
 
 fn is_jsonl(p: &Path) -> bool {
     p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+}
+
+/// `(dev, ino)` of a directory entry that is a regular file, without
+/// following a symbolic link.
+fn regular_file_id(e: &std::fs::DirEntry) -> Option<(i64, i64)> {
+    let m = e.metadata().ok()?;
+    m.file_type().is_file().then(|| (m.dev() as i64, m.ino() as i64))
+}
+
+/// Open `rel` below the directory `root` without following a symbolic link
+/// at any component below `root`: each directory is opened relative to its
+/// parent's descriptor with `O_DIRECTORY | O_NOFOLLOW`, and the last
+/// component with `O_NOFOLLOW | O_NONBLOCK` (a FIFO swapped in cannot block
+/// the open). `root` itself is configuration and may be a link. `rel` must
+/// consist of plain names only.
+pub fn open_beneath(root: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+    let names: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .map(|c| match c {
+            Component::Normal(n) => Ok(n),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path component is not a plain name")),
+        })
+        .collect::<std::io::Result<_>>()?;
+    if names.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty relative path"));
+    }
+    let mut dir = std::fs::File::open(root)?;
+    for (i, name) in names.iter().enumerate() {
+        let last = i + 1 == names.len();
+        let c = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if last { libc::O_NONBLOCK } else { libc::O_DIRECTORY };
+        // SAFETY: `dir` is an open descriptor for the duration of the call,
+        // `c` is a NUL-terminated string, and a non-negative result is a
+        // fresh descriptor that nothing else owns.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        if last {
+            return Ok(f);
+        }
+        dir = f;
+    }
+    unreachable!("names is not empty")
+}
+
+/// Open a discovered source for reading: through [`open_beneath`] from its
+/// root, then `fstat` the descriptor and require a regular file with the
+/// identity discovery recorded. Every later read uses this descriptor, so
+/// a path swapped for a link, another file, or a directory between
+/// discovery and reading is refused instead of followed.
+pub fn open_source(src: &Source) -> std::io::Result<(std::fs::File, FileMeta)> {
+    let rel = src
+        .path
+        .strip_prefix(&src.root)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "source outside its root"))?;
+    let f = open_beneath(&src.root, rel)?;
+    let m = f.metadata()?;
+    if !m.file_type().is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a regular file"));
+    }
+    let meta = FileMeta::of(&m);
+    if (meta.dev, meta.ino) != (src.dev, src.ino) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file replaced since discovery"));
+    }
+    Ok((f, meta))
+}
+
+/// Largest subagent `.meta.json` read.
+const MAX_META_BYTES: u64 = 1 << 20;
+
+/// `agentType` from a subagent's `agent-<id>.meta.json`, opened the same
+/// way as a transcript.
+fn subagent_type(root: &Path, meta_path: &Path) -> Option<String> {
+    let rel = meta_path.strip_prefix(root).ok()?;
+    let f = open_beneath(root, rel).ok()?;
+    if !f.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    f.take(MAX_META_BYTES).read_to_string(&mut text).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()?
+        .get("agentType")
+        .and_then(|a| a.as_str())
+        .map(String::from)
 }
 
 /// Claude sources: `<root>/<project>/<session>.jsonl` and
@@ -86,17 +196,18 @@ pub fn claude_sources(root: &Path) -> Vec<Source> {
                 let Ok(subs) = std::fs::read_dir(&subdir) else { continue };
                 for s in subs.flatten() {
                     let sp = s.path();
-                    if !s.file_type().is_ok_and(|t| t.is_file()) || !is_jsonl(&sp) {
+                    if !is_jsonl(&sp) {
                         continue;
                     }
+                    let Some((dev, ino)) = regular_file_id(&s) else { continue };
                     let stem = sp.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     let id = stem.strip_prefix("agent-").unwrap_or(&stem).to_string();
-                    let agent_type = std::fs::read_to_string(sp.with_extension("meta.json"))
-                        .ok()
-                        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                        .and_then(|v| v.get("agentType").and_then(|a| a.as_str()).map(String::from));
+                    let agent_type = subagent_type(root, &sp.with_extension("meta.json"));
                     out.push(Source {
                         path: sp,
+                        root: root.to_path_buf(),
+                        dev,
+                        ino,
                         vendor: Vendor::Claude,
                         claude_ctx: Some(claude::FileCtx { session_id: parent_sid.clone(), subagent_id: Some(id) }),
                         main: false,
@@ -104,9 +215,13 @@ pub fn claude_sources(root: &Path) -> Vec<Source> {
                     });
                 }
             } else if ft.is_file() && is_jsonl(&p) {
+                let Some((dev, ino)) = regular_file_id(&e) else { continue };
                 let sid = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 out.push(Source {
                     path: p,
+                    root: root.to_path_buf(),
+                    dev,
+                    ino,
                     vendor: Vendor::Claude,
                     claude_ctx: Some(claude::FileCtx { session_id: sid, subagent_id: None }),
                     main: true,
@@ -122,10 +237,10 @@ pub fn claude_sources(root: &Path) -> Vec<Source> {
 /// links are skipped, so a link cycle or a link out of the root is never
 /// walked; depth is capped at [`MAX_DEPTH`].
 pub fn codex_sources(root: &Path, out: &mut Vec<Source>) {
-    walk_codex(root, 0, out);
+    walk_codex(root, root, 0, out);
 }
 
-fn walk_codex(dir: &Path, depth: usize, out: &mut Vec<Source>) {
+fn walk_codex(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Source>) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -134,9 +249,19 @@ fn walk_codex(dir: &Path, depth: usize, out: &mut Vec<Source>) {
         let Ok(ft) = e.file_type() else { continue };
         let p = e.path();
         if ft.is_dir() {
-            walk_codex(&p, depth + 1, out);
+            walk_codex(root, &p, depth + 1, out);
         } else if ft.is_file() && is_jsonl(&p) {
-            out.push(Source { path: p, vendor: Vendor::Codex, claude_ctx: None, main: true, agent_type: None });
+            let Some((dev, ino)) = regular_file_id(&e) else { continue };
+            out.push(Source {
+                path: p,
+                root: root.to_path_buf(),
+                dev,
+                ino,
+                vendor: Vendor::Codex,
+                claude_ctx: None,
+                main: true,
+                agent_type: None,
+            });
         }
     }
 }
@@ -300,12 +425,12 @@ pub fn unchanged(prev: &FileState, m: &FileMeta) -> bool {
 /// the file turned out to need nothing (it never sent `Begin`).
 fn parse_file(
     src: Source,
+    f: std::fs::File,
+    meta: FileMeta,
     prev: Option<FileState>,
     full: bool,
     send: tokio::sync::mpsc::Sender<Msg>,
 ) -> std::io::Result<Option<Outcome>> {
-    let f = std::fs::File::open(&src.path)?;
-    let meta = FileMeta::of(&f.metadata()?);
 
     let append_from = match &prev {
         Some(p) if !full && p.dev == meta.dev && p.ino == meta.ino && meta.size >= p.offset => {
@@ -411,17 +536,17 @@ pub async fn ingest_file(
 ) -> Result<std::io::Result<FileReport>> {
     let path_str = src.path.to_string_lossy().into_owned();
     let prev = store::load_file_state(pool, &path_str).await?;
-    if !full {
-        if let (Some(p), Ok(m)) = (&prev, std::fs::metadata(&src.path)) {
-            if unchanged(p, &FileMeta::of(&m)) {
-                return Ok(Ok(FileReport::default()));
-            }
-        }
+    let (f, meta) = match open_source(src) {
+        Ok(o) => o,
+        Err(e) => return Ok(Err(e)),
+    };
+    if !full && prev.as_ref().is_some_and(|p| unchanged(p, &meta)) {
+        return Ok(Ok(FileReport::default()));
     }
 
     let (send, mut recv) = tokio::sync::mpsc::channel::<Msg>(2);
     let task_src = src.clone();
-    let parser = tokio::task::spawn_blocking(move || parse_file(task_src, prev, full, send));
+    let parser = tokio::task::spawn_blocking(move || parse_file(task_src, f, meta, prev, full, send));
 
     let mut tx: Option<sqlx::Transaction<'_, sqlx::Sqlite>> = None;
     let mut records = 0usize;

@@ -644,6 +644,83 @@ async fn same_size_rewrite_with_the_same_mtime_is_reread() {
     assert_eq!(dump(&ws_full).await, dump(&ws_inc).await, "incremental differs from --full");
 }
 
+/// A transcript swapped after discovery — for a link out of the root, for a
+/// directory link on its path, or for another file — is refused, and
+/// nothing outside the root is read.
+#[tokio::test]
+async fn a_source_swapped_after_discovery_is_not_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let ws = base.join("ws");
+    std::fs::create_dir_all(ws.join("memory")).unwrap();
+    let root = base.join("codex");
+    let file = root.join("2026/09/07/rollout-in.jsonl");
+    let inside = lines(&[
+        codex_meta("t-in", "/work/in"),
+        codex_ctx("gpt-5.6-sol"),
+        codex_tc("2026-09-07T09:01:00Z", (1000, 0, 50), (1000, 0, 50), 1.0, None),
+    ]);
+    write_text(&file, &inside);
+    // Outside the root: a same-named file under a same-shaped tree.
+    let outside_month = base.join("outside/09");
+    let outside_file = outside_month.join("07/rollout-in.jsonl");
+    write_text(
+        &outside_file,
+        &lines(&[
+            codex_meta("t-out", "/work/out"),
+            codex_ctx("gpt-5.6-sol"),
+            codex_tc("2026-09-07T09:02:00Z", (7777, 0, 77), (7777, 0, 77), 1.0, None),
+        ]),
+    );
+    let pool = open(&ws).await.unwrap();
+    let local = store::Local { tz: chrono_tz::UTC };
+    let discover = || {
+        let mut v = Vec::new();
+        ingest::codex_sources(&root, &mut v);
+        assert_eq!(v.len(), 1);
+        v.remove(0)
+    };
+    let nothing_read = |pool: SqlitePool| async move {
+        assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM usage_obs").await, 0);
+        assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM source_files").await, 0);
+    };
+
+    // 1. The file becomes a link to the outside file.
+    let src = discover();
+    std::fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&outside_file, &file).unwrap();
+    let e = ingest::ingest_file(&pool, local, &src, false).await.unwrap().unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}");
+    nothing_read(pool.clone()).await;
+
+    // 2. A directory on the path becomes a link to the outside tree.
+    std::fs::remove_file(&file).unwrap();
+    write_text(&file, &inside);
+    let src = discover();
+    std::fs::rename(root.join("2026/09"), root.join("2026/09-moved")).unwrap();
+    std::os::unix::fs::symlink(&outside_month, root.join("2026/09")).unwrap();
+    assert!(ingest::ingest_file(&pool, local, &src, false).await.unwrap().is_err());
+    nothing_read(pool.clone()).await;
+    std::fs::remove_file(root.join("2026/09")).unwrap();
+    std::fs::rename(root.join("2026/09-moved"), root.join("2026/09")).unwrap();
+
+    // 3. The file is replaced by another regular file.
+    let src = discover();
+    let tmpf = root.join("2026/09/07/swap.tmp");
+    std::fs::copy(&outside_file, &tmpf).unwrap();
+    std::fs::rename(&tmpf, &file).unwrap();
+    let e = ingest::ingest_file(&pool, local, &src, false).await.unwrap().unwrap_err();
+    assert!(e.to_string().contains("replaced since discovery"), "{e}");
+    nothing_read(pool.clone()).await;
+
+    // Control: rediscovered, the file is read, and only its own content.
+    write_text(&file, &inside);
+    let src = discover();
+    assert!(ingest::ingest_file(&pool, local, &src, false).await.unwrap().unwrap().read);
+    assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM usage_obs WHERE session_id = 't-in'").await, 1);
+    assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM usage_obs WHERE session_id <> 't-in'").await, 0);
+}
+
 // ─── partial refresh ────────────────────────────────────────────────────────
 
 #[tokio::test]
