@@ -450,6 +450,7 @@ async fn resolve_projects(pool: &SqlitePool, cfg: &UsageConfig) -> Result<()> {
         markers: &cfg.worktree_markers,
         encoded,
         worktree_parents,
+        repos: Vec::new(),
     };
     for (cwd,) in &cwds {
         if Path::new(cwd).exists() {
@@ -462,6 +463,16 @@ async fn resolve_projects(pool: &SqlitePool, cfg: &UsageConfig) -> Result<()> {
             resolved.push((cwd.clone(), r));
         }
     }
+    // Known repositories: roots resolved through a `.git` entry or a marker,
+    // now or in an earlier refresh. They anchor the deleted-worktree rules.
+    let is_repo = |m: &str| matches!(m, "git" | "marker" | "worktree");
+    let mut repos: std::collections::BTreeSet<String> = resolved
+        .iter()
+        .filter(|(_, r)| is_repo(r.method))
+        .map(|(_, r)| r.root.clone())
+        .collect();
+    repos.extend(stored_map.values().filter(|(_, _, m)| is_repo(m)).map(|(root, _, _)| root.clone()));
+    resolver.repos = repos.into_iter().collect();
     for (cwd,) in &cwds {
         if Path::new(cwd).exists() {
             continue;

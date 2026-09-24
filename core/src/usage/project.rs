@@ -14,13 +14,18 @@
 //!    root. A `.git` file is a linked worktree: its `gitdir:` line points
 //!    into `<main repo>/.git/worktrees/<name>`, and the main repository is
 //!    the project. This covers worktrees kept outside the repository.
-//! 4. **Deleted worktree siblings.** For a directory that no longer exists,
-//!    a sibling (same parent directory) that earlier resolved through a
-//!    `.git` file gives the repository. Worktree managers keep a repo's
-//!    worktrees side by side, so a deleted one inherits its siblings' repo.
+//! 4. **Deleted worktrees.** For a directory that no longer exists, take the
+//!    deleted directory (top-most missing component) and the existing
+//!    directory that held it:
+//!    a. a sibling that earlier resolved through a `.git` file gives the
+//!       repository (worktree managers keep a repo's worktrees side by side);
+//!    b. a holding directory named like a known repository (and not that
+//!       repository) is the `<manager>/<repo>/<workspace>` layout;
+//!    c. a deleted `<repo>-<suffix>` next to a known `<repo>` is the
+//!       `git worktree add ../<repo>-<branch>` layout.
+//!    "Known repository" = a root resolved through git or a marker.
 //! 5. **Fallback.** An existing directory is its own project; a missing
-//!    one is attributed to its top-most missing path component (the
-//!    directory that was deleted).
+//!    one is attributed to the deleted directory.
 //!
 //! Mappings are sticky: once a directory is gone, the stored mapping is
 //! kept instead of re-resolving to a worse answer (see `store.rs`).
@@ -75,6 +80,8 @@ pub struct Resolver<'a, P: Probe> {
     /// Parent directory → repository, learned from worktrees that resolved
     /// through a `.git` file.
     pub worktree_parents: HashMap<String, String>,
+    /// Repository roots already known (resolved through git or a marker).
+    pub repos: Vec<String>,
 }
 
 /// Claude Code's project-directory encoding: every character other than an
@@ -166,14 +173,8 @@ impl<'a, P: Probe> Resolver<'a, P> {
             return self.done(&path, "directory");
         }
 
-        // 4. Deleted worktree: siblings' repository.
-        if let Some(parent) = p.parent() {
-            if let Some(repo) = self.worktree_parents.get(parent.to_string_lossy().as_ref()) {
-                return self.done(repo, "sibling");
-            }
-        }
-
-        // 5. Top-most missing component.
+        // The deleted directory: the top-most missing path component, and
+        // the existing directory that held it.
         let mut missing = p.to_path_buf();
         while let Some(parent) = missing.parent() {
             if parent.parent().is_none() || self.probe.exists(parent) {
@@ -181,6 +182,36 @@ impl<'a, P: Probe> Resolver<'a, P> {
             }
             missing = parent.to_path_buf();
         }
+        let holder = missing.parent().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
+        let missing_name = missing.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+
+        // 4a. Siblings that resolved through a `.git` file.
+        if let Some(repo) = self.worktree_parents.get(&holder) {
+            return self.done(repo, "sibling");
+        }
+        // 4b. `<manager>/<repo>/<workspace>`: the holding directory is named
+        //     like a known repository and is not one itself.
+        let holder_name = Path::new(&holder).file_name().map(|n| n.to_string_lossy().into_owned());
+        if let Some(hn) = holder_name.filter(|_| Path::new(&holder) != self.home) {
+            if let Some(repo) = self.repos.iter().find(|r| self.name_of(r) == hn && **r != holder) {
+                return self.done(repo, "repo-dir");
+            }
+        }
+        // 4c. `<parent>/<repo>-<branch>` next to `<parent>/<repo>` (the
+        //     `git worktree add ../<repo>-<branch>` layout). Longest name wins.
+        if let Some(repo) = self
+            .repos
+            .iter()
+            .filter(|r| {
+                Path::new(r).parent().map(|x| x.to_string_lossy() == holder.as_str()).unwrap_or(false)
+                    && missing_name.starts_with(&format!("{}-", self.name_of(r)))
+            })
+            .max_by_key(|r| r.len())
+        {
+            return self.done(repo, "repo-prefix");
+        }
+
+        // 5. The deleted directory itself.
         self.done(&missing.to_string_lossy(), "missing")
     }
 }
@@ -253,7 +284,36 @@ mod tests {
         encoded.insert(encode_cwd("/home/op/code/beta"), "/home/op/code/beta".to_string());
         let mut worktree_parents = HashMap::new();
         worktree_parents.insert("/home/op/wt/alpha".to_string(), "/home/op/code/alpha".to_string());
-        Resolver { probe: f, home: PathBuf::from("/home/op"), markers, encoded, worktree_parents }
+        Resolver {
+            probe: f,
+            home: PathBuf::from("/home/op"),
+            markers,
+            encoded,
+            worktree_parents,
+            repos: vec!["/home/op/code/alpha".to_string(), "/home/op/code/beta".to_string()],
+        }
+    }
+
+    #[test]
+    fn deleted_worktrees_in_manager_and_prefix_layouts() {
+        let f = fs();
+        let m = markers();
+        let r = resolver(&f, &m);
+        // <manager>/<repo>/<workspace>: /home/op/wt exists, /home/op/wt/beta does not
+        // hold a git file, and "beta" is a known repository.
+        let mut dirs = f.dirs.clone();
+        dirs.insert("/home/op/mgr".to_string());
+        dirs.insert("/home/op/mgr/beta".to_string());
+        let f2 = FakeFs { dirs, git: f.git.clone() };
+        let r2 = Resolver { probe: &f2, ..r };
+        let x = r2.resolve("/home/op/mgr/beta/feature-gone/src");
+        assert_eq!((x.root.as_str(), x.method), ("/home/op/code/beta", "repo-dir"));
+        // <parent>/<repo>-<branch> next to <parent>/<repo>
+        let x = r2.resolve("/home/op/code/alpha-fix-login/web");
+        assert_eq!((x.root.as_str(), x.method), ("/home/op/code/alpha", "repo-prefix"));
+        // an unrelated deleted directory stays itself
+        let x = r2.resolve("/home/op/code/gamma/web");
+        assert_eq!((x.root.as_str(), x.method), ("/home/op/code/gamma", "missing"));
     }
 
     fn markers() -> Vec<String> {
