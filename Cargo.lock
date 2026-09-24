@@ -1574,6 +1574,7 @@ dependencies = [
  "dotenvy",
  "figment",
  "futures",
+ "libc",
  "regex",
  "reqwest",
  "serde",
@@ -3415,6 +3416,8 @@ dependencies = [
  "nucleus-core",
  "reminders",
  "serde_json",
+ "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
 ]

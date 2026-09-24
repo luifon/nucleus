@@ -45,6 +45,7 @@ export const FINDING_KINDS: { kind: string; label: string }[] = [
   { kind: "frontmatter", label: "frontmatter" },
   { kind: "unknown_source", label: "unknown source" },
   { kind: "empty_file", label: "empty files" },
+  { kind: "oversized", label: "oversized, not checked" },
 ];
 
 export type FindingGroup = { kind: string; label: string; findings: VaultFinding[] };
@@ -70,6 +71,7 @@ export const COUNT_COLUMNS: { key: keyof CheckCounts; label: string }[] = [
   { key: "missing_frontmatter", label: "frontmatter" },
   { key: "unknown_source", label: "unknown source" },
   { key: "empty_files", label: "empty files" },
+  { key: "oversized", label: "oversized" },
   { key: "fixed", label: "fixed" },
 ];
 

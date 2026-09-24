@@ -27,6 +27,7 @@ regex = { workspace = true }
 reqwest = { workspace = true }
 ts-rs = { workspace = true }
 unicode-normalization = "0.1"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

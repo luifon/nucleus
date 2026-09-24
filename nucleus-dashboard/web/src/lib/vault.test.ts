@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { CheckCounts, CheckRunSummary, VaultFinding } from "@/lib/api/vault";
-import { countDelta, formatDelta, groupFindings, MATCH_END, MATCH_START, splitSnippet } from "./vault";
+import { COUNT_COLUMNS, countDelta, formatDelta, groupFindings, MATCH_END, MATCH_START, splitSnippet } from "./vault";
 
 const S = MATCH_START;
 const E = MATCH_END;
@@ -50,6 +50,7 @@ function run(id: number, broken: number): CheckRunSummary {
     missing_frontmatter: 0,
     unknown_source: 0,
     empty_files: 0,
+    oversized: 0,
     fixed: 0,
   };
   return { id, started_at: "2026-01-01T00:00:00.000Z", trigger: "scheduled", applied: false, notes_scanned: 1, duration_ms: 1, counts };
@@ -61,4 +62,21 @@ test("countDelta compares the newest run with the one before", () => {
   expect(formatDelta(-3)).toBe("−3");
   expect(formatDelta(2)).toBe("+2");
   expect(formatDelta(0)).toBe("±0");
+});
+
+describe("COUNT_COLUMNS", () => {
+  test("shows every count the check records", () => {
+    const counts: CheckCounts = {
+      duplicates: 0,
+      broken_links: 0,
+      orphans: 0,
+      stale_inbox: 0,
+      missing_frontmatter: 0,
+      unknown_source: 0,
+      empty_files: 0,
+      oversized: 0,
+      fixed: 0,
+    };
+    expect(COUNT_COLUMNS.map((c) => c.key).sort()).toEqual(Object.keys(counts).sort());
+  });
 });
