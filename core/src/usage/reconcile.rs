@@ -21,16 +21,21 @@
 //!    that repeats it, or a counter shared by several sessions of one
 //!    process) belongs to the first run whose window holds it. Later runs
 //!    see it as *carried*.
-//! 2. **New counter part.** A run with carried responses subtracts what its
-//!    counter already holds from earlier runs, `D`:
-//!    - when its token total is at least that of the largest earlier run
-//!      owning its carried responses, the counter continued that run's
-//!      counter: `D` = that run's totals (per category, capped at the
-//!      run's own), and `D`'s dollars = that run's `costUSD`;
-//!    - otherwise the counter restarted and holds the carried responses at
-//!      most: `D` = the carried responses' tokens (capped), and `D`'s
-//!      dollars = the run's `costUSD` times `D`'s share of the run's table
-//!      price (token share for a model without a price).
+//! 2. **New counter part.** A run subtracts `D`, what its counter provably
+//!    already holds from earlier runs. Proof comes from response identities
+//!    and the counter's own identity, never from comparing totals:
+//!    - **continued**: an earlier run with the same start time (the same
+//!      counter), at least one response key in both windows, and no counter
+//!      category above this run's. The latest such run (largest total) is
+//!      the one continued. `D` = its totals (background calls included:
+//!      they are the same records of the same counter), plus the carried
+//!      responses its window does not hold; `D`'s dollars = its `costUSD`
+//!      plus the extra responses' price share of the remaining dollars;
+//!    - otherwise the counter restarted: `D` = the carried responses'
+//!      tokens (capped at the run's counter), and `D`'s dollars = the run's
+//!      `costUSD` times `D`'s share of the run's table price (token share
+//!      for a model without a price). An earlier run's background tokens
+//!      are never subtracted here: nothing shows they are in this counter.
 //!
 //!    `C' = C − D` and `costUSD' = costUSD − D$` are the run's new part.
 //! 3. **Counted.** Tokens: the owned responses, plus a **residual** row of
@@ -47,10 +52,11 @@
 //! records cache writes without the 5-minute/1-hour split; `C'`'s split
 //! follows the window's responses (1-hour when the window has none).
 //!
-//! When a counter continued an earlier run under a new start time (its
-//! window then holds none of the earlier responses), the overlap is not
-//! visible and is not subtracted. The data this was built on shows
-//! continued counters keeping the original start time.
+//! A counter that continued an earlier run under a new start time is
+//! treated as restarted: only the responses both windows hold are
+//! subtracted, so the earlier run's background calls may be counted twice.
+//! The data this was built on shows continued counters keeping the
+//! original start time.
 //!
 //! Residual and adjustment rows are derived: every refresh deletes and
 //! recomputes all of them, so they never drift from their inputs.
@@ -60,7 +66,7 @@ use super::store::Local;
 use crate::config::ModelPrice;
 use anyhow::Result;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Price every response row whose cost is unset, or all of them when the
 /// effective price table changed; each row is one request, so OpenAI's
@@ -191,6 +197,24 @@ impl Counter {
         }
     }
 
+    fn plus(self, o: Counter) -> Counter {
+        Counter {
+            input: self.input + o.input,
+            output: self.output + o.output,
+            cache_read: self.cache_read + o.cache_read,
+            cache_write: self.cache_write + o.cache_write,
+        }
+    }
+
+    /// Every category at least `o`'s: what a counter that continued `o`
+    /// holds.
+    fn covers(self, o: Counter) -> bool {
+        self.input >= o.input
+            && self.output >= o.output
+            && self.cache_read >= o.cache_read
+            && self.cache_write >= o.cache_write
+    }
+
     fn minus(self, o: Counter) -> Counter {
         Counter {
             input: (self.input - o.input).max(0),
@@ -285,49 +309,74 @@ pub fn reconcile_model(runs: &[RunInput], price: Option<&ModelPrice>) -> Vec<Run
         Some(p) if cost(p, c) > 0.0 => cost(p, c),
         _ => c.total() as f64,
     };
+    let share_usd = |part: Counter, whole: Counter, usd: f64, window: &Tokens| {
+        let (_, whole_split) = residual(&Tokens::default(), window, whole);
+        let (_, part_split) = residual(&Tokens::default(), window, part);
+        let w = weight(&whole_split);
+        if w > 0.0 { usd * (weight(&part_split) / w).min(1.0) } else { 0.0 }
+    };
     let mut owner: HashMap<&str, usize> = HashMap::new();
+    let keys: Vec<HashSet<&str>> = runs.iter().map(|r| r.window.iter().map(|(k, _)| k.as_str()).collect()).collect();
+    let mut done: Vec<usize> = Vec::new();
     let mut out = vec![RunOutcome::default(); runs.len()];
     for &i in &order {
         let run = &runs[i];
+        let c = run.counter;
         let mut own = Tokens::default();
-        let mut carried = Tokens::default();
         let mut window = Tokens::default();
-        let mut preds: Vec<usize> = Vec::new();
+        let mut carried_any = false;
         for (key, t) in &run.window {
             add(&mut window, t);
-            match owner.get(key.as_str()) {
-                Some(&p) => {
-                    add(&mut carried, t);
-                    if !preds.contains(&p) {
-                        preds.push(p);
-                    }
-                }
-                None => {
-                    owner.insert(key.as_str(), i);
-                    add(&mut own, t);
-                }
+            if owner.contains_key(key.as_str()) {
+                carried_any = true;
+            } else {
+                owner.insert(key.as_str(), i);
+                add(&mut own, t);
             }
         }
-        let c = run.counter;
-        let (d, d_usd) = match preds.iter().copied().max_by_key(|&p| runs[p].counter.total()) {
-            None => (Counter::default(), 0.0),
-            Some(p) if c.total() >= runs[p].counter.total() => {
-                (c.min(runs[p].counter), runs[p].cost_usd.min(run.cost_usd))
+        // The counter continued an earlier run only when that is provable:
+        // the same counter identity (start time), at least one response in
+        // both windows, and no category below the earlier counter's.
+        let cont = done
+            .iter()
+            .copied()
+            .filter(|&p| {
+                runs[p].start_ms == run.start_ms
+                    && c.covers(runs[p].counter)
+                    && keys[p].iter().any(|k| keys[i].contains(k))
+            })
+            .max_by_key(|&p| (runs[p].counter.total(), runs[p].snapshot_ts_ms));
+        // Carried responses the continued counter does not already hold.
+        let mut extra = Tokens::default();
+        for (key, t) in &run.window {
+            if owner.get(key.as_str()) != Some(&i) && !cont.is_some_and(|p| keys[p].contains(key.as_str())) {
+                add(&mut extra, t);
             }
-            Some(_) => {
-                let d = c.min(Counter::of(&carried));
-                let (_, c_split) = residual(&Tokens::default(), &window, c);
-                let (_, d_split) = residual(&Tokens::default(), &window, d);
-                let w = weight(&c_split);
-                let share = if w > 0.0 { weight(&d_split) / w } else { 0.0 };
-                (d, run.cost_usd * share.min(1.0))
+        }
+        let (d, d_usd) = match cont {
+            Some(p) => {
+                let base = c.min(runs[p].counter);
+                let base_usd = runs[p].cost_usd.min(run.cost_usd);
+                let rest = c.minus(base);
+                let more = rest.min(Counter::of(&extra));
+                (base.plus(more), base_usd + share_usd(more, rest, run.cost_usd - base_usd, &window))
+            }
+            None => {
+                let d = c.min(Counter::of(&extra));
+                (d, share_usd(d, c, run.cost_usd, &window))
             }
         };
         let c_new = c.minus(d);
         let new_cost_usd = (run.cost_usd - d_usd).max(0.0);
         let (res, c_split) = residual(&own, &window, c_new);
         let table_c = price.map(|p| cost(p, &c_split)).unwrap_or(0.0);
-        out[i] = RunOutcome { residual: res, adjustment: new_cost_usd - table_c, new_cost_usd, carried: !preds.is_empty() };
+        out[i] = RunOutcome {
+            residual: res,
+            adjustment: new_cost_usd - table_c,
+            new_cost_usd,
+            carried: carried_any || cont.is_some(),
+        };
+        done.push(i);
     }
     out
 }
@@ -578,8 +627,8 @@ mod tests {
             run("s-b", 5, 20, (300_000, 30_000), 4.95, &[("r1", r1), ("r2", r2)]),
         ];
         let out = reconcile_model(&runs, Some(&price));
-        // Second run has the larger counter: treated as continuing the first
-        // (its totals include R1): new part = R2 with $3.30.
+        // Different start times: a restarted counter. D = R1 alone, a third
+        // of the table price, so the new part is R2 with $3.30.
         assert!((out[1].new_cost_usd - 3.30).abs() < 1e-9);
         let total = total_usd(&runs, &out, Some(&price), &[r1, r2]);
         assert!((total - (1.65 + 3.30)).abs() < 1e-9, "total {total}");
@@ -602,6 +651,64 @@ mod tests {
         assert_eq!(out[1].new_cost_usd, 0.0);
         assert_eq!(out[1].residual.total(), 0);
         assert!((total_usd(&runs, &out, None, &[r1, r2]) - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn restarted_larger_counter_subtracts_only_the_shared_response() {
+        // Run A: R1 plus 500 background input tokens (title generation),
+        // $1.50. Run B restarted its counter (new start time), repeats R1,
+        // and adds R2 and R3: a larger total than A's, $3.00. Only R1 is
+        // provably in both counters; A's background tokens are not in B's.
+        let r1 = tok(1000, 100);
+        let r2 = tok(1000, 100);
+        let r3 = tok(1000, 100);
+        let runs = vec![
+            run("s-a", 1, 10, (1500, 100), 1.5, &[("r1", r1)]),
+            run("s-b", 5, 30, (3000, 300), 3.0, &[("r1", r1), ("r2", r2), ("r3", r3)]),
+        ];
+        let out = reconcile_model(&runs, None);
+        assert!(out[1].carried);
+        assert_eq!(out[0].residual.input, 500, "A keeps its background tokens");
+        assert_eq!(out[1].residual.total(), 0, "B's new part is exactly R2 + R3");
+        // D = R1: 1100 of B's 3300 tokens, so $1.00 of B's $3.00.
+        assert!((out[1].new_cost_usd - 2.0).abs() < 1e-12, "{}", out[1].new_cost_usd);
+        assert!((total_usd(&runs, &out, None, &[r1, r2, r3]) - 3.5).abs() < 1e-12, "not 3.00");
+    }
+
+    #[test]
+    fn same_start_counter_below_its_predecessor_is_not_a_continuation() {
+        // Same start time, but B's input is below A's: B's counter cannot
+        // hold A's, so only the shared R1 is subtracted.
+        let r1 = tok(1000, 100);
+        let r2 = tok(200, 200);
+        let runs = vec![
+            run("s-a", 1, 10, (1500, 100), 1.5, &[("r1", r1)]),
+            run("s-b", 1, 20, (1200, 300), 1.5, &[("r1", r1), ("r2", r2)]),
+        ];
+        let out = reconcile_model(&runs, None);
+        assert_eq!(out[0].residual.input, 500);
+        assert_eq!(out[1].residual.total(), 0);
+        // D = R1 = 1100 of 1500 tokens.
+        assert!((out[1].new_cost_usd - 1.5 * 400.0 / 1500.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn continuation_is_found_through_a_run_that_owns_no_response() {
+        // Q owns R1. P continues Q's counter (same start), owns nothing, and
+        // adds 500 background tokens. F continues P and adds R3. F's new
+        // part is R3 only; P's background is already in P's counter.
+        let r1 = tok(1000, 100);
+        let r3 = tok(1000, 100);
+        let runs = vec![
+            run("s-q", 1, 10, (1000, 100), 1.0, &[("r1", r1)]),
+            run("s-p", 1, 20, (1500, 100), 1.5, &[("r1", r1)]),
+            run("s-f", 1, 30, (2500, 200), 2.5, &[("r1", r1), ("r3", r3)]),
+        ];
+        let out = reconcile_model(&runs, None);
+        assert_eq!(out[1].residual.input, 500);
+        assert_eq!(out[2].residual.total(), 0);
+        assert!((out[2].new_cost_usd - 1.0).abs() < 1e-12, "{}", out[2].new_cost_usd);
+        assert!((total_usd(&runs, &out, None, &[r1, r3]) - 2.5).abs() < 1e-12);
     }
 
     #[test]
