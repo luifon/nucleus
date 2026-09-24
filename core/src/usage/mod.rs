@@ -4,21 +4,23 @@
 //!
 //! Core owns `memory/usage.db` (ADR-020). The single writer is
 //! [`refresh`], reached through `nucleus usage refresh` (the dashboard
-//! spawns it) and the distiller's daily pass; a lock file serializes runs.
-//! The dashboard opens the DB read-only.
+//! spawns it) and the distiller's daily pass; an advisory file lock
+//! serializes runs. The dashboard opens the DB read-only.
 //!
 //! The store keeps aggregates permanently. Claude Code deletes transcripts
 //! after about 30 days, so a refresh at least that often keeps the record
 //! complete; the first refresh backfills whatever still exists.
 //!
-//! Incremental: each source file's read offset is stored with the records
-//! it produced (one transaction), so a refresh reads only appended bytes.
-//! Every write is keyed and idempotent; `--full` re-reads everything and
-//! converges on the same rows.
+//! Incremental: each source file's read offset and content fingerprint are
+//! stored with the records it produced (one transaction), so a refresh
+//! reads only appended bytes, and re-reads a file whole when it was
+//! rewritten (see `ingest.rs`). Every key is derived from content, so
+//! `--full` converges on the same rows.
 
 pub mod attribution;
 pub mod claude;
 pub mod codex;
+pub mod ingest;
 pub mod pricing;
 pub mod project;
 pub mod query;
@@ -29,16 +31,14 @@ pub mod store;
 
 use crate::config::UsageConfig;
 use anyhow::{Context, Result, bail};
-use records::{Record, Vendor};
 use sqlx::SqlitePool;
-use std::io::{BufRead, Seek};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 pub const DB_PATH: &str = "memory/usage.db";
 pub const LOCK_PATH: &str = "memory/usage-refresh.lock";
-/// A lock file untouched for this long belongs to a dead refresh.
-pub const LOCK_STALE: Duration = Duration::from_secs(300);
+/// Warnings kept per refresh run (the counts are always complete).
+const MAX_WARNINGS: usize = 20;
 
 /// Open for writing (the refresh). Applies migrations.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
@@ -56,55 +56,58 @@ pub async fn open_read_only(workspace_root: &Path) -> Result<Option<SqlitePool>>
     Ok(Some(crate::db::open_read_only(&path).await?))
 }
 
-/// Whether a refresh holds the lock right now.
+/// Whether a refresh holds the lock right now. Probes the advisory lock
+/// without waiting; the probe holds it for the duration of one system call.
 pub fn refresh_running(workspace_root: &Path) -> bool {
-    let lock = workspace_root.join(LOCK_PATH);
-    std::fs::metadata(&lock)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_some_and(|age| age < LOCK_STALE)
+    let Ok(f) = std::fs::OpenOptions::new().read(true).open(workspace_root.join(LOCK_PATH)) else {
+        return false;
+    };
+    matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
-/// Lock file held for the refresh; touched after every file (heartbeat) and
-/// removed on drop.
-struct RefreshLock {
-    path: PathBuf,
+/// The refresh lock: an exclusive advisory lock (`flock`) on
+/// `memory/usage-refresh.lock`, held through an open file descriptor for
+/// the whole refresh. The kernel releases it when the descriptor closes,
+/// including when the process dies, so there is no staleness timer, no
+/// heartbeat, and no lock file to delete. The file itself stays.
+pub struct RefreshLock {
+    _file: std::fs::File,
 }
 
 impl RefreshLock {
-    fn acquire(workspace_root: &Path) -> Result<Self> {
+    /// Take the lock. A status probe ([`refresh_running`]) holds it for a
+    /// moment, so a busy lock is retried for up to one second before the
+    /// refresh is declared already running.
+    pub async fn acquire(workspace_root: &Path) -> Result<Self> {
         let path = workspace_root.join(LOCK_PATH);
-        for _ in 0..2 {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut f) => {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        for attempt in 0..10 {
+            match file.try_lock() {
+                Ok(()) => {
                     use std::io::Write;
-                    let _ = writeln!(f, "{}", std::process::id());
-                    return Ok(Self { path });
+                    let _ = file.set_len(0);
+                    let _ = writeln!(&file, "{}", std::process::id());
+                    return Ok(Self { _file: file });
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if refresh_running(workspace_root) {
-                        bail!("a usage refresh is already running ({} is fresh)", path.display());
-                    }
-                    tracing::warn!("usage: reclaiming stale refresh lock {}", path.display());
-                    let _ = std::fs::remove_file(&path);
+                Err(std::fs::TryLockError::WouldBlock) if attempt < 9 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+                Err(std::fs::TryLockError::WouldBlock) => break,
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("locking {}", path.display()));
+                }
             }
         }
-        bail!("could not acquire {}", path.display())
-    }
-
-    fn heartbeat(&self) {
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&self.path) {
-            let _ = f.set_modified(SystemTime::now());
-        }
-    }
-}
-
-impl Drop for RefreshLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        bail!("a usage refresh is already running ({} is locked)", path.display())
     }
 }
 
@@ -118,182 +121,65 @@ pub struct RefreshOptions {
 pub struct RefreshStats {
     pub files_seen: usize,
     pub files_read: usize,
+    /// Files that could not be read (permissions, I/O errors). Their data
+    /// is missing from this refresh; the next one retries them.
+    pub files_failed: usize,
     pub bytes_read: u64,
     pub records: usize,
+    /// Relevant lines that were not valid JSON, in the bytes read now.
+    pub malformed_lines: i64,
+    /// Lines over the reader's size limit, skipped, in the bytes read now.
+    pub oversized_lines: i64,
+    /// The first [`MAX_WARNINGS`] problems, as text.
+    pub warnings: Vec<String>,
     pub sessions_labeled: usize,
     pub reconcile: reconcile::ReconcileStats,
     pub elapsed: Duration,
 }
 
-/// One source file to consider.
-struct Source {
-    path: PathBuf,
-    vendor: Vendor,
-    /// Claude only: the file's attribution.
-    claude_ctx: Option<claude::FileCtx>,
-    /// Claude main transcript (vs subagent).
-    main: bool,
-    agent_type: Option<String>,
-}
+impl RefreshStats {
+    /// A refresh that finished but left data out.
+    pub fn partial(&self) -> bool {
+        self.files_failed > 0 || self.malformed_lines > 0 || self.oversized_lines > 0
+    }
 
-fn claude_sources(root: &Path) -> Vec<Source> {
-    let mut out = Vec::new();
-    let Ok(projects) = std::fs::read_dir(root) else {
-        return out;
-    };
-    for proj in projects.flatten() {
-        let Ok(entries) = std::fs::read_dir(proj.path()) else { continue };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                // <session>/subagents/agent-<id>.jsonl
-                let Some(parent_sid) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-                    continue;
-                };
-                let Ok(subs) = std::fs::read_dir(p.join("subagents")) else { continue };
-                for s in subs.flatten() {
-                    let sp = s.path();
-                    if sp.extension().and_then(|x| x.to_str()) != Some("jsonl") {
-                        continue;
-                    }
-                    let stem = sp.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    let id = stem.strip_prefix("agent-").unwrap_or(&stem).to_string();
-                    let agent_type = std::fs::read_to_string(sp.with_extension("meta.json"))
-                        .ok()
-                        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                        .and_then(|v| v.get("agentType").and_then(|a| a.as_str()).map(String::from));
-                    out.push(Source {
-                        path: sp,
-                        vendor: Vendor::Claude,
-                        claude_ctx: Some(claude::FileCtx {
-                            session_id: parent_sid.clone(),
-                            subagent_id: Some(id),
-                        }),
-                        main: false,
-                        agent_type,
-                    });
-                }
-            } else if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
-                let sid = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                out.push(Source {
-                    path: p,
-                    vendor: Vendor::Claude,
-                    claude_ctx: Some(claude::FileCtx { session_id: sid, subagent_id: None }),
-                    main: true,
-                    agent_type: None,
-                });
-            }
+    fn warn(&mut self, msg: String) {
+        tracing::warn!("usage: {msg}");
+        if self.warnings.len() < MAX_WARNINGS {
+            self.warnings.push(msg);
         }
     }
-    out
-}
-
-fn codex_sources(root: &Path, out: &mut Vec<Source>) {
-    let Ok(entries) = std::fs::read_dir(root) else { return };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            codex_sources(&p, out);
-        } else if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
-            out.push(Source { path: p, vendor: Vendor::Codex, claude_ctx: None, main: true, agent_type: None });
-        }
-    }
-}
-
-/// Read complete lines from `offset`; a trailing line without its newline is
-/// left for the next refresh. Returns the new offset.
-fn read_from(path: &Path, offset: u64, mut each: impl FnMut(&[u8], u64)) -> std::io::Result<u64> {
-    let mut f = std::fs::File::open(path)?;
-    f.seek(std::io::SeekFrom::Start(offset))?;
-    let mut r = std::io::BufReader::with_capacity(1 << 20, f);
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-    let mut pos = offset;
-    loop {
-        buf.clear();
-        let n = r.read_until(b'\n', &mut buf)?;
-        if n == 0 || buf.last() != Some(&b'\n') {
-            break;
-        }
-        each(&buf[..n - 1], pos);
-        pos += n as u64;
-    }
-    Ok(pos)
-}
-
-struct Parsed {
-    records: Vec<Record>,
-    offset: u64,
-    carry: String,
-    session_id: Option<String>,
-    subagent_id: Option<String>,
-}
-
-fn parse_file(src_path: PathBuf, vendor: Vendor, ctx: Option<claude::FileCtx>, offset: u64, carry: String) -> std::io::Result<Parsed> {
-    let mut records = Vec::new();
-    match vendor {
-        Vendor::Claude => {
-            let ctx = ctx.expect("claude source has a ctx");
-            let mut c: claude::Carry = serde_json::from_str(&carry).unwrap_or_default();
-            let new_offset = read_from(&src_path, offset, |line, _| claude::parse_line(line, &ctx, &mut c, &mut records))?;
-            Ok(Parsed {
-                records: claude::dedupe_batch(records),
-                offset: new_offset,
-                carry: serde_json::to_string(&c).unwrap_or_default(),
-                session_id: Some(ctx.session_id),
-                subagent_id: ctx.subagent_id,
-            })
-        }
-        Vendor::Codex => {
-            let mut c: codex::Carry = serde_json::from_str(&carry).unwrap_or_default();
-            let new_offset = read_from(&src_path, offset, |line, at| codex::parse_line(line, at, &mut c, &mut records))?;
-            let sub = (c.thread_id != c.session_id).then(|| c.thread_id.clone()).flatten();
-            Ok(Parsed {
-                records,
-                offset: new_offset,
-                carry: serde_json::to_string(&c).unwrap_or_default(),
-                session_id: c.session_id.clone(),
-                subagent_id: sub,
-            })
-        }
-    }
-}
-
-fn mtime_secs(m: &std::fs::Metadata) -> i64 {
-    m.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// Run one refresh: ingest new transcript bytes, resolve projects, apply
 /// Nucleus labels, price, reconcile. Errors if another refresh is running.
 pub async fn refresh(workspace_root: &Path, cfg: &UsageConfig, opts: RefreshOptions) -> Result<RefreshStats> {
     let started = std::time::Instant::now();
-    let lock = RefreshLock::acquire(workspace_root)?;
+    let lock = RefreshLock::acquire(workspace_root).await?;
     let pool = open(workspace_root).await?;
     let run_id: i64 = sqlx::query_scalar("INSERT INTO refresh_runs (started_at) VALUES (?1) RETURNING id")
         .bind(crate::timestamp::now())
         .fetch_one(&pool)
         .await?;
 
-    let result = refresh_inner(&pool, workspace_root, cfg, opts, &lock).await;
-    let (stats, err) = match result {
-        Ok(mut s) => {
-            s.elapsed = started.elapsed();
-            (s, None)
-        }
-        Err(e) => (RefreshStats::default(), Some(format!("{e:#}"))),
-    };
+    let mut stats = RefreshStats::default();
+    let result = refresh_inner(&pool, workspace_root, cfg, opts, &mut stats).await;
+    stats.elapsed = started.elapsed();
+    let err = result.err().map(|e| format!("{e:#}"));
     sqlx::query(
-        "UPDATE refresh_runs SET finished_at = ?1, files_seen = ?2, files_read = ?3, bytes_read = ?4,
-                                 rows_written = ?5, error = ?6 WHERE id = ?7",
+        "UPDATE refresh_runs SET finished_at = ?1, files_seen = ?2, files_read = ?3, files_failed = ?4,
+                                 bytes_read = ?5, rows_written = ?6, malformed_lines = ?7,
+                                 oversized_lines = ?8, warnings = ?9, error = ?10 WHERE id = ?11",
     )
     .bind(crate::timestamp::now())
     .bind(stats.files_seen as i64)
     .bind(stats.files_read as i64)
+    .bind(stats.files_failed as i64)
     .bind(stats.bytes_read as i64)
     .bind(stats.records as i64)
+    .bind(stats.malformed_lines)
+    .bind(stats.oversized_lines)
+    .bind((!stats.warnings.is_empty()).then(|| serde_json::to_string(&stats.warnings).unwrap_or_default()))
     .bind(&err)
     .bind(run_id)
     .execute(&pool)
@@ -311,9 +197,8 @@ async fn refresh_inner(
     workspace_root: &Path,
     cfg: &UsageConfig,
     opts: RefreshOptions,
-    lock: &RefreshLock,
-) -> Result<RefreshStats> {
-    let mut stats = RefreshStats::default();
+    stats: &mut RefreshStats,
+) -> Result<()> {
     let tz = crate::claude_session::nucleus_tz();
     let local = store::Local { tz };
     if store::meta_get(pool, "tz").await?.as_deref() != Some(tz.name()) {
@@ -321,59 +206,43 @@ async fn refresh_inner(
         store::meta_set(pool, "tz", tz.name()).await?;
     }
 
-    let mut sources = claude_sources(&crate::config::expand_home(&cfg.claude_projects_dir));
-    codex_sources(&crate::config::expand_home(&cfg.codex_sessions_dir), &mut sources);
+    let mut sources = ingest::claude_sources(&crate::config::expand_home(&cfg.claude_projects_dir));
+    ingest::codex_sources(&crate::config::expand_home(&cfg.codex_sessions_dir), &mut sources);
+    sources.sort_by(|a, b| a.path.cmp(&b.path));
     stats.files_seen = sources.len();
 
-    for src in sources {
-        let path_str = src.path.to_string_lossy().into_owned();
-        let Ok(meta) = std::fs::metadata(&src.path) else { continue };
-        let size = meta.len() as i64;
-        let mtime = mtime_secs(&meta);
-        let prev = store::load_file_state(pool, &path_str).await?;
-        let (offset, carry) = match &prev {
-            Some(p) if !opts.full && p.size == size && p.mtime == mtime => continue,
-            Some(p) if !opts.full && size >= p.offset => (p.offset as u64, p.carry.clone()),
-            _ => (0u64, String::new()),
-        };
-
-        let (path, vendor, ctx) = (src.path.clone(), src.vendor, src.claude_ctx.clone());
-        let parsed = tokio::task::spawn_blocking(move || parse_file(path, vendor, ctx, offset, carry))
-            .await
-            .context("parser task")?;
-        let parsed = match parsed {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("usage: reading {path_str}: {e}");
-                continue;
+    for src in &sources {
+        match ingest::ingest_file(pool, local, src, opts.full).await? {
+            Ok(r) => {
+                if r.read {
+                    stats.files_read += 1;
+                }
+                stats.bytes_read += r.bytes;
+                stats.records += r.records;
+                stats.malformed_lines += r.malformed;
+                stats.oversized_lines += r.oversized;
+                if r.malformed > 0 {
+                    stats.warn(format!("{}: {} malformed usage line(s) skipped", src.path.display(), r.malformed));
+                }
+                if r.oversized > 0 {
+                    stats.warn(format!(
+                        "{}: {} line(s) over {} MiB skipped",
+                        src.path.display(),
+                        r.oversized,
+                        ingest::MAX_LINE_BYTES >> 20
+                    ));
+                }
             }
-        };
-        stats.files_read += 1;
-        stats.bytes_read += parsed.offset.saturating_sub(offset);
-
-        let state = store::FileState {
-            path: path_str.clone(),
-            vendor: src.vendor,
-            session_id: parsed.session_id.clone(),
-            subagent_id: parsed.subagent_id.clone(),
-            size,
-            mtime,
-            offset: parsed.offset as i64,
-            carry: parsed.carry,
-        };
-        let ensure = parsed.session_id.as_deref();
-        let facts = store::FileFacts {
-            transcript_path: (src.main && src.vendor == Vendor::Claude || src.vendor == Vendor::Codex && parsed.subagent_id.is_none())
-                .then_some(path_str.as_str()),
-            ensure_session: ensure,
-            subagent: match (&parsed.subagent_id, ensure) {
-                (Some(sub), Some(parent)) => Some((sub.as_str(), parent, src.agent_type.as_deref())),
-                _ => None,
-            },
-        };
-        stats.records += store::write_batch(pool, local, &state, &facts, &parsed.records).await?;
-        lock.heartbeat();
+            // Deleted between discovery and read (Claude Code's cleanup):
+            // nothing to report; its stored data stays.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                stats.files_failed += 1;
+                stats.warn(format!("{}: not read: {e}", src.path.display()));
+            }
+        }
     }
+    store::derive_rows(pool).await?;
 
     resolve_projects(pool, cfg).await?;
     let labels = attribution::collect(workspace_root).await;
@@ -387,7 +256,7 @@ async fn refresh_inner(
     if store::meta_get(pool, "first_refresh").await?.is_none() {
         store::meta_set(pool, "first_refresh", &crate::timestamp::now()).await?;
     }
-    Ok(stats)
+    Ok(())
 }
 
 /// Map every session's working directory to a project. Sticky for

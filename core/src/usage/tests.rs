@@ -229,13 +229,14 @@ async fn end_to_end_refresh() {
         scalar_f(
         &pool,
         "SELECT SUM(cost_usd) FROM usage_rows
-          WHERE key IN (SELECT key FROM usage_keys WHERE session_id='s-main')
+          WHERE key IN (SELECT key FROM usage_obs WHERE session_id='s-main')
              OR (kind != 'response' AND session_id='s-main')",
     )
     .await;
     // The fork repeats msg-b and its cost-state covers it: no residual for it.
     assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM usage_rows WHERE kind='residual'").await, 1);
-    assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM usage_keys WHERE key='claude:msg-b'").await, 2);
+    assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM usage_obs WHERE key='claude:msg-b'").await, 2);
+    assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM usage_rows WHERE key='claude:msg-b'").await, 1);
     // costUSD of the run (0.06759 + 0.00146) + table(msg-c) (1*5 + 100*25)/1e6
     assert!((s_main_cost - (0.06759 + 0.00146 + 0.002505)).abs() < 1e-9, "cost {s_main_cost}");
 
@@ -340,10 +341,309 @@ async fn end_to_end_refresh() {
     assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM usage_rows WHERE key='claude:msg-e'").await, 1);
 }
 
+// ─── lock ───────────────────────────────────────────────────────────────────
+
 #[tokio::test]
-async fn second_refresh_is_refused_while_the_lock_is_fresh() {
+async fn refresh_is_refused_while_another_holds_the_lock_and_never_steals_it() {
     let fx = fixture().await;
-    std::fs::write(fx.ws.join(LOCK_PATH), "123\n").unwrap();
+    let held = RefreshLock::acquire(&fx.ws).await.unwrap();
+    assert!(refresh_running(&fx.ws));
+    // An old mtime on the lock file means nothing: there is no staleness
+    // timer to expire while the holder is alive.
+    let f = std::fs::File::options().write(true).open(fx.ws.join(LOCK_PATH)).unwrap();
+    f.set_modified(std::time::SystemTime::UNIX_EPOCH).unwrap();
     let err = refresh(&fx.ws, &fx.cfg, RefreshOptions::default()).await.unwrap_err();
-    assert!(err.to_string().contains("already running"));
+    assert!(err.to_string().contains("already running"), "{err}");
+    assert!(fx.ws.join(LOCK_PATH).exists(), "the refused refresh must not delete the holder's lock");
+    drop(held);
+    assert!(!refresh_running(&fx.ws));
+    refresh(&fx.ws, &fx.cfg, RefreshOptions::default()).await.unwrap();
+    assert!(!refresh_running(&fx.ws), "released when the refresh ends");
+}
+
+// ─── convergence: incremental == --full ─────────────────────────────────────
+
+fn codex_meta(id: &str, cwd: &str) -> String {
+    format!(r#"{{"timestamp":"2026-09-05T09:00:00Z","type":"session_meta","payload":{{"id":"{id}","cwd":"{cwd}","originator":"codex-tui","source":"cli"}}}}"#)
+}
+
+fn codex_ctx(model: &str) -> String {
+    format!(r#"{{"timestamp":"2026-09-05T09:00:01Z","type":"turn_context","payload":{{"model":"{model}"}}}}"#)
+}
+
+/// A token_count event; `total` and `last` are (input, cached, output).
+fn codex_tc(ts: &str, total: (i64, i64, i64), last: (i64, i64, i64), used: f64, resets: Option<i64>) -> String {
+    let u = |(i, c, o): (i64, i64, i64)| {
+        format!(r#"{{"input_tokens":{i},"cached_input_tokens":{c},"output_tokens":{o},"reasoning_output_tokens":0,"total_tokens":{}}}"#, i + o)
+    };
+    let resets = resets.map(|r| r.to_string()).unwrap_or_else(|| "null".into());
+    format!(
+        r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{},"last_token_usage":{}}},"rate_limits":{{"primary":{{"used_percent":{used},"window_minutes":10080,"resets_at":{resets}}},"plan_type":"plus"}}}}}}"#,
+        u(total),
+        u(last)
+    )
+}
+
+fn cost_state(session: &str, start_ms: i64, model: &str, c: (i64, i64, i64, i64), usd: f64) -> String {
+    format!(
+        r#"{{"type":"cost-state","sessionId":"{session}","startTime":{start_ms},"modelUsage":{{"{model}":{{"inputTokens":{},"outputTokens":{},"cacheReadInputTokens":{},"cacheCreationInputTokens":{},"costUSD":{usd}}}}}}}"#,
+        c.0, c.1, c.2, c.3
+    )
+}
+
+fn write_text(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// Rewrite in place (same inode, O_TRUNC) and move mtime forward, so the
+/// change is visible even within one second.
+fn rewrite_in_place(path: &Path, text: &str, bump_secs: u64) {
+    let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open(path).unwrap();
+    f.write_all(text.as_bytes()).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(bump_secs)).unwrap();
+}
+
+fn lines(ls: &[String]) -> String {
+    ls.iter().map(|l| format!("{l}\n")).collect()
+}
+
+/// Every counted value, in a canonical order: what `--full` must reproduce.
+async fn dump(ws: &Path) -> Vec<String> {
+    let pool = crate::db::open_read_only(&ws.join(DB_PATH)).await.unwrap();
+    let mut out = Vec::new();
+    let rows: Vec<(String, String, String, Option<String>, i64, String, i64, i64, i64, i64, i64, f64)> = sqlx::query_as(
+        "SELECT key, kind, session_id, subagent_id, ts_ms, model, input, cache_write_5m, cache_write_1h,
+                cache_read, output, COALESCE(cost_usd, -1) FROM usage_rows ORDER BY key",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for r in rows {
+        out.push(format!("row {} {} {} {:?} {} {} {} {} {} {} {} {:.9}", r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10, r.11));
+    }
+    let limits: Vec<(String, i64, Option<i64>)> =
+        sqlx::query_as("SELECT DISTINCT key, ts_ms, resets_at FROM limit_events ORDER BY key").fetch_all(&pool).await.unwrap();
+    out.extend(limits.into_iter().map(|l| format!("limit {l:?}")));
+    let rates: Vec<(String, i64, f64, i64)> = sqlx::query_as(
+        "SELECT slot, reset_key, used_percent, MAX(ts_ms) FROM rate_snapshots GROUP BY slot, reset_key, used_percent ORDER BY 1, 2, 3",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    out.extend(rates.into_iter().map(|r| format!("rate {r:?}")));
+    let sessions: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT session_id, project_name, agent FROM sessions ORDER BY session_id").fetch_all(&pool).await.unwrap();
+    out.extend(sessions.into_iter().map(|s| format!("session {s:?}")));
+    pool.close().await;
+    out
+}
+
+#[tokio::test]
+async fn incremental_refresh_equals_full_through_rewrites_forks_and_resets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let repo = base.join("code/gamma");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let repo_s = repo.to_string_lossy().into_owned();
+    let projects = base.join("claude");
+    let pdir = projects.join(project::encode_cwd(&repo_s));
+    let codex_root = base.join("codex");
+    let cdir = codex_root.join("2026/09/05");
+    let ws_inc = base.join("ws-inc");
+    let ws_full = base.join("ws-full");
+    for ws in [&ws_inc, &ws_full] {
+        std::fs::create_dir_all(ws.join("memory")).unwrap();
+    }
+    let cfg = UsageConfig {
+        claude_projects_dir: projects.to_string_lossy().into_owned(),
+        codex_sessions_dir: codex_root.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let inc = |step: &'static str| {
+        let (ws, cfg) = (ws_inc.clone(), cfg.clone());
+        async move {
+            let s = refresh(&ws, &cfg, RefreshOptions::default()).await.unwrap();
+            assert!(!s.partial(), "{step}: {:?}", s.warnings);
+        }
+    };
+    let start = parse_ts("2026-09-05T08:00:00Z");
+    let main = pdir.join("s-one.jsonl");
+    let a = |id: &str, ts: &str, out: i64| assistant(id, ts, "claude-opus-5", 10, 100, 1000, out, None);
+
+    // 1. Initial files.
+    write_text(
+        &main,
+        &lines(&[user("2026-09-05T08:00:00Z", &repo_s), a("m1", "2026-09-05T08:01:00Z", 500), a("m2", "2026-09-05T08:02:00Z", 300)]),
+    );
+    let rollout = cdir.join("rollout-2026-09-05T09-00-00-t-one.jsonl");
+    write_text(
+        &rollout,
+        &lines(&[
+            codex_meta("t-one", &repo_s),
+            codex_ctx("gpt-5.6-sol"),
+            codex_tc("2026-09-05T09:01:00Z", (1000, 800, 50), (1000, 800, 50), 10.0, None),
+            codex_tc("2026-09-05T09:01:00Z", (1000, 800, 50), (1000, 800, 50), 10.0, None),
+        ]),
+    );
+    inc("initial").await;
+
+    // 2. Append, ending in a half-written line.
+    let m3 = a("m3", "2026-09-05T08:03:00Z", 700);
+    append(&main, &format!("{}\n{}", a("m3", "2026-09-05T08:03:00Z", 1), &m3[..30]));
+    inc("append").await;
+    append(&main, &format!("{}\n", &m3[30..]));
+    inc("append rest").await;
+
+    // 3. Same-size rewrite: m2's output 300 → 900, identical length.
+    let text = std::fs::read_to_string(&main).unwrap();
+    let rewritten = text.replace(r#""output_tokens":300,"#, r#""output_tokens":900,"#);
+    assert_eq!(rewritten.len(), text.len());
+    rewrite_in_place(&main, &rewritten, 10);
+    inc("same-size rewrite").await;
+    {
+        let pool = open(&ws_inc).await.unwrap();
+        assert_eq!(scalar_i(&pool, "SELECT output FROM usage_rows WHERE key='claude:m2'").await, 900);
+        pool.close().await;
+    }
+
+    // 4. Truncate and regrow past the old offset: m1 is gone, new responses
+    //    and a cost-state run follow. Same inode.
+    let regrown = lines(&[
+        user("2026-09-05T08:00:00Z", &repo_s),
+        a("m2", "2026-09-05T08:02:00Z", 900),
+        a("m3", "2026-09-05T08:03:00Z", 700),
+        a("m4", "2026-09-05T08:04:00Z", 250),
+        a("m5", "2026-09-05T08:05:00Z", 125),
+        a("m6", "2026-09-05T08:06:00Z", 60),
+        cost_state("s-one", start, "claude-opus-5", (60, 3000, 6000, 600), 0.5),
+    ]);
+    assert!(regrown.len() as u64 > std::fs::metadata(&main).unwrap().len());
+    rewrite_in_place(&main, &regrown, 20);
+    inc("truncate and regrow").await;
+    {
+        let pool = open(&ws_inc).await.unwrap();
+        assert_eq!(
+            scalar_i(&pool, "SELECT COUNT(*) FROM usage_rows WHERE key='claude:m1'").await,
+            0,
+            "a response no file observes any more is removed"
+        );
+        pool.close().await;
+    }
+
+    // 5. Fork (new session file repeating m5/m6, with a counter that
+    //    continues s-one's run) and a resume of s-one (new run).
+    write_text(
+        &pdir.join("s-fork.jsonl"),
+        &lines(&[
+            user("2026-09-05T08:10:00Z", &repo_s),
+            a("m5", "2026-09-05T08:05:00Z", 125),
+            a("m6", "2026-09-05T08:06:00Z", 60),
+            a("f1", "2026-09-05T08:11:00Z", 400),
+            cost_state("s-fork", start, "claude-opus-5", (80, 3500, 7000, 700), 0.62),
+        ]),
+    );
+    append(
+        &main,
+        &lines(&[
+            a("m7", "2026-09-05T10:00:00Z", 80),
+            cost_state("s-one", parse_ts("2026-09-05T09:59:00Z"), "claude-opus-5", (15, 90, 1000, 100), 0.07),
+        ]),
+    );
+    inc("fork and resume").await;
+
+    // 6. Codex: counter reset whose total collides with the previous total,
+    //    readings without a reset time, then a replace-by-rename rewrite
+    //    (new inode) that keeps the content and adds an event.
+    append(
+        &rollout,
+        &lines(&[
+            codex_tc("2026-09-05T09:10:00Z", (1040, 0, 10), (1040, 0, 10), 12.0, None),
+            codex_tc("2026-09-05T09:11:00Z", (1040, 0, 10), (1040, 0, 10), 12.0, None),
+            codex_tc("2026-09-05T09:20:00Z", (2000, 500, 60), (960, 500, 50), 15.0, Some(1_790_000_000)),
+        ]),
+    );
+    inc("codex reset").await;
+    let mut ctext = std::fs::read_to_string(&rollout).unwrap();
+    ctext.push_str(&lines(&[codex_tc("2026-09-05T09:30:00Z", (3000, 1500, 90), (1000, 1000, 30), 18.0, Some(1_790_000_000))]));
+    let tmpf = cdir.join("rollout.tmp");
+    std::fs::write(&tmpf, &ctext).unwrap();
+    std::fs::rename(&tmpf, &rollout).unwrap();
+    inc("codex rename").await;
+
+    let incremental = dump(&ws_inc).await;
+    {
+        let pool = open(&ws_inc).await.unwrap();
+        // Codex: repeat skipped, colliding reset counted, rewrite added one.
+        assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM usage_rows WHERE vendor='codex'").await, 4);
+        assert_eq!(scalar_i(&pool, "SELECT SUM(output) FROM usage_rows WHERE vendor='codex'").await, 50 + 10 + 50 + 30);
+        // Null-reset readings deduplicate: 10% and 12% once each.
+        assert_eq!(
+            scalar_i(&pool, "SELECT COUNT(*) FROM rate_snapshots WHERE resets_at IS NULL").await,
+            2
+        );
+        // m5 and m6 are counted once although two files hold them.
+        assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM usage_rows WHERE key IN ('claude:m5','claude:m6')").await, 2);
+        pool.close().await;
+    }
+
+    // A fresh database read with --full, and --full over the incremental one.
+    refresh(&ws_full, &cfg, RefreshOptions { full: true }).await.unwrap();
+    assert_eq!(dump(&ws_full).await, incremental, "fresh --full differs from the incremental history");
+    refresh(&ws_inc, &cfg, RefreshOptions { full: true }).await.unwrap();
+    assert_eq!(dump(&ws_inc).await, incremental, "--full over the incremental DB changed it");
+}
+
+// ─── partial refresh ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn unreadable_files_and_malformed_lines_make_a_partial_refresh() {
+    let fx = fixture().await;
+    // A malformed assistant line in the middle of a transcript.
+    append(&fx.main, "{\"type\":\"assistant\",\"message\":{\"id\":\"broken\"\n");
+    // An unreadable Codex file.
+    let locked = PathBuf::from(&fx.cfg.codex_sessions_dir).join("2026/09/01/rollout-locked.jsonl");
+    std::fs::write(&locked, "{}\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&locked).is_ok() {
+        return; // running as root: permissions do not apply
+    }
+
+    let s = refresh(&fx.ws, &fx.cfg, RefreshOptions::default()).await.unwrap();
+    assert!(s.partial());
+    assert_eq!(s.files_failed, 1);
+    assert_eq!(s.malformed_lines, 1);
+    assert!(s.warnings.iter().any(|w| w.contains("rollout-locked.jsonl")));
+
+    let pool = crate::db::open_read_only(&fx.ws.join(DB_PATH)).await.unwrap();
+    let st = query::status(Some(&pool), &fx.ws).await.unwrap();
+    let last = st.last_refresh.unwrap();
+    assert_eq!((last.files_failed, last.malformed_lines), (1, 1));
+    assert!(last.warnings.unwrap().contains("rollout-locked.jsonl"));
+    // The malformed line stays reported after later refreshes read nothing.
+    pool.close().await;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let again = refresh(&fx.ws, &fx.cfg, RefreshOptions::default()).await.unwrap();
+    assert!(!again.partial());
+    let pool = crate::db::open_read_only(&fx.ws.join(DB_PATH)).await.unwrap();
+    let st = query::status(Some(&pool), &fx.ws).await.unwrap();
+    assert_eq!(st.malformed_lines_total, 1);
+}
+
+// ─── batching ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_file_larger_than_one_batch_is_counted_whole() {
+    let fx = fixture().await;
+    let n = ingest::BATCH_RECORDS * 2 + 7;
+    let mut text = String::new();
+    for i in 0..n {
+        text.push_str(&assistant(&format!("bulk-{i}"), "2026-09-04T10:00:00Z", "claude-opus-5", 1, 0, 0, 2, None));
+        text.push('\n');
+    }
+    append(&fx.main, &text);
+    refresh(&fx.ws, &fx.cfg, RefreshOptions::default()).await.unwrap();
+    let pool = open(&fx.ws).await.unwrap();
+    assert_eq!(scalar_i(&pool, "SELECT COUNT(*) FROM usage_rows WHERE key LIKE 'claude:bulk-%'").await, n as i64);
 }

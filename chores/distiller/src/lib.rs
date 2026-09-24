@@ -75,13 +75,21 @@ async fn usage_maintenance(workspace_root: &Path, settings: &Settings) {
                 "distiller",
                 "usage",
                 &format!(
-                    "usage refresh: {} of {} transcript files changed ({:.1} MB), {} records, {} sessions labeled, {:.1}s",
+                    "usage refresh: {} of {} transcript files changed ({:.1} MB), {} records, {} sessions labeled, {:.1}s{}",
                     s.files_read,
                     s.files_seen,
                     s.bytes_read as f64 / 1e6,
                     s.records,
                     s.sessions_labeled,
                     s.elapsed.as_secs_f64(),
+                    if s.partial() {
+                        format!(
+                            " — PARTIAL: {} file(s) not read, {} malformed and {} oversized line(s) skipped",
+                            s.files_failed, s.malformed_lines, s.oversized_lines
+                        )
+                    } else {
+                        String::new()
+                    },
                 ),
                 nucleus_core::diary::Tag::Routine,
             );

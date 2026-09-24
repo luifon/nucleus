@@ -3,9 +3,10 @@
 //!
 //! Token fields: `input` is uncached input, `cache_write` both cache-write
 //! durations, `cache_read` cached input, `output` includes reasoning;
-//! `tokens` is their sum. `cost_usd` is the list-price estimate (response
-//! and residual rows at table prices plus the cost-state adjustments, see
-//! `reconcile.rs`).
+//! `tokens` is their sum. `cost_usd` is the dollar estimate (response and
+//! residual rows at table prices plus the cost-state adjustments, see
+//! `reconcile.rs`); `third_party_usd` is the part of it priced from a
+//! third-party estimate rather than a vendor list price.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -32,6 +33,9 @@ pub struct UsageTotals {
     /// unless a cost-state adjustment priced them).
     #[ts(type = "number")]
     pub unpriced_tokens: i64,
+    /// Dollars in `cost_usd` priced from a third-party estimate (a model
+    /// whose vendor publishes no price; see the price listing).
+    pub third_party_usd: f64,
     /// Number of API responses (Claude) / turn deltas (Codex).
     #[ts(type = "number")]
     pub responses: i64,
@@ -49,9 +53,16 @@ const TOTALS: &str = "
     COALESCE(SUM(u.cost_usd),0.0) AS cost_usd,
     COALESCE(SUM(CASE WHEN p.matched_key IS NULL AND u.kind != 'adjustment'
                       THEN u.input + u.cache_write_5m + u.cache_write_1h + u.cache_read + u.output ELSE 0 END),0) AS unpriced_tokens,
+    COALESCE(SUM(CASE WHEN p.basis = 'third-party-estimate' THEN u.cost_usd ELSE 0.0 END),0.0) AS third_party_usd,
     COALESCE(SUM(CASE WHEN u.kind = 'response' THEN 1 ELSE 0 END),0) AS responses";
 
 const FROM: &str = "FROM usage_rows u LEFT JOIN prices p ON p.model = u.model";
+
+/// Unpriced tokens over `usage_rows u LEFT JOIN prices p`.
+const UNPRICED: &str = "COALESCE(SUM(CASE WHEN p.matched_key IS NULL AND u.kind != 'adjustment'
+    THEN u.input + u.cache_write_5m + u.cache_write_1h + u.cache_read + u.output ELSE 0 END),0)";
+/// Dollars priced from a third-party estimate over the same join.
+const THIRD_PARTY: &str = "COALESCE(SUM(CASE WHEN p.basis = 'third-party-estimate' THEN u.cost_usd ELSE 0.0 END),0.0)";
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export)]
@@ -120,7 +131,11 @@ pub struct UsageRateReading {
 #[ts(export)]
 pub struct UsageSummary {
     pub days: u32,
+    /// Today in the operator's timezone (`NUCLEUS_TZ`).
     pub today: String,
+    /// First local day of the range: `today − (days − 1)`, or for all time
+    /// the first day with data under the tool filter (today when none).
+    pub range_from: String,
     pub by_vendor: Vec<UsageVendorTotals>,
     pub day: UsageCompare,
     pub week: UsageCompare,
@@ -171,6 +186,11 @@ pub struct UsageAgentRow {
     #[ts(type = "number")]
     pub sessions: i64,
     pub cost_30d: f64,
+    /// Tokens in the last 30 days without a price (not in `cost_30d`).
+    #[ts(type = "number")]
+    pub unpriced_tokens_30d: i64,
+    /// Part of `cost_30d` priced from a third-party estimate.
+    pub third_party_usd_30d: f64,
     #[ts(type = "number")]
     pub sessions_30d: i64,
     pub last_day: Option<String>,
@@ -191,6 +211,11 @@ pub struct UsageReminderRow {
     #[ts(type = "number")]
     pub sessions: i64,
     pub cost_30d: f64,
+    /// Tokens in the last 30 days without a price (not in `cost_30d`).
+    #[ts(type = "number")]
+    pub unpriced_tokens_30d: i64,
+    /// Part of `cost_30d` priced from a third-party estimate.
+    pub third_party_usd_30d: f64,
     #[ts(type = "number")]
     pub sessions_30d: i64,
     pub last_day: Option<String>,
@@ -231,6 +256,11 @@ pub struct UsageRatePoint {
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export)]
 pub struct UsageLimits {
+    /// Inclusive local-day bounds of the range, in `timezone`
+    /// (`NUCLEUS_TZ`). For all time, `from` is the first event day.
+    pub from: String,
+    pub to: String,
+    pub timezone: String,
     pub events: Vec<UsageLimitEvent>,
     pub codex_daily: Vec<UsageRatePoint>,
 }
@@ -259,12 +289,27 @@ pub struct UsageSessionRow {
 pub struct UsagePrice {
     pub model: String,
     pub matched_key: Option<String>,
-    pub source: Option<String>,
+    /// `list-price`, `third-party-estimate` or `nucleus.toml`.
+    pub basis: Option<String>,
+    pub source_url: Option<String>,
+    /// Date the source was read.
+    pub retrieved: Option<String>,
     pub input: Option<f64>,
     pub output: Option<f64>,
     pub cache_read: Option<f64>,
     pub cache_write_5m: Option<f64>,
     pub cache_write_1h: Option<f64>,
+    /// The cache-write rates are derived, not listed by the source.
+    pub cache_write_inferred: bool,
+    /// The cache-read rate is derived, not listed by the source.
+    pub cache_read_inferred: bool,
+    /// Whole-request rates above this many input tokens (OpenAI).
+    #[ts(type = "number | null")]
+    pub long_context_above: Option<i64>,
+    pub lc_input: Option<f64>,
+    pub lc_output: Option<f64>,
+    pub lc_cache_read: Option<f64>,
+    pub lc_cache_write: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, TS, FromRow)]
@@ -276,10 +321,21 @@ pub struct UsageRefreshRun {
     pub files_seen: i64,
     #[ts(type = "number")]
     pub files_read: i64,
+    /// Files that could not be read in this run.
+    #[ts(type = "number")]
+    pub files_failed: i64,
     #[ts(type = "number")]
     pub bytes_read: i64,
     #[ts(type = "number")]
     pub rows_written: i64,
+    /// Relevant lines that were not valid JSON, in the bytes read.
+    #[ts(type = "number")]
+    pub malformed_lines: i64,
+    /// Lines over the reader's size limit, skipped, in the bytes read.
+    #[ts(type = "number")]
+    pub oversized_lines: i64,
+    /// JSON array of the first warning messages, when any.
+    pub warnings: Option<String>,
     pub error: Option<String>,
 }
 
@@ -296,8 +352,19 @@ pub struct UsageStatus {
     pub prices: Vec<UsagePrice>,
     #[ts(type = "number")]
     pub sessions: i64,
-    /// Sum of Claude Code's own cost-state estimates.
+    /// Sum of Claude Code's own cost-state estimates, each counter counted
+    /// once (see `reconcile.rs`).
     pub cost_state_usd: f64,
+    /// Cost-state runs whose window repeated responses of an earlier run.
+    #[ts(type = "number")]
+    pub cost_state_carried_runs: i64,
+    /// Over every stored file: relevant lines skipped as malformed or
+    /// oversized. Unlike `last_refresh`, these stay until the file is
+    /// rewritten, so they report data missing from the store now.
+    #[ts(type = "number")]
+    pub malformed_lines_total: i64,
+    #[ts(type = "number")]
+    pub oversized_lines_total: i64,
     /// Sum of `costUSD − table price` over all cost-state runs: how far the
     /// price table is from Claude Code's prices on the covered tokens.
     pub cost_state_adjustment_usd: f64,
@@ -386,6 +453,20 @@ async fn compare(
     })
 }
 
+/// Inclusive local-day bounds shown for a range: `days` days ending today,
+/// or for all time (`days == 0`) from the first day with data (`first`,
+/// today when there is none). Computed on the server in `NUCLEUS_TZ`, so
+/// the page never mixes in the browser's timezone.
+pub fn range_bounds(today: chrono::NaiveDate, days: u32, first: Option<&str>) -> (String, String) {
+    let to = day(today);
+    let from = if days == 0 {
+        first.filter(|f| *f <= to.as_str()).map(String::from).unwrap_or_else(|| to.clone())
+    } else {
+        range_start(today, days)
+    };
+    (from, to)
+}
+
 /// First local day of a `days`-long range ending today; `days == 0` = all.
 fn range_start(today: chrono::NaiveDate, days: u32) -> String {
     if days == 0 {
@@ -410,13 +491,17 @@ pub async fn status(pool: Option<&SqlitePool>, workspace_root: &std::path::Path)
             prices: vec![],
             sessions: 0,
             cost_state_usd: 0.0,
+            cost_state_carried_runs: 0,
+            malformed_lines_total: 0,
+            oversized_lines_total: 0,
             cost_state_adjustment_usd: 0.0,
             residual_tokens: 0,
             claude_complete_since: None,
         });
     };
     let last_refresh: Option<UsageRefreshRun> = sqlx::query_as(
-        "SELECT started_at, finished_at, files_seen, files_read, bytes_read, rows_written, error
+        "SELECT started_at, finished_at, files_seen, files_read, files_failed, bytes_read, rows_written,
+                malformed_lines, oversized_lines, warnings, error
            FROM refresh_runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1",
     )
     .fetch_optional(pool)
@@ -425,13 +510,21 @@ pub async fn status(pool: Option<&SqlitePool>, workspace_root: &std::path::Path)
         sqlx::query_as("SELECT MIN(local_day), MAX(local_day) FROM usage_rows").fetch_one(pool).await?;
     let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions").fetch_one(pool).await?;
     let prices: Vec<UsagePrice> = sqlx::query_as(
-        "SELECT model, matched_key, source, input, output, cache_read, cache_write_5m, cache_write_1h
+        "SELECT model, matched_key, basis, source_url, retrieved, input, output, cache_read, cache_write_5m,
+                cache_write_1h, cache_write_inferred, cache_read_inferred, long_context_above, lc_input,
+                lc_output, lc_cache_read, lc_cache_write
            FROM prices ORDER BY matched_key IS NULL DESC, model",
     )
     .fetch_all(pool)
     .await?;
-    let cost_state_usd: f64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(cost_usd),0.0) FROM cost_runs").fetch_one(pool).await?;
+    let meta_num = |v: Option<String>| v.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let cost_state_usd = meta_num(super::store::meta_get(pool, "cost_state_usd").await?);
+    let cost_state_carried_runs = meta_num(super::store::meta_get(pool, "cost_state_carried_runs").await?) as i64;
+    let (malformed_lines_total, oversized_lines_total): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(malformed_lines),0), COALESCE(SUM(oversized_lines),0) FROM source_files",
+    )
+    .fetch_one(pool)
+    .await?;
     let (adj, residual): (f64, i64) = sqlx::query_as(
         "SELECT COALESCE(SUM(CASE WHEN kind='adjustment' THEN cost_usd ELSE 0.0 END),0.0),
                 COALESCE(SUM(CASE WHEN kind='residual'
@@ -462,6 +555,9 @@ pub async fn status(pool: Option<&SqlitePool>, workspace_root: &std::path::Path)
         prices,
         sessions,
         cost_state_usd,
+        cost_state_carried_runs,
+        malformed_lines_total,
+        oversized_lines_total,
         cost_state_adjustment_usd: adj,
         residual_tokens: residual,
         claude_complete_since,
@@ -571,8 +667,18 @@ pub async fn summary(pool: &SqlitePool, days: u32, v: VendorFilter) -> Result<Us
     .fetch_all(pool)
     .await?;
 
+    let first: Option<String> = if days == 0 {
+        sqlx::query_scalar(&format!("SELECT MIN(local_day) FROM usage_rows WHERE 1=1{}", v.and("vendor")))
+            .fetch_one(pool)
+            .await?
+    } else {
+        None
+    };
+    let (range_from, _) = range_bounds(today, days, first.as_deref());
+
     Ok(UsageSummary {
         days,
+        range_from,
         today: to,
         by_vendor,
         day: day_cmp,
@@ -641,7 +747,8 @@ pub async fn nucleus(pool: &SqlitePool, days: u32, workspace_root: &str, v: Vend
     let agents: Vec<UsageAgentRow> = sqlx::query_as(&format!(
         "SELECT COALESCE(s.agent, 'unlabeled') AS agent, {TOTALS},
                 COUNT(DISTINCT CASE WHEN u.local_day BETWEEN ?1 AND ?2 THEN u.session_id END) AS sessions,
-                0.0 AS cost_30d, 0 AS sessions_30d, MAX(u.local_day) AS last_day
+                0.0 AS cost_30d, 0 AS unpriced_tokens_30d, 0.0 AS third_party_usd_30d, 0 AS sessions_30d,
+                MAX(u.local_day) AS last_day
            FROM usage_rows u LEFT JOIN prices p ON p.model = u.model
            JOIN sessions s ON s.session_id = u.session_id
           WHERE (s.agent IS NOT NULL OR s.project_root = ?3) AND u.local_day BETWEEN ?1 AND ?2{vf}
@@ -652,9 +759,11 @@ pub async fn nucleus(pool: &SqlitePool, days: u32, workspace_root: &str, v: Vend
     .bind(workspace_root)
     .fetch_all(pool)
     .await?;
-    let agents_30d: Vec<(String, f64, i64)> = sqlx::query_as(&format!(
-        "SELECT COALESCE(s.agent, 'unlabeled'), COALESCE(SUM(u.cost_usd),0.0), COUNT(DISTINCT u.session_id)
-           FROM usage_rows u JOIN sessions s ON s.session_id = u.session_id
+    let agents_30d: Vec<(String, f64, i64, i64, f64)> = sqlx::query_as(&format!(
+        "SELECT COALESCE(s.agent, 'unlabeled'), COALESCE(SUM(u.cost_usd),0.0), COUNT(DISTINCT u.session_id),
+                {UNPRICED} AS unpriced, {THIRD_PARTY} AS third_party
+           FROM usage_rows u LEFT JOIN prices p ON p.model = u.model
+           JOIN sessions s ON s.session_id = u.session_id
           WHERE (s.agent IS NOT NULL OR s.project_root = ?2) AND u.local_day >= ?1{vf}
           GROUP BY COALESCE(s.agent, 'unlabeled')"
     ))
@@ -665,9 +774,11 @@ pub async fn nucleus(pool: &SqlitePool, days: u32, workspace_root: &str, v: Vend
     let agents = agents
         .into_iter()
         .map(|mut a| {
-            if let Some((_, c, n)) = agents_30d.iter().find(|(name, _, _)| *name == a.agent) {
+            if let Some((_, c, n, unpriced, third)) = agents_30d.iter().find(|r| r.0 == a.agent) {
                 a.cost_30d = *c;
                 a.sessions_30d = *n;
+                a.unpriced_tokens_30d = *unpriced;
+                a.third_party_usd_30d = *third;
             }
             a
         })
@@ -678,6 +789,11 @@ pub async fn nucleus(pool: &SqlitePool, days: u32, workspace_root: &str, v: Vend
                 m.created_by AS created_by, {TOTALS},
                 COUNT(DISTINCT CASE WHEN u.local_day BETWEEN ?1 AND ?2 THEN u.session_id END) AS sessions,
                 COALESCE(SUM(CASE WHEN u.local_day >= ?3 THEN u.cost_usd ELSE 0.0 END),0.0) AS cost_30d,
+                COALESCE(SUM(CASE WHEN u.local_day >= ?3 AND p.matched_key IS NULL AND u.kind != 'adjustment'
+                                  THEN u.input + u.cache_write_5m + u.cache_write_1h + u.cache_read + u.output
+                                  ELSE 0 END),0) AS unpriced_tokens_30d,
+                COALESCE(SUM(CASE WHEN u.local_day >= ?3 AND p.basis = 'third-party-estimate'
+                                  THEN u.cost_usd ELSE 0.0 END),0.0) AS third_party_usd_30d,
                 COUNT(DISTINCT CASE WHEN u.local_day >= ?3 THEN u.session_id END) AS sessions_30d,
                 MAX(u.local_day) AS last_day
            FROM usage_rows u LEFT JOIN prices p ON p.model = u.model
@@ -706,16 +822,29 @@ pub async fn nucleus(pool: &SqlitePool, days: u32, workspace_root: &str, v: Vend
 
 pub async fn limits(pool: &SqlitePool, days: u32, v: VendorFilter) -> Result<UsageLimits> {
     let today = today_local();
-    let from = range_start(today, days);
+    let first: Option<String> = if days == 0 {
+        sqlx::query_scalar(&format!("SELECT MIN(e.local_day) FROM limit_events e WHERE 1=1{}", v.and("e.vendor")))
+            .fetch_one(pool)
+            .await?
+    } else {
+        None
+    };
+    let (from, to) = range_bounds(today, days, first.as_deref());
+    // A limit event repeated in several files (a fork copies the lines) is
+    // shown once: the copy from the first path.
     let rows: Vec<(i64, String, String, String, Option<String>, Option<String>, String, Option<i64>, Option<String>, Option<i64>, Option<String>)> =
         sqlx::query_as(&format!(
             "SELECT e.ts_ms, e.local_day, e.vendor, e.session_id, s.project_name, s.agent, e.kind,
                     e.status, e.limit_type, e.resets_at, e.message
-               FROM limit_events e LEFT JOIN sessions s ON s.session_id = e.session_id
-              WHERE e.local_day >= ?1{} ORDER BY e.ts_ms DESC LIMIT 500",
+               FROM limit_events e
+               JOIN (SELECT key, MIN(path) AS path FROM limit_events GROUP BY key) k
+                 ON k.key = e.key AND k.path = e.path
+               LEFT JOIN sessions s ON s.session_id = e.session_id
+              WHERE e.local_day BETWEEN ?1 AND ?2{} ORDER BY e.ts_ms DESC LIMIT 500",
             v.and("e.vendor")
         ))
         .bind(&from)
+        .bind(&to)
         .fetch_all(pool)
         .await?;
     let events = rows
@@ -751,7 +880,7 @@ pub async fn limits(pool: &SqlitePool, days: u32, v: VendorFilter) -> Result<Usa
     let mut daily: std::collections::BTreeMap<(String, String), f64> = Default::default();
     for (slot, used, ts) in snaps {
         let d = local.fields(ts).0;
-        if d.as_str() < from.as_str() {
+        if d.as_str() < from.as_str() || d.as_str() > to.as_str() {
             continue;
         }
         let e = daily.entry((d, slot)).or_insert(0.0);
@@ -761,7 +890,7 @@ pub async fn limits(pool: &SqlitePool, days: u32, v: VendorFilter) -> Result<Usa
         .into_iter()
         .map(|((day, slot), max_used_percent)| UsageRatePoint { day, slot, max_used_percent })
         .collect();
-    Ok(UsageLimits { events, codex_daily })
+    Ok(UsageLimits { from, to, timezone: tz.name().to_string(), events, codex_daily })
 }
 
 pub async fn sessions(pool: &SqlitePool, days: u32, limit: u32, v: VendorFilter) -> Result<Vec<UsageSessionRow>> {
@@ -819,3 +948,20 @@ pub async fn sessions(pool: &SqlitePool, days: u32, limit: u32, v: VendorFilter)
 }
 
 use chrono::Datelike;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_bounds_are_local_days_from_the_server() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
+        assert_eq!(range_bounds(today, 7, None), ("2026-09-18".into(), "2026-09-24".into()));
+        assert_eq!(range_bounds(today, 1, None), ("2026-09-24".into(), "2026-09-24".into()));
+        // All time: from the first day with data, today when there is none,
+        // never after today.
+        assert_eq!(range_bounds(today, 0, Some("2026-03-02")).0, "2026-03-02");
+        assert_eq!(range_bounds(today, 0, None).0, "2026-09-24");
+        assert_eq!(range_bounds(today, 0, Some("2026-10-01")).0, "2026-09-24");
+    }
+}

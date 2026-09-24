@@ -10,13 +10,20 @@
 //! Usage lives on `event_msg` / `token_count` events: `info.total_token_usage`
 //! is the thread's cumulative total and `info.last_token_usage` the usage of
 //! the response that produced the event. Codex re-emits an unchanged event
-//! after some turns (same total), and a thread can restart its counter
-//! (total drops; `last` then equals `total`). Rule: an event whose total
-//! equals the previous event's total is a repeat and is skipped; every other
-//! event contributes its `last_token_usage`. Summing `last` instead of
-//! differencing totals is also correct for a forked thread, whose first
-//! total includes the parent's history but whose `last` is its own first
-//! response.
+//! after some turns (same totals), and a thread can restart its counter
+//! (totals drop; `last` then equals `total`). Rule: an event whose
+//! cumulative totals equal the previous event's totals in every field
+//! (input, cached, cache writes, output, reasoning, total) is a repeat and
+//! is skipped; every other event contributes its `last_token_usage`.
+//! Comparing all fields, not only `total_tokens`, keeps a counter reset
+//! whose new total happens to equal the old one from being taken for a
+//! repeat. Summing `last` instead of differencing totals is also correct
+//! for a forked thread, whose first total includes the parent's history but
+//! whose `last` is its own first response.
+//!
+//! The row key is built from the event's content — thread id, timestamp and
+//! the cumulative totals — never from its byte position, so re-reading a
+//! rewritten file produces the same keys.
 //!
 //! OpenAI counts cached tokens inside `input_tokens` and reasoning tokens
 //! inside `output_tokens`. The row stores `input = input - cached` so the
@@ -40,7 +47,22 @@ pub struct Carry {
     /// subagent, the thread itself otherwise.
     pub session_id: Option<String>,
     pub model: Option<String>,
-    pub prev_total: Option<i64>,
+    /// Cumulative totals of the last counted event.
+    pub prev_total: Option<Totals>,
+    /// Timestamp of the first parsed line.
+    #[serde(default)]
+    pub first_ts_ms: Option<i64>,
+}
+
+/// Every field of a cumulative `total_token_usage`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct Totals {
+    pub input: i64,
+    pub cached: i64,
+    pub cache_write: i64,
+    pub output: i64,
+    pub reasoning: i64,
+    pub total: i64,
 }
 
 #[derive(Deserialize)]
@@ -119,18 +141,27 @@ fn parent_thread(source: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Parse one line at byte `offset` of the file.
-pub fn parse_line(line: &[u8], offset: u64, carry: &mut Carry, out: &mut Vec<Record>) {
+/// Parse one line.
+pub fn parse_line(line: &[u8], carry: &mut Carry, out: &mut Vec<Record>) -> LineStatus {
     if !wanted(line) {
-        return;
+        return LineStatus::Ignored;
     }
     let Ok(l) = serde_json::from_slice::<Line>(line) else {
-        return;
+        return LineStatus::Malformed;
     };
-    let Some(p) = l.payload else { return };
-    let ts_ms = l.timestamp.as_deref().and_then(parse_ts_ms).unwrap_or(0);
+    let ts = l.timestamp.as_deref().and_then(parse_ts_ms);
+    if let Some(t) = ts {
+        carry.first_ts_ms.get_or_insert(t);
+    }
+    let Some(p) = l.payload else { return LineStatus::Parsed };
+    let ts_ms = ts.unwrap_or(0);
+    parse_payload(l.kind.as_deref(), p, ts_ms, carry, out);
+    LineStatus::Parsed
+}
 
-    match (l.kind.as_deref(), p.kind.as_deref()) {
+fn parse_payload(kind: Option<&str>, p: Payload, ts_ms: i64, carry: &mut Carry, out: &mut Vec<Record>) {
+
+    match (kind, p.kind.as_deref()) {
         (Some("session_meta"), _) => {
             // A forked thread repeats its parent's meta after its own; the
             // first one names this file's thread.
@@ -167,13 +198,25 @@ pub fn parse_line(line: &[u8], offset: u64, carry: &mut Carry, out: &mut Vec<Rec
             let (Some(total), Some(last)) = (info.total_token_usage, info.last_token_usage) else {
                 return;
             };
-            if carry.prev_total == Some(total.total_tokens) {
+            let totals = Totals {
+                input: total.input_tokens,
+                cached: total.cached_input_tokens,
+                cache_write: total.cache_write_input_tokens,
+                output: total.output_tokens,
+                reasoning: total.reasoning_output_tokens,
+                total: total.total_tokens,
+            };
+            if carry.prev_total == Some(totals) {
                 return; // re-emitted event
             }
-            carry.prev_total = Some(total.total_tokens);
+            carry.prev_total = Some(totals);
             let cached = last.cached_input_tokens.min(last.input_tokens);
+            let t = totals;
             out.push(Record::Usage(UsageRow {
-                key: format!("codex:{thread}:{offset}"),
+                key: format!(
+                    "codex:{thread}:{ts_ms}:{}:{}:{}:{}:{}:{}",
+                    t.input, t.cached, t.cache_write, t.output, t.reasoning, t.total
+                ),
                 vendor: Vendor::Codex,
                 session_id: session,
                 subagent_id: (carry.session_id.as_deref() != Some(thread.as_str()))
@@ -232,10 +275,8 @@ mod tests {
     fn run(lines: &[&str]) -> (Vec<Record>, Carry) {
         let mut carry = Carry::default();
         let mut out = Vec::new();
-        let mut offset = 0u64;
         for l in lines {
-            parse_line(l.as_bytes(), offset, &mut carry, &mut out);
-            offset += l.len() as u64 + 1;
+            parse_line(l.as_bytes(), &mut carry, &mut out);
         }
         (out, carry)
     }
@@ -245,6 +286,10 @@ mod tests {
     }
 
     fn tc(total: (i64, i64, i64, i64), last: (i64, i64, i64, i64)) -> String {
+        tc_at("2026-09-01T12:00:00Z", total, last)
+    }
+
+    fn tc_at(ts: &str, total: (i64, i64, i64, i64), last: (i64, i64, i64, i64)) -> String {
         let u = |(i, c, o, r): (i64, i64, i64, i64)| {
             format!(
                 r#"{{"input_tokens":{i},"cached_input_tokens":{c},"cache_write_input_tokens":0,"output_tokens":{o},"reasoning_output_tokens":{r},"total_tokens":{}}}"#,
@@ -252,7 +297,7 @@ mod tests {
             )
         };
         format!(
-            r#"{{"timestamp":"2026-09-01T12:00:00Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{},"last_token_usage":{}}},"rate_limits":{{"primary":{{"used_percent":12.0,"window_minutes":10080,"resets_at":1790000000}},"secondary":null,"plan_type":"plus","rate_limit_reached_type":null}}}}}}"#,
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{},"last_token_usage":{}}},"rate_limits":{{"primary":{{"used_percent":12.0,"window_minutes":10080,"resets_at":1790000000}},"secondary":null,"plan_type":"plus","rate_limit_reached_type":null}}}}}}"#,
             u(total),
             u(last)
         )
@@ -282,9 +327,45 @@ mod tests {
         assert_eq!(rows[0].model, "gpt-5.6-sol");
         assert_eq!(rows[0].session_id, "t-1");
         assert!(rows[0].subagent_id.is_none());
-        assert_eq!(carry.prev_total, Some(305));
+        assert_eq!(carry.prev_total.map(|t| t.total), Some(305));
         // one rate snapshot per event, including the repeat
         assert_eq!(r.iter().filter(|r| matches!(r, Record::Rate(_))).count(), 4);
+    }
+
+    #[test]
+    fn counter_reset_with_a_colliding_total_is_not_a_repeat() {
+        // The reset event's total_tokens (1050) equals the previous event's,
+        // but its fields differ: it is new usage, not a re-emitted event.
+        let (r, _) = run(&[
+            META,
+            CTX,
+            &tc_at("2026-09-01T12:00:00Z", (1000, 800, 50, 0), (1000, 800, 50, 0)),
+            &tc_at("2026-09-01T12:10:00Z", (1040, 0, 10, 0), (1040, 0, 10, 0)),
+        ]);
+        let rows = rows(&r);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].tokens.input, 1040);
+        assert_eq!(rows[1].tokens.output, 10);
+    }
+
+    #[test]
+    fn keys_depend_on_content_not_position() {
+        let ev = tc((1000, 800, 50, 10), (1000, 800, 50, 10));
+        let (a, _) = run(&[META, CTX, &ev]);
+        // The same event behind extra lines: same key.
+        let noise = r#"{"timestamp":"2026-09-01T11:59:30Z","type":"response_item","payload":{"type":"message"}}"#;
+        let (b, _) = run(&[META, noise, noise, CTX, &ev]);
+        assert_eq!(rows(&a)[0].key, rows(&b)[0].key);
+        assert!(rows(&a)[0].key.starts_with("codex:t-1:"));
+    }
+
+    #[test]
+    fn malformed_relevant_lines_are_reported() {
+        let mut carry = Carry::default();
+        let mut out = Vec::new();
+        let bad = br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":"#;
+        assert_eq!(parse_line(bad, &mut carry, &mut out), LineStatus::Malformed);
+        assert_eq!(parse_line(b"not json at all", &mut carry, &mut out), LineStatus::Ignored);
     }
 
     #[test]

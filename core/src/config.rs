@@ -311,7 +311,7 @@ pub struct UsageConfig {
     pub prices: std::collections::BTreeMap<String, ModelPrice>,
 }
 
-/// List price of one model in USD per million tokens. `cache_write_5m` and
+/// Price of one model in USD per million tokens. `cache_write_5m` and
 /// `cache_write_1h` are the two Anthropic cache-write durations; a vendor
 /// with one cache-write price sets both to the same value.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
@@ -321,6 +321,22 @@ pub struct ModelPrice {
     pub cache_read: f64,
     pub cache_write_5m: f64,
     pub cache_write_1h: f64,
+    /// Rates for a request whose prompt exceeds a size, applied to the whole
+    /// request (OpenAI's long-context pricing).
+    #[serde(default)]
+    pub long_context: Option<LongContextPrice>,
+}
+
+/// Whole-request rates above a prompt size, USD per million tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct LongContextPrice {
+    /// The rates apply when the request's input tokens (uncached + cached +
+    /// cache writes) are strictly more than this.
+    pub above_input_tokens: i64,
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
 }
 
 fn default_claude_projects_dir() -> String {

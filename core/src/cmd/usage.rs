@@ -64,17 +64,27 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             let s = usage::refresh(&root, &settings.usage, usage::RefreshOptions { full }).await?;
             println!(
                 "usage refresh: {} files seen, {} read ({:.1} MB), {} records, {} sessions labeled, \
-                 {} cost-state runs (${:.2} Claude Code estimate, table drift ${:+.2}), {:.1}s",
+                 {} cost-state runs ({} repeating an earlier run; ${:.2} Claude Code estimate, table drift ${:+.2}), {:.1}s",
                 s.files_seen,
                 s.files_read,
                 s.bytes_read as f64 / 1e6,
                 s.records,
                 s.sessions_labeled,
                 s.reconcile.runs,
+                s.reconcile.carried_runs,
                 s.reconcile.cost_state_usd,
                 s.reconcile.adjustment_usd,
                 s.elapsed.as_secs_f64()
             );
+            if s.partial() {
+                println!(
+                    "PARTIAL: {} file(s) not read, {} malformed usage line(s), {} oversized line(s) skipped",
+                    s.files_failed, s.malformed_lines, s.oversized_lines
+                );
+                for w in &s.warnings {
+                    println!("  {w}");
+                }
+            }
         }
         Cmd::Report { days, top, vendor } => {
             let v = match vendor.as_str() {
@@ -88,7 +98,7 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
                 return Ok(());
             };
             let sum = usage::query::summary(&pool, days, v).await?;
-            println!("range: {} (estimates at API list price)", sum.range.label);
+            println!("range: {} (dollar estimates at API prices; not billing)", sum.range.label);
             for v in &sum.by_vendor {
                 println!(
                     "  {:<7} {:>9} tokens  ${:>10.2}  {} sessions  (cache read {}, unpriced {})",
@@ -120,7 +130,15 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             let n = usage::query::nucleus(&pool, days, &ws, v).await?;
             println!("nucleus agents:");
             for a in n.agents.iter().take(top) {
-                println!("  {:<20} ${:>9.2}  {} sessions  (last 30d ${:.2})", a.agent, a.totals.cost_usd, a.sessions, a.cost_30d);
+                let unpriced = if a.unpriced_tokens_30d > 0 {
+                    format!(" + {} tokens without a price", tok(a.unpriced_tokens_30d))
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  {:<20} ${:>9.2}  {} sessions  (last 30d ${:.2}{unpriced})",
+                    a.agent, a.totals.cost_usd, a.sessions, a.cost_30d
+                );
             }
             println!("reminders (last 30 days):");
             for r in n.reminders.iter().take(top) {
@@ -135,6 +153,18 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             }
             let l = usage::query::limits(&pool, days, v).await?;
             println!("limit/error events: {}", l.events.len());
+            let third: f64 = sum.by_vendor.iter().map(|v| v.totals.third_party_usd).sum();
+            if third > 0.0 {
+                let st = usage::query::status(Some(&pool), &root).await?;
+                for p in st.prices.iter().filter(|p| p.basis.as_deref() == Some("third-party-estimate")) {
+                    println!(
+                        "note: ${third:.2} of the totals prices {} at a third-party estimate, not an API list price ({}, retrieved {})",
+                        p.model,
+                        p.source_url.as_deref().unwrap_or("-"),
+                        p.retrieved.as_deref().unwrap_or("-")
+                    );
+                }
+            }
         }
     }
     Ok(())

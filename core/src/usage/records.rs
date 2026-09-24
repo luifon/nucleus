@@ -22,8 +22,10 @@ impl Vendor {
 /// One billed model response (Claude) or one turn delta (Codex).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageRow {
-    /// Global dedupe key. Claude: `claude:<message.id>` (fallback requestId,
-    /// then line uuid). Codex: `codex:<thread id>:<byte offset of the line>`.
+    /// Global dedupe key, derived from the line content only (never from
+    /// its position in the file). Claude: `claude:<message.id>` (fallback
+    /// requestId, then line uuid). Codex: `codex:<thread id>:<event
+    /// timestamp>:<cumulative totals>`.
     pub key: String,
     pub vendor: Vendor,
     /// The top-level session the usage is attributed to. A subagent's usage
@@ -110,6 +112,17 @@ pub enum Record {
     Limit(LimitEvent),
     Session(SessionInfo),
     Rate(RateSnapshot),
+}
+
+/// What the parser made of one complete line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineStatus {
+    /// Not a line type the parser reads.
+    Ignored,
+    Parsed,
+    /// A line of a type the parser reads that is not valid JSON. Counted and
+    /// reported by the refresh; the line itself is skipped.
+    Malformed,
 }
 
 /// Parse an RFC3339 timestamp to Unix milliseconds.

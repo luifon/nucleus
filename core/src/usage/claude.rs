@@ -40,6 +40,10 @@ pub struct FileCtx {
 pub struct Carry {
     /// Latest line timestamp seen so far in this file.
     pub last_ts_ms: Option<i64>,
+    /// First line timestamp of the file (orders the files that repeat a
+    /// response; see `store::derive_rows`).
+    #[serde(default)]
+    pub first_ts_ms: Option<i64>,
     /// Whether the session's working directory was already emitted.
     pub cwd_seen: bool,
 }
@@ -165,17 +169,20 @@ fn wanted(line: &[u8], carry: &Carry) -> bool {
         || (!carry.cwd_seen && memmem::find(line, b"\"cwd\":\"").is_some())
 }
 
-/// Parse one line. Lines that fail to parse are skipped (a half-written
-/// final line never reaches here: the reader stops at the last newline).
-pub fn parse_line(line: &[u8], ctx: &FileCtx, carry: &mut Carry, out: &mut Vec<Record>) {
+/// Parse one line. A line that carries one of the parsed record types but
+/// is not valid JSON is reported as [`LineStatus::Malformed`] (a
+/// half-written final line never reaches here: the reader stops at the last
+/// newline).
+pub fn parse_line(line: &[u8], ctx: &FileCtx, carry: &mut Carry, out: &mut Vec<Record>) -> LineStatus {
     if let Some(ts) = quick_timestamp(line) {
         carry.last_ts_ms = Some(carry.last_ts_ms.map_or(ts, |t| t.max(ts)));
+        carry.first_ts_ms.get_or_insert(ts);
     }
     if !wanted(line, carry) {
-        return;
+        return LineStatus::Ignored;
     }
     let Ok(l) = serde_json::from_slice::<Line>(line) else {
-        return;
+        return LineStatus::Malformed;
     };
 
     if !carry.cwd_seen && ctx.subagent_id.is_none() {
@@ -194,7 +201,7 @@ pub fn parse_line(line: &[u8], ctx: &FileCtx, carry: &mut Carry, out: &mut Vec<R
         Some("assistant") => assistant(line, l, ts_ms, ctx, carry, out),
         Some("cost-state") => {
             let (Some(start_ms), Some(usage)) = (l.start_time, l.model_usage) else {
-                return;
+                return LineStatus::Parsed;
             };
             let models: Vec<CostRunModel> = usage
                 .into_iter()
@@ -209,7 +216,7 @@ pub fn parse_line(line: &[u8], ctx: &FileCtx, carry: &mut Carry, out: &mut Vec<R
                 })
                 .collect();
             if models.is_empty() {
-                return;
+                return LineStatus::Parsed;
             }
             // cost-state lives only in main files; a subagent never writes one.
             out.push(Record::CostRun(CostRun {
@@ -229,6 +236,7 @@ pub fn parse_line(line: &[u8], ctx: &FileCtx, carry: &mut Carry, out: &mut Vec<R
         }
         _ => {}
     }
+    LineStatus::Parsed
 }
 
 fn assistant(
@@ -412,8 +420,8 @@ mod tests {
 
     #[test]
     fn usage_limit_and_other_api_errors_become_limit_events() {
-        let limit = r#"{"type":"assistant","uuid":"u-429","timestamp":"2026-09-19T23:00:51.675Z","message":{"id":"x","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"You've hit your session limit"}]},"quotaLimits":{"status":"rejected","resetsAt":1789861800,"rateLimitType":"five_hour"},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}"#;
-        let overload = r#"{"type":"assistant","uuid":"u-529","timestamp":"2026-09-19T23:10:00Z","message":{"id":"y","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"Overloaded"}]},"error":"server_error","isApiErrorMessage":true,"apiErrorStatus":529}"#;
+        let limit = r#"{"type":"assistant","uuid":"u-429","timestamp":"2026-09-01T10:00:00Z","message":{"id":"x","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"You've hit your session limit"}]},"quotaLimits":{"status":"rejected","resetsAt":1790000000,"rateLimitType":"five_hour"},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}"#;
+        let overload = r#"{"type":"assistant","uuid":"u-529","timestamp":"2026-09-01T10:10:00Z","message":{"id":"y","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"Overloaded"}]},"error":"server_error","isApiErrorMessage":true,"apiErrorStatus":529}"#;
         let r = parse_all(&[limit, overload], &ctx());
         assert!(usage_rows(&r).is_empty(), "synthetic lines carry no usage");
         let ev: Vec<&LimitEvent> =
@@ -422,7 +430,7 @@ mod tests {
         assert_eq!(ev[0].kind, "rate_limit");
         assert_eq!(ev[0].status, Some(429));
         assert_eq!(ev[0].limit_type.as_deref(), Some("five_hour"));
-        assert_eq!(ev[0].resets_at, Some(1789861800));
+        assert_eq!(ev[0].resets_at, Some(1790000000));
         assert_eq!(ev[0].message.as_deref(), Some("You've hit your session limit"));
         assert_eq!(ev[1].status, Some(529));
     }
