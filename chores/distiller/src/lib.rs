@@ -58,7 +58,38 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     metabolism(&workspace_root, &diary_root, &settings).await?;
     contemplation(&workspace_root, &diary_root, &settings).await?;
     session_index_maintenance(&workspace_root, &settings).await;
+    usage_maintenance(&workspace_root, &settings).await;
     Ok(())
+}
+
+/// ADR-034 daily usage refresh. Claude Code deletes transcripts after about
+/// 30 days; a daily pass keeps `memory/usage.db` complete whether or not
+/// anyone opens the dashboard. Best-effort like the index maintenance; a
+/// refresh already running (started from the dashboard) is not an error.
+async fn usage_maintenance(workspace_root: &Path, settings: &Settings) {
+    use nucleus_core::usage;
+    match usage::refresh(workspace_root, &settings.usage, usage::RefreshOptions::default()).await {
+        Ok(s) => {
+            let _ = nucleus_core::diary::record_observation(
+                workspace_root,
+                "distiller",
+                "usage",
+                &format!(
+                    "usage refresh: {} of {} transcript files changed ({:.1} MB), {} records, {} sessions labeled, {:.1}s",
+                    s.files_read,
+                    s.files_seen,
+                    s.bytes_read as f64 / 1e6,
+                    s.records,
+                    s.sessions_labeled,
+                    s.elapsed.as_secs_f64(),
+                ),
+                nucleus_core::diary::Tag::Routine,
+            );
+        }
+        Err(e) => {
+            tracing::warn!(err = %format!("{e:#}"), "usage refresh failed");
+        }
+    }
 }
 
 /// ADR-023 daily catch-up: refresh the session-search index and prune
