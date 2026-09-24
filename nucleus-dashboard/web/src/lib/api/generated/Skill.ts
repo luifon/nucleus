@@ -4,57 +4,57 @@ import type { SkillTier } from "./SkillTier";
 /**
  * A parsed skill, ready for the dashboard API or the learner's library view.
  */
-export type Skill = { 
+export type Skill = {
 /**
  * Frontmatter `name`, falling back to the directory name (CC convention).
  */
-name: string, 
+name: string,
 /**
  * Name of the skill directory inside its tier root. Unique within a
  * tier; together with `tier` it identifies the skill for the dashboard
  * actions (move / archive / restore / delete). For archived skills it
  * may carry a date suffix (`<name>-YYYY-MM-DD`).
  */
-dir_name: string, description: string, 
+dir_name: string, description: string,
 /**
  * Storage tier; see `SkillTier`.
  */
-tier: SkillTier, 
+tier: SkillTier,
 /**
  * Absolute path to the SKILL.md file, spelled through the tier root
  * (a symlinked skill keeps the symlink path here, not its target). Pass
  * it unchanged to `GET /skills/api/body`.
  */
-path: string, 
+path: string,
 /**
  * Raw target of the skill directory when it is a symlink (for example a
  * relative path into a vendor directory), else null. Symlinked skills
  * cannot be moved or archived.
  */
-symlink_target: string | null, 
+symlink_target: string | null,
 /**
  * Active tiers only: the tier whose same-named copy Claude Code loads
  * instead of this one (precedence `global` > `repo` > `personal`). Null
  * when this copy is the one that loads. Always null for archive tiers.
  */
-shadowed_by: SkillTier | null, 
+shadowed_by: SkillTier | null,
 /**
  * Other active tiers holding a skill with the same frontmatter name or
  * directory name, highest precedence first. For an archived skill: the
  * active tiers that hold its `restore_name` or frontmatter name, so a
  * non-empty list means restore will be refused.
  */
-also_in: Array<SkillTier>, 
+also_in: Array<SkillTier>,
 /**
  * Archive tiers only: the directory name the skill gets on restore
  * (frontmatter `name`, else the directory name without its trailing
  * `-YYYY-MM-DD[-N]` or `-YYYYMMDDTHHMMSS` suffix). Null for active tiers.
  */
-restore_name: string | null, flavor: string | null, 
+restore_name: string | null, flavor: string | null,
 /**
  * ADR-017: "agent" when the learner authored it; None for hand-written.
  */
-created_by: string | null, 
+created_by: string | null,
 /**
  * ADR-017: protected from the curator's auto-archive when true. The
  * dashboard also refuses to archive a pinned skill.

@@ -199,6 +199,10 @@ write into the vault, follow these rules:
    separator) instead of creating a new duplicate. For `2-Daily-Notes`,
    if today's note already exists, ALWAYS append with a `## HH:MM`
    sub-heading rather than creating a new file.
+   Find the existing note with the vault search, not the folder tree:
+   `./target/release/nucleus vault-search <theme words> [--bucket <folder>]`
+   (ADR-035; skill `vault-search`). It covers titles, headings, tags,
+   frontmatter and text, and never returns credential notes.
 
 5. **META-CORRECTIONS use `move` ops.** When a capture is correcting a
    prior misfile ("that note from earlier should be in Projects/X"),

@@ -118,6 +118,19 @@ schedule      = "30 4 * * *"
 log_path      = "memory/skill-gap-learner.log"
 diary_key     = "skill-gap-learner"
 
+[[agent]]
+name          = "vault-check"
+class         = "maintenance"
+launch        = "launchd-cron"
+runtime       = "rust"
+launchd_label = "dev.nucleus.vault-check"
+# ADR-035: deterministic weekly vault check (no claude session). launchd wakes
+# it hourly; `[vault_check] cron` in nucleus.toml decides when it runs.
+# Records memory/vault_check.db and enqueues a one-line WhatsApp summary.
+schedule      = "0 20 * * 0"
+log_path      = "memory/vault-check.log"
+diary_key     = "vault-check"
+
 # ── infra (host process / scheduler; no operator persona) ──
 
 [[agent]]

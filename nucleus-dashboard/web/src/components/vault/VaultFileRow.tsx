@@ -18,7 +18,7 @@ export default function VaultFileRow({ file }: { file: VaultFile }) {
     setExpanded(next);
     if (next && body === null && !bodyErr) {
       try {
-        setBody(await getVaultFile(file.path));
+        setBody(await getVaultFile(file.relpath));
       } catch (e) {
         setBodyErr(String(e));
       }
@@ -35,8 +35,7 @@ export default function VaultFileRow({ file }: { file: VaultFile }) {
   // Build an obsidian:// deep-link so the operator can open the
   // file in Obsidian directly. Falls back to a noop if Obsidian
   // can't intercept the URL.
-  const vaultDir = file.path.slice(0, file.path.length - file.relpath.length - 1);
-  const vaultName = vaultDir.split("/").pop() ?? "";
+  const vaultName = file.vault_name;
   const obsidianUrl =
     vaultName && file.relpath
       ? `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(file.relpath.replace(/\.md$/, ""))}`

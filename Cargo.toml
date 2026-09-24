@@ -8,6 +8,7 @@ members = [
     "chores/distiller",
     "chores/reminders",
     "chores/skill-gap-learner",
+    "chores/vault-check",
     "nucleus-dashboard/api",
     "nucleus",
 ]

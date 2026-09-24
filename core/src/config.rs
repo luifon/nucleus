@@ -22,6 +22,8 @@ pub struct Settings {
     pub reminders: RemindersConfig,
     pub session_search: SessionSearchConfig,
     pub usage: UsageConfig,
+    pub vault_search: VaultSearchConfig,
+    pub vault_check: VaultCheckConfig,
     pub ports: PortsConfig,
 }
 
@@ -362,6 +364,184 @@ impl Default for UsageConfig {
     }
 }
 
+/// ADR-035 vault search. `exclude` ADDS to the built-in exclusion floor in
+/// `nucleus_core::vault::exclude` (dot folders, credential-like names, the
+/// homelab credentials area); it can never remove an entry from that floor.
+/// Globs are vault-relative and case-insensitive; a pattern without `/`
+/// matches any single path component.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VaultSearchConfig {
+    #[serde(default = "default_vault_exclude")]
+    pub exclude: Vec<String>,
+    /// Extra case-insensitive, multi-line regex for credential notes, added
+    /// to the built-in detector in `nucleus_core::vault::exclude` (which
+    /// cannot be turned off). A note whose text matches is never indexed,
+    /// never returned, and never touched by `vault-check`. Empty = only the
+    /// built-in detector.
+    #[serde(default)]
+    pub credential_content_regex: String,
+    /// Dashboard search: skip the index update when the last successful
+    /// update started less than this many seconds ago and the vault's
+    /// watermark (every note's path, size, mtime and inode, plus the
+    /// exclusion rules) has not changed since.
+    #[serde(default = "default_reindex_fresh_secs")]
+    pub dashboard_reindex_fresh_secs: u64,
+    /// Dashboard search: the longest a request waits for an index update
+    /// before it answers 503. The update keeps running; later requests
+    /// share it.
+    #[serde(default = "default_reindex_wait_secs")]
+    pub dashboard_reindex_wait_secs: u64,
+}
+
+impl Default for VaultSearchConfig {
+    fn default() -> Self {
+        Self {
+            exclude: default_vault_exclude(),
+            credential_content_regex: String::new(),
+            dashboard_reindex_fresh_secs: default_reindex_fresh_secs(),
+            dashboard_reindex_wait_secs: default_reindex_wait_secs(),
+        }
+    }
+}
+
+fn default_reindex_fresh_secs() -> u64 {
+    30
+}
+
+fn default_reindex_wait_secs() -> u64 {
+    20
+}
+
+/// `[vault_search]` as `<workspace_root>/nucleus.toml` states it now, read
+/// on its own so a long-running process (the dashboard) can apply a changed
+/// exclusion without a restart. A missing file or table means the defaults;
+/// an unreadable file or invalid TOML is an error, so a caller fails closed
+/// instead of falling back to weaker rules.
+pub fn load_vault_search(workspace_root: &Path) -> Result<VaultSearchConfig> {
+    #[derive(Deserialize)]
+    struct Partial {
+        #[serde(default)]
+        vault_search: VaultSearchConfig,
+    }
+    let path = workspace_root.join("nucleus.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(VaultSearchConfig::default()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let partial: Partial = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(partial.vault_search)
+}
+
+fn default_vault_exclude() -> Vec<String> {
+    vec![
+        "**/attachments/**".to_string(),
+        "**/_attachments/**".to_string(),
+        "**/assets/**".to_string(),
+    ]
+}
+
+/// ADR-035 weekly vault check. All defaulted, so a nucleus.toml without a
+/// `[vault_check]` table loads.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VaultCheckConfig {
+    /// When `nucleus vault-check --scheduled` is due (5-field cron in
+    /// `NUCLEUS_TZ`). The launchd job wakes hourly; this decides whether a
+    /// wake runs the check. Default: Sunday 20:00.
+    #[serde(default = "default_vault_check_cron")]
+    pub cron: String,
+    /// 0-Inbox notes older than this are reported.
+    #[serde(default = "default_inbox_max_age_days")]
+    pub inbox_max_age_days: i64,
+    /// Frontmatter keys every note must carry (CLAUDE.md Rule 9.7).
+    #[serde(default = "default_required_frontmatter")]
+    pub required_frontmatter: Vec<String>,
+    /// Allowed `source:` values. An entry ending in `*` is a prefix. A value
+    /// joined with `+` (`a+b`) is valid when every part is.
+    #[serde(default = "default_source_vocabulary")]
+    pub source_vocabulary: Vec<String>,
+    /// Notes never reported as orphans (hubs, journals, inbox, archive).
+    #[serde(default = "default_orphan_exempt")]
+    pub orphan_exempt: Vec<String>,
+    /// Notes never reported for missing frontmatter or unknown source.
+    #[serde(default = "default_frontmatter_exempt")]
+    pub frontmatter_exempt: Vec<String>,
+    /// Apply the safe fix on scheduled runs. Manual runs use `--apply`.
+    #[serde(default)]
+    pub scheduled_apply: bool,
+    /// Enqueue the WhatsApp summary on scheduled runs.
+    #[serde(default = "default_true_bool")]
+    pub notify: bool,
+}
+
+impl Default for VaultCheckConfig {
+    fn default() -> Self {
+        Self {
+            cron: default_vault_check_cron(),
+            inbox_max_age_days: default_inbox_max_age_days(),
+            required_frontmatter: default_required_frontmatter(),
+            source_vocabulary: default_source_vocabulary(),
+            orphan_exempt: default_orphan_exempt(),
+            frontmatter_exempt: default_frontmatter_exempt(),
+            scheduled_apply: false,
+            notify: true,
+        }
+    }
+}
+
+fn default_vault_check_cron() -> String {
+    "0 20 * * 0".to_string()
+}
+fn default_inbox_max_age_days() -> i64 {
+    14
+}
+fn default_required_frontmatter() -> Vec<String> {
+    vec!["created".to_string(), "source".to_string()]
+}
+/// The writers Nucleus itself ships plus the generic manual origins.
+/// Operators add their own writers in nucleus.toml.
+pub fn default_source_vocabulary() -> Vec<String> {
+    [
+        "whatsapp-braindump",
+        "alfred-braindump",
+        "chat-braindump",
+        "distiller-contemplation",
+        "obsidian-chat",
+        "whatsapp-docstore",
+        "whatsapp-chat",
+        "nucleus-chat*",
+        "nucleus-session",
+        "claude-code*",
+        "claude-session*",
+        "voice-dictation",
+        "deep-research",
+        "research",
+        "manual",
+        "import",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+fn default_orphan_exempt() -> Vec<String> {
+    [
+        "README.md",
+        "index.md",
+        "Home.md",
+        "_*",
+        "0-Inbox/**",
+        "1-Main-Notes/**",
+        "2-Daily-Notes/**",
+        "7-Archives/**",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+fn default_frontmatter_exempt() -> Vec<String> {
+    ["README.md", "Home.md"].iter().map(|s| s.to_string()).collect()
+}
+
 fn default_reminder_channels() -> Vec<String> {
     vec!["discord-home".to_string()]
 }
@@ -398,6 +578,10 @@ struct TomlConfig {
     session_search: SessionSearchConfig,
     #[serde(default)]
     usage: UsageConfig,
+    #[serde(default)]
+    vault_search: VaultSearchConfig,
+    #[serde(default)]
+    vault_check: VaultCheckConfig,
     ports: PortsConfig,
 }
 
@@ -458,6 +642,8 @@ impl Settings {
             reminders: toml.reminders,
             session_search: toml.session_search,
             usage: toml.usage,
+            vault_search: toml.vault_search,
+            vault_check: toml.vault_check,
             ports: toml.ports,
         })
     }
@@ -746,6 +932,40 @@ mod workspace_root_tests {
     fn relative_root_is_rejected() {
         let err = resolve_workspace_root(Path::new("nucleus"), None).unwrap_err().to_string();
         assert!(err.contains("absolute"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod vault_config_tests {
+    use super::*;
+
+    /// The documented example and the code defaults must not drift.
+    #[test]
+    fn example_vault_tables_match_defaults() {
+        let example: toml::Value = toml::from_str(include_str!("../../nucleus.toml.example")).unwrap();
+        let search: VaultSearchConfig = example["vault_search"].clone().try_into().unwrap();
+        let check: VaultCheckConfig = example["vault_check"].clone().try_into().unwrap();
+        let (ds, dc) = (VaultSearchConfig::default(), VaultCheckConfig::default());
+        assert_eq!(search.exclude, ds.exclude);
+        assert_eq!(search.credential_content_regex, ds.credential_content_regex);
+        assert_eq!(search.dashboard_reindex_fresh_secs, ds.dashboard_reindex_fresh_secs);
+        assert_eq!(search.dashboard_reindex_wait_secs, ds.dashboard_reindex_wait_secs);
+        assert_eq!(check.cron, dc.cron);
+        assert_eq!(check.inbox_max_age_days, dc.inbox_max_age_days);
+        assert_eq!(check.required_frontmatter, dc.required_frontmatter);
+        assert_eq!(check.source_vocabulary, dc.source_vocabulary);
+        assert_eq!(check.orphan_exempt, dc.orphan_exempt);
+        assert_eq!(check.frontmatter_exempt, dc.frontmatter_exempt);
+        assert_eq!((check.scheduled_apply, check.notify), (dc.scheduled_apply, dc.notify));
+    }
+
+    #[test]
+    fn missing_tables_use_defaults() {
+        let search: VaultSearchConfig = toml::from_str("").unwrap();
+        let check: VaultCheckConfig = toml::from_str("").unwrap();
+        assert!(search.credential_content_regex.is_empty());
+        assert_eq!(check.cron, "0 20 * * 0");
+        assert!(!check.scheduled_apply);
     }
 }
 

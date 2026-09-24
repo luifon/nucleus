@@ -3,37 +3,37 @@
 /**
  * One agent execution. Serialized one-per-line in `runs.jsonl`.
  */
-export type RunRow = { 
+export type RunRow = {
 /**
  * Unique per spawn (a fresh UUID, distinct from `session_id` so a
  * resumed/rotated session that reuses an id still gets its own row).
  */
-run_id: string, 
+run_id: string,
 /**
  * Registry agent name (`agent_label`).
  */
-agent: string, 
+agent: string,
 /**
  * Claude session id — names the transcript file.
  */
-session_id: string, 
+session_id: string,
 /**
  * Absolute path to the transcript JSONL (read in place; never copied).
  */
-transcript_path: string, 
+transcript_path: string,
 /**
  * tmux `session:window` target while the window was alive.
  */
-tmux_target: string, started_at: string, 
+tmux_target: string, started_at: string,
 /**
  * RFC3339 when the session closed; null while in-flight.
  */
-ended_at: string | null, 
+ended_at: string | null,
 /**
  * Outcome at close; null while in-flight. (Best-effort — a crashed
  * process leaves this null, which reads as "ran, outcome unknown".)
  */
-ok: boolean | null, 
+ok: boolean | null,
 /**
  * `claude --version` output captured at spawn (ADR-020: forensics,
  * NOT pinning — the latest binary always runs; this records which one

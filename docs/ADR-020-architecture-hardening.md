@@ -67,6 +67,15 @@ every six months.
    cross-venue delivery, not ad-hoc reaching into another service's
    tables. `db::open` sets `busy_timeout(5s)` so reader/writer overlap
    retries instead of failing fast.
+   *Clarified by [[ADR-035]] (2026-09-24):* the writer is one program,
+   not one OS process. A command that sessions invoke on demand
+   (`nucleus vault-search` for `vault_index.db`) is the single writer
+   even when two invocations overlap, provided the invocations
+   serialize (an advisory lock plus `BEGIN IMMEDIATE`) and each one
+   reads its configuration after it holds the lock, so no invocation
+   writes under stale settings. Every other process reads the DB
+   read-only; a long-running process that needs the DB current runs
+   the writer command as a subprocess (the dashboard's vault search).
 6. **Versioned migrations (core/src/migrate.rs).** The per-binary
    "ensure_schema on every boot" pattern could never express *run
    exactly once*, so backfills and value sweeps re-executed forever and

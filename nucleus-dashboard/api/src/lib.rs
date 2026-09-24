@@ -144,8 +144,29 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     } else {
         PathBuf::from(vault_path_raw)
     };
+    // ADR-035 search: the index writer is the `vault-search` command, run
+    // as a subprocess before each search; this process only reads the index.
+    let vault_search = match handlers::vault::subprocess_reindex(workspace_root.clone()) {
+        Ok(reindex) => Some(handlers::vault::VaultSearch {
+            index_db: workspace_root.join(nucleus_core::vault::index::DB_PATH),
+            refresh: handlers::vault::IndexRefresh::new(
+                reindex,
+                handlers::vault::vault_watermark(vault_root.clone(), workspace_root.clone()),
+                std::time::Duration::from_secs(settings.vault_search.dashboard_reindex_fresh_secs),
+                std::time::Duration::from_secs(settings.vault_search.dashboard_reindex_wait_secs),
+            ),
+        }),
+        Err(e) => {
+            tracing::warn!("nucleus-dashboard: cannot locate the nucleus binary: {e:#} — vault search disabled");
+            None
+        }
+    };
     let vault_state = Arc::new(handlers::vault::VaultState {
         root: vault_root.clone(),
+        workspace_root: workspace_root.clone(),
+        search: vault_search,
+        check_db: workspace_root.join(nucleus_core::vault::check::DB_PATH),
+        bucket_verdicts: Default::default(),
     });
     app = app.nest("/vault/api", handlers::vault::router(vault_state));
 

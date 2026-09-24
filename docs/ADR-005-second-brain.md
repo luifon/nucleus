@@ -38,6 +38,8 @@ The vault is exposed to Claude sessions via `--add-dir ~/Documents/Obsidian/` (a
 
 **Reading.** Claude navigates the vault semantically through filenames + frontmatter + section headers + the per-bucket README files. No embeddings — context-driven traversal. The README in each bucket tells Claude what belongs there.
 
+> **Amended by [[ADR-035]] (2026-09-24).** Traversal alone stopped scaling: the planner and the distiller saw a folder tree truncated to 20 sub-folders and 10 notes per bucket, so Rule 9.4 (append over create) depended on luck. A full-text index (`nucleus vault-search`, FTS5, still no embeddings) now finds notes by title, headings, tags, frontmatter and text. Both writers are told to search each theme before a `create`; credential notes are never indexed. A weekly `nucleus vault-check` reports duplicates, broken links, orphans, stale inbox items, frontmatter gaps, unknown `source:` values and empty files.
+
 **Writing.** When a bot writes a note, it follows three rules (codified in CLAUDE.md Rule 9):
 1. **Pick the right bucket.** Use the bucket READMEs as ground truth. If unsure between two, prefer 0-Inbox.
 2. **Link siblings.** Read the immediate siblings (other notes in the same Project/Area) and add `[[wiki-links]]` to anything thematically related. This is how the graph emerges.

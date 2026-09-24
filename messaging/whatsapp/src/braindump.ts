@@ -117,7 +117,7 @@ export interface InterpretResult {
   note?: string;
 }
 
-interface ClaudePlan {
+export interface ClaudePlan {
   ops: CaptureOp[];
   summary: string;
   confidence: number;
@@ -141,6 +141,11 @@ const NEEDS_DIRECTIVE_FOR_SUBFOLDER = new Set([
   "4-Areas",
   "5-Resources",
 ]);
+
+/** The vault search CLI (ADR-035), run from the workspace root. */
+export const VAULT_SEARCH_CMD = "./target/release/nucleus vault-search";
+/** Pre-approval for the planner session; the CLI only reads the vault. */
+export const VAULT_SEARCH_TOOL = `Bash(${VAULT_SEARCH_CMD}:*)`;
 
 /** Exported so index.ts can include it in the boot-time orphan wipe — every
  *  tmux session this process spawns windows into must be on that list. */
@@ -207,6 +212,9 @@ export async function planCapture(
     // a session we spawned — pre-allowing tells the classifier to skip.
     allowedTools: [
       "Bash(npx --prefix messaging/whatsapp tsx messaging/whatsapp/src/ack.ts:*)",
+      // ADR-035: read-only full-text search of the vault, so the planner can
+      // find an existing note to APPEND to instead of creating a duplicate.
+      VAULT_SEARCH_TOOL,
     ],
     addDirs: [config.vaultPath],
     tmuxSession: TMUX_SESSION,
@@ -725,7 +733,7 @@ haven't, then emit the JSON and nothing else.`;
 /** parsePlan that returns null instead of throwing — used so a serialization
  *  slip routes into the retry / fallback path rather than dropping the
  *  capture entirely. */
-function safeParsePlan(raw: string | undefined): ClaudePlan | null {
+export function safeParsePlan(raw: string | undefined): ClaudePlan | null {
   if (!raw || !raw.trim()) return null;
   try {
     return parsePlan(raw);
@@ -738,7 +746,7 @@ function safeParsePlan(raw: string | undefined): ClaudePlan | null {
  *  verbatim capture into 0-Inbox as a single create op so the operator's
  *  normal review/apply flow preserves it. Low confidence flags that the
  *  decomposition is the operator's to do by hand. */
-function buildFallbackPlan(
+export function buildFallbackPlan(
   text: string,
   inputKind: "text" | "voice",
   today: string,
@@ -864,7 +872,7 @@ function parseOpPatches(raw: any, opCount: number): OpPatch[] {
   return out;
 }
 
-function parseInterpretResponse(raw: string, opCount: number): InterpretResult {
+export function parseInterpretResponse(raw: string, opCount: number): InterpretResult {
   const cleaned = extractJsonBlock(raw);
   let obj: any;
   try {
@@ -918,7 +926,7 @@ function parseInterpretResponse(raw: string, opCount: number): InterpretResult {
 
 // ==================== PROMPTS ====================
 
-function buildPlanPrompt(
+export function buildPlanPrompt(
   text: string,
   inputKind: "text" | "voice",
   vaultPath: string,
@@ -1026,6 +1034,17 @@ DECOMPOSITION (the most important rule):
    covers a theme. Look at existing notes' titles + frontmatter; if a
    captured fragment overlaps, append instead of duplicating.
 
+   The VAULT STRUCTURE list at the end is truncated. Before you CREATE,
+   search every note's title, headings, tags and text for each theme:
+
+     ${VAULT_SEARCH_CMD} <2-4 distinctive words> [--bucket <folder>]
+
+   Each result prints the note's vault-relative path (use it as an
+   append targetPath or a [[link]]) and a matching excerpt. If a result
+   already covers the theme, APPEND to it. Several dated notes on one
+   theme in one folder mean the theme already has a home. Only CREATE
+   when the search finds nothing that fits.
+
 3. The capture may be a META-CORRECTION ("that thing earlier should be
    in Projects/X, not Inbox", "rename that file", "decompose what I
    sent before"). Detect this and use \`move\` ops to actually relocate
@@ -1094,7 +1113,7 @@ CONFIDENCE:
     (0-Inbox or append to a catch-all). Don't surface alternatives —
     the operator will review the plan and can reject/refine.
 
-VAULT STRUCTURE:
+VAULT STRUCTURE (truncated folder tree; use ${VAULT_SEARCH_CMD} to find notes by content):
 ${vaultSummary}`;
 }
 

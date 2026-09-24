@@ -2,7 +2,7 @@
 import type { UsageLimitEvent } from "./UsageLimitEvent";
 import type { UsageRatePoint } from "./UsageRatePoint";
 
-export type UsageLimits = { 
+export type UsageLimits = {
 /**
  * Inclusive local-day bounds of the range, in `timezone`
  * (`NUCLEUS_TZ`). For all time, `from` is the first event day.

@@ -4,11 +4,11 @@ import type { ReminderRef } from "./ReminderRef";
 /**
  * Body of every non-2xx response from this surface.
  */
-export type SkillsErrorBody = { 
+export type SkillsErrorBody = {
 /**
  * Human-readable reason, ready to show to the operator.
  */
-error: string, 
+error: string,
 /**
  * Reminders that block the action (409 on move/archive); empty
  * otherwise.

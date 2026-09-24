@@ -41,6 +41,7 @@ NUCLEUS_LAUNCHD_PREFIX=tech.mycompany ./tools/launchd/install.sh
 | `distiller-weekly.plist.example` | Sunday 04:00 contemplation | StartCalendarInterval |
 | `preference-learner.plist.example` | Weekly news preference learning | StartCalendarInterval |
 | `reminders-tick.plist.example` | Reminders polling worker | StartInterval 60 |
+| `vault-check.plist.example` | Weekly vault check (ADR-035); runs when `[vault_check] cron` is due | StartInterval 3600 |
 
 ## Pausing a job
 

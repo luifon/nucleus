@@ -28,6 +28,8 @@ memchr = "2"
 libc = "0.2"
 reqwest = { workspace = true }
 ts-rs = { workspace = true }
+unicode-normalization = "0.1"
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

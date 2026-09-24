@@ -1334,6 +1334,34 @@ pub async fn enqueue_whatsapp(
     Ok(row.0)
 }
 
+/// Enqueue at most once per `source`: the row is inserted only when no row
+/// with the same `source` exists, in one statement, so two processes (or a
+/// retry after a crash) cannot both enqueue. `source` is the caller's
+/// idempotency key (for example `vault-check:<occurrence>`). Returns the new
+/// row id, or `None` when a row for the key was already queued.
+pub async fn enqueue_whatsapp_once(
+    pool: &SqlitePool,
+    target: &str,
+    body: &str,
+    source: &str,
+) -> Result<Option<i64>> {
+    let now = Utc::now().to_rfc3339();
+    let row: Option<(i64,)> = sqlx::query_as(
+        "INSERT INTO outbound_queue (target, body, source, enqueued_at, status, attempts)
+         SELECT ?1, ?2, ?3, ?4, 'pending', 0
+          WHERE NOT EXISTS (SELECT 1 FROM outbound_queue WHERE source = ?3)
+         RETURNING id",
+    )
+    .bind(target)
+    .bind(body)
+    .bind(source)
+    .bind(&now)
+    .fetch_optional(pool)
+    .await
+    .context("enqueue outbound whatsapp (once)")?;
+    Ok(row.map(|r| r.0))
+}
+
 /// Parse an `--at` string into a `DateTime<Tz>` localized to the
 /// operator's timezone. Accepts `now` (case-insensitive: the current time,
 /// so the reminder is due at the next tick), offset-aware RFC3339

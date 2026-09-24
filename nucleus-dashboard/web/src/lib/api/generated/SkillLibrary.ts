@@ -5,20 +5,20 @@ import type { Skill } from "./Skill";
  * The whole skill library, grouped for the dashboard. Each group is sorted
  * by `name`, then `dir_name`.
  */
-export type SkillLibrary = { 
+export type SkillLibrary = {
 /**
  * Tier `personal`: `<workspace>/.nucleus/.claude/skills`.
  */
-personal: Array<Skill>, 
+personal: Array<Skill>,
 /**
  * Tier `repo`: `<workspace>/.claude/skills` (committed; read-only in the
  * dashboard).
  */
-repo: Array<Skill>, 
+repo: Array<Skill>,
 /**
  * Tier `global`: `$HOME/.claude/skills`. Empty when HOME is unknown.
  */
-global: Array<Skill>, 
+global: Array<Skill>,
 /**
  * Tiers `personal-archive` and `global-archive`, told apart by `tier`.
  */

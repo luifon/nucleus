@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LAUNCHD_PREFIX__.vault-check</string>
+    <!-- ADR-035: the weekly vault check. launchd wakes it hourly; the
+         command itself decides whether the [vault_check] cron in
+         nucleus.toml (default Sunday 20:00) is due, so the schedule is a
+         nucleus.toml setting and a missed slot runs at the next wake.
+         Deterministic: no claude session, so no NUCLEUS_CLAUDE_BIN. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__USER_HOME__/Development/nucleus/target/release/nucleus</string>
+        <string>vault-check</string>
+        <string>--scheduled</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__USER_HOME__/Development/nucleus</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TZ</key>
+        <string>__TZ__</string>
+        <key>NUCLEUS_LOG</key>
+        <string>info</string>
+        <key>PATH</key>
+        <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/vault-check.log</string>
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/vault-check.log</string>
+</dict>
+</plist>

@@ -6,11 +6,11 @@ import type { MutableTier } from "./MutableTier";
  * (`.nucleus/.claude/skills`) and `global` (`~/.claude/skills`). The
  * destination is the other of the two.
  */
-export type MoveSkillReq = { 
+export type MoveSkillReq = {
 /**
  * `Skill.dir_name` of the skill to move.
  */
-dir_name: string, 
+dir_name: string,
 /**
  * The skill's current tier.
  */
