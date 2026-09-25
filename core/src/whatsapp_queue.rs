@@ -376,6 +376,10 @@ pub struct IntakeInbound {
     pub wa_msg_id: String,
     pub text: String,
     pub received_at: String,
+    /// `text` when the operator typed it; `voice` (a transcription) or
+    /// `forwarded` otherwise. Only typed text can be a command. A bot table
+    /// without the column reads as `unknown` (never a command).
+    pub input_kind: String,
 }
 
 /// Rows of `intake_inbound` with an id above `after`, oldest first.
@@ -383,10 +387,14 @@ pub async fn intake_inbound_after(pool: &SqlitePool, after: i64, limit: i64) -> 
     if !table_exists(pool, "intake_inbound").await? {
         return Ok(vec![]);
     }
-    Ok(sqlx::query_as(
-        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at FROM intake_inbound
-          WHERE id > ?1 ORDER BY id LIMIT ?2",
-    )
+    let has_kind: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('intake_inbound') WHERE name = 'input_kind'")
+        .fetch_one(pool)
+        .await?;
+    let kind = if has_kind > 0 { "input_kind" } else { "'unknown'" };
+    Ok(sqlx::query_as(&format!(
+        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, {kind} AS input_kind FROM intake_inbound
+          WHERE id > ?1 ORDER BY id LIMIT ?2"
+    ))
     .bind(after)
     .bind(limit)
     .fetch_all(pool)
@@ -521,6 +529,20 @@ mod tests {
         // Before the bot created its tables, nothing is there to read.
         assert!(intake_group(&pool, "3").await.unwrap().is_none());
         assert!(intake_inbound_after(&pool, 0, 10).await.unwrap().is_empty());
+        // A bot table without input_kind reads every row as `unknown`, which
+        // is never a command.
+        sqlx::query(
+            "CREATE TABLE intake_inbound (id INTEGER PRIMARY KEY AUTOINCREMENT, item_key TEXT NOT NULL, chat_id TEXT NOT NULL,
+             wa_msg_id TEXT NOT NULL, text TEXT NOT NULL, received_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at) VALUES ('3', 'c', 'm', 'approve', 't')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(intake_inbound_after(&pool, 0, 10).await.unwrap()[0].input_kind, "unknown");
     }
 
     #[test]

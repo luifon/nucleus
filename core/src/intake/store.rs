@@ -243,6 +243,20 @@ fn migrate_v3(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
     })
 }
 
+/// v4 (finding: lost operator commands): the processing state of every
+/// operator message read from WhatsApp, keyed by the message. The read
+/// watermark only moves past messages that are applied or failed for good.
+const SCHEMA_V4: &str = "CREATE TABLE inbound_commands (
+    msg_ref     TEXT PRIMARY KEY,
+    wa_row_id   INTEGER NOT NULL,
+    item_key    TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    error       TEXT,
+    received_at TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+)";
+
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(super::INTAKE_DB_PATH)).await?;
@@ -252,6 +266,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             crate::migrate::Migration { version: 1, name: "intake baseline", step: crate::migrate::Step::Sql(SCHEMA_V1) },
             crate::migrate::Migration { version: 2, name: "collected commit", step: crate::migrate::Step::Sql(SCHEMA_V2) },
             crate::migrate::Migration { version: 3, name: "revision binding", step: crate::migrate::Step::Rust(migrate_v3) },
+            crate::migrate::Migration { version: 4, name: "inbound command state", step: crate::migrate::Step::Sql(SCHEMA_V4) },
         ],
     )
     .await
@@ -838,13 +853,21 @@ fn bind_vals<'q>(
 ///
 /// Moving to `failed` or `blocked` records `from` as the failed stage; a retry clears
 /// the failure; a terminal stage records `closed_at`.
-pub async fn advance(
+pub async fn advance(pool: &SqlitePool, id: i64, from: Stage, ev: StageEvent, reason: &str, set: Vec<(&str, Val)>) -> Result<bool> {
+    advance_caused(pool, id, from, ev, reason, set, None).await
+}
+
+/// [`advance`] caused by operator message `cause` (an
+/// [`inbound_commands`] key): the message is marked `applied` in the same
+/// transaction, so a crash leaves both undone or both done.
+pub async fn advance_caused(
     pool: &SqlitePool,
     id: i64,
     from: Stage,
     ev: StageEvent,
     reason: &str,
     mut set: Vec<(&str, Val)>,
+    cause: Option<&str>,
 ) -> Result<bool> {
     let to = transition(from, &ev)?;
     let now = crate::timestamp::now();
@@ -880,21 +903,45 @@ pub async fn advance(
         .bind(reason)
         .execute(&mut *tx)
         .await?;
+        mark_applied(&mut tx, cause).await?;
     }
     tx.commit().await?;
     Ok(moved)
 }
 
+async fn mark_applied(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, cause: Option<&str>) -> Result<()> {
+    if let Some(c) = cause {
+        sqlx::query("UPDATE inbound_commands SET state = 'applied', error = NULL, updated_at = ?2 WHERE msg_ref = ?1")
+            .bind(c)
+            .bind(crate::timestamp::now())
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Set columns of item `id` while it is in stage `stage`, without a stage
 /// change. Returns `false` when the item left that stage.
 pub async fn update(pool: &SqlitePool, id: i64, stage: Stage, set: Vec<(&str, Val)>) -> Result<bool> {
+    update_caused(pool, id, stage, set, None).await
+}
+
+/// [`update`] caused by operator message `cause`, marked `applied` in the
+/// same transaction when the update happens.
+pub async fn update_caused(pool: &SqlitePool, id: i64, stage: Stage, set: Vec<(&str, Val)>, cause: Option<&str>) -> Result<bool> {
     let extra = set_clause(&set, 4)?;
     if extra.is_empty() {
         return Ok(true);
     }
     let sql = format!("UPDATE items SET updated_at = ?2, {extra} WHERE id = ?1 AND stage = ?3");
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let q = sqlx::query(&sql).bind(id).bind(crate::timestamp::now()).bind(stage.as_str());
-    Ok(bind_vals(q, &set).execute(pool).await?.rows_affected() == 1)
+    let done = bind_vals(q, &set).execute(&mut *tx).await?.rows_affected() == 1;
+    if done {
+        mark_applied(&mut tx, cause).await?;
+    }
+    tx.commit().await?;
+    Ok(done)
 }
 
 /// Record that `task_id` is an item's task for `stage`.
@@ -942,6 +989,13 @@ pub struct NewMessage<'a> {
 /// Append a message to item `id`'s thread. Returns its id, or `None` when
 /// `external_ref` was seen before.
 pub async fn add_message(pool: &SqlitePool, id: i64, m: NewMessage<'_>) -> Result<Option<i64>> {
+    add_message_caused(pool, id, m, None).await
+}
+
+/// [`add_message`] that also marks operator message `cause` applied, in
+/// one transaction (a plain thread message is applied by being stored).
+pub async fn add_message_caused(pool: &SqlitePool, id: i64, m: NewMessage<'_>, cause: Option<&str>) -> Result<Option<i64>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let res = sqlx::query(
         "INSERT OR IGNORE INTO item_messages (item_id, at, author, via, body, external_ref, pending_agent, wa_state)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -954,8 +1008,10 @@ pub async fn add_message(pool: &SqlitePool, id: i64, m: NewMessage<'_>) -> Resul
     .bind(m.external_ref)
     .bind(m.pending_agent as i64)
     .bind(if m.to_whatsapp { None } else { Some("none") })
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    mark_applied(&mut tx, cause).await?;
+    tx.commit().await?;
     Ok((res.rows_affected() == 1).then(|| res.last_insert_rowid()))
 }
 
@@ -1000,6 +1056,75 @@ pub async fn set_wa_queued(pool: &SqlitePool, message_id: i64, outbound: i64) ->
         .execute(pool)
         .await?;
     Ok(())
+}
+
+// ── operator messages from WhatsApp ──────────────────────────────────────
+
+/// Processing state of one operator message (`inbound_commands`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundState {
+    /// `received`, `applied` or `failed`.
+    pub state: String,
+    pub attempts: i64,
+}
+
+impl InboundState {
+    /// Applied, or failed for good: the watermark may move past it.
+    pub fn is_final(&self) -> bool {
+        self.state == "applied" || self.state == "failed"
+    }
+}
+
+/// Record that operator message `msg_ref` (WhatsApp row `row_id`) was read;
+/// returns its state (a message read before keeps its state).
+pub async fn inbound_receive(pool: &SqlitePool, msg_ref: &str, row_id: i64, item_key: &str) -> Result<InboundState> {
+    let now = crate::timestamp::now();
+    sqlx::query(
+        "INSERT OR IGNORE INTO inbound_commands (msg_ref, wa_row_id, item_key, state, attempts, received_at, updated_at)
+         VALUES (?1, ?2, ?3, 'received', 0, ?4, ?4)",
+    )
+    .bind(msg_ref)
+    .bind(row_id)
+    .bind(item_key)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    inbound_state(pool, msg_ref).await?.context("inbound message vanished")
+}
+
+pub async fn inbound_state(pool: &SqlitePool, msg_ref: &str) -> Result<Option<InboundState>> {
+    let row: Option<(String, i64)> = sqlx::query_as("SELECT state, attempts FROM inbound_commands WHERE msg_ref = ?1")
+        .bind(msg_ref)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(state, attempts)| InboundState { state, attempts }))
+}
+
+/// Finish operator message `msg_ref` as `applied` or `failed` (a refused
+/// command, or one that failed `max` times).
+pub async fn inbound_finish(pool: &SqlitePool, msg_ref: &str, state: &str, error: Option<&str>) -> Result<()> {
+    if !matches!(state, "applied" | "failed") {
+        bail!("an inbound message ends applied or failed, not {state}");
+    }
+    sqlx::query("UPDATE inbound_commands SET state = ?2, error = ?3, updated_at = ?4 WHERE msg_ref = ?1 AND state = 'received'")
+        .bind(msg_ref)
+        .bind(state)
+        .bind(error)
+        .bind(crate::timestamp::now())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Count a failed attempt at applying `msg_ref`; returns the new state.
+pub async fn inbound_attempt_failed(pool: &SqlitePool, msg_ref: &str, error: &str) -> Result<InboundState> {
+    sqlx::query("UPDATE inbound_commands SET attempts = attempts + 1, error = ?2, updated_at = ?3 WHERE msg_ref = ?1")
+        .bind(msg_ref)
+        .bind(error)
+        .bind(crate::timestamp::now())
+        .execute(pool)
+        .await?;
+    inbound_state(pool, msg_ref).await?.context("inbound message vanished")
 }
 
 // ── comment binding ──────────────────────────────────────────────────────

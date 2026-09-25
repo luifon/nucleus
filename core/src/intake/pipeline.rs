@@ -407,32 +407,43 @@ async fn admit_one(ctx: &Ctx, ev: &Event) -> Result<Option<Item>> {
 // ── operator replies from WhatsApp ───────────────────────────────────────
 
 const WA_INBOUND_WATERMARK: &str = "wa_inbound_last_id";
+/// An operator message whose application fails this many times (not a
+/// refusal: a database or other error) is given up and reported.
+const MAX_INBOUND_ATTEMPTS: i64 = 5;
 
 /// Read the operator messages the bot routed to items since the last read.
+/// Each message has a processing state in intake.db (`received` →
+/// `applied` / `failed`, [`store::inbound_receive`]); a message is applied
+/// once, keyed by its WhatsApp id, and the watermark moves only past
+/// messages that are applied or failed for good. A message that fails for
+/// another reason stops the read (later messages wait, so their order is
+/// kept) and is tried again at the next tick.
 async fn ingest_whatsapp(ctx: &Ctx) -> Result<()> {
     let after: i64 = store::meta(&ctx.db, WA_INBOUND_WATERMARK).await?.and_then(|v| v.parse().ok()).unwrap_or(0);
     let rows = crate::whatsapp_queue::intake_inbound_after(&ctx.wa, after, 200).await?;
     for row in rows {
-        let n: Option<i64> = row.item_key.trim().trim_start_matches('#').parse().ok();
-        let item = match n {
-            Some(n) => store::item(&ctx.db, n).await.ok(),
-            None => None,
-        };
-        match item {
-            Some(item) if !item.stage().is_terminal() => {
-                let r = format!("wa:{}:{}", row.chat_id, row.wa_msg_id);
-                if let Err(e) = operator_text(ctx, &item, &row.text, &r).await {
-                    tracing::warn!(item = item.id, err = %format!("{e:#}"), "intake: handling an operator message failed");
+        let msg_ref = format!("wa:{}:{}", row.chat_id, row.wa_msg_id);
+        let state = store::inbound_receive(&ctx.db, &msg_ref, row.id, &row.item_key).await?;
+        if !state.is_final() {
+            if let Err(e) = apply_inbound(ctx, &row, &msg_ref).await {
+                let err = format!("{e:#}");
+                let st = store::inbound_attempt_failed(&ctx.db, &msg_ref, &clip(&err, 1_000)).await?;
+                tracing::warn!(msg = %msg_ref, attempts = st.attempts, err, "intake: applying an operator message failed");
+                if st.attempts < MAX_INBOUND_ATTEMPTS {
+                    return Err(e.context(format!("operator message {} (attempt {})", row.id, st.attempts)));
                 }
-            }
-            _ => {
-                let body = fill(&ctx.cfg.texts.unknown_item, &[("n", row.item_key.trim_start_matches('#'))]);
+                store::inbound_finish(&ctx.db, &msg_ref, "failed", Some(&clip(&err, 1_000))).await?;
                 crate::whatsapp_queue::enqueue_text_once(
                     &ctx.wa,
                     crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM,
-                    &body,
+                    &format!(
+                        "Your message for item #{} could not be applied after {} attempts; it was not acted on. \
+                         Check the item and send it again.",
+                        row.item_key.trim_start_matches('#'),
+                        st.attempts
+                    ),
                     "intake",
-                    &format!("intake:unknown:{}", row.id),
+                    &format!("intake:inbound-failed:{}", row.id),
                 )
                 .await?;
             }
@@ -442,41 +453,88 @@ async fn ingest_whatsapp(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Apply one operator message from WhatsApp; on return it is applied or
+/// failed for good (a refusal), or an error is returned.
+async fn apply_inbound(ctx: &Ctx, row: &crate::whatsapp_queue::IntakeInbound, msg_ref: &str) -> Result<()> {
+    let n: Option<i64> = row.item_key.trim().trim_start_matches('#').parse().ok();
+    let item = match n {
+        Some(n) => store::item(&ctx.db, n).await.ok(),
+        None => None,
+    };
+    match item {
+        Some(item) if !item.stage().is_terminal() => operator_text(ctx, &item, &row.text, msg_ref, &row.input_kind).await,
+        _ => {
+            let body = fill(&ctx.cfg.texts.unknown_item, &[("n", row.item_key.trim_start_matches('#'))]);
+            crate::whatsapp_queue::enqueue_text_once(
+                &ctx.wa,
+                crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM,
+                &body,
+                "intake",
+                &format!("intake:unknown:{}", row.id),
+            )
+            .await?;
+            store::inbound_finish(&ctx.db, msg_ref, "failed", Some("no open item")).await
+        }
+    }
+}
+
 /// One operator message from the item's WhatsApp thread: a command, or a
 /// message for the thread (and for the refinement agent during
-/// refinement). `external_ref` deduplicates a message delivered twice.
-pub async fn operator_text(ctx: &Ctx, item: &Item, text: &str, external_ref: &str) -> Result<()> {
-    let cmd = stage::parse_command(text);
-    let for_agent = cmd == OperatorCommand::Message && item.stage() == Stage::Refinement;
-    let added = store::add_message(
-        &ctx.db,
-        item.id,
-        NewMessage {
-            author: "operator",
-            via: "whatsapp",
-            body: text,
-            external_ref: Some(external_ref),
-            pending_agent: for_agent,
-            to_whatsapp: false,
-        },
-    )
-    .await?;
-    if added.is_none() {
-        return Ok(()); // seen before
+/// refinement). `msg_ref` is the message's [`store::inbound_receive`] key:
+/// the thread keeps the message once, and the command's effect and the
+/// `applied` mark are one transaction, so a message handled again after a
+/// crash is applied exactly once. Only typed text (`input_kind` `text`) can
+/// be a command; a command in a voice note or a forwarded message is kept
+/// as a message and refused.
+pub async fn operator_text(ctx: &Ctx, item: &Item, text: &str, msg_ref: &str, input_kind: &str) -> Result<()> {
+    if store::inbound_state(&ctx.db, msg_ref).await?.map(|s| s.is_final()).unwrap_or(false) {
+        return Ok(()); // applied or refused before
     }
-    let outcome = match cmd {
-        OperatorCommand::ApprovePlan(v) => approve_plan(ctx, item.id, v, "whatsapp").await.map(|_| ()),
-        OperatorCommand::ApproveComment => approve_comment(ctx, item.id, None, "whatsapp").await.map(|_| ()),
-        OperatorCommand::SkipComment => skip_comment(ctx, item.id, "whatsapp").await.map(|_| ()),
-        OperatorCommand::Cancel => cancel(ctx, item.id, "whatsapp").await.map(|_| ()),
-        OperatorCommand::Message if item.stage() != Stage::Refinement => {
-            note(ctx, item.id, &fill_vars(&ctx.cfg.texts.stage_note, &item_vars(ctx, item))).await
+    let cmd = stage::parse_command(text);
+    let typed = input_kind == "text";
+    let for_agent = cmd == OperatorCommand::Message && item.stage() == Stage::Refinement;
+    let message = NewMessage {
+        author: "operator",
+        via: "whatsapp",
+        body: text,
+        external_ref: Some(msg_ref),
+        pending_agent: for_agent,
+        to_whatsapp: false,
+    };
+    if cmd == OperatorCommand::Message {
+        // Stored and applied in one transaction.
+        store::add_message_caused(&ctx.db, item.id, message, Some(msg_ref)).await?;
+        if item.stage() != Stage::Refinement {
+            note_once(ctx, item.id, &fill_vars(&ctx.cfg.texts.stage_note, &item_vars(ctx, item)), &format!("stage-note:{msg_ref}"))
+                .await?;
         }
-        OperatorCommand::Message => Ok(()),
+        return Ok(());
+    }
+    // A command: the thread keeps the operator's message (once), then the
+    // command runs with the message as its cause.
+    store::add_message(&ctx.db, item.id, message).await?;
+    let cause = Some(msg_ref);
+    let outcome = if !typed {
+        refuse(format!(
+            "Item #{}: commands must be typed; a {input_kind} message is kept in the thread and not acted on.",
+            item.id
+        ))
+    } else {
+        match cmd {
+            OperatorCommand::ApprovePlan(v) => approve_plan_caused(ctx, item.id, v, "whatsapp", cause).await.map(|_| ()),
+            OperatorCommand::ApproveComment => approve_comment_caused(ctx, item.id, None, "whatsapp", cause).await.map(|_| ()),
+            OperatorCommand::SkipComment => skip_comment_caused(ctx, item.id, "whatsapp", cause).await.map(|_| ()),
+            OperatorCommand::Cancel => cancel_caused(ctx, item.id, "whatsapp", cause).await.map(|_| ()),
+            OperatorCommand::Message => unreachable!("handled above"),
+        }
     };
     match outcome {
-        Err(e) if e.downcast_ref::<Refusal>().is_some() => note(ctx, item.id, &e.to_string()).await,
-        other => other,
+        Ok(()) => store::inbound_finish(&ctx.db, msg_ref, "applied", None).await,
+        Err(e) if e.downcast_ref::<Refusal>().is_some() => {
+            note_once(ctx, item.id, &e.to_string(), &format!("refusal:{msg_ref}")).await?;
+            store::inbound_finish(&ctx.db, msg_ref, "failed", Some(&e.to_string())).await
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -490,6 +548,10 @@ fn refuse<T>(msg: String) -> Result<T> {
 /// read; it must be the latest. Refused while a refinement turn runs (its
 /// reply may replace the plan) and when there is no plan.
 pub async fn approve_plan(ctx: &Ctx, n: i64, version: Option<u32>, via: &str) -> Result<Item> {
+    approve_plan_caused(ctx, n, version, via, None).await
+}
+
+async fn approve_plan_caused(ctx: &Ctx, n: i64, version: Option<u32>, via: &str, cause: Option<&str>) -> Result<Item> {
     let item = store::item(&ctx.db, n).await?;
     let vars = item_vars(ctx, &item);
     if item.stage() != Stage::Refinement {
@@ -506,7 +568,7 @@ pub async fn approve_plan(ctx: &Ctx, n: i64, version: Option<u32>, via: &str) ->
             return refuse(format!("Plan v{v} is not the latest plan of item #{n}; the latest is v{}.", item.plan_version));
         }
     }
-    let moved = store::advance(
+    let moved = store::advance_caused(
         &ctx.db,
         n,
         Stage::Refinement,
@@ -519,6 +581,7 @@ pub async fn approve_plan(ctx: &Ctx, n: i64, version: Option<u32>, via: &str) ->
             ("approved_via", via.into()),
             ("current_task_id", Val::Text(None)),
         ],
+        cause,
     )
     .await?;
     if !moved {
@@ -532,6 +595,10 @@ pub async fn approve_plan(ctx: &Ctx, n: i64, version: Option<u32>, via: &str) ->
 /// Approve the proposed issue comment, optionally with the operator's own
 /// text. The next tick posts it.
 pub async fn approve_comment(ctx: &Ctx, n: i64, text: Option<String>, via: &str) -> Result<Item> {
+    approve_comment_caused(ctx, n, text, via, None).await
+}
+
+async fn approve_comment_caused(ctx: &Ctx, n: i64, text: Option<String>, via: &str, cause: Option<&str>) -> Result<Item> {
     let item = store::item(&ctx.db, n).await?;
     if item.stage() != Stage::Review || item.comment_state != "proposed" {
         return refuse(format!("Item #{n} has no proposed comment waiting for approval."));
@@ -540,7 +607,7 @@ pub async fn approve_comment(ctx: &Ctx, n: i64, text: Option<String>, via: &str)
     if let Some(t) = text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
         set.push(("comment_draft", t.into()));
     }
-    if !store::update(&ctx.db, n, Stage::Review, set).await? {
+    if !store::update_caused(&ctx.db, n, Stage::Review, set, cause).await? {
         return refuse(format!("Item #{n} changed while approving; look at it again."));
     }
     tracing::info!(item = n, via, "intake: comment approved");
@@ -549,11 +616,17 @@ pub async fn approve_comment(ctx: &Ctx, n: i64, text: Option<String>, via: &str)
 
 /// Close the review without a comment on the issue.
 pub async fn skip_comment(ctx: &Ctx, n: i64, via: &str) -> Result<Item> {
+    skip_comment_caused(ctx, n, via, None).await
+}
+
+async fn skip_comment_caused(ctx: &Ctx, n: i64, via: &str, cause: Option<&str>) -> Result<Item> {
     let item = store::item(&ctx.db, n).await?;
     if item.stage() != Stage::Review || !matches!(item.comment_state.as_str(), "proposed" | "approved") {
         return refuse(format!("Item #{n} has no comment waiting."));
     }
-    store::update(&ctx.db, n, Stage::Review, vec![("comment_state", "skipped".into())]).await?;
+    if !store::update_caused(&ctx.db, n, Stage::Review, vec![("comment_state", "skipped".into())], cause).await? {
+        return refuse(format!("Item #{n} changed while skipping the comment; look at it again."));
+    }
     tracing::info!(item = n, via, "intake: comment skipped");
     store::item(&ctx.db, n).await
 }
@@ -584,18 +657,23 @@ pub async fn reply(ctx: &Ctx, n: i64, text: &str, via: &str) -> Result<Item> {
 
 /// Stop an item: cancel its running task and close it.
 pub async fn cancel(ctx: &Ctx, n: i64, via: &str) -> Result<Item> {
+    cancel_caused(ctx, n, via, None).await
+}
+
+async fn cancel_caused(ctx: &Ctx, n: i64, via: &str, cause: Option<&str>) -> Result<Item> {
     let item = store::item(&ctx.db, n).await?;
     if item.stage().is_terminal() {
         return refuse(format!("Item #{n} is already {}.", item.stage));
     }
     stop_task(ctx, &item).await;
-    let moved = store::advance(
+    let moved = store::advance_caused(
         &ctx.db,
         n,
         item.stage(),
         StageEvent::Cancel,
         &format!("cancelled via {via}"),
         vec![("current_task_id", Val::Text(None))],
+        cause,
     )
     .await?;
     if !moved {

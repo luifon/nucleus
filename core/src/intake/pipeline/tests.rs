@@ -82,7 +82,8 @@ async fn fixture() -> Fixture {
         "CREATE TABLE IF NOT EXISTS intake_groups (item_key TEXT PRIMARY KEY, jid TEXT, subject TEXT,
             status TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL, closed_at TEXT)",
         "CREATE TABLE IF NOT EXISTS intake_inbound (id INTEGER PRIMARY KEY AUTOINCREMENT, item_key TEXT NOT NULL,
-            chat_id TEXT NOT NULL, wa_msg_id TEXT NOT NULL, text TEXT NOT NULL, received_at TEXT NOT NULL)",
+            chat_id TEXT NOT NULL, wa_msg_id TEXT NOT NULL, text TEXT NOT NULL, received_at TEXT NOT NULL,
+            input_kind TEXT NOT NULL DEFAULT 'text')",
     ] {
         sqlx::query(ddl).execute(&ctx.wa).await.unwrap();
     }
@@ -146,16 +147,23 @@ fn eval_output(class: &str) -> String {
     )
 }
 
-async fn inbound(f: &Fixture, item: i64, msg_id: &str, text: &str) {
+async fn inbound(f: &Fixture, item: i64, msg_id: &str, text: &str) -> i64 {
+    inbound_kind(f, item, msg_id, text, "text").await
+}
+
+async fn inbound_kind(f: &Fixture, item: i64, msg_id: &str, text: &str, kind: &str) -> i64 {
     sqlx::query(
-        "INSERT INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at) VALUES (?1, 'chat', ?2, ?3, 't')",
+        "INSERT INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind)
+         VALUES (?1, 'chat', ?2, ?3, 't', ?4)",
     )
     .bind(item.to_string())
     .bind(msg_id)
     .bind(text)
+    .bind(kind)
     .execute(&f.ctx.wa)
     .await
-    .unwrap();
+    .unwrap()
+    .last_insert_rowid()
 }
 
 async fn outbound(f: &Fixture) -> Vec<(String, String)> {
@@ -452,7 +460,7 @@ async fn unknown_items_and_duplicate_messages() {
     // The same WhatsApp message again is ignored.
     let before = store::messages(&f.ctx.db, 1).await.unwrap().len();
     let item = item1(&f).await;
-    operator_text(&f.ctx, &item, "a note", "wa:chat:x2").await.unwrap();
+    operator_text(&f.ctx, &item, "a note", "wa:chat:x2", "text").await.unwrap();
     assert_eq!(store::messages(&f.ctx.db, 1).await.unwrap().len(), before);
 }
 
@@ -815,4 +823,94 @@ async fn the_secret_guard_blocks_a_push_and_a_comment() {
     let it = item1(&f).await;
     assert_eq!((it.stage(), it.failed_stage.as_deref()), (Stage::Blocked, Some("review")));
     assert_eq!(f.gh.calls_with("issue comment"), 0);
+}
+
+/// Item #1 in refinement in the DM with plan v1 and no turn running.
+async fn with_plan(f: &Fixture) {
+    accept(f, 1).await;
+    tick(f).await;
+    finish_current(f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
+    tick(f).await;
+    finish_current(f, TaskStatus::Done, Some("===PLAN===\n1. do it\n===END PLAN==="), None).await;
+    tick(f).await;
+    let it = item1(f).await;
+    assert_eq!((it.stage(), it.plan_version, it.current_task_id.as_deref()), (Stage::Refinement, 1, None));
+}
+
+fn dm_fixture(f: Fixture) -> Fixture {
+    let mut cfg = f.ctx.cfg.clone();
+    cfg.whatsapp.refinement_groups = false;
+    Fixture { ctx: Ctx { cfg, ..f.ctx }, ..f }
+}
+
+#[tokio::test]
+async fn a_command_stored_before_a_crash_is_applied_exactly_once() {
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    let row = inbound(&f, 1, "m9", "approve").await;
+    // A tick stored the operator's message and stopped before applying it.
+    store::inbound_receive(&f.ctx.db, "wa:chat:m9", row, "1").await.unwrap();
+    store::add_message(
+        &f.ctx.db,
+        1,
+        NewMessage { author: "operator", via: "whatsapp", body: "approve", external_ref: Some("wa:chat:m9"), pending_agent: false, to_whatsapp: false },
+    )
+    .await
+    .unwrap();
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Implementation, "the stored command was applied");
+    tick(&f).await;
+    let approvals = store::transitions(&f.ctx.db, 1).await.unwrap().iter().filter(|t| t.reason.contains("approved via whatsapp")).count();
+    assert_eq!(approvals, 1);
+    assert_eq!(store::inbound_state(&f.ctx.db, "wa:chat:m9").await.unwrap().unwrap().state, "applied");
+    let wm = store::meta(&f.ctx.db, WA_INBOUND_WATERMARK).await.unwrap();
+    assert_eq!(wm.as_deref(), Some(row.to_string().as_str()));
+    let msgs = store::messages(&f.ctx.db, 1).await.unwrap();
+    assert_eq!(msgs.iter().filter(|m| m.body == "approve").count(), 1, "the thread keeps the message once");
+}
+
+#[tokio::test]
+async fn a_failing_message_holds_later_ones_back_until_it_is_given_up() {
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    sqlx::query(
+        "CREATE TRIGGER fail_boom BEFORE INSERT ON item_messages WHEN NEW.body = 'boom'
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+    )
+    .execute(&f.ctx.db)
+    .await
+    .unwrap();
+    let boom = inbound(&f, 1, "b1", "boom").await;
+    let approve = inbound(&f, 1, "b2", "approve").await;
+    for attempt in 1..MAX_INBOUND_ATTEMPTS {
+        let r = super::tick(&f.ctx, false).await.unwrap();
+        assert!(r.errors.iter().any(|e| e.contains("injected failure")), "{r:?}");
+        assert_eq!(item1(&f).await.stage(), Stage::Refinement, "the later approval waits");
+        assert!(store::inbound_state(&f.ctx.db, "wa:chat:b2").await.unwrap().is_none());
+        assert_eq!(store::inbound_state(&f.ctx.db, "wa:chat:b1").await.unwrap().unwrap().attempts, attempt);
+        let wm: i64 = store::meta(&f.ctx.db, WA_INBOUND_WATERMARK).await.unwrap().map(|v| v.parse().unwrap()).unwrap_or(0);
+        assert!(wm < boom);
+    }
+    let _ = super::tick(&f.ctx, false).await.unwrap();
+    assert_eq!(store::inbound_state(&f.ctx.db, "wa:chat:b1").await.unwrap().unwrap().state, "failed");
+    assert_eq!(item1(&f).await.stage(), Stage::Implementation);
+    let wm = store::meta(&f.ctx.db, WA_INBOUND_WATERMARK).await.unwrap();
+    assert_eq!(wm.as_deref(), Some(approve.to_string().as_str()));
+    assert!(outbound(&f).await.iter().any(|(t, b)| t == "dm" && b.contains("could not be applied")));
+}
+
+#[tokio::test]
+async fn commands_must_be_typed() {
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    inbound_kind(&f, 1, "v1", "approve", "voice").await;
+    inbound_kind(&f, 1, "v2", "approve", "forwarded").await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Refinement);
+    let notes: Vec<String> = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().map(|m| m.body).collect();
+    assert!(notes.iter().any(|n| n.contains("commands must be typed")), "{notes:?}");
+    assert_eq!(store::inbound_state(&f.ctx.db, "wa:chat:v1").await.unwrap().unwrap().state, "failed");
+    inbound(&f, 1, "t1", "approve").await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Implementation);
 }
