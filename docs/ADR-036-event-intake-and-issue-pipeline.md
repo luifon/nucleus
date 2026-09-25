@@ -363,11 +363,18 @@ cross-site, as the Tasks cancel does (ADR-033 §7).
 
 `nucleus intake tick [--poll] | list [--all] [--json] | show <n> [--json] |
 reply <n> --text T | approve-plan <n> [--version V] | approve-comment <n>
-[--text T] | skip-comment <n> | cancel <n> | retry <n>`.
+[--text T] | skip-comment <n> | cancel <n> | retry <n> | group-resolve <n>
+--left|--absent`.
+
+`list` and `show` print JSON with `--json`. JSON is for programs and is not
+fenced; only when the caller is the WhatsApp DM session is the output (JSON
+or text) printed inside a data fence, because a session reads it
+(Amendment, finding 1b). `group-resolve` is the operator's only way to end a
+WhatsApp group creation whose outcome is unknown (finding 6).
 
 | Caller (`crate::caller`) | May |
 |---|---|
-| Operator | every command |
+| Operator | every command (`group-resolve` only from the operator) |
 | WhatsApp DM chat session | `list`, `show`, `cancel` (not in a turn that read an agent message) |
 | Detached process (launchd, the bot, the dashboard) | `tick` |
 | Workers, other sessions, unscoped chats, unknown | nothing |
@@ -397,7 +404,8 @@ operator how to approve; it cannot approve, reply in a thread, or retry.
 
 `[intake]` in `nucleus.toml` (see `nucleus.toml.example`): `enabled`,
 `work_dir`, `label`, `min_confidence`, `test_timeout_minutes`,
-`commit_author_name`, `commit_author_email`,
+`commit_author_name`, `commit_author_email`, `import_max_files`,
+`import_max_file_bytes`, `import_max_total_bytes`, `scan_max_bytes`,
 `[[intake.repos]]` (`repo`, `test_command`, `default_branch`,
 `pr_issue_keyword`), `[intake.github]` (`gh_bin`, `poll_interval_secs`,
 `collaborator_cache_secs`, `max_pages`, `remote_url`), `[intake.whatsapp]`
@@ -607,37 +615,82 @@ the remote's default branch (read live with `ls-remote --symref` during
 preparation) and for `main`, `master`, `develop`, `development`, `trunk`,
 `production`, `release`, `gh-pages`.
 
+**Round 3: bounded import.** Before `git add` reads any file, the clone is
+checked: a walk that follows no symlink and skips `.git` directories
+refuses FIFOs, sockets and devices; the paths git would consider (tracked
+and untracked, not ignored) are listed through a bounded reader and checked
+with `lstat` against `[intake] import_max_files` (default 20 000),
+`import_max_file_bytes` (default 10 MiB; a sparse file counts by its
+length) and `import_max_total_bytes` (default 200 MiB). Import writes git
+objects into a temporary object directory, with the mirror's objects as an
+alternate, and moves them into the mirror only when the commit exists; a
+failed import leaves no index and no loose object. Staged submodule entries
+(mode 160000) must equal the base's: an unchanged base submodule is kept;
+an added, deleted or moved one is refused. Every refusal blocks the item
+with its reason.
+
+**Round 3: pinned executables.** `git` and `gh` are resolved once to
+canonical absolute paths (symlinks followed to the real file); every Nucleus
+git command runs that path, never a `PATH` lookup. When a tick (or a
+dashboard action) process starts, before it reads anything a worker wrote,
+it records the SHA-256 of both files. Before each privileged network step
+(fetch, push, pull request, comment) the hashes are checked again; a change
+blocks the item and the step does not run.
+
+**Round 3: leased pushes.** The first push of an item only creates
+`refs/heads/nucleus/item-<n>` (`--force-with-lease=<ref>:` with an empty
+expected value): it fails when the branch exists with any commit. Nucleus
+records the commit it pushed (`items.pushed_sha`); a later push leases on
+exactly that commit and fails when the branch holds anything else.
+
 Limits: without an OS sandbox the implementation agent runs with the
 operator's user rights and can change files between Nucleus's checks and
 its use of them (for example replace the clone directory after the check).
+The executable pins cover one process: a same-user worker can replace `git`
+or `gh` between two ticks, or change whatever the next tick pins, until the
+OS sandbox or a separate OS identity exists.
 The `gh` credential helper reads gh's own configuration, which the agent
 can also write; a changed gh configuration can at most make authentication
 fail or use another account's token for the configured URL.
 
 ### Finding 3 — the source gate was stale at the irreversible step
 
-Implementation start, the push and the issue comment each read the issue
-live twice (`live_gate`). The first read comes before the step's
-preparation (mirror sync, clone, import, secret scan, reading the remote's
-default branch); the second read is the last step before the action, with
-no other network or long-running work between it and `start_task`, `push`
-or posting the comment. Each read requires the issue to be open, carry the
-label from the same label event, set by an account that is a collaborator
-now, with the bound title, body and comments: a closed issue closes the
-item, a missing label cancels it, anything else makes it stale. The second
-read must also see the same revision as the first: the issue's
-`updated_at`, its `lastEditedAt`, the label event and the (id, hash) of
-every trusted comment. Any difference means the issue changed during the
-preparation: the step does nothing, records why in `error`, and starts
-again at the next tick. Any read failure (network, API error, a timeline
-longer than `max_pages`) is a step error: nothing starts and nothing is
-pushed; after three errors the item fails and `retry` reads again. The
-label removed cancels the item at every stage, including `pr` and
-`review`. Events without an adapter (`nucleus events emit --accept`) have
-no live source; their stored event is checked instead.
+GitHub has no write that is conditional on an issue revision, so the time
+between a check and a write cannot be removed; it is kept as short as
+possible, and the last live read before a write is its authorization
+point. A change at GitHub after that read is not seen for that one write.
 
-Limit: the push itself, and the pull request call after it, still follow
-the second read by the time these calls take.
+Implementation start, the push, the pull request and the issue comment each
+depend on live reads (`live_gate`). A step reads first, before its
+preparation (mirror sync, clone, import, secret scan, reading the remote's
+default branch), and then reads again right before every distinct write,
+with nothing between that read and the write:
+
+- the worker start: read, then the task is created and launched;
+- the push: read, then the push;
+- the pull request: after the push, the PR lookup (`gh pr list --head`,
+  so a retry does not open a second PR), then a read, then `gh pr create`;
+- the comment: the comments-list lookup (so a retry does not post twice),
+  then a read, then `gh issue comment`.
+
+Each read requires the issue to be open, carry the label from the same
+label event, set by an account that is a collaborator now, with the bound
+title, body and comments: a closed issue closes the item, a missing label
+cancels it, anything else makes it stale. A read after the first must also
+see the same revision as the first: the issue's `updated_at`, its
+`lastEditedAt`, the label event and the (id, hash) of every trusted
+comment; a difference means the issue changed during the step, which then
+does nothing, records why in `error`, and starts again at the next tick. An
+item stopped after its push keeps the record of the pushed branch
+(`items.pushed_sha`). Any read failure (network, API error, a timeline
+longer than `max_pages`) is a step error: nothing is written; after three
+errors the item fails and `retry` reads again. The label removed cancels
+the item at every stage, including `pr` and `review`. Events without an
+adapter (`nucleus events emit --accept`) have no live source; their stored
+event is checked instead.
+
+Limit: a gate change between the last read and the write it authorizes
+(the time of one API call) is not seen for that write.
 
 ### Finding 4 — public pull request text
 
@@ -664,6 +717,11 @@ categories (for example `pii-email`, `env-value`, `credential-…`,
 `guard-unavailable`), never the matched text, and a thread note; nothing is
 published. `retry` scans again; `cancel` stops the item.
 
+The diff is read through a bounded reader. One longer than `[intake]
+scan_max_bytes` (default 16 MiB) blocks the item with that reason: it is
+never cut and passed to the guard. (The guard script reads its whole input,
+so the bound is what keeps its memory bounded.)
+
 Limit: legitimate content that matches a pattern (an email address in the
 repository's code) blocks the item; there is no override.
 
@@ -689,37 +747,45 @@ not recognized as the operator.
 ### Finding 6 — group lifecycle
 
 The bot claims a request with `UPDATE … SET status = 'creating'|'closing'
-WHERE id = ? AND status = 'pending'` before any WhatsApp call. Every
-creation ends the group subject with a code-owned token derived from the
-request id (` ~r<id>`).
+WHERE id = ? AND status = 'pending'` before any WhatsApp call. Before the
+create call it generates a random 64-bit recovery nonce, stores it with the
+request, and puts it at the end of the group subject (` ~<16 hex>`).
 
 A failed creation is `fallback` only when nothing was created for certain:
-a 4xx answer from WhatsApp other than 408, or a call that was never sent
-(no live connection). Anything else (a timeout, a closed or lost
-connection, a server error, an unrecognized error, or a claim older than 10
-minutes because the bot stopped mid-call) is `unknown`. An unknown
-creation is never repeated, never treated as closed, and keeps counting
-against `max_groups_per_day`. Two minutes after it became unknown, and then
-every two minutes, the bot lists the groups it participates in
-(`groupFetchAllParticipating`): a group whose subject ends with the token is
-recorded with its JID and a membership baseline from the list, and the
-pipeline then asks the bot to leave it once its item no longer uses it (the
-thread moved to the DM when the creation became unknown); a list without it
-marks the creation `absent`. A failed listing changes nothing. An unknown
-creation still unresolved after one hour is reported to the operator in DM.
+a 4xx answer from WhatsApp other than 408, or a call that was never sent (no
+live connection, or a claim that stopped before its nonce was stored).
+Anything else (a timeout, a closed or lost connection, a server error, an
+unrecognized error, or a claim older than 10 minutes because the bot
+stopped mid-call) is `unknown`. An unknown creation is never repeated,
+never treated as closed, and keeps counting against `max_groups_per_day`.
+
+Every two minutes the bot lists the groups it participates in
+(`groupFetchAllParticipating`). Exactly one group whose subject ends with
+the nonce is `quarantined`: recorded with its JID, never added to the
+target allowlist, never sent to, and left (the item's thread moved to the
+DM when the creation became unknown); once the bot confirms it left, the
+record is `closed`. Zero or several matches, or a failed listing, change
+nothing: a search that does not find the group is not evidence that it does
+not exist, and WhatsApp gives no definite answer. An unresolved creation is
+reported to the operator in DM after one hour and at most once a day after
+that. The operator ends it with `nucleus intake group-resolve <n> --left`
+(the operator left the group) or `--absent` (no such group exists); the
+command queues a `resolve` request that the bot applies. That command is
+the only way to a closed record without the bot confirming it left.
 
 An item closed before the bot handles its create request gets no group; one
 closed while the create call runs gets the new group left at once. Leaving
 is retried with backoff (30 s, doubling, at most 1 hour, 8 attempts, then an
 alert); a failed leave counts as done when the bot is confirmed not to be a
-member. The bot sets `closed_at` only when it left. The pipeline sets
-`group_closed_at` only when the bot's table shows the group `closed`,
-`fallback` or `absent`, never for `unknown`. The pipeline adds a close
-request only when none is pending, and every tick asks the bot to leave
-active groups whose item is closed, missing, or moved to the DM.
+member. The bot sets `closed_at` only when it left or the operator resolved
+the creation. The pipeline sets `group_closed_at` only when the bot's table
+shows `closed` or `fallback`, never for `unknown` or `quarantined`. The
+pipeline adds a close request only when none is pending, and every tick
+asks the bot to leave active groups whose item is closed, missing, or moved
+to the DM.
 
-Limit: a group whose subject was changed by hand (so the token is gone)
-cannot be found; the one-hour report tells the operator to check.
+Limit: a creation whose group lost its nonce (the subject was changed by
+hand) stays unknown until the operator resolves it.
 
 ### Finding 7 — lost operator commands
 
@@ -740,6 +806,29 @@ command's effect and loses the note.
 
 ### Verification of the amendment
 
+Round 3: a label removed right after the push stops the item before
+`gh pr create` and keeps the pushed branch recorded
+(`a_label_removed_after_the_push_stops_the_pull_request`); the comment is
+posted only after a read that follows the comments lookup
+(`the_comment_is_written_only_after_a_fresh_read_that_follows_the_lookup`);
+a changed `gh` file blocks the next privileged step
+(`a_changed_executable_blocks_the_next_privileged_step`, `tools.rs`);
+a file over the per-file limit, a sparse file, too many files, a FIFO and
+the total limit are refused before `git add`, with no object or scratch
+directory left (`oversized_trees_and_special_files_are_refused_before_git_add`),
+and a pipeline item is blocked with the reason, as is a diff over the scan
+limit (`limits_block_the_item_with_a_clear_reason`); an unchanged base
+submodule is kept and an added, deleted or moved one refused
+(`submodules_of_the_base_may_stay_but_not_change`); the first push is
+create-only and later pushes lease on the recorded commit
+(`pushes_are_leased_on_the_exact_ref`,
+`an_existing_branch_is_never_overwritten_by_the_first_push`); `show --json`
+parses as JSON (`show_json_is_valid_json`); random nonces, one exact match
+quarantined and left, decoys untouched, a match with extra members left,
+several matches unknown, daily alerts, operator resolution
+(`intake.test.ts`), and the pipeline never counts an unknown or quarantined
+group as closed (`an_unknown_group_is_never_counted_as_closed`).
+
 Round 2 (after a second review): an issue title with fence-escape and
 instruction text reaches the typed worker message only inside the fence
 (`an_issue_title_reaches_workers_only_inside_the_fence`, and
@@ -756,8 +845,9 @@ publishes nothing (`only_one_code_owned_commit_is_published`); an issue
 changed during the secret scan stops the push, and an edited body during
 the scan makes the item stale (`a_change_during_the_scan_stops_the_push`);
 a group creation that timed out but happened is found by its token and
-left, a missing one becomes absent, an unresolvable one stays unknown and
-is reported (`intake.test.ts`), and the pipeline never counts an unknown
+left, and an unresolvable one stays unknown and is reported
+(`intake.test.ts`; round 3 replaced the token with a random nonce and
+removed the `absent` result), and the pipeline never counts an unknown
 group as closed (`an_unknown_group_is_never_counted_as_closed`).
 
 Round 1:
