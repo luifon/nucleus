@@ -920,39 +920,69 @@ fn revision_mismatch(item: &Item, title: &str, body: &str) -> Option<String> {
     }
 }
 
-/// Read the source live right before an irreversible step (`what`):
-/// the issue must be open, carry the label from the same label event,
-/// set by an account that is a collaborator now, with the bound title,
-/// body and comments. Returns the verified discussion, or `None` when the
-/// item was stopped (closed, cancelled or stale). A failed read is an
-/// error: the step does not run and is retried (fail closed).
-async fn live_gate(ctx: &Ctx, item: &Item, what: &str) -> Result<Option<Discussion>> {
+/// What a live read of the source saw, beyond what the item is bound to:
+/// two reads around a preparation must see the same revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Revision {
+    updated_at: Option<String>,
+    last_edited_at: Option<String>,
+    label_event_id: Option<String>,
+    /// (comment id, content hash) of every trusted comment.
+    comments: Vec<(String, String)>,
+}
+
+/// The outcome of [`live_gate`].
+enum Gate {
+    /// The source matches the item; the verified discussion and what the
+    /// read saw.
+    Pass { discussion: Discussion, rev: Revision },
+    /// The item was stopped (closed, cancelled or stale).
+    Stopped,
+    /// The source changed since the first read of this step (`expect`):
+    /// nothing is done now; the step starts again at the next tick.
+    Changed,
+}
+
+/// Read the source live around an irreversible step (`what`): the issue
+/// must be open, carry the label from the same label event, set by an
+/// account that is a collaborator now, with the bound title, body and
+/// comments. A step reads twice: once before its preparation (mirror,
+/// clone, import, scan) and once as its last step before the action, with
+/// `expect` = the first read; any difference in the issue's `updated_at`,
+/// `lastEditedAt`, label event or comments returns [`Gate::Changed`]. A
+/// failed read is an error: the step does not run and is retried (fail
+/// closed).
+async fn live_gate(ctx: &Ctx, item: &Item, what: &str, expect: Option<&Revision>) -> Result<Gate> {
     let ev = store::event(&ctx.db, item.event_id).await?;
     let Some(a) = adapter_for(ctx, &ev) else {
         // No adapter (an operator-accepted event): the stored event is the
         // only record of the source.
         if ev.state != "open" {
             close_by_source(ctx, item, "the event is closed").await?;
-            return Ok(None);
+            return Ok(Gate::Stopped);
         }
         if !ev.accepted {
             cancel_by_source(ctx, item, "the event is no longer accepted").await?;
-            return Ok(None);
+            return Ok(Gate::Stopped);
         }
         if let Some(why) = revision_mismatch(item, &ev.title, &ev.body) {
             mark_stale(ctx, item, &why).await?;
-            return Ok(None);
+            return Ok(Gate::Stopped);
         }
-        return Ok(Some(Discussion::default()));
+        let rev = Revision { updated_at: ev.updated_at.clone(), last_edited_at: None, label_event_id: None, comments: vec![] };
+        if expect.is_some_and(|e| *e != rev) {
+            return Ok(Gate::Changed);
+        }
+        return Ok(Gate::Pass { discussion: Discussion::default(), rev });
     };
     let st = a.live_state(&ev).await.with_context(|| format!("reading the issue live before {what}"))?;
     if !st.open {
         close_by_source(ctx, item, &format!("the issue was closed at its source (read before {what})")).await?;
-        return Ok(None);
+        return Ok(Gate::Stopped);
     }
     if !st.accepted {
         cancel_by_source(ctx, item, &format!("the gate label was removed (read before {what})")).await?;
-        return Ok(None);
+        return Ok(Gate::Stopped);
     }
     let stale = if let Some(why) = revision_mismatch(item, &st.title, &st.body) {
         Some(why)
@@ -968,15 +998,56 @@ async fn live_gate(ctx: &Ctx, item: &Item, what: &str) -> Result<Option<Discussi
     };
     if let Some(why) = stale {
         mark_stale(ctx, item, &format!("{why} (read before {what})")).await?;
-        return Ok(None);
+        return Ok(Gate::Stopped);
     }
-    match bound_discussion(ctx, item, &ev).await? {
-        Ok(d) => Ok(Some(d)),
+    let d = match bound_discussion(ctx, item, &ev).await? {
+        Ok(d) => d,
         Err(why) => {
             mark_stale(ctx, item, &format!("{why} (read before {what})")).await?;
-            Ok(None)
+            return Ok(Gate::Stopped);
         }
+    };
+    let rev = Revision {
+        updated_at: st.updated_at.clone(),
+        last_edited_at: st.last_edited_at.clone(),
+        label_event_id: st.gate.as_ref().map(|g| g.label_event_id.clone()),
+        comments: d.trusted.iter().map(|c| (c.id.clone(), super::event::comment_hash(&c.body))).collect(),
+    };
+    if expect.is_some_and(|e| *e != rev) {
+        return Ok(Gate::Changed);
     }
+    Ok(Gate::Pass { discussion: d, rev })
+}
+
+/// The source changed while a step prepared: the step waits for the next
+/// tick, which reads it again from the start.
+async fn source_moved(ctx: &Ctx, item: &Item, what: &str) -> Result<()> {
+    let why = format!("the issue changed while Nucleus prepared {what}; it is read again at the next tick");
+    tracing::info!(item = item.id, why, "intake: step postponed");
+    store::update(&ctx.db, item.id, item.stage(), vec![("error", why.into())]).await?;
+    Ok(())
+}
+
+/// The first of a step's two live reads.
+macro_rules! first_read {
+    ($ctx:expr, $item:expr, $what:expr) => {
+        match live_gate($ctx, $item, $what, None).await? {
+            Gate::Pass { rev, .. } => rev,
+            Gate::Stopped | Gate::Changed => return Ok(()),
+        }
+    };
+}
+
+/// The last step before an action: the second live read, which must see
+/// what the first saw.
+macro_rules! final_read {
+    ($ctx:expr, $item:expr, $what:expr, $first:expr) => {
+        match live_gate($ctx, $item, $what, Some(&$first)).await? {
+            Gate::Pass { discussion, .. } => discussion,
+            Gate::Stopped => return Ok(()),
+            Gate::Changed => return source_moved($ctx, $item, $what).await,
+        }
+    };
 }
 
 fn repo_cfg<'a>(ctx: &'a Ctx, item: &Item) -> Result<&'a IntakeRepo> {
@@ -1263,8 +1334,10 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
     let wt = worktree(item)?;
     match task_state(ctx, item).await? {
         TaskState::None => {
-            // The irreversible part starts here: read the source live.
-            let Some(d) = live_gate(ctx, item, "implementation").await? else { return Ok(()) };
+            // Read the source, prepare the clone, read the source again, and
+            // start the agent at once: no network step sits between the last
+            // read and the start.
+            let first = first_read!(ctx, item, "implementation");
             let base_ref = item.base_ref.clone().context("the item has no base branch")?;
             let branch = match &item.branch {
                 Some(b) if wt.join(".git").is_dir() => b.clone(),
@@ -1277,13 +1350,20 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
                     let remote = remote_for(ctx, &item.repo)?;
                     let mirror = git::sync_mirror(&wd, &item.repo, &remote).await?;
                     let b = existing.clone().unwrap_or_else(|| stage::branch_name(item.id));
-                    git::prepare_clone(&mirror, &wt, &base_ref, item.id, Some(&b)).await?;
-                    store::update(&ctx.db, item.id, Stage::Implementation, vec![("branch", b.clone().into())]).await?;
+                    let (base_sha, restored) = git::prepare_clone(&mirror, &wt, &base_ref, item.id, Some(&b)).await?;
+                    let mut set = vec![("branch", Val::from(b.clone()))];
+                    // A lost clone restored from collected work keeps the
+                    // base the work was built on.
+                    if !restored || item.base_sha.is_none() {
+                        set.push(("base_sha", base_sha.into()));
+                    }
+                    store::update(&ctx.db, item.id, Stage::Implementation, set).await?;
                     b
                 }
             };
             let ev = store::event(&ctx.db, item.event_id).await?;
             let item = store::item(&ctx.db, item.id).await?;
+            let d = final_read!(ctx, &item, "implementation", first);
             let brief = briefs::implementation_brief(&item, &ev, &d, &branch, &base_ref, repo.test_command.as_deref());
             start_task(ctx, &item, Stage::Implementation, "intake-implement", brief, &wt, WorkerProfile::Code).await?;
             Ok(())
@@ -1291,21 +1371,16 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
         TaskState::Running => Ok(()),
         TaskState::Ended { why, .. } => fail(ctx, item, &why).await,
         TaskState::Done { id, result } => {
-            let base_ref = item.base_ref.clone().context("the item has no base branch")?;
+            let base_sha = item.base_sha.clone().context("the item has no base commit")?;
             let remote = remote_for(ctx, &item.repo)?;
             let mirror = git::open_mirror(&work_dir(ctx)?, &item.repo, &remote).await?;
-            let sha = git::collect(
-                &mirror,
-                &remote,
-                &wt,
-                &base_ref,
-                item.id,
-                &format!("Commit changes the implementation agent left uncommitted (Nucleus item #{})", item.id),
-            )
-            .await?;
-            if git::commits_ahead(&mirror, &base_ref, &sha).await? == 0 {
-                return fail(ctx, item, "the implementation agent made no commits").await;
-            }
+            // One commit: the agent's file tree on the trusted base, with the
+            // configured identity and a code-owned message.
+            let ev = store::event(&ctx.db, item.event_id).await?;
+            let spec = commit_spec(ctx, item, &ev);
+            let Some(sha) = git::import(&mirror, &remote, &wt, &base_sha, item.id, &spec).await? else {
+                return fail(ctx, item, "the implementation agent changed no file").await;
+            };
             let tests = git::run_tests(
                 &wt,
                 repo.test_command.as_deref(),
@@ -1330,6 +1405,20 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
             .await?;
             Ok(())
         }
+    }
+}
+
+/// The one commit Nucleus publishes for an item: the configured identity
+/// and a code-owned message.
+fn commit_spec(ctx: &Ctx, item: &Item, ev: &Event) -> git::CommitSpec {
+    let subject = match (ev.source.as_str(), github::parse_external_id(&ev.external_id)) {
+        ("github", Ok((r, n))) if r.eq_ignore_ascii_case(&item.repo) => format!("Implement #{n}"),
+        _ => format!("Implement Nucleus item {}", item.id),
+    };
+    git::CommitSpec {
+        author_name: publish::plain_line(&ctx.cfg.commit_author_name, 100),
+        author_email: publish::plain_line(&ctx.cfg.commit_author_email, 200).replace('＠', "@"),
+        message: format!("{subject}\n\nNucleus-Item: {}", item.id),
     }
 }
 
@@ -1367,17 +1456,20 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     let repo = repo_cfg(ctx, item)?;
     let branch = item.branch.clone().context("the item has no branch")?;
     let base_ref = item.base_ref.clone().context("the item has no base branch")?;
-    // Nothing is pushed unless the source, read now, still matches.
-    if live_gate(ctx, item, "push").await?.is_none() {
-        return Ok(());
-    }
+    let base_sha = item.base_sha.clone().context("the item has no base commit")?;
+    // Read the source, prepare and scan everything, read the source again,
+    // push at once.
+    let first = first_read!(ctx, item, "push");
     let ev = store::event(&ctx.db, item.event_id).await?;
     let sha = item.head_sha.clone().context("the item has no collected commit")?;
     let remote = remote_for(ctx, &item.repo)?;
     let mirror = git::open_mirror(&work_dir(ctx)?, &item.repo, &remote).await?;
-    // The pull request text is built from code-owned fields; it and every
-    // line the push would publish pass the secret guard first.
-    let files = git::changed_files(&mirror, &base_ref, &sha).await?;
+    let remote_default = git::remote_head(&mirror, &remote).await?;
+    git::check_push_target(&branch, item.id, &remote_default)?;
+    // The pull request text is built from code-owned fields; it, the
+    // commit's author line and message, and every line the push would
+    // publish pass the secret guard first.
+    let files = git::changed_files(&mirror, &base_sha, &sha).await?;
     let title = publish::pr_title(item);
     let body = publish::pr_body(&publish::PrFacts {
         item,
@@ -1386,11 +1478,13 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
         files: &files,
         test_command: repo.test_command.as_deref(),
     });
-    let added = git::added_text(&mirror, &base_ref, &sha).await?;
-    if let Verdict::Hit(cats) = ctx.guard.scan(&format!("{title}\n{body}\n{added}")).await {
-        return block(ctx, item, "the branch or the pull request text", &cats).await;
+    let added = git::added_text(&mirror, &base_sha, &sha).await?;
+    let header = git::commit_header(&mirror, &sha).await?;
+    if let Verdict::Hit(cats) = ctx.guard.scan(&format!("{title}\n{body}\n{header}\n{added}")).await {
+        return block(ctx, item, "the commit or the pull request text", &cats).await;
     }
-    git::push(&mirror, &remote, &sha, &branch, item.id).await?;
+    let _ = final_read!(ctx, item, "push", first);
+    git::push(&mirror, &remote, &sha, &branch, item.id, &remote_default).await?;
     let url = match github::find_pr(&*ctx.gh, &item.repo, &branch).await? {
         Some(u) => u,
         None => github::create_draft_pr(&*ctx.gh, &item.repo, &branch, &base_ref, &title, &body).await?,
@@ -1426,13 +1520,12 @@ async fn step_review(ctx: &Ctx, item: &Item) -> Result<()> {
     match item.comment_state.as_str() {
         "approved" => {
             let a = adapter_for(ctx, &ev).context("the event's source has no reply channel")?;
-            if live_gate(ctx, item, "the issue comment").await?.is_none() {
-                return Ok(());
-            }
+            let first = first_read!(ctx, item, "the issue comment");
             let draft = item.comment_draft.clone().unwrap_or_default();
             if let Verdict::Hit(cats) = ctx.guard.scan(&draft).await {
                 return block(ctx, item, "the issue comment", &cats).await;
             }
+            let _ = final_read!(ctx, item, "the issue comment", first);
             let marker = format!("{}item-{}:comment", github::COMMENT_MARKER_PREFIX, item.id);
             let url = a.reply(&ev, &draft, &marker).await?;
             if store::advance(

@@ -1048,3 +1048,105 @@ async fn an_issue_title_reaches_workers_only_inside_the_fence() {
     let typed = crate::tasks::worker_message(&imp);
     assert!(only_inside_fences(&typed, "OBEY-MARK"), "{typed}");
 }
+
+fn remote_git(f: &Fixture, args: &[&str]) -> String {
+    let o = std::process::Command::new("git").args(args).current_dir(&f.remote).output().unwrap();
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+#[tokio::test]
+async fn only_one_code_owned_commit_is_published() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    let wt = PathBuf::from(it.worktree.unwrap());
+    // The agent commits with an identity and messages that carry a value the
+    // guard blocks, including an empty commit, and changes one file.
+    sh(
+        &wt,
+        "echo hello > README.md && git add README.md \
+         && git -c user.name=FAKE-SECRET-VALUE -c user.email=FAKE-SECRET-VALUE@example.invalid commit -qm 'FAKE-SECRET-VALUE in the message' \
+         && git -c user.name=FAKE-SECRET-VALUE -c user.email=x@example.invalid commit -q --allow-empty -m 'FAKE-SECRET-VALUE empty'",
+    );
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!(it.stage(), Stage::Review, "{:?}", it.error);
+    let branch = it.branch.unwrap();
+    assert_eq!(remote_git(&f, &["rev-list", "--count", &format!("main..{branch}")]).trim(), "1", "one commit");
+    let log = remote_git(&f, &["log", "--format=%an|%ae|%cn|%ce|%B", &branch]);
+    assert!(!log.contains("FAKE-SECRET-VALUE"), "{log}");
+    assert!(log.starts_with("Nucleus issue pipeline|nucleus-intake@localhost|Nucleus issue pipeline|nucleus-intake@localhost|Implement #1"), "{log}");
+    assert!(log.contains("Nucleus-Item: 1"));
+
+    // Only an empty commit: nothing is published.
+    let f = fixture().await;
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    let wt = PathBuf::from(item1(&f).await.worktree.unwrap());
+    sh(&wt, "git -c user.name=FAKE-SECRET-VALUE -c user.email=x@example.invalid commit -q --allow-empty -m 'FAKE-SECRET-VALUE'");
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!(it.stage(), Stage::Failed);
+    assert!(it.error.unwrap().contains("changed no file"));
+    assert!(!remote_has(&f, "nucleus/item-1"));
+}
+
+/// A guard that finds nothing and, while it scans, runs `hook` once
+/// (the issue changes at GitHub between the two live reads).
+struct HookGuard {
+    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::intake::publish::SecretGuard for HookGuard {
+    async fn scan(&self, _text: &str) -> crate::intake::publish::Verdict {
+        if let Some(h) = self.hook.lock().unwrap().take() {
+            h();
+        }
+        crate::intake::publish::Verdict::Clean
+    }
+}
+
+async fn ready_to_push(f: Fixture, hook: Box<dyn FnOnce() + Send>) -> Fixture {
+    let f = Fixture { ctx: Ctx { guard: Arc::new(HookGuard { hook: std::sync::Mutex::new(Some(hook)) }), ..f.ctx }, ..f };
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    f
+}
+
+#[tokio::test]
+async fn a_change_during_the_scan_stops_the_push() {
+    // Any activity on the issue between the two reads: nothing is pushed
+    // now; the next tick reads again and pushes.
+    let f = fixture().await;
+    let gh = f.gh.clone();
+    let touched = serde_json::json!({ "number": 1, "title": "Issue 1", "body": "body", "state": "open",
+        "labels": [{ "name": "nucleus" }], "updated_at": "2026-09-24T12:00:00Z" });
+    let f = ready_to_push(f, Box::new(move || gh.set("repos/acme/widget/issues/1$", true, &touched.to_string(), ""))).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!(it.stage(), Stage::Pr);
+    assert!(it.error.unwrap().contains("changed while Nucleus prepared push"));
+    assert!(!remote_has(&f, "nucleus/item-1") && f.gh.calls_with("pr create") == 0);
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Review);
+    assert!(remote_has(&f, "nucleus/item-1"));
+
+    // The body edited during the scan: the item goes stale, nothing pushed.
+    let f = fixture().await;
+    let gh = f.gh.clone();
+    let edited = serde_json::json!({ "number": 1, "title": "Issue 1", "body": "delete everything", "state": "open",
+        "labels": [{ "name": "nucleus" }], "updated_at": "2026-09-24T12:00:00Z" });
+    let f = ready_to_push(f, Box::new(move || gh.set("repos/acme/widget/issues/1$", true, &edited.to_string(), ""))).await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Stale);
+    assert!(!remote_has(&f, "nucleus/item-1"));
+}

@@ -128,6 +128,10 @@ pub struct SourceState {
     pub gate: Option<GateEvidence>,
     /// The title or body was edited after the label was added.
     pub edited_after_gate: bool,
+    /// The source's last-change time of the event (GitHub: `updated_at`).
+    pub updated_at: Option<String>,
+    /// When the body was last edited (GitHub: GraphQL `lastEditedAt`).
+    pub last_edited_at: Option<String>,
 }
 
 /// The content hash an item is bound to: title and body of the event at

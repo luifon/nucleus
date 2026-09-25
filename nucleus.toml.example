@@ -223,6 +223,10 @@ max_runtime_hours = 12
 # label = "nucleus"
 # min_confidence = 0.7          # a "simple" eval below this goes to refinement
 # test_timeout_minutes = 30     # Nucleus's own test run before the draft PR
+# # The one commit Nucleus publishes per item (the agent's commits, authors
+# # and messages are never pushed). Placeholders; use your own values.
+# commit_author_name = "Nucleus issue pipeline"
+# commit_author_email = "nucleus@example.com"
 #
 # [[intake.repos]]
 # repo = "owner/repo"
@@ -234,8 +238,9 @@ max_runtime_hours = 12
 # gh_bin = "/opt/homebrew/bin/gh"   # launchd has no shell PATH (Rule 5)
 # poll_interval_secs = 300
 # collaborator_cache_secs = 3600
-# # Nucleus fetches from and pushes to this URL only ({repo} = owner/name),
-# # with gh as the credential helper; it never reads a URL from a clone.
+# # Nucleus fetches from and pushes to this URL only ({repo} = owner/name).
+# # HTTPS only: git runs with no global or system config (the agent can
+# # edit ~/.gitconfig), so the only credential helper is gh at gh_bin.
 # remote_url = "https://github.com/{repo}.git"
 #
 # Items that need a plan get a WhatsApp group with the bot and the operator.

@@ -9,18 +9,22 @@
 //!   a fixed template and removes hooks, alternates and similar files, so a
 //!   change an agent made to it has no effect.
 //! - `<work_dir>/<owner>__<name>/item-<n>` — a separate clone of the mirror
-//!   for one item. The item's agents work there. Nucleus never runs git
-//!   with that clone's configuration after an agent could have written it:
-//!   it reads the agent's commits by fetching from the clone into the
-//!   mirror, and it commits leftover changes with the mirror's
-//!   configuration and a temporary index (`--git-dir=<mirror>
-//!   --work-tree=<clone>`).
+//!   for one item. The item's agents work there. After an agent could have
+//!   written to it, Nucleus runs no git command against it: no fetch from
+//!   it, no command with its `.git` as git directory. [`import`] reads only
+//!   its file tree, into the mirror, with a Nucleus-owned temporary index
+//!   (`--git-dir=<mirror> --work-tree=<clone>`), and makes one commit with
+//!   a fixed identity and a code-owned message on the trusted base. None of
+//!   the agent's commits, authors or messages is published.
 //!
-//! Every git process Nucleus starts runs with [`HARDENING`]: hooks off,
-//! `core.fsmonitor` off, credential helpers reset, the `ext::` transport
-//! off, no system configuration, and inherited `GIT_*` variables removed.
-//! Network steps name the remote by its configured URL, never by a remote
-//! name, and set the `gh` credential helper explicitly.
+//! Every git process Nucleus starts runs with [`HARDENING`] and no
+//! configuration file except the mirror's own template: no system and no
+//! global configuration (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`;
+//! the implementation agent runs as the same OS user and can edit
+//! `~/.gitconfig`), no global attributes or excludes file, inherited
+//! `GIT_*` variables removed. Network steps name the remote by its
+//! configured HTTPS URL, never by a remote name, and authenticate only
+//! through the `gh` credential helper at its absolute path.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -58,8 +62,21 @@ pub const HARDENING: &[&str] = &[
     "-c",
     "diff.external=",
     "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.excludesFile=/dev/null",
+    "-c",
     "advice.detachedHead=false",
 ];
+
+/// The identity and message of the one commit Nucleus publishes for an
+/// item (from `nucleus.toml`, never from an agent or a git config).
+#[derive(Debug, Clone)]
+pub struct CommitSpec {
+    pub author_name: String,
+    pub author_email: String,
+    pub message: String,
+}
 
 /// Branch names Nucleus never pushes to, besides the repository's default
 /// branch.
@@ -70,31 +87,68 @@ pub const PROTECTED_BRANCHES: &[&str] = &["main", "master", "develop", "developm
 pub struct Remote {
     /// The configured repository's URL (never read from a clone).
     pub url: String,
-    /// The `gh` binary, used as the credential helper for network steps.
-    pub gh_bin: String,
+    /// The absolute path of `gh`, the only credential helper, for an HTTPS
+    /// URL; `None` for a local repository path (tests).
+    pub gh_bin: Option<PathBuf>,
 }
 
 impl Remote {
     /// The URL of `repo` from the configured template (`{repo}` is
-    /// replaced by `owner/name`).
+    /// replaced by `owner/name`). Only HTTPS URLs are accepted (and a local
+    /// absolute path, used by tests): SSH would need an ssh command, and
+    /// git would read it from a configuration file the agent can write.
+    /// `gh_bin` is resolved to an absolute path through `PATH` when it is a
+    /// bare name.
     pub fn for_repo(template: &str, repo: &str, gh_bin: &str) -> Result<Remote> {
         check_repo_name(repo)?;
         let url = template.replace("{repo}", repo);
-        if url.trim().is_empty() || url.chars().any(|c| c.is_control() || c == '"' || c == '\\') {
+        if url.trim().is_empty() || url.chars().any(|c| c.is_control() || c.is_whitespace() || c == '"' || c == '\\' || c == '\'') {
             bail!("the remote URL for {repo} is empty or contains a character that is not allowed");
         }
-        if url.starts_with('-') || url.starts_with("ext::") {
-            bail!("the remote URL for {repo} is not a repository URL");
+        if url.starts_with("https://") {
+            let gh = resolve_bin(gh_bin).with_context(|| format!("[intake.github] gh_bin {gh_bin:?} was not found"))?;
+            return Ok(Remote { url, gh_bin: Some(gh) });
         }
-        Ok(Remote { url, gh_bin: gh_bin.to_string() })
+        if url.starts_with('/') {
+            return Ok(Remote { url, gh_bin: None });
+        }
+        bail!("the remote URL for {repo} must start with https:// (SSH and other transports are not supported)")
     }
 
     /// The `-c` options that set the `gh` credential helper (after
     /// [`HARDENING`] reset the list).
     fn credential_args(&self) -> Vec<String> {
-        let quoted = format!("'{}'", self.gh_bin.replace('\'', r"'\''"));
-        vec!["-c".into(), format!("credential.helper=!{quoted} auth git-credential")]
+        match &self.gh_bin {
+            Some(gh) => {
+                let quoted = format!("'{}'", gh.to_string_lossy().replace('\'', r"'\''"));
+                vec!["-c".into(), format!("credential.helper=!{quoted} auth git-credential")]
+            }
+            None => vec![],
+        }
     }
+}
+
+/// `name` as an absolute path: itself when absolute, else the first
+/// executable file of that name on `PATH`.
+pub fn resolve_bin(name: &str) -> Result<PathBuf> {
+    let p = Path::new(name);
+    if p.is_absolute() {
+        if p.is_file() {
+            return Ok(p.to_path_buf());
+        }
+        bail!("{name} does not exist");
+    }
+    if name.contains('/') || name.is_empty() {
+        bail!("{name:?} is neither an absolute path nor a command name");
+    }
+    let path = std::env::var_os("PATH").context("PATH is not set")?;
+    for dir in std::env::split_paths(&path) {
+        let c = dir.join(name);
+        if c.is_file() && c.is_absolute() {
+            return Ok(c);
+        }
+    }
+    bail!("{name} is not on PATH")
 }
 
 /// `owner/name` with GitHub's characters only.
@@ -109,18 +163,20 @@ pub fn check_repo_name(repo: &str) -> Result<()> {
 }
 
 /// Run git in `cwd` with [`HARDENING`], extra `-c` options and extra
-/// environment. Inherited `GIT_*` variables are removed except the author
-/// and committer identity, so a caller's `GIT_DIR` or `GIT_INDEX_FILE` (a
-/// git hook's environment) cannot redirect the command.
+/// environment. Every inherited `GIT_*` variable is removed, so a caller's
+/// `GIT_DIR` or `GIT_INDEX_FILE` (a git hook's environment) cannot redirect
+/// the command, and no system or global configuration is read.
 async fn run(cwd: &Path, pre: &[String], args: &[&str], env: &[(&str, &str)]) -> Result<GitOut> {
     let mut cmd = tokio::process::Command::new("git");
     for (k, _) in std::env::vars_os() {
         let k = k.to_string_lossy().into_owned();
-        if k.starts_with("GIT_") && !k.starts_with("GIT_AUTHOR_") && !k.starts_with("GIT_COMMITTER_") {
+        if k.starts_with("GIT_") {
             cmd.env_remove(k);
         }
     }
     cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LFS_SKIP_SMUDGE", "1");
     for (k, v) in env {
@@ -333,7 +389,10 @@ pub async fn remote_head(mirror: &Path, remote: &Remote) -> Result<String> {
 /// mirror holds collected work for the item (`refs/nucleus/item-<n>`,
 /// a retry after the clone was lost) and `branch` is given, the clone is
 /// put on `branch` at that work; otherwise `branch` is created at the base.
-pub async fn prepare_clone(mirror: &Path, wt: &Path, base_ref: &str, item: i64, branch: Option<&str>) -> Result<()> {
+/// Returns the base commit the clone starts from (the commit Nucleus's one
+/// commit for the item will have as its parent), and whether collected
+/// work was restored (then the item keeps the base that work was built on).
+pub async fn prepare_clone(mirror: &Path, wt: &Path, base_ref: &str, item: i64, branch: Option<&str>) -> Result<(String, bool)> {
     if let Some(b) = branch {
         check_branch_name(b)?;
     }
@@ -353,16 +412,19 @@ pub async fn prepare_clone(mirror: &Path, wt: &Path, base_ref: &str, item: i64, 
         bail!("cloning the mirror into {} failed: {}", wt.display(), out.stderr);
     }
     git_ok(wt, &["checkout", "--quiet", "--detach", &format!("origin/{base_ref}")]).await?;
+    let base_sha = mirror_ok(mirror, &["rev-parse", "--verify", &format!("refs/heads/{base_ref}^{{commit}}")]).await?.trim().to_string();
+    let mut restored = false;
     if let Some(b) = branch {
         let saved = mirror_git(mirror, &[], &["rev-parse", "--verify", "--quiet", &format!("{}^{{commit}}", item_ref(item))], &[]).await?;
         if saved.ok {
             git_ok(wt, &["fetch", "--quiet", "--no-tags", "origin", &format!("+{}:refs/heads/{b}", item_ref(item))]).await?;
             git_ok(wt, &["switch", "--quiet", b]).await?;
+            restored = true;
         } else {
             git_ok(wt, &["switch", "--quiet", "-c", b]).await?;
         }
     }
-    Ok(())
+    Ok((base_sha, restored))
 }
 
 /// A git branch name Nucleus may create: letters, digits, `/`, `-`, `_`,
@@ -380,95 +442,96 @@ pub fn check_branch_name(b: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read the agent's work into the mirror: fetch the clone's `HEAD` into
-/// `refs/nucleus/item-<n>`, check that it descends from the base branch,
-/// and commit what the agent left uncommitted on top (with the mirror's
-/// configuration and a temporary index; the clone's configuration and
-/// hooks are not used). Returns the commit to push.
-pub async fn collect(mirror: &Path, remote: &Remote, wt: &Path, base_ref: &str, item: i64, leftovers_message: &str) -> Result<String> {
+/// Import the agent's file tree into the mirror as one commit on
+/// `base_sha`, with `spec`'s fixed identity and code-owned message. No git
+/// command runs against the clone: git reads its files as a work tree of
+/// the mirror (`--git-dir=<mirror> --work-tree=<clone>`) with a temporary
+/// index. Paths named `.git` are never read (git refuses them), so the
+/// clone's own repository, whatever it contains, is ignored; symlinks are
+/// stored as symlinks (their target text), never followed. The clone's
+/// `.gitignore` files decide which untracked files are left out, and its
+/// `.gitattributes` can only name drivers, which resolve to nothing: the
+/// only configuration is the mirror's template, checked here to define no
+/// filter, diff or merge driver. A nested repository (a gitlink) is
+/// refused. Returns `None` when the tree equals the base (no change).
+pub async fn import(mirror: &Path, remote: &Remote, wt: &Path, base_sha: &str, item: i64, spec: &CommitSpec) -> Result<Option<String>> {
     reset_mirror(mirror, remote).await?;
-    let r = item_ref(item);
-    let out = mirror_git(
-        mirror,
-        &["-c".into(), "protocol.file.allow=always".into()],
-        &["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", &wt.to_string_lossy(), &format!("+HEAD:{r}")],
-        &[],
-    )
-    .await?;
-    if !out.ok {
-        bail!("reading the agent's commits from {} failed: {}", wt.display(), out.stderr);
+    let meta = std::fs::symlink_metadata(wt).with_context(|| format!("reading {}", wt.display()))?;
+    if !meta.is_dir() {
+        bail!("the item's clone {} is not a directory (a symlink or a file)", wt.display());
     }
-    let base = format!("refs/heads/{base_ref}");
-    let desc = mirror_git(mirror, &[], &["merge-base", "--is-ancestor", &base, &r], &[]).await?;
-    if !desc.ok {
-        bail!("the agent's HEAD does not descend from {base_ref}; Nucleus pushes only work based on the default branch");
+    let drivers = mirror_git(mirror, &[], &["config", "--get-regexp", r"^(filter|diff|merge)\.[^.]+\."], &[]).await?;
+    if !drivers.stdout.trim().is_empty() {
+        bail!("the mirror's configuration defines a filter, diff or merge driver");
     }
     let index = mirror.join(format!("nucleus-index-{item}"));
     let _ = std::fs::remove_file(&index);
     let index_s = index.to_string_lossy().into_owned();
-    let wt_arg = format!("--work-tree={}", wt.display());
-    let pre = vec![wt_arg];
+    let pre = vec![format!("--work-tree={}", wt.display())];
     let env_index = [("GIT_INDEX_FILE", index_s.as_str())];
-    for args in [vec!["read-tree", r.as_str()], vec!["add", "--all", "--", "."]] {
-        let out = mirror_git(mirror, &pre, &args, &env_index).await?;
-        if !out.ok {
-            let _ = std::fs::remove_file(&index);
-            bail!("git {} failed: {}", args.join(" "), out.stderr);
+    let result = async {
+        for args in [vec!["read-tree", base_sha], vec!["add", "--all", "--", "."]] {
+            let out = mirror_git(mirror, &pre, &args, &env_index).await?;
+            if !out.ok {
+                bail!("git {} failed: {}", args.join(" "), out.stderr);
+            }
         }
+        let staged = mirror_git(mirror, &pre, &["ls-files", "--stage"], &env_index).await?;
+        if let Some(l) = staged.stdout.lines().find(|l| l.starts_with("160000 ")) {
+            bail!("the clone contains a nested repository ({}); Nucleus does not publish one", l.split('\t').nth(1).unwrap_or("?"));
+        }
+        let tree = mirror_git(mirror, &pre, &["write-tree"], &env_index).await?;
+        if !tree.ok {
+            bail!("git write-tree failed: {}", tree.stderr);
+        }
+        Ok(tree.stdout.trim().to_string())
     }
-    let tree = mirror_git(mirror, &pre, &["write-tree"], &env_index).await?;
+    .await;
     let _ = std::fs::remove_file(&index);
-    if !tree.ok {
-        bail!("git write-tree failed: {}", tree.stderr);
+    let tree = result?;
+    let base_tree = mirror_ok(mirror, &["rev-parse", &format!("{base_sha}^{{tree}}")]).await?;
+    if tree == base_tree.trim() {
+        return Ok(None);
     }
-    let tree = tree.stdout.trim().to_string();
-    let head_tree = mirror_ok(mirror, &["rev-parse", &format!("{r}^{{tree}}")]).await?;
-    if tree != head_tree.trim() {
-        let ident = mirror_git(mirror, &[], &["var", "GIT_COMMITTER_IDENT"], &[]).await?;
-        let fallback = [
-            ("GIT_AUTHOR_NAME", "Nucleus"),
-            ("GIT_AUTHOR_EMAIL", "nucleus@localhost"),
-            ("GIT_COMMITTER_NAME", "Nucleus"),
-            ("GIT_COMMITTER_EMAIL", "nucleus@localhost"),
-        ];
-        let env: &[(&str, &str)] = if ident.ok { &[] } else { &fallback };
-        let commit = mirror_git(mirror, &[], &["commit-tree", &tree, "-p", &r, "-m", leftovers_message], env).await?;
-        if !commit.ok {
-            bail!("committing the agent's uncommitted changes failed: {}", commit.stderr);
-        }
-        let sha = commit.stdout.trim().to_string();
-        mirror_ok(mirror, &["update-ref", &r, &sha]).await?;
+    let ident = [
+        ("GIT_AUTHOR_NAME", spec.author_name.as_str()),
+        ("GIT_AUTHOR_EMAIL", spec.author_email.as_str()),
+        ("GIT_COMMITTER_NAME", spec.author_name.as_str()),
+        ("GIT_COMMITTER_EMAIL", spec.author_email.as_str()),
+    ];
+    let commit = mirror_git(mirror, &[], &["commit-tree", &tree, "-p", base_sha, "-m", &spec.message], &ident).await?;
+    if !commit.ok {
+        bail!("creating the item's commit failed: {}", commit.stderr);
     }
-    Ok(mirror_ok(mirror, &["rev-parse", &format!("{r}^{{commit}}")]).await?.trim().to_string())
+    let sha = commit.stdout.trim().to_string();
+    mirror_ok(mirror, &["update-ref", &item_ref(item), &sha]).await?;
+    Ok(Some(sha))
 }
 
-/// Commits in `sha` that the base branch does not have.
-pub async fn commits_ahead(mirror: &Path, base_ref: &str, sha: &str) -> Result<u64> {
-    let n = mirror_ok(mirror, &["rev-list", "--count", &format!("refs/heads/{base_ref}..{sha}")]).await?;
-    n.trim().parse().context("git rev-list --count")
+/// The author line and message of `sha` (what the push would publish
+/// besides the diff).
+pub async fn commit_header(mirror: &Path, sha: &str) -> Result<String> {
+    mirror_ok(mirror, &["log", "-1", "--format=%an <%ae>%n%cn <%ce>%n%B", sha]).await
 }
 
-/// Paths `sha` changes relative to its merge base with the base branch.
-pub async fn changed_files(mirror: &Path, base_ref: &str, sha: &str) -> Result<Vec<String>> {
-    let out = mirror_ok(
-        mirror,
-        &["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", &format!("refs/heads/{base_ref}...{sha}")],
-    )
-    .await?;
+/// Paths the commit `sha` changes relative to its parent `base_sha`.
+pub async fn changed_files(mirror: &Path, base_sha: &str, sha: &str) -> Result<Vec<String>> {
+    let out = mirror_ok(mirror, &["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", base_sha, sha]).await?;
     Ok(out.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect())
 }
 
-/// Every line `sha` adds relative to its merge base with the base branch,
-/// with the file names (what a push would publish).
-pub async fn added_text(mirror: &Path, base_ref: &str, sha: &str) -> Result<String> {
-    let diff = mirror_ok(
-        mirror,
-        &["diff", "-U0", "--no-color", "--no-renames", "--no-ext-diff", "--no-textconv", "--text", &format!("refs/heads/{base_ref}...{sha}")],
-    )
-    .await?;
+/// Every line the commit `sha` adds relative to its parent `base_sha`, with
+/// every file name it touches (what a push would publish; symlink targets
+/// appear as added lines).
+pub async fn added_text(mirror: &Path, base_sha: &str, sha: &str) -> Result<String> {
+    let diff = mirror_ok(mirror, &["diff", "-U0", "--no-color", "--no-renames", "--no-ext-diff", "--no-textconv", "--text", base_sha, sha]).await?;
     let mut out = String::new();
     for l in diff.lines() {
-        if let Some(path) = l.strip_prefix("+++ b/") {
+        if let Some(path) = l.strip_prefix("--- a/") {
+            out.push_str("file: ");
+            out.push_str(path);
+            out.push('\n');
+        } else if let Some(path) = l.strip_prefix("+++ b/") {
             out.push_str("file: ");
             out.push_str(path);
             out.push('\n');
@@ -500,12 +563,13 @@ pub fn check_push_target(branch: &str, item: i64, default_branch: &str) -> Resul
 }
 
 /// Push exactly `sha` to `refs/heads/<branch>` at the configured URL. No
-/// force, no other ref, no pre-push hook; the mirror is reset first and the
-/// remote's default branch is read live and refused as a target.
-pub async fn push(mirror: &Path, remote: &Remote, sha: &str, branch: &str, item: i64) -> Result<()> {
+/// force, no other ref, no pre-push hook; the mirror is reset first.
+/// `remote_default` is the remote's default branch, read live by the
+/// caller while preparing (so no network read sits between the caller's
+/// final source check and the push); it is refused as a target.
+pub async fn push(mirror: &Path, remote: &Remote, sha: &str, branch: &str, item: i64, remote_default: &str) -> Result<()> {
     reset_mirror(mirror, remote).await?;
-    let head = remote_head(mirror, remote).await?;
-    check_push_target(branch, item, &head)?;
+    check_push_target(branch, item, remote_default)?;
     if !sha.chars().all(|c| c.is_ascii_hexdigit()) || sha.len() < 40 {
         bail!("{sha:?} is not a commit id");
     }
@@ -575,6 +639,11 @@ mod tests {
         assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
     }
 
+    fn out(dir: &Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    }
+
     /// A bare "remote" with one commit on `main`.
     fn fixture() -> (tempfile::TempDir, PathBuf, Remote) {
         let d = tempfile::tempdir().unwrap();
@@ -585,57 +654,73 @@ mod tests {
             "git config user.email t@example.invalid && git config user.name T && echo one > a.txt && git add a.txt \
              && git commit -qm init && git push -q origin HEAD:main",
         );
-        let remote = Remote { url: root.join("remote.git").to_string_lossy().into_owned(), gh_bin: "gh".into() };
+        let remote = Remote { url: root.join("remote.git").to_string_lossy().into_owned(), gh_bin: None };
         (d, root, remote)
     }
 
+    fn spec() -> CommitSpec {
+        CommitSpec { author_name: "Pipeline".into(), author_email: "pipeline@example.invalid".into(), message: "Implement #1\n\nNucleus-Item: 1".into() }
+    }
+
     fn remote_branches(root: &Path) -> String {
-        let out = std::process::Command::new("git").args(["branch", "--list"]).current_dir(root.join("remote.git")).output().unwrap();
-        String::from_utf8_lossy(&out.stdout).into_owned()
+        out(&root.join("remote.git"), &["branch", "--list"])
     }
 
     #[tokio::test]
-    async fn mirror_clone_collect_push_cycle() {
+    async fn mirror_clone_import_push_cycle() {
         let (_d, root, remote) = fixture();
         let work = root.join("work");
         let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
         assert_eq!(default_branch(&mirror, &remote, None).await.unwrap(), "main");
         assert_eq!(default_branch(&mirror, &remote, Some("develop")).await.unwrap(), "develop");
         let wt = worktree_path(&work, "acme/widget", 1);
-        prepare_clone(&mirror, &wt, "main", 1, Some("nucleus/item-1-x")).await.unwrap();
-        assert!(wt.join("a.txt").exists());
-        // The agent commits once and leaves one change uncommitted.
-        sh(&wt, "git -c user.email=a@example.invalid -c user.name=A commit -q --allow-empty -m agent && echo two > a.txt && echo new > b.txt");
-        let sha = collect(&mirror, &remote, &wt, "main", 1, "leftover").await.unwrap();
-        assert_eq!(commits_ahead(&mirror, "main", &sha).await.unwrap(), 2);
-        let mut files = changed_files(&mirror, "main", &sha).await.unwrap();
+        let (base, restored) = prepare_clone(&mirror, &wt, "main", 1, Some("nucleus/item-1")).await.unwrap();
+        assert!(!restored && wt.join("a.txt").exists());
+        // Nothing changed: no commit.
+        assert_eq!(import(&mirror, &remote, &wt, &base, 1, &spec()).await.unwrap(), None);
+        // The agent commits once and leaves changes uncommitted, a symlink to
+        // a file outside the tree, and an ignored file.
+        sh(
+            &wt,
+            "echo two > a.txt && git -c user.email=a@example.invalid -c user.name=A commit -qam agent \
+             && echo new > b.txt && ln -s /etc/hosts link && echo x > skip.log && echo '*.log' > .gitignore",
+        );
+        let sha = import(&mirror, &remote, &wt, &base, 1, &spec()).await.unwrap().unwrap();
+        let mut files = changed_files(&mirror, &base, &sha).await.unwrap();
         files.sort();
-        assert_eq!(files, ["a.txt", "b.txt"]);
-        let added = added_text(&mirror, "main", &sha).await.unwrap();
-        assert!(added.contains("file: a.txt\ntwo\n") && added.contains("new"), "{added}");
-        push(&mirror, &remote, &sha, "nucleus/item-1-x", 1).await.unwrap();
-        assert!(remote_branches(&root).contains("nucleus/item-1-x"));
-        // A lost clone comes back on the branch with the collected work.
-        prepare_clone(&mirror, &wt, "main", 1, Some("nucleus/item-1-x")).await.unwrap();
+        assert_eq!(files, [".gitignore", "a.txt", "b.txt", "link"]);
+        let modes = out(&mirror, &["--git-dir=.", "ls-tree", &sha, "link"]);
+        assert!(modes.starts_with("120000 "), "the symlink is stored as a symlink: {modes}");
+        let added = added_text(&mirror, &base, &sha).await.unwrap();
+        assert!(added.contains("file: a.txt\ntwo\n") && added.contains("/etc/hosts"), "{added}");
+        // One commit on the base, with the fixed identity and message.
+        assert_eq!(out(&mirror, &["--git-dir=.", "rev-parse", &format!("{sha}^")]).trim(), base);
+        let header = commit_header(&mirror, &sha).await.unwrap();
+        assert!(header.starts_with("Pipeline <pipeline@example.invalid>\nPipeline <pipeline@example.invalid>\nImplement #1"), "{header}");
+        push(&mirror, &remote, &sha, "nucleus/item-1", 1, "main").await.unwrap();
+        assert!(remote_branches(&root).contains("nucleus/item-1"));
+        // A lost clone comes back on the branch with the imported work.
+        let (_, restored) = prepare_clone(&mirror, &wt, "main", 1, Some("nucleus/item-1")).await.unwrap();
+        assert!(restored);
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "two\n");
         remove_clone(&wt).unwrap();
         assert!(!wt.exists());
     }
 
     #[tokio::test]
-    async fn agent_controlled_git_metadata_is_not_used() {
+    async fn the_agent_clone_is_never_run_as_a_repository() {
         let (_d, root, remote) = fixture();
         let work = root.join("work");
         let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
         let wt = worktree_path(&work, "acme/widget", 2);
-        prepare_clone(&mirror, &wt, "main", 2, Some("nucleus/item-2")).await.unwrap();
+        let (base, _) = prepare_clone(&mirror, &wt, "main", 2, Some("nucleus/item-2")).await.unwrap();
         let marker = root.join("hook-ran");
         let hook = format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display());
-        // Hooks in the agent's clone and in the mirror, a hooksPath and an
-        // fsmonitor command in both configs, a clean filter for every file,
-        // and the remotes rewritten to a decoy.
         sh(&root, "git init -q --bare decoy.git");
         let decoy = root.join("decoy.git");
+        // Hooks, hooksPath, fsmonitor, a clean filter for every file,
+        // upload-pack settings and rewritten remotes, in the agent clone's
+        // .git and in the mirror.
         for gitdir in [wt.join(".git"), mirror.clone()] {
             std::fs::create_dir_all(gitdir.join("hooks")).unwrap();
             for name in ["pre-push", "pre-commit", "post-checkout", "reference-transaction", "pre-auto-gc"] {
@@ -647,8 +732,10 @@ mod tests {
                 &root,
                 &format!(
                     "git --git-dir='{g}' config core.hooksPath '{g}/hooks' && git --git-dir='{g}' config core.fsmonitor '{h}' \
-                     && git --git-dir='{g}' config filter.x.clean 'touch {m}; cat' && git --git-dir='{g}' config remote.origin.url '{d}' \
-                     && git --git-dir='{g}' config remote.origin.pushurl '{d}' && git --git-dir='{g}' config url.'{d}'.insteadOf '{r}'",
+                     && git --git-dir='{g}' config filter.x.clean 'touch {m}; cat' && git --git-dir='{g}' config filter.x.required true \
+                     && git --git-dir='{g}' config diff.x.command 'touch {m}' && git --git-dir='{g}' config uploadpack.packObjectsHook 'touch {m};' \
+                     && git --git-dir='{g}' config remote.origin.url '{d}' && git --git-dir='{g}' config remote.origin.pushurl '{d}' \
+                     && git --git-dir='{g}' config url.'{d}'.insteadOf '{r}'",
                     g = gitdir.display(),
                     h = gitdir.join("hooks/pre-push").display(),
                     m = marker.display(),
@@ -657,59 +744,79 @@ mod tests {
                 ),
             );
         }
-        std::fs::write(wt.join(".gitattributes"), "* filter=x\n").unwrap();
+        std::fs::write(wt.join(".gitattributes"), "* filter=x diff=x merge=x\n").unwrap();
         std::fs::write(wt.join("a.txt"), "changed\n").unwrap();
-        let sha = collect(&mirror, &remote, &wt, "main", 2, "leftover").await.unwrap();
-        push(&mirror, &remote, &sha, "nucleus/item-2", 2).await.unwrap();
-        assert!(!marker.exists(), "no hook, fsmonitor or filter ran");
+        let sha = import(&mirror, &remote, &wt, &base, 2, &spec()).await.unwrap().unwrap();
+        push(&mirror, &remote, &sha, "nucleus/item-2", 2, "main").await.unwrap();
+        assert!(!marker.exists(), "no hook, fsmonitor, filter or driver ran");
         assert!(remote_branches(&root).contains("nucleus/item-2"), "pushed to the configured remote");
-        let decoy_refs = std::process::Command::new("git").args(["for-each-ref"]).current_dir(&decoy).output().unwrap();
-        assert!(decoy_refs.stdout.is_empty(), "nothing reached the rewritten origin");
-        // The mirror's config is the template again.
+        assert!(out(&decoy, &["for-each-ref"]).is_empty(), "nothing reached the rewritten origin");
+        // The imported file is the work tree's bytes (no filter applied).
+        assert_eq!(out(&mirror, &["--git-dir=.", "show", &format!("{sha}:a.txt")]), "changed\n");
         let cfg = std::fs::read_to_string(mirror.join("config")).unwrap();
-        assert!(!cfg.contains("hooksPath") && !cfg.contains("insteadOf") && cfg.contains(&remote.url), "{cfg}");
+        assert!(!cfg.contains("hooksPath") && !cfg.contains("insteadOf") && !cfg.contains("filter") && cfg.contains(&remote.url), "{cfg}");
         assert!(!mirror.join("hooks").exists());
     }
 
     #[tokio::test]
-    async fn work_that_does_not_descend_from_the_base_is_refused() {
+    async fn nested_repositories_and_a_replaced_clone_are_refused() {
         let (_d, root, remote) = fixture();
         let work = root.join("work");
         let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
         let wt = worktree_path(&work, "acme/widget", 3);
-        prepare_clone(&mirror, &wt, "main", 3, Some("nucleus/item-3")).await.unwrap();
-        sh(&wt, "git checkout -q --orphan other && git -c user.email=a@example.invalid -c user.name=A commit -qm unrelated");
-        let e = collect(&mirror, &remote, &wt, "main", 3, "x").await.unwrap_err();
-        assert!(format!("{e:#}").contains("does not descend"), "{e:#}");
+        let (base, _) = prepare_clone(&mirror, &wt, "main", 3, Some("nucleus/item-3")).await.unwrap();
+        sh(&wt, "mkdir sub && cd sub && git init -q && echo z > z && git add z && git -c user.email=a@example.invalid -c user.name=A commit -qm z");
+        let e = import(&mirror, &remote, &wt, &base, 3, &spec()).await.unwrap_err();
+        assert!(format!("{e:#}").contains("nested repository"), "{e:#}");
+        // The clone directory replaced by a symlink to elsewhere.
+        std::fs::remove_dir_all(&wt).unwrap();
+        std::os::unix::fs::symlink(root.join("seed"), &wt).unwrap();
+        let e = import(&mirror, &remote, &wt, &base, 3, &spec()).await.unwrap_err();
+        assert!(format!("{e:#}").contains("not a directory"), "{e:#}");
+        // A .git file at the top of the tree is never read or published.
+        std::fs::remove_file(&wt).unwrap();
+        let (base, _) = prepare_clone(&mirror, &wt, "main", 3, Some("nucleus/item-3")).await.unwrap();
+        std::fs::remove_dir_all(wt.join(".git")).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", root.join("seed/.git").display())).unwrap();
+        std::fs::write(wt.join("a.txt"), "three\n").unwrap();
+        let sha = import(&mirror, &remote, &wt, &base, 3, &spec()).await.unwrap().unwrap();
+        assert_eq!(changed_files(&mirror, &base, &sha).await.unwrap(), ["a.txt"]);
     }
 
     #[test]
-    fn push_targets_and_names() {
+    fn push_targets_names_and_remotes() {
         assert!(check_push_target("nucleus/item-4", 4, "main").is_ok());
         assert!(check_push_target("nucleus/item-4-fix-typo", 4, "main").is_ok());
         assert!(check_push_target("nucleus/item-40", 4, "main").is_err(), "another item's branch");
         assert!(check_push_target("main", 4, "main").is_err());
-        assert!(check_push_target("nucleus/item-4-x", 4, "nucleus/item-4-x").is_err(), "the default branch");
+        assert!(check_push_target("nucleus/item-4", 4, "nucleus/item-4").is_err(), "the default branch");
         assert!(check_push_target("feature/x", 4, "main").is_err());
         assert!(check_push_target("nucleus/item-4-..", 4, "main").is_err());
         assert!(check_branch_name("-x").is_err());
-        assert!(Remote::for_repo("https://github.com/{repo}.git", "acme/widget", "gh").is_ok());
-        assert!(Remote::for_repo("https://github.com/{repo}.git", "acme/../x", "gh").is_err());
-        assert!(Remote::for_repo("ext::sh -c touch% /tmp/x", "acme/widget", "gh").is_err());
+        let sh_bin = resolve_bin("sh").unwrap();
+        assert!(sh_bin.is_absolute());
+        let r = Remote::for_repo("https://github.com/{repo}.git", "acme/widget", &sh_bin.to_string_lossy()).unwrap();
+        assert_eq!(r.gh_bin.as_deref(), Some(sh_bin.as_path()));
+        assert!(Remote::for_repo("https://github.com/{repo}.git", "acme/widget", "sh").unwrap().gh_bin.unwrap().is_absolute());
+        assert!(Remote::for_repo("https://github.com/{repo}.git", "acme/widget", "no-such-gh-binary").is_err());
+        assert!(Remote::for_repo("https://github.com/{repo}.git", "acme/../x", "sh").is_err());
+        let scp_style = format!("{}@{}:{{repo}}.git", "git", "github.com");
+        assert!(Remote::for_repo(&scp_style, "acme/widget", "sh").is_err(), "no SSH");
+        assert!(Remote::for_repo("ssh://github.com/{repo}.git", "acme/widget", "sh").is_err());
+        assert!(Remote::for_repo("ext::sh -c touch% /tmp/x", "acme/widget", "sh").is_err());
         assert_eq!(item_ref(7), "refs/nucleus/item-7");
     }
 
     #[tokio::test]
-    async fn push_refuses_the_remote_default_branch() {
+    async fn the_remote_default_branch_is_read_live() {
         let (_d, root, remote) = fixture();
         let work = root.join("work");
         let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
         let sha = mirror_ok(&mirror, &["rev-parse", "refs/heads/main"]).await.unwrap();
-        assert!(push(&mirror, &remote, &sha, "main", 1).await.is_err());
-        // The remote's HEAD is read live: a remote whose HEAD is the item's
-        // branch name refuses it too.
+        assert!(push(&mirror, &remote, &sha, "main", 1, "main").await.is_err());
         sh(&root.join("remote.git"), "git branch nucleus/item-1 main && git symbolic-ref HEAD refs/heads/nucleus/item-1");
-        let e = push(&mirror, &remote, &sha, "nucleus/item-1", 1).await.unwrap_err();
+        assert_eq!(remote_head(&mirror, &remote).await.unwrap(), "nucleus/item-1");
+        let e = push(&mirror, &remote, &sha, "nucleus/item-1", 1, "nucleus/item-1").await.unwrap_err();
         assert!(format!("{e:#}").contains("protected"), "{e:#}");
     }
 

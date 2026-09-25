@@ -197,7 +197,8 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
                     )?;
                 }
             }
-            Ok(emit(out))
+            emit(out);
+            Ok(())
         }
         Cmd::Show { item, json } => {
             let mut out = String::new();
@@ -266,7 +267,8 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             for t in &log {
                 writeln!(out, "  {} {} → {} ({})", t.at, t.from_stage.as_deref().unwrap_or("-"), t.to_stage, t.reason)?;
             }
-            Ok(emit(out))
+            emit(out);
+            Ok(())
         }
         Cmd::Reply { item, text } => {
             let text = if text == "-" {

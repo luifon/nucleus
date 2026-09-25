@@ -257,6 +257,10 @@ const SCHEMA_V4: &str = "CREATE TABLE inbound_commands (
     updated_at  TEXT NOT NULL
 )";
 
+/// v5: the base commit an item's clone started from (the parent of the one
+/// commit Nucleus publishes for the item).
+const SCHEMA_V5: &str = "ALTER TABLE items ADD COLUMN base_sha TEXT";
+
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(super::INTAKE_DB_PATH)).await?;
@@ -267,6 +271,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             crate::migrate::Migration { version: 2, name: "collected commit", step: crate::migrate::Step::Sql(SCHEMA_V2) },
             crate::migrate::Migration { version: 3, name: "revision binding", step: crate::migrate::Step::Rust(migrate_v3) },
             crate::migrate::Migration { version: 4, name: "inbound command state", step: crate::migrate::Step::Sql(SCHEMA_V4) },
+            crate::migrate::Migration { version: 5, name: "base commit", step: crate::migrate::Step::Sql(SCHEMA_V5) },
         ],
     )
     .await
@@ -580,6 +585,8 @@ pub struct Item {
     pub gate_at: Option<String>,
     /// Why the item stopped as `stale`.
     pub stale_reason: Option<String>,
+    /// The base commit the item's clone started from.
+    pub base_sha: Option<String>,
 }
 
 impl Item {
@@ -645,7 +652,7 @@ const ITEM_COLUMNS: &str = "id, event_id, repo, title, stage, failed_stage, erro
     base_ref, impl_summary, head_sha, tests_status, tests_output, pr_url, comment_draft, comment_state, comment_url, \
     surface, group_requested_at, group_jid, group_closed_at, current_task_id, last_task_id, step_errors, \
     created_at, updated_at, closed_at, rev_title, rev_body, revision_hash, gate_event_id, label_event_id, \
-    gate_actor, gate_at, stale_reason";
+    gate_actor, gate_at, stale_reason, base_sha";
 
 /// What a new item is bound to: the event's revision and the gate event.
 #[derive(Debug, Clone)]
@@ -820,6 +827,7 @@ const SETTABLE: &[&str] = &[
     "title",
     "closed_at",
     "stale_reason",
+    "base_sha",
 ];
 
 fn set_clause(set: &[(&str, Val)], first_param: usize) -> Result<String> {

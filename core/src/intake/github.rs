@@ -399,6 +399,8 @@ impl SourceAdapter for GithubIssues {
             body: issue["body"].as_str().unwrap_or_default().to_string(),
             gate,
             edited_after_gate,
+            updated_at: issue["updated_at"].as_str().map(str::to_string),
+            last_edited_at: last_edit,
         })
     }
 

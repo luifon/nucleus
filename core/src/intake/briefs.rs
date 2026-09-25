@@ -503,6 +503,7 @@ pub(crate) mod tests {
             gate_actor: None,
             gate_at: None,
             stale_reason: None,
+            base_sha: None,
         }
     }
 }

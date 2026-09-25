@@ -645,6 +645,12 @@ pub struct IntakeConfig {
     /// finished are stopped after this many minutes.
     #[serde(default = "default_intake_test_timeout_minutes")]
     pub test_timeout_minutes: u32,
+    /// Author and committer of the one commit Nucleus publishes per item.
+    /// The agent's own commits, authors and messages are never published.
+    #[serde(default = "default_intake_commit_author_name")]
+    pub commit_author_name: String,
+    #[serde(default = "default_intake_commit_author_email")]
+    pub commit_author_email: String,
     #[serde(default)]
     pub repos: Vec<IntakeRepo>,
     #[serde(default)]
@@ -808,6 +814,12 @@ fn default_intake_min_confidence() -> f64 {
 fn default_intake_test_timeout_minutes() -> u32 {
     30
 }
+fn default_intake_commit_author_name() -> String {
+    "Nucleus issue pipeline".into()
+}
+fn default_intake_commit_author_email() -> String {
+    "nucleus-intake@localhost".into()
+}
 fn default_intake_issue_keyword() -> String {
     "Closes".into()
 }
@@ -841,6 +853,8 @@ impl Default for IntakeConfig {
             label: default_intake_label(),
             min_confidence: default_intake_min_confidence(),
             test_timeout_minutes: default_intake_test_timeout_minutes(),
+            commit_author_name: default_intake_commit_author_name(),
+            commit_author_email: default_intake_commit_author_email(),
             repos: vec![],
             github: IntakeGithubConfig::default(),
             whatsapp: IntakeWhatsAppConfig::default(),
