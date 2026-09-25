@@ -553,7 +553,10 @@ late success marks it sent, and only after 120 s, with no send of it pending
 in this process, is it attempted again — with the same id, so WhatsApp treats
 a retry of a message that did arrive as the same message. A server
 acknowledgement for that id (Baileys `messages.update`, also after a
-reconnect or a restart) marks the row sent.
+reconnect or a restart) marks the row sent. The drain sends only while the
+WhatsApp link is open, and a send that fails because the link dropped
+returns the row to `pending` with the same id without using an attempt
+(ADR-027, amendment 2026-09).
 
 Every outbound text — replies, progress, acknowledgements, notes, task
 results, reminders, job replies, media captions — passes through a runtime
