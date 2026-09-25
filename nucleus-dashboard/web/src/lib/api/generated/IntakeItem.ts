@@ -55,6 +55,11 @@ tests_status: string | null, tests_output: string | null, pr_url: string | null,
  */
 comment_state: string, comment_url: string | null,
 /**
+ * The random operation id of the issue comment (stored before it is
+ * posted; its marker line finds an earlier post after a crash).
+ */
+comment_op: string | null,
+/**
  * Where the item's thread runs on WhatsApp: `none` (not yet),
  * `pending` (group requested), `group`, `dm`.
  */

@@ -41,6 +41,7 @@ function item(over: Partial<IntakeItem> = {}): IntakeItem {
     comment_draft: null,
     comment_state: "none",
     comment_url: null,
+    comment_op: null,
     surface: "group",
     group_requested_at: null,
     group_jid: null,
