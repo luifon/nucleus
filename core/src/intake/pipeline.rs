@@ -71,7 +71,12 @@ impl Ctx {
     /// The production context: the configured `gh`, detached workers.
     pub async fn open(ws: &Path, settings: &Settings) -> Result<Ctx> {
         // Pinned first, before this process reads anything a worker wrote.
-        let tools = super::tools::ToolPins::pin(&settings.intake.github.gh_bin)?;
+        let need_gh = settings.intake.enabled && !settings.intake.repos.is_empty();
+        let tools = super::tools::ToolPins::pin(&settings.intake.github.gh_bin, need_gh)?;
+        let gh: Arc<dyn GhRunner> = match &tools.gh {
+            Some(pin) => Arc::new(github::GhCli { pin: pin.clone() }),
+            None => Arc::new(github::NoGh),
+        };
         Ok(Ctx {
             ws: ws.to_path_buf(),
             cfg: settings.intake.clone(),
@@ -79,7 +84,7 @@ impl Ctx {
             db: store::open(ws).await?,
             tasks_db: tasks::open(ws).await?,
             wa: crate::whatsapp_queue::open(ws).await?,
-            gh: Arc::new(github::GhCli { bin: tools.gh_path(&settings.intake.github.gh_bin) }),
+            gh,
             launcher: Arc::new(WorkerLauncher),
             guard: Arc::new(publish::ScriptGuard { workspace_root: ws.to_path_buf() }),
             tools: Arc::new(tools),
@@ -856,6 +861,15 @@ async fn step_item(ctx: &Ctx, item: &Item, r: &mut TickReport) {
         Err(e) => {
             let msg = format!("{e:#}");
             r.errors.push(format!("#{} {}: {msg}", item.id, item.stage));
+            // A pinned executable changed: the step did not spawn it; the
+            // item is blocked, not retried.
+            if let Some(t) = e.downcast_ref::<super::tools::ToolChanged>() {
+                let cur = store::item(&ctx.db, item.id).await.unwrap_or_else(|_| item.clone());
+                if !cur.stage().is_terminal() && cur.stage() != Stage::Blocked && cur.stage() != Stage::Failed {
+                    let _ = block_because(ctx, &cur, format!("{t}; the process was not started")).await;
+                }
+                return;
+            }
             let fatal = e.downcast_ref::<Fatal>().is_some();
             let errors = item.step_errors + 1;
             if fatal || errors >= MAX_STEP_ERRORS {
@@ -1181,7 +1195,7 @@ fn worktree(item: &Item) -> Result<PathBuf> {
 
 /// The configured remote of the item's repo (never read from a clone).
 fn remote_for(ctx: &Ctx, repo: &str) -> Result<git::Remote> {
-    git::Remote::for_repo(&ctx.cfg.github.remote_url, repo, &ctx.tools.gh_path(&ctx.cfg.github.gh_bin))
+    git::Remote::for_repo(&ctx.cfg.github.remote_url, repo, ctx.tools.gh.as_ref())
         .map_err(|e| anyhow::Error::new(Fatal(format!("{e:#}"))))
 }
 

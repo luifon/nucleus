@@ -67,10 +67,7 @@ async fn fixture() -> Fixture {
         gh: gh.clone(),
         launcher: Arc::new(NoLaunch),
         guard: Arc::new(crate::intake::publish::ScriptGuard { workspace_root: ws.clone() }),
-        tools: Arc::new(crate::intake::tools::ToolPins {
-            git: crate::intake::tools::Pin::new(git::git_bin().unwrap()).unwrap(),
-            gh: Some(crate::intake::tools::Pin::new(&fake_gh_file(&work)).unwrap()),
-        }),
+        tools: Arc::new(crate::intake::tools::ToolPins { gh: Some(crate::intake::tools::Pin::new(&fake_gh_file(&work)).unwrap()) }),
     };
     // A stand-in for tools/check-secrets.sh with the same interface: exit 2
     // and a `    - <category>:<value>` line for a hit.

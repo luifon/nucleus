@@ -161,7 +161,12 @@ async fn ctx(s: &IntakeState) -> Result<Ctx, IntakeError> {
         return Err(IntakeError::Conflict("intake is disabled ([intake] enabled = false)".into()));
     }
     let ws = &s.workspace_root;
-    let tools = nucleus_core::intake::tools::ToolPins::pin(&s.intake.github.gh_bin).map_err(IntakeError::other)?;
+    let need_gh = !s.intake.repos.is_empty();
+    let tools = nucleus_core::intake::tools::ToolPins::pin(&s.intake.github.gh_bin, need_gh).map_err(IntakeError::other)?;
+    let gh: Arc<dyn nucleus_core::intake::github::GhRunner> = match &tools.gh {
+        Some(pin) => Arc::new(nucleus_core::intake::github::GhCli { pin: pin.clone() }),
+        None => Arc::new(nucleus_core::intake::github::NoGh),
+    };
     Ok(Ctx {
         ws: ws.clone(),
         cfg: s.intake.clone(),
@@ -169,7 +174,7 @@ async fn ctx(s: &IntakeState) -> Result<Ctx, IntakeError> {
         db: store::open(ws).await.map_err(IntakeError::other)?,
         tasks_db: tasks::open(ws).await.map_err(IntakeError::other)?,
         wa: nucleus_core::whatsapp_queue::open(ws).await.map_err(IntakeError::other)?,
-        gh: Arc::new(nucleus_core::intake::github::GhCli { bin: tools.gh_path(&s.intake.github.gh_bin) }),
+        gh,
         launcher: Arc::new(pipeline::WorkerLauncher),
         guard: Arc::new(nucleus_core::intake::publish::ScriptGuard { workspace_root: ws.clone() }),
         tools: Arc::new(tools),

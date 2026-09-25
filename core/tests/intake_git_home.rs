@@ -53,7 +53,7 @@ async fn global_git_config_has_no_effect() {
     std::env::set_var("HOME", &home);
     std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
 
-    let remote = Remote { url: remote_url, gh_bin: None };
+    let remote = Remote { url: remote_url, gh: None };
     let work = root.join("work");
     let mirror = git::sync_mirror(&work, "acme/widget", &remote).await.unwrap();
     let wt = git::worktree_path(&work, "acme/widget", 1);

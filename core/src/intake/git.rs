@@ -87,9 +87,9 @@ pub const PROTECTED_BRANCHES: &[&str] = &["main", "master", "develop", "developm
 pub struct Remote {
     /// The configured repository's URL (never read from a clone).
     pub url: String,
-    /// The absolute path of `gh`, the only credential helper, for an HTTPS
-    /// URL; `None` for a local repository path (tests).
-    pub gh_bin: Option<PathBuf>,
+    /// The pinned `gh`, the only credential helper, for an HTTPS URL;
+    /// `None` for a local repository path (tests).
+    pub gh: Option<Pin>,
 }
 
 impl Remote {
@@ -99,70 +99,40 @@ impl Remote {
     /// git would read it from a configuration file the agent can write.
     /// `gh_bin` is resolved to an absolute path through `PATH` when it is a
     /// bare name.
-    pub fn for_repo(template: &str, repo: &str, gh_bin: &str) -> Result<Remote> {
+    pub fn for_repo(template: &str, repo: &str, gh: Option<&Pin>) -> Result<Remote> {
         check_repo_name(repo)?;
         let url = template.replace("{repo}", repo);
         if url.trim().is_empty() || url.chars().any(|c| c.is_control() || c.is_whitespace() || c == '"' || c == '\\' || c == '\'') {
             bail!("the remote URL for {repo} is empty or contains a character that is not allowed");
         }
         if url.starts_with("https://") {
-            let gh = resolve_bin(gh_bin).with_context(|| format!("[intake.github] gh_bin {gh_bin:?} was not found"))?;
-            return Ok(Remote { url, gh_bin: Some(gh) });
+            let gh = gh.context("an HTTPS remote needs gh, and no gh is pinned")?;
+            return Ok(Remote { url, gh: Some(gh.clone()) });
         }
         if url.starts_with('/') {
-            return Ok(Remote { url, gh_bin: None });
+            return Ok(Remote { url, gh: None });
         }
         bail!("the remote URL for {repo} must start with https:// (SSH and other transports are not supported)")
     }
 
-    /// The `-c` options that set the `gh` credential helper (after
-    /// [`HARDENING`] reset the list).
-    fn credential_args(&self) -> Vec<String> {
-        match &self.gh_bin {
+    /// The `-c` options that set the pinned `gh` as credential helper
+    /// (after [`HARDENING`] reset the list), after checking its hash: git
+    /// runs the helper itself, so the check happens right before the git
+    /// process that may run it starts.
+    fn credential_args(&self) -> Result<Vec<String>> {
+        match &self.gh {
             Some(gh) => {
-                let quoted = format!("'{}'", gh.to_string_lossy().replace('\'', r"'\''"));
-                vec!["-c".into(), format!("credential.helper=!{quoted} auth git-credential")]
+                gh.verify().map_err(|why| anyhow::Error::new(super::tools::ToolChanged(why)))?;
+                let quoted = format!("'{}'", gh.path.to_string_lossy().replace('\'', r"'\''"));
+                Ok(vec!["-c".into(), format!("credential.helper=!{quoted} auth git-credential")])
             }
-            None => vec![],
+            None => Ok(vec![]),
         }
     }
 }
 
-/// The `git` every Nucleus git command runs: resolved once through `PATH`
-/// and canonicalized (symlinks followed to the real file), never looked up
-/// again. [`super::tools::ToolPins`] pins its hash.
-pub fn git_bin() -> Result<&'static Path> {
-    static GIT: std::sync::OnceLock<std::result::Result<PathBuf, String>> = std::sync::OnceLock::new();
-    GIT.get_or_init(|| {
-        resolve_bin("git").and_then(|p| p.canonicalize().context("canonicalizing git")).map_err(|e| format!("{e:#}"))
-    })
-    .as_ref()
-    .map(PathBuf::as_path)
-    .map_err(|e| anyhow::anyhow!("git: {e}"))
-}
-
-/// `name` as an absolute path: itself when absolute, else the first
-/// executable file of that name on `PATH`.
-pub fn resolve_bin(name: &str) -> Result<PathBuf> {
-    let p = Path::new(name);
-    if p.is_absolute() {
-        if p.is_file() {
-            return Ok(p.to_path_buf());
-        }
-        bail!("{name} does not exist");
-    }
-    if name.contains('/') || name.is_empty() {
-        bail!("{name:?} is neither an absolute path nor a command name");
-    }
-    let path = std::env::var_os("PATH").context("PATH is not set")?;
-    for dir in std::env::split_paths(&path) {
-        let c = dir.join(name);
-        if c.is_file() && c.is_absolute() {
-            return Ok(c);
-        }
-    }
-    bail!("{name} is not on PATH")
-}
+pub use super::tools::resolve_bin;
+use super::tools::Pin;
 
 /// `owner/name` with GitHub's characters only.
 pub fn check_repo_name(repo: &str) -> Result<()> {
@@ -180,7 +150,7 @@ pub fn check_repo_name(repo: &str) -> Result<()> {
 /// `GIT_DIR` or `GIT_INDEX_FILE` (a git hook's environment) cannot redirect
 /// the command, and no system or global configuration is read.
 async fn run(cwd: &Path, pre: &[String], args: &[&str], env: &[(&str, &str)]) -> Result<GitOut> {
-    let mut cmd = tokio::process::Command::new(git_bin()?);
+    let mut cmd = super::tools::git_pin()?.command()?;
     for (k, _) in std::env::vars_os() {
         let k = k.to_string_lossy().into_owned();
         if k.starts_with("GIT_") {
@@ -364,7 +334,7 @@ pub async fn sync_mirror(work_dir: &Path, repo: &str, remote: &Remote) -> Result
     reset_mirror(&mirror, remote).await?;
     let out = mirror_git(
         &mirror,
-        &remote.credential_args(),
+        &remote.credential_args()?,
         &["fetch", "--quiet", "--prune", "--no-tags", "--update-head-ok", &remote.url, "+refs/heads/*:refs/heads/*"],
         &[],
     )
@@ -386,7 +356,7 @@ pub async fn default_branch(mirror: &Path, remote: &Remote, configured: Option<&
 
 /// The remote's HEAD branch, read live.
 pub async fn remote_head(mirror: &Path, remote: &Remote) -> Result<String> {
-    let out = mirror_git(mirror, &remote.credential_args(), &["ls-remote", "--symref", &remote.url, "HEAD"], &[]).await?;
+    let out = mirror_git(mirror, &remote.credential_args()?, &["ls-remote", "--symref", &remote.url, "HEAD"], &[]).await?;
     if !out.ok {
         bail!("reading the remote's HEAD failed: {}", out.stderr);
     }
@@ -746,7 +716,7 @@ fn walk_files(dir: &Path) -> Result<Vec<PathBuf>> {
 /// output is longer (the process is stopped). A failure is an error.
 async fn run_capped(cwd: &Path, pre: &[String], args: &[&str], env: &[(&str, &str)], max_bytes: usize) -> Result<Option<Vec<u8>>> {
     use tokio::io::AsyncReadExt;
-    let mut cmd = tokio::process::Command::new(git_bin()?);
+    let mut cmd = super::tools::git_pin()?.command()?;
     for (k, _) in std::env::vars_os() {
         let k = k.to_string_lossy().into_owned();
         if k.starts_with("GIT_") {
@@ -915,7 +885,7 @@ pub async fn push(
     }
     let out = mirror_git(
         mirror,
-        &remote.credential_args(),
+        &remote.credential_args()?,
         &[
             "push",
             "--quiet",
@@ -1065,7 +1035,7 @@ mod tests {
             "git config user.email t@example.invalid && git config user.name T && echo one > a.txt && git add a.txt \
              && git commit -qm init && git push -q origin HEAD:main",
         );
-        let remote = Remote { url: root.join("remote.git").to_string_lossy().into_owned(), gh_bin: None };
+        let remote = Remote { url: root.join("remote.git").to_string_lossy().into_owned(), gh: None };
         (d, root, remote)
     }
 
@@ -1314,15 +1284,15 @@ mod tests {
         assert!(check_branch_name("-x").is_err());
         let sh_bin = resolve_bin("sh").unwrap();
         assert!(sh_bin.is_absolute());
-        let r = Remote::for_repo("https://github.com/{repo}.git", "acme/widget", &sh_bin.to_string_lossy()).unwrap();
-        assert_eq!(r.gh_bin.as_deref(), Some(sh_bin.as_path()));
-        assert!(Remote::for_repo("https://github.com/{repo}.git", "acme/widget", "sh").unwrap().gh_bin.unwrap().is_absolute());
-        assert!(Remote::for_repo("https://github.com/{repo}.git", "acme/widget", "no-such-gh-binary").is_err());
-        assert!(Remote::for_repo("https://github.com/{repo}.git", "acme/../x", "sh").is_err());
+        let pin = Pin::new(&sh_bin).unwrap();
+        let r = Remote::for_repo("https://github.com/{repo}.git", "acme/widget", Some(&pin)).unwrap();
+        assert_eq!(r.gh.as_ref().map(|p| p.path.clone()), Some(sh_bin.canonicalize().unwrap()));
+        assert!(Remote::for_repo("https://github.com/{repo}.git", "acme/widget", None).is_err(), "HTTPS needs a pinned gh");
+        assert!(Remote::for_repo("https://github.com/{repo}.git", "acme/../x", Some(&pin)).is_err());
         let scp_style = format!("{}@{}:{{repo}}.git", "git", "github.com");
-        assert!(Remote::for_repo(&scp_style, "acme/widget", "sh").is_err(), "no SSH");
-        assert!(Remote::for_repo("ssh://github.com/{repo}.git", "acme/widget", "sh").is_err());
-        assert!(Remote::for_repo("ext::sh -c touch% /tmp/x", "acme/widget", "sh").is_err());
+        assert!(Remote::for_repo(&scp_style, "acme/widget", Some(&pin)).is_err(), "no SSH");
+        assert!(Remote::for_repo("ssh://github.com/{repo}.git", "acme/widget", Some(&pin)).is_err());
+        assert!(Remote::for_repo("ext::sh -c touch% /tmp/x", "acme/widget", Some(&pin)).is_err());
         assert_eq!(item_ref(7), "refs/nucleus/item-7");
     }
 

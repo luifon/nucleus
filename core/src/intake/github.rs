@@ -28,15 +28,25 @@ pub trait GhRunner: Send + Sync {
     async fn run(&self, args: &[String], cwd: Option<&Path>) -> Result<GhOut>;
 }
 
-/// The `gh` binary.
+/// The pinned `gh` binary: its hash is checked right before every call.
 pub struct GhCli {
-    pub bin: String,
+    pub pin: super::tools::Pin,
+}
+
+/// No `gh` (intake has no GitHub source): every call fails.
+pub struct NoGh;
+
+#[async_trait::async_trait]
+impl GhRunner for NoGh {
+    async fn run(&self, _args: &[String], _cwd: Option<&Path>) -> Result<GhOut> {
+        bail!("gh is not available (intake has no GitHub source)")
+    }
 }
 
 #[async_trait::async_trait]
 impl GhRunner for GhCli {
     async fn run(&self, args: &[String], cwd: Option<&Path>) -> Result<GhOut> {
-        let mut cmd = tokio::process::Command::new(&self.bin);
+        let mut cmd = self.pin.command()?;
         cmd.args(args).stdin(std::process::Stdio::null()).env("GH_PROMPT_DISABLED", "1").env("NO_COLOR", "1");
         if let Some(d) = cwd {
             cmd.current_dir(d);
@@ -44,7 +54,7 @@ impl GhRunner for GhCli {
         let out = tokio::time::timeout(Duration::from_secs(300), cmd.output())
             .await
             .context("gh did not finish within 300 s")?
-            .with_context(|| format!("running {}", self.bin))?;
+            .with_context(|| format!("running {}", self.pin.path.display()))?;
         Ok(GhOut {
             ok: out.status.success(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
