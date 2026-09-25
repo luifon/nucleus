@@ -551,7 +551,7 @@ JSON-parsed numbers.
   `acme/widget`.
 - Agent steps are ADR-033 tasks (`origin = pipeline`) with a working
   directory and a profile (`read-only` for eval and refinement, `code` for
-  implementation). Network steps — clone, fetch, push, `gh pr create`,
+  implementation). Network steps — fetch, push, `gh pr create`,
   `gh issue comment` — are Nucleus code in `core/src/intake/`, never an
   agent. Nucleus opens draft PRs only, never merges, and comments on an
   issue only after the operator approved the text.
@@ -566,7 +566,15 @@ JSON-parsed numbers.
   bot (`messaging/whatsapp/src/intake.ts`), within `[intake.whatsapp]
   max_groups_per_day`.
 - Every write to `memory/intake.db` goes through `nucleus_core::intake`.
-  Worktrees live under `[intake] work_dir`, outside this checkout.
+  Nucleus keeps one bare mirror per repo and one clone per item under
+  `[intake] work_dir`, outside this checkout. Nucleus's own git commands
+  run with hooks disabled, the mirror's config rewritten, and the remote
+  URL from `nucleus.toml`; do not add a git step that uses the clone's
+  config or `origin`.
+- Before implementation starts and before every push or comment, Nucleus
+  reads the issue live (open, label added by a collaborator, no edit since)
+  and fails closed. The PR body is built from code-owned fields, and the
+  diff and all public text pass `tools/check-secrets.sh` first.
 
 ## When in doubt
 
