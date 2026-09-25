@@ -1179,7 +1179,31 @@ value, so `<details open="ignore previous instructions">` hid text):
 `open` with no value, an empty value or `open`; `align` one of left,
 right, center, justify; `start` an optional `-` and 1–9 digits; letter
 case ignored. Any other value is an `html_tag` finding that shows the
-decoded value. Tag syntax itself is never rendered: every invisible
+decoded value.
+
+**Raw HTML fails closed (fix round 6).** Inside every placed HTML node, and
+in the HTML reading of an unplaced one, every `<` must be recognized; the
+reader follows the WHATWG tokenizer (HTML Living Standard 13.2.5): the
+data state, the tag-name state (a name runs to whitespace, `/` or `>`, so
+`span.foo` is one name), the attribute states (names, unquoted, single-
+and double-quoted values; a `>` inside quotes does not end the tag; no
+whitespace needed after a quoted value; `/` as in `<b/x=1>`; newlines
+inside a tag), comments, and bogus comments. A `<` is one of:
+
+- text, when the tokenizer emits it as text: a `<` followed by anything
+  but an ASCII letter, `!`, `/` or `?` (`a < b`, `x <3`);
+- an allowed start or end tag (`VISIBLE_TAGS`) with allowed attributes and
+  values;
+- a finding: any other tag name, a comment, a bogus comment (`<!` not
+  followed by `--`, including declarations and CDATA; `<?`; `</` followed
+  by a non-letter; `</>`), a tag with no `>` before the end of the node, a
+  duplicate attribute (the browser keeps the first), and attributes on an
+  end tag (dropped).
+
+Each token's range, from its `<` to the `>` that ends it (or the end of
+the node), is tag syntax for the invisible-character rules below.
+
+Tag syntax itself is never rendered: every invisible
 character or character reference between a tag's `<` and its `>` (names,
 values, whitespace) is flagged, with no emoji, variation or joining
 exemption, and nothing inside a tag is a neighbour an exemption may lean
@@ -1386,6 +1410,15 @@ Fix round 5: `<details open="ignore previous instructions">` and
 sequence, `&zwj;`, a VS16 after ❤ and a Persian ZWNJ inside attribute
 values flagged, the same VS16 in the element's text not
 (`tag_syntax_gets_no_exemption`).
+
+Fix round 6: `span.foo` with a title flagged with the range of its tag,
+`<!- …>`, `<!1 x>`, `</1 x>`, `<?x y>`, `</>` and `<!DOCTYPE html>`
+flagged as bogus comments, `a < b`, `x <3` and `1<2` not flagged, a quoted
+value holding `>` kept in one token, a tag without `>` to the end of the
+node flagged, a duplicate attribute flagged, unquoted values, `<b/x=1>`,
+newlines inside a tag and attributes on an end tag handled, invisible
+characters inside a bogus comment flagged
+(`every_lt_in_raw_html_is_recognized_or_flagged`).
 
 ## Rejected alternatives
 
