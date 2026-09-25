@@ -1053,17 +1053,43 @@ Which checks read the tree and which read the text (fix round 2):
   text); the always-flagged math macros outside the math nodes (in case
   GitHub reads math where comrak does not).
 - **Invisible characters** are read from the raw text, code included,
-  with every entity outside code decoded into the same character stream
-  (each decoded character keeps its source bytes), so the emoji and
-  joining rules apply to `&zwj;` exactly as to a literal ZWJ.
+  with every character reference outside code decoded into the same
+  character stream, so the emoji and joining rules apply to `&zwj;`
+  exactly as to a literal ZWJ.
 
-Where comrak and GitHub could read differently, the stricter reading
-stays. One case found: after a removed reference definition comrak reports
-shifted positions for the paragraph's inline nodes. A code span is then
-masked only when the source at its reported position really is that code
-span, and an HTML node is placed at the occurrence of its literal nearest
-to the reported position (test
-`comrak_positions_after_a_reference_definition_do_not_hide_anything`).
+**Character references (fix round 3).** GitHub decodes references in two
+places: CommonMark decodes the ones that end in `;` in Markdown text, and
+the browser decodes the rest of the HTML the sanitizer keeps, where `;` is
+optional for numeric and legacy references (`<div>ig&#8203nore</div>`
+shows `ignore` with a zero-width space). The hold decodes everywhere
+outside code with the browser's rules, which decode at least what either
+does (`hidden/charref.rs`, WHATWG HTML "character reference state"):
+numeric references with or without `;`, U+FFFD for 0, surrogates and
+values past U+10FFFF, the Windows-1252 mapping of 0x80–0x9F; every named
+reference of the WHATWG table (`hidden/entities.rs`, generated from
+`https://html.spec.whatwg.org/entities.json`, last modified 2025-11-12:
+2,231 names, 106 legacy names valid without `;`), by longest match; the
+attribute-value rule inside tags (a legacy name without `;` followed by
+`=` or a letter or digit stays text). A reference that produces two
+characters (`&caps;` is ∩ + VARIATION SELECTOR-1) gives two characters
+with the reference's range; the finding lists the hidden ones. In
+Markdown text, decoding a reference without `;` is stricter than GitHub
+(which shows it as text), so that case can only add a finding.
+
+**Positions (fix round 3).** comrak reports shifted positions for the
+inline nodes of a paragraph that starts with a reference definition it
+removed. Every code span and inline HTML node is checked against the
+source at its reported position. When it does not match, the nodes of the
+same leaf block (paragraph, heading, table cell) with the same kind and
+literal are matched in document order against their occurrences in the
+block's source, skipping placed code spans, backslash-escaped `<` and
+reference definitions, and multi-line literals are matched line by line.
+Only a one-to-one match places them. Otherwise nothing is guessed: a code
+span stays unmasked (its content is read), and an HTML node's findings say
+"position unknown" and cover the whole location. HTML blocks keep comrak's
+position (block positions are exact). Tests:
+`comrak_positions_after_a_reference_definition_do_not_hide_anything`,
+`shifted_html_is_placed_in_document_order_or_reported_unknown`.
 
 **Each finding** stores its location (`title`, `body`, `comment <id>`), its
 kind, its raw line and column (characters; CR, LF and CRLF each end a
@@ -1078,7 +1104,7 @@ every location that has findings.
 |---|---|---|
 | `html_comment` | `<!-- … -->`, also unclosed, `<!-->`, `<!--->` | not rendered |
 | `invisible_characters` | every Unicode Cf character; the other default-ignorable code points; blank-rendering characters (Hangul fillers U+115F, U+1160, U+3164, U+FFA0; U+2800); line and paragraph separators; control characters other than tab, LF, CR; private-use characters | drawn as nothing (private use: a box at most) |
-| `invisible_entity` | an HTML entity that decodes to one of those (`&#8203;`, `&#x2060;`, `&zwj;`, `&shy;`, …) | GitHub decodes it; the page shows nothing |
+| `invisible_entity` | a character reference that produces one of those, with or without `;` as the WHATWG rules allow (`&#8203`, `&#x2060;`, `&zwj;`, `&shy`, `&caps;`, …) | GitHub decodes it; the page shows nothing |
 | `details` | a `<details>` block without `open` (with `open` the block is shown and only its content is checked) | collapsed until clicked |
 | `html_tag` | in any HTML node of the tree: a tag outside `VISIBLE_TAGS`; an attribute outside `attribute_allowed`; an incomplete or unterminated tag; nested `<sub>`/`<sup>`; declarations, processing instructions, CDATA | removed by the sanitizer, or hides or restyles content |
 | `link_definition` | `[label]: url "title"` (every definition, used or not) | renders as nothing |
@@ -1289,6 +1315,16 @@ bases, after `a`, `x`, a non-emoji arrow, repeated
 (`variation_selectors_need_a_defined_sequence`); `👩&zwj;💻`, numeric
 emoji with `&zwj;`, Persian with `&zwnj;` not flagged, `a&zwj;b` flagged
 (`entity_joiners_follow_the_same_rules`).
+
+Fix round 3: `<div>ig&#8203nore</div>`, `&#x200B` without `;` in text,
+`&zwj` without `;` left as text (not a legacy name) and `&zwj;` decoded,
+the legacy `&shy` decoded in text and not in an attribute before `=`,
+`&caps;` and `&varsubsetneq;` flagged for their VARIATION SELECTOR-1,
+`&amp` and other visible results not flagged, the numeric replacement
+rules (`character_references_follow_the_whatwg_rules`); a copy of a tag in
+a code span before the real one after a reference definition (the real
+one is reported) and a copy in a link destination (position unknown,
+whole location) (`shifted_html_is_placed_in_document_order_or_reported_unknown`).
 
 ## Rejected alternatives
 

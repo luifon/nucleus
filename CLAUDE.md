@@ -564,9 +564,11 @@ JSON-parsed numbers.
   fences, tables, links, images, math, raw HTML nodes, in any container),
   never from hand-written rules; the source text is read only where the
   tree has no node (reference definitions, entities). Invisible characters
-  are scanned on the raw text, code included, with entities decoded into
-  the same stream. A finding moves the item to `held` (`[intake]
-  hidden_content_hold`, default true) with the complete findings and raw
+  are scanned on the raw text, code included, with character references
+  decoded into the same stream by the WHATWG rules (`hidden/charref.rs`,
+  the full named table, `;` optional where HTML allows it). A finding
+  moves the item to `held` (`[intake] hidden_content_hold`, default
+  true) with the complete findings and raw
   sources stored; no agent runs until the operator releases it or cancels
   it. Every release names the hold the operator reviewed (`nucleus intake
   release <n> --hold <code>` from the terminal, the dashboard's rendered
