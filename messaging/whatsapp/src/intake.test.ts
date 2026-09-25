@@ -130,30 +130,30 @@ test("DM messages go to an item by its marker or by a quoted pipeline message", 
   assert.equal(stripGroupMarker("#6 approve", "5"), "#6 approve");
 });
 
-test("#n release reaches the item as a command only when the operator typed it", async () => {
+test("#n release <code> reaches the item as a command only when the operator typed it", async () => {
   const has = (n: string) => n === "3";
   const noLid = async () => null;
   const base = { operatorId: OP, pnForLid: noLid, quotedItem: null, hasDmThread: has };
   const opChat = `${OP}@s.whatsapp.net`;
   // Typed by the operator: routed as text, which the pipeline acts on.
-  assert.deepEqual(await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release", inputKind: "text" }), {
+  assert.deepEqual(await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release a1b2c3", inputKind: "text" }), {
     item: "3",
-    text: "release",
+    text: "release a1b2c3",
     inputKind: "text",
   });
   // A transcribed voice note or a forwarded message keeps its kind; the
   // pipeline keeps it in the thread and does not act on it.
-  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release", inputKind: "voice" }))?.inputKind, "voice");
-  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release", inputKind: "forwarded" }))?.inputKind, "forwarded");
-  // Another sender's "#3 release" never reaches the item.
+  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release a1b2c3", inputKind: "voice" }))?.inputKind, "voice");
+  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release a1b2c3", inputKind: "forwarded" }))?.inputKind, "forwarded");
+  // Another sender's "#3 release a1b2c3" never reaches the item.
   const other = `${["55119", "88888888"].join("")}@s.whatsapp.net`;
-  assert.equal(await routeOperatorDm({ ...base, chatId: other, text: "#3 release", inputKind: "text" }), null);
+  assert.equal(await routeOperatorDm({ ...base, chatId: other, text: "#3 release a1b2c3", inputKind: "text" }), null);
   // The operator in LID form, resolved through the connection's mapping.
   const lid = ["123456789012345", "lid"].join("@");
-  const viaLid = await routeOperatorDm({ ...base, chatId: lid, pnForLid: async () => opChat, text: "#3 release", inputKind: "text" });
+  const viaLid = await routeOperatorDm({ ...base, chatId: lid, pnForLid: async () => opChat, text: "#3 release a1b2c3", inputKind: "text" });
   assert.equal(viaLid?.item, "3");
   // An unknown LID is not the operator.
-  assert.equal(await routeOperatorDm({ ...base, chatId: lid, text: "#3 release", inputKind: "text" }), null);
+  assert.equal(await routeOperatorDm({ ...base, chatId: lid, text: "#3 release a1b2c3", inputKind: "text" }), null);
 });
 
 test("operator messages are stored once and quoted messages map to their item", () => {

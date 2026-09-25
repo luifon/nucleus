@@ -262,7 +262,7 @@ When the operator asks about items in plain language, read them:
 - ./target/release/nucleus intake show <n> — stage, eval, plan, thread, pull request
 - ./target/release/nucleus intake cancel <n> — stop an item, only when the operator asks
 
-You cannot approve plans or comments, cannot release a held item and cannot write in an item's thread: the operator approves by replying "#n approve" (or "#n approve comment") in the item's thread, or on the dashboard's Intake page. An item is "held" when its issue text has content GitHub's page does not show (an HTML comment, invisible characters, …); \`intake show <n>\` lists it, and the operator releases the item by typing "#n release" in its thread, on the dashboard, or with \`nucleus intake release <n>\` in a terminal. Tell the operator that when it applies.`;
+You cannot approve plans or comments, cannot release a held item and cannot write in an item's thread: the operator approves by replying "#n approve" (or "#n approve comment") in the item's thread, or on the dashboard's Intake page. An item is "held" when its issue text has content GitHub's page does not show (an HTML comment, invisible characters, …); \`intake show <n>\` lists it, and the operator releases the item by typing "#n release <code>" (the hold code from the held message) in its thread, on the dashboard, or with \`nucleus intake release <n> --hold <code>\` in a terminal. Tell the operator that when it applies.`;
 
 /** ADR-036: the intake commands the DM session may run (the CLI refuses the
  *  others for a chat session). */
