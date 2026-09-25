@@ -392,7 +392,9 @@ operator how to approve; it cannot approve, reply in a thread, or retry.
   deployed before its review rounds, so no intake.db and no whatsapp.db
   intake table existed anywhere, and the intermediate migrations were
   collapsed (round 4). The dashboard shows empty lists, refuses writes and
-  creates no intake.db when intake is disabled or the database is missing.
+  creates no intake.db when intake is disabled or the database is missing,
+  and reads an empty or half-created database (no schema version recorded,
+  or no item tables) as no items (round 5).
 - **whatsapp.db** — Rust inserts into `outbound_queue` (thread messages) and
   the new queue table `intake_group_requests`; it reads the bot's
   `intake_groups` (group state) and `intake_inbound` (operator messages,
@@ -619,33 +621,49 @@ the remote's default branch (read live with `ls-remote --symref` during
 preparation) and for `main`, `master`, `develop`, `development`, `trunk`,
 `production`, `release`, `gh-pages`.
 
-**Bounded import (rounds 3 and 4).** A walk that follows no symlink and
-skips `.git` directories refuses FIFOs, sockets and devices anywhere in the
-clone. The paths git would import (tracked and untracked, not ignored) are
-listed, as bytes, through a bounded reader; listing reads directory entries
-and the clone's ignore files, no file content. Each listed path is then
-copied into a private snapshot directory next to the temporary object
-directory: every path component is opened relative to its parent's
-descriptor with `O_NOFOLLOW` (a symlinked parent is refused); a regular
-file is checked on its opened descriptor (`fstat`: a regular file with one
-hard link) and copied by streaming, counting bytes as they are read against
-`[intake] import_max_file_bytes` (default 10 MiB) and
-`import_max_total_bytes` (default 200 MiB), so a sparse file or a file that
-grows during the copy is refused when it passes the limit; a symlink is
-recreated as a symlink from `readlinkat`; the number of paths is capped by
-`import_max_files` (default 20 000). `git add` runs only against the
-snapshot. Paths stay bytes end to end, so a name that is not UTF-8 is
-imported unchanged (APFS itself refuses such names). Staged submodule
-entries (mode 160000) must equal the base's, a base submodule directory
-that holds a repository is refused, and `.gitmodules` must stay
+**Bounded import (rounds 3 to 5).** No git command reads the agent's clone.
+Nucleus walks it itself, one directory level at a time: every path
+component is opened relative to its parent's descriptor with `O_NOFOLLOW`,
+entry types come from `statat` without following symlinks, `.git` entries
+are skipped, and the number of entries is capped. Each `.gitignore` is
+copied into a private rules directory under its own limit (`[intake]
+import_max_ignore_bytes`, default 1 MiB, counted toward the total), so a
+huge or sparse ignore file is refused without being parsed. Which entries of
+the next level are ignored is decided by `git check-ignore --no-index
+--stdin -z` (pinned git, trusted configuration, no excludes file) with the
+rules directory as its work tree; directories exist there as empty
+directories so that directory patterns apply; the paths are written and
+the answer read concurrently, the answer through a capped reader. An
+ignored directory is not entered, unless the base tracks paths inside it;
+a file the base tracks is imported even when a rule matches it, as git
+does. A directory holding a repository is refused unless it is ignored; a
+FIFO, socket or device is refused unless it is ignored. The base tree
+listing (`ls-tree -r`) is read through the capped reader, and an oversized
+one refuses the import.
+
+Each path to import is then copied into a private snapshot directory next
+to the temporary object directory: a regular file is checked on its opened
+descriptor (`fstat`: a regular file with one hard link) and copied by
+streaming, counting bytes as they are read against
+`import_max_file_bytes` (default 10 MiB) and `import_max_total_bytes`
+(default 200 MiB), so a sparse file or a file that grows during the copy is
+refused when it passes the limit; a symlink is recreated as a symlink from
+`readlinkat`, its target length counted against the same limits (checked
+before the link is created); the number of paths is capped by
+`import_max_files` (default 20 000). A symlink that replaces a directory is
+imported as a symlink; nothing behind it is read. `git add` runs only
+against the snapshot. Paths stay bytes end to end, so a name that is not
+UTF-8 is imported unchanged (APFS itself refuses such names). Staged
+submodule entries (mode 160000) must equal the base's, a base submodule
+directory that holds a repository is refused, and `.gitmodules` must stay
 byte-identical to the base when the base has submodules or either tree has
 the file. New objects are written into a temporary object directory (the
 mirror's objects as an alternate), packed there, and installed as `.pack`
 (and `.rev`) then `.idx` last, each by rename: git ignores a pack without
 its index, so a crash leaves nothing half-visible. Scratch directories
-(snapshot, index, objects) are removed after every import, and ones older
-than six hours are swept when the mirror is opened. Every refusal blocks
-the item with its reason.
+(rules, snapshot, index, objects) are removed after every import, and ones
+older than six hours are swept when the mirror is opened. Every refusal
+blocks the item with its reason.
 
 **Pinned executables (rounds 3 and 4).** `git` and `gh` are resolved once
 to canonical absolute paths (symlinks followed to the real file) and pinned
@@ -848,6 +866,17 @@ is written after the transaction; a crash between the two keeps the
 command's effect and loses the note.
 
 ### Verification of the amendment
+
+Round 5: a 4 GiB sparse `.gitignore` is refused quickly without being
+parsed (`a_huge_sparse_gitignore_is_refused_without_being_parsed`); the
+imported files match what git adds for a root `.gitignore` with a negation,
+a nested `.gitignore` and an ignored directory (which holds a FIFO that is
+never reached), and a base-tracked file matching a rule is still imported
+(`ignore_rules_match_git_and_tracked_files_stay`); a symlink whose target
+passes the per-file or total limit is refused before it is created
+(`symlink_targets_count_against_the_limits`); an empty intake.db file and one
+without the items table read as no items
+(`an_unmigrated_database_is_an_empty_list`).
 
 Round 4: an added line `++<guard hit>` blocks the push and the parser keeps
 it (`an_added_line_starting_with_plus_plus_is_scanned`,
