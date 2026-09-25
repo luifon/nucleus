@@ -29,18 +29,26 @@
 //!   `<details>`.
 //! - **The text**, with the code the tree found masked, only where the tree
 //!   gives nothing to read: link reference definitions (comrak removes them
-//!   and keeps no node), HTML entities (the tree hands back decoded text;
-//!   the source keeps the entity and its position), `<!--` outside every
-//!   HTML node (a backstop in case GitHub starts a comment where comrak
-//!   reads text), and the always-flagged math macros outside the math nodes
-//!   (in case GitHub reads math where comrak does not).
+//!   and keeps no node), character references (the tree hands back decoded
+//!   text; the source keeps the reference and its position), `<!--` outside
+//!   every HTML node (a backstop in case GitHub starts a comment where
+//!   comrak reads text), and the always-flagged math macros outside the math
+//!   nodes (in case GitHub reads math where comrak does not).
 //! - **Invisible characters** are read from the raw text, code included,
-//!   with entities outside code decoded into the same character stream, so
-//!   the emoji and joining rules see `&zwj;` as a ZWJ.
+//!   with every character reference outside code decoded into the same
+//!   character stream by a WHATWG decoder ([`charref`]: numeric references
+//!   with or without `;`, all 2,231 named ones, the legacy names without
+//!   `;`, the attribute-value rule inside tags), so the emoji and joining
+//!   rules see `&zwj;` as a ZWJ and `&#8203` as a zero-width space.
 //!
-//! comrak reports wrong inline positions after a removed reference
-//! definition, so a code span is masked only when the source at its
-//! reported position is really that code span. Where comrak and GitHub
+//! **Positions.** comrak reports wrong inline positions after a removed
+//! reference definition. Every code span and inline HTML node is checked
+//! against the source at its reported position; one that does not match is
+//! placed by matching the nodes of its paragraph (or cell, or heading) in
+//! document order against the source, skipping code, escaped `<` and
+//! reference definitions. When that is not a one-to-one match, nothing is
+//! guessed: a code span stays unmasked, and an HTML node's findings say
+//! "position unknown" and cover the whole location. Where comrak and GitHub
 //! could disagree, the stricter reading stays.
 //!
 //! **What is flagged** is listed by [`Kind`]. Invisible characters are
@@ -600,7 +608,8 @@ fn hidden_at(chars: &[char], k: usize) -> bool {
 }
 
 /// One character of the text as GitHub renders it, with its source bytes:
-/// an entity outside code is one decoded character.
+/// every character a reference outside code produces carries the
+/// reference's range.
 #[derive(Debug, Clone, Copy)]
 struct Unit {
     c: char,
@@ -609,16 +618,21 @@ struct Unit {
     entity: bool,
 }
 
-/// The characters of `text`, literal (`decode = false`, the title) or with
-/// entities outside the `code` ranges decoded.
-fn units(text: &str, code: &[(usize, usize)], decode: bool) -> Vec<Unit> {
+/// The characters of `text`: literal (`decode = false`, the title), or
+/// with every character reference outside the `code` ranges decoded
+/// ([`charref::decode_at`]). Inside `attribute` ranges (the tags of HTML
+/// nodes) the attribute-value rule applies. A backslash-escaped `&` is
+/// literal only outside `html` (a Markdown escape; HTML has none).
+fn units(text: &str, code: &[(usize, usize)], decode: bool, attribute: &[(usize, usize)], html: &[(usize, usize)]) -> Vec<Unit> {
     let b = text.as_bytes();
     let mut out = Vec::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
-        if decode && b[i] == b'&' && !escaped(b, i) && !inside(code, i) {
-            if let Some((c, len)) = entity_at(text, i) {
-                out.push(Unit { c, at: i, end: i + len, entity: true });
+        if decode && b[i] == b'&' && !inside(code, i) && !(escaped(b, i) && !inside(html, i)) {
+            if let Some((cs, len)) = charref::decode_at(text, i, inside(attribute, i)) {
+                for c in cs {
+                    out.push(Unit { c, at: i, end: i + len, entity: true });
+                }
                 i += len;
                 continue;
             }
@@ -631,19 +645,26 @@ fn units(text: &str, code: &[(usize, usize)], decode: bool) -> Vec<Unit> {
 }
 
 /// Invisible characters in a character stream: runs of literal ones, and
-/// each entity that decodes to one.
+/// each reference that produces one (one finding per reference, listing
+/// the hidden characters it produces).
 fn invisible_findings(text: &str, us: &[Unit], out: &mut Vec<Raw>) {
     let chars: Vec<char> = us.iter().map(|u| u.c).collect();
     let hidden: Vec<bool> = (0..chars.len()).map(|k| hidden_at(&chars, k)).collect();
     let mut k = 0;
     while k < us.len() {
-        if !hidden[k] {
-            k += 1;
+        if us[k].entity {
+            let (at, end) = (us[k].at, us[k].end);
+            let s = k;
+            while k < us.len() && us[k].entity && us[k].at == at {
+                k += 1;
+            }
+            let bad: Vec<String> = (s..k).filter(|&j| hidden[j]).map(|j| code_point(chars[j])).collect();
+            if !bad.is_empty() {
+                out.push(raw(Kind::InvisibleEntity, at, end, format!("{} → {}", &text[at..end], bad.join(", "))));
+            }
             continue;
         }
-        if us[k].entity {
-            let src = &text[us[k].at..us[k].end];
-            out.push(raw(Kind::InvisibleEntity, us[k].at, us[k].end, format!("{src} → {}", code_point(chars[k]))));
+        if !hidden[k] {
             k += 1;
             continue;
         }
@@ -795,6 +816,9 @@ struct HtmlNode {
     literal: String,
     map: Vec<usize>,
     range: (usize, usize),
+    /// False when the node could not be placed in the source: its findings
+    /// cover the whole location and say so.
+    known: bool,
 }
 
 impl HtmlNode {
@@ -803,23 +827,62 @@ impl HtmlNode {
     }
 }
 
-/// An HTML node at the reported range `a..b`. When the source there does
-/// not start with the literal's first line (comrak shifts inline positions
-/// after a removed reference definition), the node is placed at the
-/// occurrence of that line nearest to the reported start; its findings
-/// keep their text either way.
-fn html_node(text: &str, starts: &[usize], a: usize, b: usize, literal: String) -> HtmlNode {
-    let first = literal.split('\n').next().unwrap_or("");
-    let mut at = a;
-    if !first.is_empty() && !text[a.min(text.len())..].starts_with(first) {
-        if let Some(p) = text.match_indices(first).map(|(p, _)| p).min_by_key(|p| p.abs_diff(a)) {
-            at = p;
-        }
-    }
+/// An HTML node placed at source byte `at`.
+fn html_node(text: &str, starts: &[usize], at: usize, literal: String) -> HtmlNode {
     let line = starts.partition_point(|s| *s <= at);
     let map = html_map(text, starts, at, line, &literal);
-    let end = if at == a { b } else { map.last().copied().unwrap_or(at) };
-    HtmlNode { map, literal, range: (at, end.max(at)) }
+    let end = map.last().copied().unwrap_or(at);
+    HtmlNode { map, literal, range: (at, end.max(at)), known: true }
+}
+
+/// An HTML node that could not be placed.
+fn html_node_unknown(literal: String) -> HtmlNode {
+    HtmlNode { map: vec![0], literal, range: (0, 0), known: false }
+}
+
+/// True when `literal` (possibly several lines) is the source at `at`: its
+/// first line starts there, and every later line ends its source line (the
+/// container prefix is what comrak removed).
+fn literal_at(text: &str, starts: &[usize], at: usize, literal: &str) -> bool {
+    let lines: Vec<&str> = literal.strip_suffix('\n').unwrap_or(literal).split('\n').collect();
+    if at > text.len() || !text[at..].starts_with(lines[0]) {
+        return false;
+    }
+    let first = starts.partition_point(|s| *s <= at);
+    lines.iter().enumerate().skip(1).all(|(k, l)| {
+        let Some(&ls) = starts.get(first - 1 + k) else { return false };
+        let le = text[ls..].find('\n').map(|x| ls + x).unwrap_or(text.len());
+        text[ls..le].ends_with(l)
+    })
+}
+
+/// The code span source for a Code node with `n` backticks and content
+/// `literal`, when `text[p..]` starts with one: its end.
+fn code_span_at(text: &str, p: usize, n: usize, literal: &str) -> Option<usize> {
+    let b = text.as_bytes();
+    let run = |i: usize| b[i.min(b.len())..].iter().take_while(|c| **c == b'`').count();
+    if run(p) != n || (p > 0 && b[p - 1] == b'`') {
+        return None;
+    }
+    let mut j = p + n;
+    while j < b.len() {
+        if b[j] == b'`' {
+            let m = run(j);
+            if m == n {
+                let inner = text[p + n..j].replace('\n', " ");
+                let inner = if inner.len() >= 2 && inner.starts_with(' ') && inner.ends_with(' ') && inner.trim() != "" {
+                    inner[1..inner.len() - 1].to_string()
+                } else {
+                    inner
+                };
+                return (inner == literal).then_some(j + n);
+            }
+            j += m;
+        } else {
+            j += 1;
+        }
+    }
+    None
 }
 
 /// Map each byte of an HTML node's `literal` back to the source: literal
@@ -883,7 +946,7 @@ fn node_text<'a>(n: &'a AstNode<'a>) -> String {
 
 /// Walk the tree of `text` (normalized): findings from the nodes, and the
 /// ranges for the source-text checks.
-fn tree_scan(text: &str, out: &mut Vec<Raw>) -> Tree {
+fn tree_scan(text: &str, defs: &[(usize, usize)], out: &mut Vec<Raw>) -> Tree {
     let arena = comrak::Arena::new();
     let options = comrak_options();
     let root = comrak::parse_document(&arena, text, &options);
@@ -899,6 +962,7 @@ fn tree_scan(text: &str, out: &mut Vec<Raw>) -> Tree {
         (a, b.min(text.len()).max(a))
     };
     let mut t = Tree::default();
+    let mut pending: Vec<Pending> = Vec::new();
     for n in root.descendants() {
         let (a, b) = range(n);
         let value = n.data().value.clone();
@@ -927,14 +991,9 @@ fn tree_scan(text: &str, out: &mut Vec<Raw>) -> Tree {
                 }
             }
             NodeValue::Code(c) => {
-                // Masked only when the source there is this code span (comrak
-                // reports shifted inline positions after a removed reference
-                // definition; unmasked code only adds findings).
-                let s = slice(text, a, b);
-                let ticks = "`".repeat(c.num_backticks);
-                if c.num_backticks > 0 && s.len() >= 2 * c.num_backticks && s.starts_with(&ticks) && s.ends_with(&ticks) {
-                    t.literal.push((a, b));
-                }
+                let (block, block_range) = inline_block(n, &range);
+                let ok = code_span_at(text, a, c.num_backticks, &c.literal) == Some(b);
+                pending.push(Pending { code: Some(c.num_backticks), literal: c.literal, at: a, end: b, ok, block, block_range });
             }
             NodeValue::Math(m) => {
                 t.math.push((a, b));
@@ -963,8 +1022,13 @@ fn tree_scan(text: &str, out: &mut Vec<Raw>) -> Tree {
                     out.push(raw(Kind::ImageSource, a, b, shown(&l.url)));
                 }
             }
-            NodeValue::HtmlBlock(hb) => t.html.push(html_node(text, &starts, a, b, hb.literal)),
-            NodeValue::HtmlInline(lit) => t.html.push(html_node(text, &starts, a, b, lit)),
+            // Block positions are reliable: the node is placed where comrak says.
+            NodeValue::HtmlBlock(hb) => t.html.push(html_node(text, &starts, a, hb.literal)),
+            NodeValue::HtmlInline(lit) => {
+                let (block, block_range) = inline_block(n, &range);
+                let ok = literal_at(text, &starts, a, &lit);
+                pending.push(Pending { code: None, literal: lit, at: a, end: b, ok, block, block_range });
+            }
             NodeValue::FootnoteDefinition(_) => {
                 out.push(raw(Kind::FootnoteDefinition, a, b, shown(slice(text, a, b))));
             }
@@ -981,7 +1045,135 @@ fn tree_scan(text: &str, out: &mut Vec<Raw>) -> Tree {
             _ => {}
         }
     }
+    place_inline(text, &starts, defs, pending, &mut t);
     t
+}
+
+/// A code span or inline HTML node whose position is checked before use.
+struct Pending {
+    /// `Some(backticks)` for a code span, `None` for inline HTML.
+    code: Option<usize>,
+    literal: String,
+    at: usize,
+    end: usize,
+    /// The source at the reported position is this node.
+    ok: bool,
+    /// The leaf block that holds it (paragraph, heading, table cell…) and
+    /// that block's range (block positions are reliable).
+    block: usize,
+    block_range: (usize, usize),
+}
+
+/// The nearest ancestor of an inline node that is not inline, as an id and
+/// its source range.
+fn inline_block<'a>(n: &'a AstNode<'a>, range: &dyn Fn(&AstNode<'_>) -> (usize, usize)) -> (usize, (usize, usize)) {
+    let mut cur = n;
+    while let Some(p) = cur.parent() {
+        cur = p;
+        let inline = matches!(
+            cur.data().value,
+            NodeValue::Emph
+                | NodeValue::Strong
+                | NodeValue::Strikethrough
+                | NodeValue::Link(_)
+                | NodeValue::Image(_)
+                | NodeValue::Superscript
+                | NodeValue::Subscript
+                | NodeValue::Underline
+                | NodeValue::Highlight
+                | NodeValue::Insert
+                | NodeValue::SpoileredText
+                | NodeValue::WikiLink(_)
+                | NodeValue::Escaped
+        );
+        if !inline {
+            break;
+        }
+    }
+    (cur as *const AstNode<'_> as usize, range(cur))
+}
+
+/// Place the pending inline nodes. A node whose reported position holds it
+/// keeps it. Otherwise the nodes of one block with the same kind and
+/// literal are matched, in document order, against their occurrences in the
+/// block's source (outside placed code, escaped `<` and reference
+/// definitions); only a one-to-one match places them. An unplaced code span
+/// stays unmasked; an unplaced HTML node is reported with its position
+/// unknown.
+fn place_inline(text: &str, starts: &[usize], defs: &[(usize, usize)], pending: Vec<Pending>, t: &mut Tree) {
+    let b = text.as_bytes();
+    let mut placed: Vec<Option<(usize, usize)>> = pending.iter().map(|p| p.ok.then_some((p.at, p.end))).collect();
+    // Code first: placed code is excluded when HTML is placed.
+    for pass_code in [true, false] {
+        let mut done = vec![false; pending.len()];
+        for i in 0..pending.len() {
+            if done[i] || pending[i].code.is_some() != pass_code {
+                continue;
+            }
+            let group: Vec<usize> = (i..pending.len())
+                .filter(|&j| {
+                    pending[j].block == pending[i].block && pending[j].code == pending[i].code && pending[j].literal == pending[i].literal
+                })
+                .collect();
+            for &j in &group {
+                done[j] = true;
+            }
+            if group.iter().all(|&j| pending[j].ok) {
+                continue;
+            }
+            let (bs, be) = pending[i].block_range;
+            let code_now: Vec<(usize, usize)> = t.literal.clone();
+            let mut cands: Vec<(usize, usize)> = Vec::new();
+            let mut p = bs;
+            while p < be.min(text.len()) {
+                let hit = match pending[i].code {
+                    Some(n) => (b[p] == b'`' && !escaped(b, p)).then(|| code_span_at(text, p, n, &pending[i].literal)).flatten(),
+                    None => (b[p] == b'<'
+                        && !escaped(b, p)
+                        && !inside(&code_now, p)
+                        && !inside(defs, p)
+                        && literal_at(text, starts, p, &pending[i].literal))
+                    .then(|| p + pending[i].literal.len()),
+                };
+                match hit {
+                    Some(e) if e <= be => {
+                        cands.push((p, e));
+                        p = e.max(p + 1);
+                    }
+                    _ => p += 1,
+                }
+            }
+            if cands.len() == group.len() {
+                for (k, &j) in group.iter().enumerate() {
+                    placed[j] = Some(cands[k]);
+                }
+            } else {
+                for &j in &group {
+                    if !pending[j].ok {
+                        placed[j] = None;
+                    }
+                }
+            }
+        }
+        if pass_code {
+            for (j, p) in pending.iter().enumerate() {
+                if p.code.is_some() {
+                    if let Some(r) = placed[j] {
+                        t.literal.push(r);
+                    }
+                }
+            }
+        }
+    }
+    for (j, p) in pending.into_iter().enumerate() {
+        if p.code.is_none() {
+            t.html.push(match placed[j] {
+                Some((at, _)) => html_node(text, starts, at, p.literal),
+                None => html_node_unknown(p.literal),
+            });
+        }
+    }
+    t.html.sort_by_key(|h| if h.known { h.range.0 } else { usize::MAX });
 }
 
 /// A link's destination is visible when its text, normalized, is the
@@ -1292,10 +1484,12 @@ fn element_text(m: &str, from: usize, name: &str) -> Option<String> {
 /// declarations, processing instructions and CDATA (removed by the
 /// sanitizer). `m` is the masked source (for labels and `<details>` ends),
 /// `text` the unmasked source.
-fn tree_html(nodes: &[HtmlNode], m: &str, text: &str, out: &mut Vec<Raw>) {
+fn tree_html(nodes: &[HtmlNode], m: &str, text: &str, out: &mut Vec<Raw>) -> Vec<(usize, usize)> {
     let mut small_depth = 0i32;
+    let mut tags: Vec<(usize, usize)> = Vec::new();
     for node in nodes {
         let lit = node.literal.as_str();
+        let from = out.len();
         let b = lit.as_bytes();
         let lower = lit.to_ascii_lowercase();
         let mut i = 0;
@@ -1338,6 +1532,9 @@ fn tree_html(nodes: &[HtmlNode], m: &str, text: &str, out: &mut Vec<Raw>) {
                 continue;
             };
             let (sa, se) = (node.src(i), node.src(tag.end));
+            if node.known {
+                tags.push((sa, se));
+            }
             let src = shown(&lit[i..tag.end]);
             let name = tag.name.as_str();
             if tag.unterminated {
@@ -1393,7 +1590,16 @@ fn tree_html(nodes: &[HtmlNode], m: &str, text: &str, out: &mut Vec<Raw>) {
             }
             i = tag.end.max(i + 1);
         }
+        if !node.known {
+            // Not placed in the source: the whole location, said plainly.
+            for f in &mut out[from..] {
+                f.at = 0;
+                f.end = text.len();
+                f.text = format!("position unknown (the source has this more than once, or comrak's position could not be matched): {}", f.text);
+            }
+        }
     }
+    tags
 }
 
 /// Strip block-container prefixes (blockquote `>`, list markers) from the
@@ -1430,6 +1636,14 @@ fn after_containers(line: &str) -> usize {
 /// source lines (the tree keeps no node for a reference definition). A line
 /// that only looks like one (inside a paragraph) is flagged too.
 fn definitions(m: &str, text: &str, out: &mut Vec<Raw>) {
+    for (kind, s, e) in definition_spans(m) {
+        out.push(raw(kind, s, e, shown(slice(text, s, e))));
+    }
+}
+
+/// The reference and footnote definitions of `m`: (kind, start, end).
+fn definition_spans(m: &str) -> Vec<(Kind, usize, usize)> {
+    let mut spans = Vec::new();
     let starts = line_starts(m);
     for (k, &s) in starts.iter().enumerate() {
         let e = m[s..].find('\n').map(|x| s + x).unwrap_or(m.len());
@@ -1465,8 +1679,9 @@ fn definitions(m: &str, text: &str, out: &mut Vec<Raw>) {
                 end = m[ns..].find('\n').map(|x| ns + x).unwrap_or(m.len());
             }
         }
-        out.push(raw(kind, s + at, end, shown(slice(text, s + at, end))));
+        spans.push((kind, s + at, end));
     }
+    spans
 }
 
 /// [`MATH_ALWAYS_FLAG`] macros anywhere outside code and outside the math
@@ -1489,70 +1704,23 @@ fn hiding_macros(m: &str, text: &str, math: &[(usize, usize)], out: &mut Vec<Raw
     }
 }
 
-/// Named HTML entities that decode to an invisible character.
-const INVISIBLE_ENTITIES: &[(&str, char)] = &[
-    ("shy", '\u{AD}'),
-    ("zwnj", '\u{200C}'),
-    ("zwj", '\u{200D}'),
-    ("lrm", '\u{200E}'),
-    ("rlm", '\u{200F}'),
-    ("ZeroWidthSpace", '\u{200B}'),
-    ("NegativeVeryThinSpace", '\u{200B}'),
-    ("NegativeThinSpace", '\u{200B}'),
-    ("NegativeMediumSpace", '\u{200B}'),
-    ("NegativeThickSpace", '\u{200B}'),
-    ("NoBreak", '\u{2060}'),
-    ("ApplyFunction", '\u{2061}'),
-    ("af", '\u{2061}'),
-    ("InvisibleTimes", '\u{2062}'),
-    ("it", '\u{2062}'),
-    ("InvisibleComma", '\u{2063}'),
-    ("ic", '\u{2063}'),
-];
-
-/// The entity at `i` (`text[i] == '&'`) and its length: decimal,
-/// hexadecimal, [`INVISIBLE_ENTITIES`], and the few named ones that matter
-/// for the characters around an invisible one. Others stay literal.
-fn entity_at(text: &str, i: usize) -> Option<(char, usize)> {
-    let b = text.as_bytes();
-    let rel = b[i + 1..b.len().min(i + 40)].iter().position(|c| *c == b';')?;
-    let body = &text[i + 1..i + 1 + rel];
-    let c = if let Some(num) = body.strip_prefix('#') {
-        let v = if let Some(hex) = num.strip_prefix(['x', 'X']) {
-            (!hex.is_empty() && hex.len() <= 6 && hex.bytes().all(|c| c.is_ascii_hexdigit()))
-                .then(|| u32::from_str_radix(hex, 16).ok())
-                .flatten()
-        } else {
-            (!num.is_empty() && num.len() <= 7 && num.bytes().all(|c| c.is_ascii_digit())).then(|| num.parse::<u32>().ok()).flatten()
-        };
-        v.and_then(char::from_u32).filter(|c| *c != '\0')?
-    } else {
-        match body {
-            "amp" => '&',
-            "lt" => '<',
-            "gt" => '>',
-            "quot" => '"',
-            "apos" => '\'',
-            "nbsp" => '\u{A0}',
-            _ => INVISIBLE_ENTITIES.iter().find(|(n, _)| *n == body).map(|(_, c)| *c)?,
-        }
-    };
-    Some((c, rel + 2))
-}
-
 /// Every finding of one Markdown text (normalized).
 fn scan_markdown_raw(text: &str) -> Vec<Raw> {
     let mut out = Vec::new();
-    let tree = tree_scan(text, &mut out);
-    invisible_findings(text, &units(text, &tree.literal, true), &mut out);
+    let defs: Vec<(usize, usize)> = definition_spans(text).into_iter().map(|(_, s, e)| (s, e)).collect();
+    let tree = tree_scan(text, &defs, &mut out);
     let m = masked(text, &tree.literal);
-    tree_html(&tree.html, &m, text, &mut out);
-    let html_ranges: Vec<(usize, usize)> = tree.html.iter().map(|h| h.range).collect();
+    let tags = tree_html(&tree.html, &m, text, &mut out);
+    let html_ranges: Vec<(usize, usize)> = tree.html.iter().filter(|h| h.known).map(|h| h.range).collect();
+    invisible_findings(text, &units(text, &tree.literal, true, &tags, &html_ranges), &mut out);
     text_comments(&m, text, &html_ranges, &mut out);
     definitions(&m, text, &mut out);
     hiding_macros(&m, text, &tree.math, &mut out);
     out.sort_by_key(|r| (r.at, r.kind, r.end));
-    out.dedup_by(|x, y| x.kind == y.kind && x.at == y.at);
+    // The tree and a text check can report one thing twice; a finding whose
+    // position is unknown is kept apart from the others.
+    let unknown = |r: &Raw| r.text.starts_with("position unknown");
+    out.dedup_by(|x, y| x.kind == y.kind && x.at == y.at && unknown(x) == unknown(y) && (!unknown(x) || x.text == y.text));
     out
 }
 
@@ -1603,7 +1771,7 @@ fn locate(location: &str, raw_text: &str, norm: &Normalized, found: Vec<Raw>) ->
 pub fn scan_title(title: &str) -> Vec<Finding> {
     let norm = normalize(title);
     let mut found = Vec::new();
-    invisible_findings(&norm.text, &units(&norm.text, &[], false), &mut found);
+    invisible_findings(&norm.text, &units(&norm.text, &[], false, &[], &[]), &mut found);
     locate("title", title, &norm, found)
 }
 
@@ -1707,6 +1875,9 @@ pub fn describe(f: &Finding, max: usize) -> String {
     let one_line = f.text.replace('\n', " ⏎ ");
     format!("{} {}:{} {label}: {}", f.location, f.line, f.column, clip_chars(&one_line, max))
 }
+
+mod charref;
+mod entities;
 
 #[cfg(test)]
 mod tests;

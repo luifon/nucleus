@@ -379,3 +379,51 @@ fn entity_joiners_follow_the_same_rules() {
     assert!(has("a&#xFE0F;", Kind::InvisibleEntity));
     assert!(!has("\u{2764}&#xFE0F;", Kind::InvisibleEntity));
 }
+
+#[test]
+fn character_references_follow_the_whatwg_rules() {
+    // Numeric without `;`, inside raw HTML and in text.
+    let f = only("<div>ig&#8203nore</div>", Kind::InvisibleEntity);
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert_eq!(f[0].text, "&#8203 → U+200B ZERO WIDTH SPACE");
+    assert!(has("a &#x200B b", Kind::InvisibleEntity));
+    // `zwj` is not a legacy name: without `;` it stays text.
+    assert!(kinds("a&zwj b").is_empty());
+    assert!(has("a&zwj;b", Kind::InvisibleEntity));
+    // A legacy name without `;`: decoded in text, not in an attribute
+    // value when `=` follows (the attribute-value rule).
+    assert!(has("x&shy=2", Kind::InvisibleEntity));
+    assert!(!has("<a href=\"https://example.invalid/?a=1&shy=2\">https://example.invalid/?a=1&amp;shy=2</a>", Kind::InvisibleEntity));
+    // Named references that produce two characters: base + VS1.
+    for src in ["&caps;", "&varsubsetneq;"] {
+        let f = only(src, Kind::InvisibleEntity);
+        assert_eq!(f.len(), 1, "{src}: {f:?}");
+        assert!(f[0].text.contains("VARIATION SELECTOR-1"), "{}", f[0].text);
+    }
+    // Visible results: no finding.
+    assert!(kinds("&amp &amp; &lt;b&gt; &copy &nbsp;").is_empty());
+    // Numeric replacement rules: 0 and surrogates become U+FFFD, 0x80 is
+    // the euro sign, 0x81 stays a C1 control (invisible).
+    assert!(kinds("&#0; &#xD800; &#x80; &#128;").is_empty());
+    assert!(has("&#x81;", Kind::InvisibleEntity));
+    assert_eq!(charref::numeric_char(0x9F), '\u{178}');
+    assert_eq!(charref::numeric_char(0x110000), '\u{FFFD}');
+    // Inside code the reference is shown literally.
+    assert!(kinds("`&#8203`").is_empty());
+}
+
+#[test]
+fn shifted_html_is_placed_in_document_order_or_reported_unknown() {
+    // After a reference definition comrak's inline positions are shifted;
+    // a harmless copy of the tag inside a code span comes first.
+    let src = "[x]: /a\n`<iframe>` <iframe>\n";
+    let f = only(src, Kind::HtmlTag);
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert_eq!((f[0].line, f[0].column), (2, 12), "the real tag, not the copy in code: {f:?}");
+    // A copy the matcher cannot rule out (a link destination): no guess.
+    let src = "[x]: /a\n[t](<iframe>) <iframe>\n";
+    let f = only(src, Kind::HtmlTag);
+    assert!(!f.is_empty(), "{f:?}");
+    assert!(f[0].text.starts_with("position unknown"), "{f:?}");
+    assert_eq!((f[0].start, f[0].end), (0, src.chars().count() as u32));
+}
