@@ -189,9 +189,15 @@ pub trait SourceAdapter: Send + Sync {
     /// The event's state at the source now, with the evidence of who opened
     /// its gate. Any failure is an error; the caller fails closed.
     async fn live_state(&self, event: &Event) -> Result<SourceState>;
-    /// Post `body` on the event at its source (GitHub: an issue comment).
-    /// `marker` is a unique string the adapter embeds invisibly and checks
-    /// first, so a retry after a crash does not post twice. Returns the
-    /// URL of the reply when the source gives one.
-    async fn reply(&self, event: &Event, body: &str, marker: &str) -> Result<Option<String>>;
+    /// The URL of an earlier reply that carries `marker` (a retry after a
+    /// crash must not post twice), if one exists. A read only.
+    async fn find_reply(&self, event: &Event, marker: &str) -> Result<Option<String>>;
+    /// Post `body` on the event at its source (GitHub: an issue comment),
+    /// with `marker` embedded invisibly. The caller runs [`find_reply`]
+    /// first and a live gate read between the two, so nothing but that
+    /// read sits between the check and this write. Returns the URL of the
+    /// reply when the source gives one.
+    ///
+    /// [`find_reply`]: SourceAdapter::find_reply
+    async fn post_reply(&self, event: &Event, body: &str, marker: &str) -> Result<Option<String>>;
 }

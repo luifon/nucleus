@@ -1171,3 +1171,50 @@ async fn an_unknown_group_is_never_counted_as_closed() {
     tick(&f).await;
     assert!(item1(&f).await.group_closed_at.is_some());
 }
+
+#[tokio::test]
+async fn a_label_removed_after_the_push_stops_the_pull_request() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    // Right after the PR lookup (after the push), the label is removed at
+    // GitHub.
+    f.gh.after("pr list", |gh| {
+        let unlabeled = serde_json::json!({ "number": 1, "title": "Issue 1", "body": "body", "state": "open", "labels": [] });
+        gh.set("repos/acme/widget/issues/1$", true, &unlabeled.to_string(), "");
+    });
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!(it.stage(), Stage::Cancelled, "{:?}", it.error);
+    assert!(it.error.unwrap().contains("read before the pull request"));
+    assert_eq!(f.gh.calls_with("pr create"), 0, "no pull request");
+    assert!(remote_has(&f, "nucleus/item-1"), "the branch was pushed");
+    assert_eq!(it.pushed_sha, it.head_sha, "the pushed commit is recorded");
+}
+
+#[tokio::test]
+async fn the_comment_is_written_only_after_a_fresh_read_that_follows_the_lookup() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    tick(&f).await;
+    approve_comment(&f.ctx, 1, None, "cli").await.unwrap();
+    // The step's first live read lists the comments once; the idempotency
+    // lookup is the second comments call. Right after it, the label is
+    // removed: only a read after the lookup can see that.
+    f.gh.after("issues/1/comments", |gh| {
+        gh.after("issues/1/comments", |gh| {
+            let unlabeled = serde_json::json!({ "number": 1, "title": "Issue 1", "body": "body", "state": "open", "labels": [] });
+            gh.set("repos/acme/widget/issues/1$", true, &unlabeled.to_string(), "");
+        })
+    });
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
+    assert_eq!(f.gh.calls_with("issue comment"), 0);
+}

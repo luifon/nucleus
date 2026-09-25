@@ -504,6 +504,7 @@ pub(crate) mod tests {
             gate_at: None,
             stale_reason: None,
             base_sha: None,
+            pushed_sha: None,
         }
     }
 }

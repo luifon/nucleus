@@ -404,29 +404,24 @@ impl SourceAdapter for GithubIssues {
         })
     }
 
-    async fn reply(&self, event: &Event, body: &str, marker: &str) -> Result<Option<String>> {
-        let (repo, number) = parse_external_id(&event.external_id)?;
-        let tagged = format!("{body}\n\n<!-- {marker} -->");
-        // A comment with this marker already exists: an earlier attempt
-        // posted it and stopped before recording that.
+    async fn find_reply(&self, event: &Event, marker: &str) -> Result<Option<String>> {
+        let (_, number) = parse_external_id(&event.external_id)?;
         for c in self.comments(number).await? {
             if c["body"].as_str().map(|b| b.contains(marker)).unwrap_or(false) {
-                return Ok(c["html_url"].as_str().map(str::to_string));
+                return Ok(Some(c["html_url"].as_str().unwrap_or_default().to_string()));
             }
         }
+        Ok(None)
+    }
+
+    async fn post_reply(&self, event: &Event, body: &str, marker: &str) -> Result<Option<String>> {
+        let (repo, number) = parse_external_id(&event.external_id)?;
+        let tagged = format!("{body}\n\n<!-- {marker} -->");
         let file = tempfile_with(&tagged)?;
         let out = self
             .gh
             .run(
-                &args(&[
-                    "issue",
-                    "comment",
-                    &number.to_string(),
-                    "--repo",
-                    &repo,
-                    "--body-file",
-                    &file.path().to_string_lossy(),
-                ]),
+                &args(&["issue", "comment", &number.to_string(), "--repo", &repo, "--body-file", &file.path().to_string_lossy()]),
                 None,
             )
             .await?;
@@ -531,10 +526,15 @@ pub(crate) mod tests {
     /// Scripted `gh`: each rule is (argument substring, response); the first
     /// rule whose substring occurs in the joined arguments answers. Every
     /// call is recorded.
+    type Hook = Box<dyn FnOnce(&FakeGh) + Send>;
+
     #[derive(Default)]
     pub(crate) struct FakeGh {
         pub rules: Mutex<Vec<(String, GhOut)>>,
         pub calls: Mutex<Vec<String>>,
+        /// Run once, after answering the first call whose arguments contain
+        /// the needle (something changes at GitHub right after that call).
+        pub hooks: Mutex<Vec<(String, Hook)>>,
     }
 
     impl FakeGh {
@@ -543,6 +543,9 @@ pub(crate) mod tests {
                 needle.to_string(),
                 GhOut { ok, stdout: stdout.to_string(), stderr: stderr.to_string() },
             ));
+        }
+        pub(crate) fn after(&self, needle: &str, hook: impl FnOnce(&FakeGh) + Send + 'static) {
+            self.hooks.lock().unwrap().push((needle.to_string(), Box::new(hook)));
         }
         /// Replace the rule for `needle` (or add it first).
         pub(crate) fn set(&self, needle: &str, ok: bool, stdout: &str, stderr: &str) {
@@ -566,16 +569,25 @@ pub(crate) mod tests {
                 shown.push_str(&format!(" BODY<<{body}>>"));
             }
             self.calls.lock().unwrap().push(shown);
+            let mut answer = GhOut { ok: false, stdout: String::new(), stderr: format!("no fake rule for: {joined}") };
             for (needle, out) in self.rules.lock().unwrap().iter() {
                 let hit = match needle.strip_suffix('$') {
                     Some(end) => joined.ends_with(end),
                     None => joined.contains(needle.as_str()),
                 };
                 if hit {
-                    return Ok(out.clone());
+                    answer = out.clone();
+                    break;
                 }
             }
-            Ok(GhOut { ok: false, stdout: String::new(), stderr: format!("no fake rule for: {joined}") })
+            let hook = {
+                let mut hooks = self.hooks.lock().unwrap();
+                hooks.iter().position(|(n, _)| joined.contains(n.as_str())).map(|i| hooks.remove(i).1)
+            };
+            if let Some(h) = hook {
+                h(self);
+            }
+            Ok(answer)
         }
     }
 
@@ -694,7 +706,8 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let url = a.reply(&ev, "Draft PR open.", "nucleus-intake:item-1:comment").await.unwrap();
+        assert_eq!(a.find_reply(&ev, "nucleus-intake:item-1:comment").await.unwrap(), None);
+        let url = a.post_reply(&ev, "Draft PR open.", "nucleus-intake:item-1:comment").await.unwrap();
         assert_eq!(url.as_deref(), Some("https://example.invalid/acme/widget/issues/9#issuecomment-1"));
         assert!(gh.calls.lock().unwrap().iter().any(|c| c.contains("BODY<<Draft PR open.\n\n<!-- nucleus-intake:item-1:comment -->>>")));
         // The marker is already on the issue: nothing is posted.
@@ -709,7 +722,7 @@ pub(crate) mod tests {
                 },
             ),
         );
-        let url = a.reply(&ev, "Draft PR open.", "nucleus-intake:item-1:comment").await.unwrap();
+        let url = a.find_reply(&ev, "nucleus-intake:item-1:comment").await.unwrap();
         assert_eq!(url.as_deref(), Some("https://example.invalid/c/2"));
         assert_eq!(gh.calls_with("issue comment 9"), 1);
     }

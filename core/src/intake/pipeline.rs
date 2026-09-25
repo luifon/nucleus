@@ -1483,11 +1483,18 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     if let Verdict::Hit(cats) = ctx.guard.scan(&format!("{title}\n{body}\n{header}\n{added}")).await {
         return block(ctx, item, "the commit or the pull request text", &cats).await;
     }
+    // Each write gets its own fresh read right before it (GitHub has no
+    // write conditional on an issue revision; the last read is the
+    // authorization point for that one write).
     let _ = final_read!(ctx, item, "push", first);
     git::push(&mirror, &remote, &sha, &branch, item.id, &remote_default).await?;
+    store::update(&ctx.db, item.id, Stage::Pr, vec![("pushed_sha", sha.clone().into())]).await?;
     let url = match github::find_pr(&*ctx.gh, &item.repo, &branch).await? {
         Some(u) => u,
-        None => github::create_draft_pr(&*ctx.gh, &item.repo, &branch, &base_ref, &title, &body).await?,
+        None => {
+            let _ = final_read!(ctx, item, "the pull request", first);
+            github::create_draft_pr(&*ctx.gh, &item.repo, &branch, &base_ref, &title, &body).await?
+        }
     };
     let can_reply = adapter_for(ctx, &ev).is_some();
     let summary = publish::escape_summary(item.impl_summary.as_deref().unwrap_or(""), 600);
@@ -1525,9 +1532,16 @@ async fn step_review(ctx: &Ctx, item: &Item) -> Result<()> {
             if let Verdict::Hit(cats) = ctx.guard.scan(&draft).await {
                 return block(ctx, item, "the issue comment", &cats).await;
             }
-            let _ = final_read!(ctx, item, "the issue comment", first);
             let marker = format!("{}item-{}:comment", github::COMMENT_MARKER_PREFIX, item.id);
-            let url = a.reply(&ev, &draft, &marker).await?;
+            // The lookup (a retry must not post twice), then a fresh read,
+            // then the write.
+            let url = match a.find_reply(&ev, &marker).await? {
+                Some(u) => Some(u),
+                None => {
+                    let _ = final_read!(ctx, item, "the issue comment", first);
+                    a.post_reply(&ev, &draft, &marker).await?
+                }
+            };
             if store::advance(
                 &ctx.db,
                 item.id,
