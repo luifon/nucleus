@@ -46,8 +46,6 @@ pub const HARDENING: &[&str] = &[
     "-c",
     "protocol.ext.allow=never",
     "-c",
-    "core.sshCommand=ssh",
-    "-c",
     "core.askPass=",
     "-c",
     "core.pager=cat",
