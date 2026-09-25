@@ -513,6 +513,8 @@ pub struct ImportLimits {
     pub max_total_bytes: u64,
     /// Largest ignore file (`.gitignore`) read to decide what is ignored.
     pub max_ignore_bytes: u64,
+    /// Most directory entries the walk reads, counted as they are read.
+    pub max_entries: usize,
 }
 
 /// Import the agent's file tree into the mirror as one commit on
@@ -591,7 +593,10 @@ async fn import_in(
     else {
         refuse!("the base tree lists more than the import limits allow; nothing was imported");
     };
-    let base = BaseTree::parse(&base_listing);
+    // Letter case as the clone's file system treats it, probed in a private
+    // directory on the same file system (the scratch directory).
+    let ignore_case = super::snapshot::fs_ignores_case(scratch)?;
+    let base = BaseTree::parse(&base_listing, ignore_case);
     let base_links = gitlinks(&String::from_utf8_lossy(&base_listing), true);
 
     // Walk the clone ourselves (no git command reads it): descriptor-
@@ -603,7 +608,7 @@ async fn import_in(
     let rules = scratch.join("rules");
     std::fs::create_dir_all(&rules)?;
     let mut budget = super::snapshot::Budget { files: 0, bytes: 0 };
-    let candidates = walk_clone(mirror, root, &rules, &base, limits, &mut budget).await?;
+    let candidates = walk_clone(mirror, root, &rules, &base, limits, &mut budget, ignore_case).await?;
 
     // The private snapshot: every candidate copied with descriptor-
     // relative, no-follow operations and read limits (snapshot.rs).
@@ -611,8 +616,8 @@ async fn import_in(
         super::snapshot::copy_path(root, rel, &snapshot, limits, &mut budget, *gitlink)?;
     }
 
-    // git add reads only the snapshot.
-    let pre = vec![format!("--work-tree={}", snapshot.display())];
+    // git add reads only the snapshot, with the same letter-case rule.
+    let pre = vec![format!("--work-tree={}", snapshot.display()), "-c".into(), format!("core.ignoreCase={ignore_case}")];
     let out = mirror_git(mirror, &pre, &["add", "--all", "--", "."], &env).await?;
     if !out.ok {
         bail!("git add failed: {}", out.stderr);
@@ -738,15 +743,26 @@ struct BaseTree {
     tracked: std::collections::HashSet<Vec<u8>>,
     dirs: std::collections::HashSet<Vec<u8>>,
     gitlinks: std::collections::HashSet<Vec<u8>>,
+    /// Keys are ASCII-lowercased (a case-insensitive file system).
+    ignore_case: bool,
 }
 
 impl BaseTree {
+    /// The lookup key of a path.
+    fn key(&self, path: &[u8]) -> Vec<u8> {
+        if self.ignore_case {
+            path.to_ascii_lowercase()
+        } else {
+            path.to_vec()
+        }
+    }
+
     /// From `ls-tree -r -z` output (records `mode type id\tpath`).
-    fn parse(listing: &[u8]) -> BaseTree {
-        let mut t = BaseTree { tracked: Default::default(), dirs: Default::default(), gitlinks: Default::default() };
+    fn parse(listing: &[u8], ignore_case: bool) -> BaseTree {
+        let mut t = BaseTree { tracked: Default::default(), dirs: Default::default(), gitlinks: Default::default(), ignore_case };
         for rec in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
             let Some(tab) = rec.iter().position(|b| *b == b'\t') else { continue };
-            let (head, path) = (&rec[..tab], rec[tab + 1..].to_vec());
+            let (head, path) = (&rec[..tab], t.key(&rec[tab + 1..]));
             if head.starts_with(b"160000 ") {
                 t.gitlinks.insert(path.clone());
             }
@@ -778,47 +794,53 @@ async fn walk_clone(
     base: &BaseTree,
     limits: &ImportLimits,
     budget: &mut super::snapshot::Budget,
+    ignore_case: bool,
 ) -> Result<Vec<(Vec<u8>, bool)>> {
     use super::snapshot::Kind;
     use std::os::unix::ffi::OsStrExt;
-    let max_entries = limits.max_files.saturating_mul(50).max(100_000);
-    let mut seen = 0usize;
+    let mut entries = super::snapshot::EntryBudget { seen: 0, max: limits.max_entries };
     let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
+    let is_name = |name: &[u8], want: &[u8]| if ignore_case { name.eq_ignore_ascii_case(want) } else { name == want };
     // (directory, whether only base-tracked paths are kept below it)
     let mut level: Vec<(Vec<u8>, bool)> = vec![(Vec::new(), false)];
     while !level.is_empty() {
         let mut children: Vec<(Vec<u8>, Kind, bool, bool)> = Vec::new(); // rel, kind, tracked_only parent, is repo dir
         for (dir, tracked_only) in &level {
             let fd = super::snapshot::open_rel_dir(root, dir)?;
-            let (entries, _) = super::snapshot::read_entries(&fd)?;
-            for (name, kind) in entries {
-                seen += 1;
-                if seen > max_entries {
-                    refuse!("the clone has more than {max_entries} entries on disk; nothing was imported");
-                }
+            for (name, kind) in super::snapshot::read_entries(&fd, &mut entries)? {
                 let rel = join_rel(dir, &name);
-                if name == b".gitignore" && kind == Kind::File && !tracked_only {
-                    super::snapshot::copy_ignore_file(&fd, &rel, &rules.join(std::ffi::OsStr::from_bytes(&rel)), limits.max_ignore_bytes, limits, budget)?;
+                // The name git reads as the directory's ignore file (any
+                // case on a case-insensitive file system), copied under
+                // its canonical name.
+                if is_name(&name, b".gitignore") && kind == Kind::File && !tracked_only {
+                    let canon = join_rel(dir, b".gitignore");
+                    super::snapshot::copy_ignore_file(&fd, &rel, &rules.join(std::ffi::OsStr::from_bytes(&canon)), limits.max_ignore_bytes, limits, budget)?;
+                }
+                // A `.gitmodules` that is not exactly the base's name would
+                // be read as `.gitmodules` on a case-insensitive checkout.
+                if name.eq_ignore_ascii_case(b".gitmodules") && name != b".gitmodules" {
+                    refuse!("{} is a case variant of .gitmodules; nothing was imported", String::from_utf8_lossy(&rel));
                 }
                 let mut repo = false;
                 if kind == Kind::Dir {
                     std::fs::create_dir_all(rules.join(std::ffi::OsStr::from_bytes(&rel)))?;
                     let sub = super::snapshot::open_rel_dir(root, &rel)?;
-                    repo = super::snapshot::read_entries(&sub)?.1;
+                    repo = super::snapshot::holds_repo(&sub);
                 }
                 children.push((rel, kind, *tracked_only, repo));
             }
         }
         let asked: Vec<&[u8]> = children.iter().filter(|c| !c.2).map(|c| c.0.as_slice()).collect();
-        let ignored = check_ignore(mirror, rules, &asked).await?;
+        let ignored = check_ignore(mirror, rules, &asked, ignore_case, CHECK_IGNORE_TIMEOUT).await?;
         let mut next = Vec::new();
         for (rel, kind, tracked_only, repo) in children {
             let is_ignored = tracked_only || ignored.contains(&rel);
-            let tracked = base.tracked.contains(&rel);
+            let key = base.key(&rel);
+            let tracked = base.tracked.contains(&key);
             match kind {
-                Kind::Dir if base.gitlinks.contains(&rel) => out.push((rel, true)),
+                Kind::Dir if base.gitlinks.contains(&key) => out.push((rel, true)),
                 Kind::Dir => {
-                    let holds_tracked = base.dirs.contains(&rel);
+                    let holds_tracked = base.dirs.contains(&key);
                     if is_ignored && !holds_tracked {
                         continue;
                     }
@@ -847,13 +869,22 @@ async fn walk_clone(
     Ok(out)
 }
 
+/// How long one `git check-ignore` may take (write, read and wait).
+pub const CHECK_IGNORE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The paths among `paths` that the ignore files in `rules` exclude
 /// (`git check-ignore --no-index --stdin -z`, pinned git, trusted
 /// configuration, no global excludes file). Directories exist in `rules` as
 /// empty directories so that directory-only patterns apply. Input is
 /// written and output read concurrently; the output is capped by the input
 /// size.
-async fn check_ignore(mirror: &Path, rules: &Path, paths: &[&[u8]]) -> Result<std::collections::HashSet<Vec<u8>>> {
+pub async fn check_ignore(
+    mirror: &Path,
+    rules: &Path,
+    paths: &[&[u8]],
+    ignore_case: bool,
+    timeout: Duration,
+) -> Result<std::collections::HashSet<Vec<u8>>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     if paths.is_empty() {
         return Ok(Default::default());
@@ -862,38 +893,65 @@ async fn check_ignore(mirror: &Path, rules: &Path, paths: &[&[u8]]) -> Result<st
     let cap = input.len() + 4096;
     let mut cmd = git_command(
         mirror,
-        &[format!("--git-dir={}", mirror.display()), format!("--work-tree={}", rules.display())],
+        &[
+            format!("--git-dir={}", mirror.display()),
+            format!("--work-tree={}", rules.display()),
+            "-c".into(),
+            format!("core.ignoreCase={ignore_case}"),
+        ],
         &["check-ignore", "--no-index", "--stdin", "-z"],
         &[],
     )?;
     cmd.current_dir(rules).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().context("running git check-ignore")?;
     let mut stdin = child.stdin.take().context("no stdin")?;
-    let writer = tokio::spawn(async move {
-        let r = stdin.write_all(&input).await;
-        drop(stdin);
-        r
-    });
     let mut stdout = child.stdout.take().context("no stdout")?;
-    let mut buf = Vec::new();
-    let mut chunk = vec![0u8; 1 << 16];
-    loop {
-        let n = stdout.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > cap {
+    let mut stderr = child.stderr.take().context("no stderr")?;
+    let exchange = async {
+        let writer = async {
+            let r = stdin.write_all(&input).await;
+            drop(stdin);
+            r
+        };
+        let reader = async {
+            let mut buf = Vec::new();
+            let mut chunk = vec![0u8; 1 << 16];
+            loop {
+                let n = stdout.read(&mut chunk).await?;
+                if n == 0 {
+                    return Ok::<Option<Vec<u8>>, std::io::Error>(Some(buf));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > cap {
+                    return Ok(None);
+                }
+            }
+        };
+        let mut err = Vec::new();
+        let (w, r, _) = tokio::join!(writer, reader, stderr.read_to_end(&mut err));
+        let _ = w;
+        let status = child.wait().await?;
+        Ok::<_, anyhow::Error>((r?, status, err))
+    };
+    let (buf, status, err) = match tokio::time::timeout(timeout, exchange).await {
+        Ok(r) => r?,
+        Err(_) => {
+            // The exchange (which borrowed the child) is dropped: kill and
+            // reap the process.
             let _ = child.kill().await;
-            bail!("git check-ignore printed more than it was given");
+            return Err(anyhow::Error::new(ImportRefused(format!(
+                "deciding which files are ignored took longer than {} s; nothing was imported",
+                timeout.as_secs()
+            ))));
         }
-    }
-    let _ = writer.await;
-    let out = child.wait_with_output().await?;
+    };
+    let Some(buf) = buf else {
+        bail!("git check-ignore printed more than it was given");
+    };
     // Exit 1: no path is ignored.
-    match out.status.code() {
+    match status.code() {
         Some(0) | Some(1) => {}
-        _ => bail!("git check-ignore failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        _ => bail!("git check-ignore failed: {}", String::from_utf8_lossy(&err).trim()),
     }
     Ok(buf.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| p.to_vec()).collect())
 }
@@ -1242,7 +1300,7 @@ mod tests {
         (d, root, remote)
     }
 
-    const LIMITS: ImportLimits = ImportLimits { max_files: 1000, max_file_bytes: 1 << 20, max_total_bytes: 8 << 20, max_ignore_bytes: 1 << 16 };
+    const LIMITS: ImportLimits = ImportLimits { max_files: 1000, max_file_bytes: 1 << 20, max_total_bytes: 8 << 20, max_ignore_bytes: 1 << 16, max_entries: 100_000 };
 
     fn object_files(mirror: &Path) -> usize {
         walk_files(&mirror.join("objects")).unwrap().len()
@@ -1499,6 +1557,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn letter_case_follows_the_clone_file_system_like_git() {
+        let (_d, root, remote) = fixture();
+        let seed = root.join("seed");
+        sh(&seed, "printf 'secrets/\\n*.tmp\\n' > .gitignore && git add .gitignore && git commit -qm rules && git push -q origin HEAD:main");
+        let work = root.join("work");
+        let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
+        let wt = worktree_path(&work, "acme/widget", 14);
+        let (base, _) = prepare_clone(&mirror, &wt, "main", 14, Some("nucleus/item-14")).await.unwrap();
+        let folds = crate::intake::snapshot::fs_ignores_case(&root).unwrap();
+        sh(
+            &wt,
+            "mkdir -p Secrets sub && echo t > Secrets/token && echo x > A.TMP && printf '*.bak\\n' > sub/.GitIgnore \
+             && echo b > sub/x.bak && echo k > sub/keep.txt",
+        );
+        // git's own view in the clone (its core.ignorecase was set by the
+        // clone for this file system).
+        let git_view = std::process::Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        let mut expected: Vec<String> = String::from_utf8_lossy(&git_view.stdout).lines().map(str::to_string).collect();
+        expected.sort();
+        let sha = import(&mirror, &remote, &wt, &base, 14, &spec(), &LIMITS).await.unwrap().unwrap();
+        let mut changed = changed_files(&mirror, &base, &sha).await.unwrap();
+        changed.sort();
+        assert_eq!(changed, expected, "the same files git would add on this file system (case-insensitive: {folds})");
+        if folds {
+            assert!(!changed.iter().any(|c| c.starts_with("Secrets/") || c.ends_with(".bak")), "{changed:?}");
+            // A `.GIT` directory is a repository on this file system.
+            sh(&wt, "mkdir -p nested/.GIT && echo n > nested/file");
+            let e = import(&mirror, &remote, &wt, &base, 14, &spec(), &LIMITS).await.unwrap_err();
+            assert!(format!("{e:#}").contains("nested repository at nested"), "{e:#}");
+            std::fs::remove_dir_all(wt.join("nested")).unwrap();
+        }
+        // A case variant of .gitmodules is refused on any file system.
+        std::fs::write(wt.join(".GitModules"), "x").unwrap();
+        let e = import(&mirror, &remote, &wt, &base, 14, &spec(), &LIMITS).await.unwrap_err();
+        assert!(format!("{e:#}").contains("case variant of .gitmodules"), "{e:#}");
+    }
+
+    #[tokio::test]
     async fn gitmodules_must_stay_as_in_the_base() {
         let (_d, root, remote) = fixture();
         let seed = root.join("seed");
@@ -1552,8 +1652,10 @@ mod tests {
         let seed = root.join("seed");
         // Listing keeps bytes whatever the file system allows.
         let listed = b"100644 blob 0123\ta.txt\x00100644 blob 4567\tdir/caf\xe9.txt\x00";
-        let t = BaseTree::parse(listed);
+        let t = BaseTree::parse(listed, false);
         assert!(t.tracked.contains(&b"dir/caf\xe9.txt"[..]) && t.dirs.contains(&b"dir"[..]));
+        let folded = BaseTree::parse(b"100644 blob 0\tDocs/README.md\x00", true);
+        assert!(folded.tracked.contains(&folded.key(b"docs/readme.MD")) && folded.dirs.contains(&folded.key(b"DOCS")));
         assert_eq!(crate::intake::snapshot::dest_of(Path::new("/s"), b"caf\xe9.txt").as_os_str().as_bytes(), b"/s/caf\xe9.txt");
         let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
         if let Err(e) = std::fs::write(seed.join(name), "latin-1 name\n") {

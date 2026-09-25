@@ -234,6 +234,7 @@ max_runtime_hours = 12
 # import_max_file_bytes = 10485760     # 10 MiB
 # import_max_total_bytes = 209715200   # 200 MiB
 # import_max_ignore_bytes = 1048576    # 1 MiB per .gitignore (a private copy decides what is ignored)
+# import_max_entries = 1000000         # directory entries the walk reads, counted as read
 # # Largest diff the secret guard reads; a longer diff blocks the item.
 # scan_max_bytes = 16777216            # 16 MiB
 #

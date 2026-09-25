@@ -1448,6 +1448,7 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
                 max_file_bytes: ctx.cfg.import_max_file_bytes,
                 max_total_bytes: ctx.cfg.import_max_total_bytes,
                 max_ignore_bytes: ctx.cfg.import_max_ignore_bytes,
+                max_entries: ctx.cfg.import_max_entries,
             };
             let imported = match git::import(&mirror, &remote, &wt, &base_sha, item.id, &spec, &limits).await {
                 Ok(i) => i,

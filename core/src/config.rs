@@ -664,6 +664,9 @@ pub struct IntakeConfig {
     /// untracked files are ignored; counted toward the total.
     #[serde(default = "default_intake_import_max_ignore_bytes")]
     pub import_max_ignore_bytes: u64,
+    /// Most directory entries the import walk reads (counted as read).
+    #[serde(default = "default_intake_import_max_entries")]
+    pub import_max_entries: usize,
     /// Largest diff the secret guard reads; a longer diff blocks the item
     /// (it is never cut and passed).
     #[serde(default = "default_intake_scan_max_bytes")]
@@ -849,6 +852,9 @@ fn default_intake_import_max_total_bytes() -> u64 {
 fn default_intake_import_max_ignore_bytes() -> u64 {
     1024 * 1024
 }
+fn default_intake_import_max_entries() -> usize {
+    1_000_000
+}
 fn default_intake_scan_max_bytes() -> usize {
     16 * 1024 * 1024
 }
@@ -891,6 +897,7 @@ impl Default for IntakeConfig {
             import_max_file_bytes: default_intake_import_max_file_bytes(),
             import_max_total_bytes: default_intake_import_max_total_bytes(),
             import_max_ignore_bytes: default_intake_import_max_ignore_bytes(),
+            import_max_entries: default_intake_import_max_entries(),
             scan_max_bytes: default_intake_scan_max_bytes(),
             repos: vec![],
             github: IntakeGithubConfig::default(),

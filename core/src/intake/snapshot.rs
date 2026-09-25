@@ -69,7 +69,7 @@ fn open_dir(parent: &OwnedFd, name: &[u8]) -> rustix::io::Result<OwnedFd> {
 pub fn copy_path(root: &OwnedFd, rel: &[u8], dest_root: &Path, limits: &ImportLimits, budget: &mut Budget, gitlink_dir: bool) -> Result<()> {
     let parts: Vec<&[u8]> = rel.split(|b| *b == b'/').filter(|p| !p.is_empty()).collect();
     let Some((leaf, dirs)) = parts.split_last() else { return Ok(()) };
-    if parts.iter().any(|p| *p == b"." || *p == b".." || *p == b".git") {
+    if parts.iter().any(|p| *p == b"." || *p == b".." || is_dot_git(p)) {
         refuse!("{} is not a path Nucleus imports; nothing was imported", show(rel));
     }
     let mut cur = open_dir(root, b".").context("opening the clone")?;
@@ -185,24 +185,35 @@ pub enum Kind {
     Special,
 }
 
-/// A directory's entries (name bytes, kind) and whether it holds `.git`.
-pub type Entries = (Vec<(Vec<u8>, Kind)>, bool);
+/// The entry budget of one walk: every directory entry read counts,
+/// checked as it is read.
+pub struct EntryBudget {
+    pub seen: usize,
+    pub max: usize,
+}
 
-/// The entries of directory `dir` (names as bytes; `.`, `..` and `.git`
-/// left out), each with its type from `statat` without following symlinks,
-/// and whether the directory holds a `.git` entry (a repository).
-pub fn read_entries(dir: &OwnedFd) -> Result<Entries> {
+/// True when `name` is `.git`, in any letter case: git never reads or
+/// stores such a path, and on a case-insensitive file system `.GIT` is the
+/// same directory.
+pub fn is_dot_git(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b".git")
+}
+
+/// The entries of directory `dir` (names as bytes; `.`, `..` and any
+/// `.git` case variant left out), each with its type from `statat` without
+/// following symlinks. Every entry read is counted in `budget` before it is
+/// stat-ed or kept; at the limit the walk stops and the import is refused.
+pub fn read_entries(dir: &OwnedFd, budget: &mut EntryBudget) -> Result<Vec<(Vec<u8>, Kind)>> {
     let mut out = Vec::new();
-    let mut has_git = false;
     let mut d = rustix::fs::Dir::read_from(dir)?;
     while let Some(e) = d.read() {
         let e = e?;
-        let name = e.file_name().to_bytes().to_vec();
-        if name == b"." || name == b".." {
-            continue;
+        budget.seen += 1;
+        if budget.seen > budget.max {
+            refuse!("the clone has more than {} entries on disk; nothing was imported", budget.max);
         }
-        if name == b".git" {
-            has_git = true;
+        let name = e.file_name().to_bytes().to_vec();
+        if name == b"." || name == b".." || is_dot_git(&name) {
             continue;
         }
         let st = match rustix::fs::statat(dir, OsStr::from_bytes(&name), AtFlags::SYMLINK_NOFOLLOW) {
@@ -218,7 +229,25 @@ pub fn read_entries(dir: &OwnedFd) -> Result<Entries> {
         };
         out.push((name, kind));
     }
-    Ok((out, has_git))
+    Ok(out)
+}
+
+/// True when directory `dir` holds a `.git` entry (a repository), by a
+/// direct no-follow `statat` (on a case-insensitive file system this also
+/// finds `.GIT`).
+pub fn holds_repo(dir: &OwnedFd) -> bool {
+    rustix::fs::statat(dir, ".git", AtFlags::SYMLINK_NOFOLLOW).is_ok()
+}
+
+/// Whether the file system of `dir` (a private directory Nucleus owns,
+/// on the same file system as the clone) folds letter case: a probe file is
+/// created and looked up under another case.
+pub fn fs_ignores_case(dir: &Path) -> Result<bool> {
+    let probe = dir.join("CaseProbe");
+    std::fs::write(&probe, b"")?;
+    let folded = std::fs::symlink_metadata(dir.join("caseprobe")).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    Ok(folded)
 }
 
 /// Copy the ignore file `name` of directory `dir` (at `rel` in the clone)
@@ -276,6 +305,22 @@ mod tests {
     }
 
     #[test]
+    fn the_entry_budget_stops_the_iterator_at_the_limit() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            std::fs::write(d.path().join(format!("f{i}")), "").unwrap();
+        }
+        let root = open_root(d.path()).unwrap();
+        let mut b = EntryBudget { seen: 0, max: 5 };
+        let e = read_entries(&root, &mut b).unwrap_err();
+        assert!(e.downcast_ref::<ImportRefused>().unwrap().0.contains("more than 5 entries"));
+        assert_eq!(b.seen, 6, "the iterator stopped right after the limit");
+        let mut b = EntryBudget { seen: 0, max: 100 };
+        assert_eq!(read_entries(&root, &mut b).unwrap().len(), 20);
+        assert!(is_dot_git(b".GIT") && is_dot_git(b".git") && !is_dot_git(b".github"));
+    }
+
+    #[test]
     fn symlink_targets_count_against_the_limits() {
         let d = tempfile::tempdir().unwrap();
         let clone = d.path().join("clone");
@@ -286,7 +331,7 @@ mod tests {
         std::os::unix::fs::symlink(&long, clone.join("long")).unwrap();
         std::os::unix::fs::symlink("short", clone.join("short")).unwrap();
         let root = open_root(&clone).unwrap();
-        let limits = ImportLimits { max_files: 10, max_file_bytes: 500, max_total_bytes: 1000, max_ignore_bytes: 100 };
+        let limits = ImportLimits { max_files: 10, max_file_bytes: 500, max_total_bytes: 1000, max_ignore_bytes: 100, max_entries: 1000 };
         let mut b = Budget { files: 0, bytes: 0 };
         let e = copy_path(&root, b"long", &snap, &limits, &mut b, false).unwrap_err();
         assert!(e.downcast_ref::<ImportRefused>().unwrap().0.contains("longer than the per-file limit"));
