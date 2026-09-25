@@ -70,6 +70,7 @@ import { makeVaultManifestHook } from "./docstore_vault.js";
 import { transcribe } from "./transcribe.js";
 import { GroupAllowlist, resolveTarget } from "./target_policy.js";
 import { handleBrainDump, sweepExpiredPlans, type BraindumpDeps } from "./braindump_flow.js";
+import { GroupExecutor, IntakeStore, routeDm, stripGroupMarker } from "./intake.js";
 import { planCapture, applyPlan, interpretResponse, BRAINDUMP_TMUX_SESSION } from "./braindump.js";
 
 // Every tmux session this process spawns claude windows into. Defined once
@@ -116,7 +117,7 @@ const baileysLogger = pino({ level: "silent" });
  * until populated. Held in module scope so the message handler can read it
  * without plumbing through args.
  */
-type ChatRole = "whatsapp-group" | "braindump" | "dm";
+type ChatRole = "whatsapp-group" | "braindump" | "intake" | "dm";
 let groupAllowlist: GroupAllowlist | null = null;
 
 /** JID-shape discriminator (ADR-005b). Groups end `@g.us`; DMs end
@@ -219,6 +220,22 @@ The operator asks about tasks in plain language; you pick the command:
 - ./target/release/nucleus tasks output <id> — the result, or the latest progress while it runs
 - ./target/release/nucleus tasks cancel <id> — stop a task`;
 
+/** ADR-036: issue-pipeline items, DM only. */
+const INTAKE_CAPABILITY_PROMPT = `## Issue pipeline items (ADR-036)
+
+Issues labeled for Nucleus become pipeline items (#1, #2, …): an eval, a plan discussion with the operator for complex ones, an implementation in a worktree, a draft pull request. Each item has its own thread: a WhatsApp group for items that needed a plan, or messages marked "[#n]" in this DM. Those threads go to the pipeline, not to you.
+
+When the operator asks about items in plain language, read them:
+- ./target/release/nucleus intake list — open items (add --all for closed ones)
+- ./target/release/nucleus intake show <n> — stage, eval, plan, thread, pull request
+- ./target/release/nucleus intake cancel <n> — stop an item, only when the operator asks
+
+You cannot approve plans or comments and cannot write in an item's thread: the operator approves by replying "#n approve" (or "#n approve comment") in the item's thread, or on the dashboard's Intake page. Tell the operator that when it applies.`;
+
+/** ADR-036: the intake commands the DM session may run (the CLI refuses the
+ *  others for a chat session). */
+const INTAKE_TOOL_ALLOWLIST = ["list", "show", "cancel"].map((c) => `Bash(./target/release/nucleus intake ${c}:*)`);
+
 /** Bash patterns the DM pool pre-approves for background tasks: the five
  *  chat commands only. `tasks run` and `tasks sweep` are internal (and the
  *  CLI refuses them from a chat session anyway). */
@@ -281,6 +298,9 @@ async function main() {
   }
 
   const store = new ChatSessionStore(config.dbPath);
+  // ADR-036: issue-pipeline groups and operator replies to items (after
+  // ChatSessionStore, which creates outbound_queue).
+  const intakeStore = new IntakeStore(config.dbPath);
   // Note: pending_classifications schema still lives in ChatSessionStore's
   // CREATE block (kept for forward-compat); the multi-op braindump pipeline
   // doesn't use it — corrections happen via follow-up captures + move ops
@@ -409,10 +429,10 @@ async function main() {
         taskScope: true,
         workspaceRoot: config.workspaceRoot,
         tmuxSession: DM_TMUX_SESSION,
-        appendSystemPrompt: `${config.appendSystemPromptDm}\n\n${TURNS_CAPABILITY_PROMPT}\n\n${DOCS_CAPABILITY_PROMPT}\n\n${TASKS_CAPABILITY_PROMPT}`,
+        appendSystemPrompt: `${config.appendSystemPromptDm}\n\n${TURNS_CAPABILITY_PROMPT}\n\n${DOCS_CAPABILITY_PROMPT}\n\n${TASKS_CAPABILITY_PROMPT}\n\n${INTAKE_CAPABILITY_PROMPT}`,
         permissionMode: config.permissionMode,
         disallowedTools: config.disallowedTools,
-        allowedTools: [...DOC_TOOL_ALLOWLIST, ...TASKS_TOOL_ALLOWLIST],
+        allowedTools: [...DOC_TOOL_ALLOWLIST, ...TASKS_TOOL_ALLOWLIST, ...INTAKE_TOOL_ALLOWLIST],
         agentLabel: "whatsapp",
         idleTimeoutMs: 4 * 60 * 60 * 1000,
         reviewNudgeInterval: config.skillNudgeInterval,
@@ -496,8 +516,41 @@ async function main() {
     },
   });
 
+  // ADR-036: create and leave issue-pipeline groups on the live connection.
+  // A created group contains the bot and the operator only (Baileys
+  // groupCreate adds the creator itself; the operator is the one
+  // participant passed).
+  const groupExecutor = new GroupExecutor({
+    store: intakeStore,
+    config: config.intake,
+    api: {
+      create: async (subject, participants) => {
+        const sock = liveSock;
+        if (!sock) throw new Error("no live connection");
+        const meta = await withTimeout(sock.groupCreate(subject, participants), 30_000);
+        return { jid: meta.id, members: (meta.participants ?? []).map((p: { id: string }) => p.id) };
+      },
+      leave: async (jid) => {
+        const sock = liveSock;
+        if (!sock) throw new Error("no live connection");
+        await withTimeout(sock.groupLeave(jid), 30_000);
+      },
+    },
+    operatorJid: () => {
+      const first = config.allowedDmSenders.values().next();
+      return first.done ? null : `${first.value}@s.whatsapp.net`;
+    },
+    onActive: (jid) => groupAllowlist?.addIntake([jid]),
+    onClosed: (jid) => groupAllowlist?.removeIntake(jid),
+    log: { info: (o, m) => log.info(o, m), warn: (o, m) => log.warn(o, m) },
+  });
+  setInterval(() => {
+    if (!liveSock || !groupAllowlist) return;
+    groupExecutor.tick().catch((e) => log.warn({ err: (e as Error).message }, "whatsapp: intake group executor failed"));
+  }, 5_000);
+
   const inbound = new InboundGate(turnStore);
-  await connect({ config, store, engine, outbound, plansStore, docStore, jobStore, turnStore, inbound, drain });
+  await connect({ config, store, engine, outbound, plansStore, docStore, jobStore, turnStore, inbound, drain, intakeStore });
 }
 
 /** Everything the connection and the message handlers use. */
@@ -513,6 +566,8 @@ interface Bot {
   /** ADR-033 inbound dedup: received → handled per WhatsApp message. */
   inbound: InboundGate;
   drain: OutboundDrain;
+  /** ADR-036: issue-pipeline groups and operator replies to items. */
+  intakeStore: IntakeStore;
 }
 
 /** Run a `nucleus` subcommand detached, best-effort (no-op when the binary
@@ -642,7 +697,7 @@ async function connect(bot: Bot): Promise<void> {
       // Resolve the allowlist asynchronously so handler is ready before any
       // unexpected event fires. Then start the outbound drain — the
       // drainer needs the allowlist to authorize each target.
-      resolveAllowlist(sock, config)
+      resolveAllowlist(sock, config, bot.intakeStore.activeGroups().map((g) => g.jid))
         .then(() => {
           startOutboundDrain(drain);
           startPlanExpirySweep(braindumpDeps(sock, bot));
@@ -742,9 +797,10 @@ async function connect(bot: Bot): Promise<void> {
   });
 }
 
-async function resolveAllowlist(sock: WASocket, config: Config): Promise<void> {
+async function resolveAllowlist(sock: WASocket, config: Config, intakeJids: string[]): Promise<void> {
   // Configured JIDs apply at once; configured names need the group list.
-  groupAllowlist = new GroupAllowlist(config);
+  // ADR-036: the issue-pipeline groups the bot created and has not left.
+  groupAllowlist = new GroupAllowlist(config).addIntake(intakeJids);
   const requested = config.allowedGroupNames.length + config.brainDumpGroupNames.length;
   if (requested === 0) {
     log.info({ allowedJids: Object.fromEntries(groupAllowlist.roles) }, "whatsapp: allowlist resolved (no group lookups needed)");
@@ -755,7 +811,7 @@ async function resolveAllowlist(sock: WASocket, config: Config): Promise<void> {
     groupAllowlist = new GroupAllowlist(
       config,
       Object.entries(groups).map(([jid, meta]) => ({ jid, subject: meta?.subject ?? "" })),
-    );
+    ).addIntake(intakeJids);
     log.info(
       {
         requestedGroup: config.allowedGroupNames,
@@ -870,7 +926,11 @@ async function handleMessage(sock: WASocket, msg: WAMessage, bot: Bot): Promise<
     //     anyone who creates a group with the same name as one of yours and
     //     adds the bot could spam it.
     const participant = msg.key.participant ?? "";
-    const senderOk = await isSenderAllowed(sock, participant, config.allowedSenders);
+    // ADR-036: an issue-pipeline group has the bot and the operator only;
+    // the operator is recognized by the DM allowlist too.
+    const senders =
+      role === "intake" ? new Set([...config.allowedSenders, ...config.allowedDmSenders]) : config.allowedSenders;
+    const senderOk = await isSenderAllowed(sock, participant, senders);
     if (!senderOk) {
       log.warn(
         { chatId, participant },
@@ -948,6 +1008,16 @@ async function dispatchInbound(
 ): Promise<void> {
   const { config, engine, plansStore, docStore, jobStore, outbound } = bot;
 
+  // ADR-036: every message in an issue-pipeline group belongs to its item.
+  if (role === "intake") {
+    const itemKey = bot.intakeStore.itemForGroup(chatId);
+    if (!itemKey) return;
+    const text = await messageText(sock, msg, chatId, outbound);
+    if (text === null) return;
+    routeToItem(bot, itemKey, chatId, msg, stripGroupMarker(text, itemKey));
+    return;
+  }
+
   // ADR-018: inbound media (images/documents) intercepts BEFORE the
   // braindump dispatch — media archives to the document library in every
   // role; only the DM role additionally gets the act-on-this path.
@@ -1011,6 +1081,19 @@ async function dispatchInbound(
 
   if (!text.trim()) return;
 
+  // ADR-036: a DM message for an issue-pipeline item (it starts with the
+  // item's #n marker, or it replies to a message the pipeline sent for the
+  // item) goes to the item's thread, not to the chat session.
+  if (role === "dm") {
+    const quoted = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? null;
+    const quotedItem = quoted ? bot.intakeStore.itemForSentMessage(quoted) : null;
+    const routed = routeDm(text, quotedItem, (n) => bot.intakeStore.hasDmThread(n));
+    if (routed) {
+      routeToItem(bot, routed.item, chatId, msg, routed.text);
+      return;
+    }
+  }
+
   log.info({ chatId, role, kind: inputKind, len: text.length }, "whatsapp: processing message");
 
   // Brain-dump capture is structurally group-only: a JID only carries the
@@ -1030,6 +1113,52 @@ async function dispatchInbound(
     quotedJson,
   });
   log.info({ chatId, ref, duplicate }, "whatsapp: message handed to the turn engine");
+}
+
+/** ADR-036: the text of a message for an issue-pipeline item — the text or
+ *  caption, or a voice memo's transcription. Null when there is none (a
+ *  transcription failure is noted in the chat). */
+async function messageText(
+  sock: WASocket,
+  msg: WAMessage,
+  chatId: string,
+  outbound: OutboundQueueStore,
+): Promise<string | null> {
+  if (msg.message?.audioMessage) {
+    try {
+      const buffer = (await downloadMediaMessage(msg, "buffer", {}, {
+        logger: baileysLogger as any,
+        reuploadRequest: sock.updateMediaMessage,
+      })) as Buffer;
+      const t = (await transcribe(buffer)).text.trim();
+      return t || null;
+    } catch (e) {
+      outbound.enqueue({
+        target: chatId,
+        source: "chat-note",
+        body: formatReply(fill(texts.transcriptionFailed, { error: (e as Error).message })),
+        dedupKey: msg.key.id ? `${msg.key.id}:transcription-failed` : null,
+      });
+      return null;
+    }
+  }
+  const t = extractText(msg).trim();
+  return t || null;
+}
+
+/** ADR-036: hand an operator message to the issue pipeline. The row in
+ *  `intake_inbound` is the durable hand-off; the tick reads it (and runs
+ *  at once here, and every minute from launchd). */
+function routeToItem(bot: Bot, itemKey: string, chatId: string, msg: WAMessage, text: string): void {
+  if (!text) return;
+  const fresh = bot.intakeStore.recordInbound({
+    itemKey,
+    chatId,
+    waMsgId: msg.key.id ?? `${Date.now()}`,
+    text,
+  });
+  log.info({ chatId, item: itemKey, fresh }, "whatsapp: message routed to an issue-pipeline item");
+  if (fresh) runNucleus(bot.config, ["intake", "tick"]);
 }
 
 /** ADR-018 inbound media (inbound_media_flow.ts), bound to the bot. */
