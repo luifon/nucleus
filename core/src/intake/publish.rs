@@ -93,8 +93,23 @@ async fn run_script(ws: &Path, text: &str) -> Result<Vec<String>> {
     if !script.is_file() {
         anyhow::bail!("tools/check-secrets.sh is missing");
     }
+    // The script calls git: a private PATH entry makes that the pinned git
+    // (checked right before the script starts).
+    let git = super::tools::git_pin()?;
+    git.verify().map_err(|why| anyhow::Error::new(super::tools::ToolChanged(why)))?;
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let bin = Dir(std::env::temp_dir().join(format!("nucleus-guard-{}", uuid::Uuid::new_v4().simple())));
+    std::fs::create_dir(&bin.0).context("creating a private bin directory")?;
+    std::os::unix::fs::symlink(&git.path, bin.0.join("git"))?;
+    let path = format!("{}:{}", bin.0.display(), std::env::var("PATH").unwrap_or_default());
     let mut child = tokio::process::Command::new("bash")
         .arg(&script)
+        .env("PATH", path)
         .current_dir(ws)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
