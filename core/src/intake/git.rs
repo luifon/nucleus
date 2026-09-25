@@ -952,30 +952,93 @@ pub struct TestRun {
     pub output: String,
 }
 
+/// Most bytes of test output kept in memory: the tail (stdout and stderr
+/// interleaved as they arrive). Older output is dropped while reading.
+pub const TEST_OUTPUT_TAIL_BYTES: usize = 256 * 1024;
+
+/// Keep the last `cap` bytes appended to it.
+struct Tail {
+    buf: std::collections::VecDeque<u8>,
+    cap: usize,
+}
+
+impl Tail {
+    fn push(&mut self, data: &[u8]) {
+        let data = if data.len() > self.cap { &data[data.len() - self.cap..] } else { data };
+        let over = (self.buf.len() + data.len()).saturating_sub(self.cap);
+        self.buf.drain(..over);
+        self.buf.extend(data);
+    }
+}
+
 /// Run the repo's test command in the clone (`sh -c`), with a time limit.
 /// The command comes from the operator's configuration, never from an
-/// agent.
+/// agent. It runs in its own process group; stdout and stderr are drained
+/// at once into a buffer that keeps the last [`TEST_OUTPUT_TAIL_BYTES`];
+/// on timeout the whole group is killed and the shell reaped.
 pub async fn run_tests(wt: &Path, command: Option<&str>, timeout: Duration) -> Result<TestRun> {
+    use tokio::io::AsyncReadExt;
     let Some(command) = command.filter(|c| !c.trim().is_empty()) else {
         return Ok(TestRun { status: "not_run", output: String::new() });
     };
     let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c").arg(command).current_dir(wt).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(wt)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
     for var in crate::proc_tree::SESSION_VARS {
         cmd.env_remove(var);
     }
-    let out = match tokio::time::timeout(timeout, cmd.output()).await {
-        Err(_) => return Ok(TestRun { status: "timeout", output: format!("stopped after {} s", timeout.as_secs()) }),
-        Ok(o) => o.context("running the test command")?,
+    let mut child = cmd.spawn().context("running the test command")?;
+    let pgid = child.id().map(|p| p as i32);
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(Tail { buf: Default::default(), cap: TEST_OUTPUT_TAIL_BYTES }));
+    let mut readers = Vec::new();
+    let out: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(child.stdout.take().context("no stdout")?);
+    let err: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(child.stderr.take().context("no stderr")?);
+    for mut r in [out, err] {
+        let tail = tail.clone();
+        readers.push(tokio::spawn(async move {
+            let mut chunk = vec![0u8; 1 << 16];
+            while let Ok(n) = r.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                tail.lock().unwrap().push(&chunk[..n]);
+            }
+        }));
+    }
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(s) => Some(s.context("waiting for the test command")?),
+        Err(_) => {
+            if let Some(g) = pgid {
+                // SAFETY: killpg only sends a signal to the group this
+                // function created.
+                unsafe {
+                    libc::killpg(g, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            None
+        }
     };
-    let mut all = String::from_utf8_lossy(&out.stdout).into_owned();
-    all.push_str(&String::from_utf8_lossy(&out.stderr));
-    let tail: String = {
-        let chars: Vec<char> = all.chars().collect();
-        let start = chars.len().saturating_sub(4_000);
-        chars[start..].iter().collect()
-    };
-    Ok(TestRun { status: if out.status.success() { "passed" } else { "failed" }, output: tail })
+    // Readers end when every writer in the group is gone; a stray process
+    // that keeps a pipe open cannot hold the tick for long.
+    for r in readers {
+        let _ = tokio::time::timeout(Duration::from_secs(5), r).await;
+    }
+    let bytes: Vec<u8> = tail.lock().unwrap().buf.iter().copied().collect();
+    let text = String::from_utf8_lossy(&bytes);
+    let chars: Vec<char> = text.chars().collect();
+    let kept: String = chars[chars.len().saturating_sub(4_000)..].iter().collect();
+    Ok(match status {
+        None => TestRun { status: "timeout", output: format!("stopped after {} s\n{kept}", timeout.as_secs()) },
+        Some(s) => TestRun { status: if s.success() { "passed" } else { "failed" }, output: kept },
+    })
 }
 
 #[cfg(test)]
@@ -1315,6 +1378,28 @@ mod tests {
         assert_eq!((r.status, r.output.trim()), ("failed", "bad"));
         let r = run_tests(d.path(), Some("sleep 5"), Duration::from_millis(200)).await.unwrap();
         assert_eq!(r.status, "timeout");
+        // Endless output: stopped at the timeout, the tail kept, memory
+        // bounded by the tail buffer.
+        let started = std::time::Instant::now();
+        let r = run_tests(d.path(), Some("while :; do echo endless-line; done"), Duration::from_millis(800)).await.unwrap();
+        assert_eq!(r.status, "timeout");
+        assert!(r.output.contains("endless-line") && r.output.len() < 5_000, "{}", r.output.len());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // The whole process group is killed, not only the shell.
+        let pidfile = d.path().join("pid");
+        let r = run_tests(d.path(), Some(&format!("sleep 30 & echo $! > {}; wait", pidfile.display())), Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(r.status, "timeout");
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the background sleep was killed with its group");
+        let mut t = Tail { buf: Default::default(), cap: 8 };
+        t.push(b"0123456789");
+        t.push(b"ab");
+        assert_eq!(t.buf.iter().copied().collect::<Vec<_>>(), b"456789ab");
         assert_eq!(run_tests(d.path(), None, Duration::from_secs(1)).await.unwrap().status, "not_run");
     }
 
