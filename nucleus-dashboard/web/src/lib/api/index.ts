@@ -14,3 +14,4 @@ export * from "./vault";
 export * from "./chat";
 export * from "./dashboard";
 export * from "./tasks";
+export * from "./intake";

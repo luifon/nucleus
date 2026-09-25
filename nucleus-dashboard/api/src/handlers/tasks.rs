@@ -138,19 +138,29 @@ async fn detail(
 /// neither (curl on the tailnet) is not a browser request and carries no
 /// ambient credentials to abuse.
 fn require_same_origin(headers: &HeaderMap) -> Result<(), TasksError> {
+    match cross_site_reason(headers) {
+        Some(why) => Err(TasksError::Forbidden(why)),
+        None => Ok(()),
+    }
+}
+
+/// Why a request is cross-site, or `None` when it is not. Shared by every
+/// mutating dashboard route that follows the ADR-033 §7 threat model (the
+/// Tasks cancel, the Intake actions of ADR-036).
+pub(crate) fn cross_site_reason(headers: &HeaderMap) -> Option<String> {
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         if !matches!(site, "same-origin" | "none") {
-            return Err(TasksError::Forbidden(format!("cross-site request ({site})")));
+            return Some(format!("cross-site request ({site})"));
         }
     }
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         let origin_host = origin.split("://").nth(1).unwrap_or("");
         let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
         if origin_host.is_empty() || origin_host != host {
-            return Err(TasksError::Forbidden(format!("origin {origin} is not this dashboard")));
+            return Some(format!("origin {origin} is not this dashboard"));
         }
     }
-    Ok(())
+    None
 }
 
 async fn cancel(
