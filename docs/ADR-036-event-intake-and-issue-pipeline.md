@@ -1057,24 +1057,45 @@ Which checks read the tree and which read the text (fix round 2):
   character stream, so the emoji and joining rules apply to `&zwj;`
   exactly as to a literal ZWJ.
 
-**Character references (fix round 3).** GitHub decodes references in two
-places: CommonMark decodes the ones that end in `;` in Markdown text, and
-the browser decodes the rest of the HTML the sanitizer keeps, where `;` is
-optional for numeric and legacy references (`<div>ig&#8203nore</div>`
-shows `ignore` with a zero-width space). The hold decodes everywhere
-outside code with the browser's rules, which decode at least what either
-does (`hidden/charref.rs`, WHATWG HTML "character reference state"):
-numeric references with or without `;`, U+FFFD for 0, surrogates and
-values past U+10FFFF, the Windows-1252 mapping of 0x80–0x9F; every named
-reference of the WHATWG table (`hidden/entities.rs`, generated from
-`https://html.spec.whatwg.org/entities.json`, last modified 2025-11-12:
-2,231 names, 106 legacy names valid without `;`), by longest match; the
-attribute-value rule inside tags (a legacy name without `;` followed by
-`=` or a letter or digit stays text). A reference that produces two
-characters (`&caps;` is ∩ + VARIATION SELECTOR-1) gives two characters
-with the reference's range; the finding lists the hidden ones. In
-Markdown text, decoding a reference without `;` is stricter than GitHub
-(which shows it as text), so that case can only add a finding.
+**Character references (fix rounds 3 and 4).** GitHub decodes references
+in two places with different rules, and the hold decodes each range
+exactly as its renderer does. Decoding more than the renderer is not
+stricter: it changes the characters the exemptions look at (round 4: with
+`&copy` decoded in Markdown, `&copy&#xFE0F;` looked like the sequence
+©+VS16, while GitHub shows `&copy` as text and the VS16 after `y` is
+invisible).
+
+- **Markdown text** (outside code and outside the placed HTML nodes):
+  CommonMark decodes only references that end in `;` — `&#` and 1–7
+  digits, `&#x` and 1–6 hex digits, or a name of the table below — and
+  maps code point 0 and invalid ones to U+FFFD, with no Windows-1252
+  remapping (`&#128;` is the C1 control U+0080, flagged). A
+  backslash-escaped `&` stays text. An unescaped `*` may be an emphasis
+  delimiter the page does not show, so it stands in the character stream
+  as U+FFFC, which no exemption accepts as a neighbour.
+- **Raw HTML** (the placed HTML nodes): the browser's WHATWG rules
+  (`hidden/charref.rs`, "character reference state"): numeric references
+  with or without `;`, U+FFFD for 0, surrogates and values past U+10FFFF,
+  the Windows-1252 mapping of 0x80–0x9F; every named reference of the
+  WHATWG table (`hidden/entities.rs`, generated from
+  `https://html.spec.whatwg.org/entities.json`, last modified 2025-11-12:
+  2,231 names, 106 legacy names valid without `;`), by longest match; the
+  attribute-value rule inside tags (a legacy name without `;` followed by
+  `=` or a letter or digit stays text). `<div>ig&#8203nore</div>` shows
+  `ignore` with a zero-width space.
+- **An HTML node whose position is unknown**: which rule applies is not
+  known, so its source is read as Markdown with the rest of the text, and
+  its literal is read again with the WHATWG rules; a finding from either
+  counts, over the whole location.
+
+Only inline HTML tags are raw HTML: in `<span>&copy&#xFE0F;</span>` on a
+line of its own the text between the tags is Markdown text (a `<span>` does
+not start an HTML block), so `&copy` stays text and the VS16 is flagged; in
+an HTML block (`<div>…</div>`) it is decoded and not flagged. A reference
+that produces two characters (`&caps;` is ∩ + VARIATION SELECTOR-1) gives
+two characters with the reference's range; the finding lists the hidden
+ones. The exemptions that look at neighbours (variation sequences, RGI ZWJ
+sequences, joining scripts) all read this rendered stream.
 
 **Positions (fix round 3).** comrak reports shifted positions for the
 inline nodes of a paragraph that starts with a reference definition it
@@ -1084,6 +1105,11 @@ same leaf block (paragraph, heading, table cell) with the same kind and
 literal are matched in document order against their occurrences in the
 block's source, skipping placed code spans, backslash-escaped `<` and
 reference definitions, and multi-line literals are matched line by line.
+A reported position counts only when the node is there and the place is
+not inside a reference definition (or, for HTML, inside code that checked
+out); when any node of a leaf block fails, every node of that block goes
+through the matcher (round 4), so a wrong reported position that happens
+to hold the same literal inside a definition is never used.
 Only a one-to-one match places them. Otherwise nothing is guessed: a code
 span stays unmasked (its content is read), and an HTML node's findings say
 "position unknown" and cover the whole location. HTML blocks keep comrak's
@@ -1325,6 +1351,20 @@ rules (`character_references_follow_the_whatwg_rules`); a copy of a tag in
 a code span before the real one after a reference definition (the real
 one is reported) and a copy in a link destination (position unknown,
 whole location) (`shifted_html_is_placed_in_document_order_or_reported_unknown`).
+
+Fix round 4: each context decoded by its renderer — `&#8203` and
+`&#x200B` without `;` are text in Markdown and decoded in `<div>`,
+`&shy` is text in Markdown, decoded in HTML text and not in an attribute
+before `=`, `&#128;` is a C1 control in Markdown and the euro sign in HTML
+(`character_references_are_decoded_as_their_renderer_does`); in pairs,
+`&copy&#xFE0F;` flagged in Markdown and not in `<div>`, `*`+VS16 before
+emphasis flagged and `\*`+VS16 not, RGI ZWJ across emphasis delimiters
+or across a reference Markdown leaves as text flagged and in an HTML block
+not, a Persian ZWNJ across emphasis or next to a reference Markdown leaves
+as text flagged and in an HTML block not
+(`exemptions_see_the_characters_the_renderer_shows`); `[a]:
+<iframe>\nxxxxx<iframe>` never reports the definition
+(`a_reported_position_inside_a_definition_is_never_used`).
 
 ## Rejected alternatives
 

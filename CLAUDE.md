@@ -565,10 +565,12 @@ JSON-parsed numbers.
   never from hand-written rules; the source text is read only where the
   tree has no node (reference definitions, entities). Invisible characters
   are scanned on the raw text, code included, with character references
-  decoded into the same stream by the WHATWG rules (`hidden/charref.rs`,
-  the full named table, `;` optional where HTML allows it). A finding
-  moves the item to `held` (`[intake] hidden_content_hold`, default
-  true) with the complete findings and raw
+  decoded into the same stream exactly as each range's renderer does:
+  CommonMark in Markdown text (only references ending in `;`), the WHATWG
+  rules in raw HTML nodes (`hidden/charref.rs`, the full named table, the
+  attribute-value rule in tags), both for an HTML node of unknown
+  position. A finding moves the item to `held` (`[intake]
+  hidden_content_hold`, default true) with the complete findings and raw
   sources stored; no agent runs until the operator releases it or cancels
   it. Every release names the hold the operator reviewed (`nucleus intake
   release <n> --hold <code>` from the terminal, the dashboard's rendered
