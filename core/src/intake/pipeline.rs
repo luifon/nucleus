@@ -1548,6 +1548,35 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     let mirror = git::open_mirror(&work_dir(ctx)?, &item.repo, &remote).await?;
     let remote_default = git::remote_head(&mirror, &remote).await?;
     git::check_push_target(&branch, item.id, &remote_default)?;
+    // What the remote's item branch holds now: a push that happened before
+    // a crash (before pushed_sha was recorded) is recognized, not repeated.
+    let at_remote = git::remote_branch(&mirror, &remote, &branch).await?;
+    let mut already_pushed = false;
+    let mut lease = item.pushed_sha.clone();
+    match (&at_remote, &item.pushed_sha) {
+        (Some(r), _) if *r == sha => {
+            store::update(&ctx.db, item.id, Stage::Pr, vec![("pushed_sha", sha.clone().into())]).await?;
+            already_pushed = true;
+        }
+        (Some(r), None) => {
+            return block_because(
+                ctx,
+                item,
+                format!("the remote branch {branch} already exists at {r}, which Nucleus did not push; nothing was pushed"),
+            )
+            .await;
+        }
+        (Some(r), Some(p)) if r != p => {
+            return block_because(
+                ctx,
+                item,
+                format!("the remote branch {branch} moved to {r} after Nucleus pushed {p}; nothing was pushed"),
+            )
+            .await;
+        }
+        (None, Some(_)) => lease = None, // deleted at the remote: created again
+        _ => {}
+    }
     // The pull request text is built from code-owned fields; it, the
     // commit's author line and message, and every line the push would
     // publish pass the secret guard first.
@@ -1578,12 +1607,14 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     // Each write gets its own fresh read right before it (GitHub has no
     // write conditional on an issue revision; the last read is the
     // authorization point for that one write).
-    let _ = final_read!(ctx, item, "push", first);
-    if !tools_unchanged(ctx, item, "the push").await? {
-        return Ok(());
+    if !already_pushed {
+        let _ = final_read!(ctx, item, "push", first);
+        if !tools_unchanged(ctx, item, "the push").await? {
+            return Ok(());
+        }
+        git::push(&mirror, &remote, &sha, &branch, item.id, &remote_default, lease.as_deref()).await?;
+        store::update(&ctx.db, item.id, Stage::Pr, vec![("pushed_sha", sha.clone().into())]).await?;
     }
-    git::push(&mirror, &remote, &sha, &branch, item.id, &remote_default, item.pushed_sha.as_deref()).await?;
-    store::update(&ctx.db, item.id, Stage::Pr, vec![("pushed_sha", sha.clone().into())]).await?;
     let url = match github::find_pr(&*ctx.gh, &item.repo, &branch).await? {
         Some(u) => u,
         None => {

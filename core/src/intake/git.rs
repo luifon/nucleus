@@ -366,6 +366,23 @@ pub async fn remote_head(mirror: &Path, remote: &Remote) -> Result<String> {
         .context("cannot tell the remote's default branch")
 }
 
+/// The commit the remote's exact ref `refs/heads/<branch>` holds now
+/// (`ls-remote` against the configured URL), or `None` when it does not
+/// exist.
+pub async fn remote_branch(mirror: &Path, remote: &Remote, branch: &str) -> Result<Option<String>> {
+    check_branch_name(branch)?;
+    reset_mirror(mirror, remote).await?;
+    let want = format!("refs/heads/{branch}");
+    let out = mirror_git(mirror, &remote.credential_args()?, &["ls-remote", &remote.url, &want], &[]).await?;
+    if !out.ok {
+        bail!("reading {want} at the remote failed: {}", out.stderr);
+    }
+    Ok(out.stdout.lines().find_map(|l| {
+        let (sha, name) = l.split_once('\t')?;
+        (name == want).then(|| sha.trim().to_string())
+    }))
+}
+
 /// Create the item's clone again from the mirror, detached at `base_ref`.
 /// Used for the read-only eval and refinement agents, and again right
 /// before implementation so the work starts from the newest base. When the

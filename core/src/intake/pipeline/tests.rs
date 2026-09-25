@@ -1250,10 +1250,10 @@ async fn an_existing_branch_is_never_overwritten_by_the_first_push() {
     std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
     finish_current(&f, TaskStatus::Done, Some("done"), None).await;
     sh(&f.remote, "git branch nucleus/item-1 main");
-    let r = super::tick(&f.ctx, false).await.unwrap();
-    assert!(r.errors.iter().any(|e| e.contains("pushing nucleus/item-1 failed")), "{r:?}");
+    tick(&f).await;
     let it = item1(&f).await;
-    assert_eq!((it.stage(), it.pushed_sha.as_deref()), (Stage::Pr, None));
+    assert_eq!((it.stage(), it.pushed_sha.as_deref()), (Stage::Blocked, None));
+    assert!(it.error.unwrap().contains("which Nucleus did not push"));
     assert_eq!(remote_git(&f, &["rev-parse", "nucleus/item-1"]), remote_git(&f, &["rev-parse", "main"]), "the branch is untouched");
     assert_eq!(f.gh.calls_with("pr create"), 0);
 }
@@ -1322,4 +1322,33 @@ async fn an_added_line_starting_with_plus_plus_is_scanned() {
     let it = item1(&f).await;
     assert_eq!(it.stage(), Stage::Blocked, "{:?}", it.error);
     assert!(!remote_has(&f, "nucleus/item-1"));
+}
+
+#[tokio::test]
+async fn a_push_before_a_crash_is_recognized_and_not_repeated() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    // Implementation done, then (as if in the Pr step) the push happened and
+    // the process stopped before recording it.
+    let good = f.ctx.cfg.clone();
+    let mut bad = good.clone();
+    bad.github.remote_url = "/nonexistent/remote.git".into();
+    let f = Fixture { ctx: Ctx { cfg: bad, ..f.ctx }, ..f };
+    let _ = super::tick(&f.ctx, false).await.unwrap(); // implementation → pr; the remote cannot be reached
+    let f = Fixture { ctx: Ctx { cfg: good, ..f.ctx }, ..f };
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.pushed_sha.as_deref()), (Stage::Pr, None));
+    let sha = it.head_sha.clone().unwrap();
+    let remote = git::Remote { url: f.remote.to_string_lossy().into_owned(), gh: None };
+    let mirror = git::open_mirror(&f.ctx.cfg.work_dir_path(), "acme/widget", &remote).await.unwrap();
+    git::push(&mirror, &remote, &sha, "nucleus/item-1", 1, "main", None).await.unwrap();
+    // The next tick finds the commit at the remote, records it, and goes on.
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.pushed_sha.as_deref()), (Stage::Review, Some(sha.as_str())));
+    assert_eq!(f.gh.calls_with("pr create"), 1);
 }
