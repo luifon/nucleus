@@ -1,7 +1,8 @@
 # ADR-036 — Event intake and the issue pipeline
 
-**Status:** Accepted (2026-09-24) — Implemented (2026-09-24), live verification pending
-(real `gh` against the configured repos, real WhatsApp group creation).
+**Status:** Accepted (2026-09-24) — Implemented (2026-09-24), amended after an adversarial
+review (2026-09-24, see "Amendment: review findings"); live verification pending (real `gh`
+against the configured repos, real WhatsApp group creation).
 
 **Builds on / changes:**
 - [[ADR-033]] — every agent step is a task in the task ledger (`origin =
@@ -72,7 +73,8 @@ A polling source implements `SourceAdapter`:
 | `cursor_key()` | the ADR-029 watermark key of this adapter instance |
 | `poll_interval()` | minimum time between two polls |
 | `poll(cursor)` | events changed since the cursor, and the next cursor |
-| `discussion(event)` | the trusted part of the discussion (comments) |
+| `discussion(event, live)` | the trusted part of the discussion (comments, with ids); `live` checks every author's trust at the source now |
+| `live_state(event)` | the event's state at the source now: open, gate label present, title, body, who opened the gate, whether the text changed after the gate |
 | `reply(event, body, marker)` | post on the event at its source, without posting twice |
 
 A push-style source (a script, a future webhook receiver) calls
@@ -102,15 +104,21 @@ has no shell PATH, Rule 5). One adapter instance per configured repo.
   which the issues API also lists, are skipped. The tick polls a repo only
   when `poll_interval_secs` (default 300) have passed since its last poll.
 - **Gate.** `accepted` is true when the issue carries `[intake] label`
-  (default `nucleus`, compared case-insensitively). The pipeline creates an
-  item only for an accepted, open event on a configured repo.
+  (default `nucleus`, compared case-insensitively). A poll never creates an
+  item. The tick's gate check reads every accepted, open event on a
+  configured repo that has no open item and changed since its last check
+  live at GitHub (Amendment, finding 1) and creates the item only when the
+  gate holds there.
 - **Collaborators.** `GET /repos/{repo}/collaborators/{login}`: success means
   collaborator, a 404 means not. Any other failure counts as not trusted for
   that read and is not cached. Answers are cached in intake.db for
-  `collaborator_cache_secs` (default 3600). Logins outside GitHub's
-  character set are never looked up. `discussion()` returns only comments
-  by collaborators and the number left out; Nucleus's own comments (they
-  carry the marker below) are skipped.
+  `collaborator_cache_secs` (default 3600). The cache serves display and
+  polling only: every brief and every action boundary checks live
+  (Amendment, finding 1c). Logins outside GitHub's character set are never
+  looked up. `discussion()` returns only comments by collaborators and the
+  number left out; Nucleus's own comments (they carry the marker below) are
+  skipped. A comment list longer than `max_pages` is an error, not a
+  shortened list.
 - **Reply.** `gh issue comment` with the body plus an invisible marker
   `<!-- nucleus-intake:item-<n>:comment -->`. Before posting, the comments
   are searched for the marker, so a crash between the post and its record
@@ -123,14 +131,16 @@ repo. Its stage is one of:
 
 | Stage | What happens |
 |---|---|
-| `queued` | Nucleus clones the repo on first use (`gh repo clone`), fetches, and checks out the item's worktree detached at `origin/<default branch>` |
+| `queued` | Nucleus fetches the repo into its mirror and creates the item's clone detached at the default branch |
 | `eval` | the eval agent runs (read-only) |
 | `refinement` | discussion with the operator until a plan is approved |
 | `implementation` | the implementation agent runs (`code` profile); then Nucleus commits what the agent left uncommitted, checks that the branch has commits, and runs the repo's tests |
 | `pr` | Nucleus pushes the branch and opens a draft PR |
 | `review` | the PR is open; the proposed issue comment waits for the operator |
-| `closed`, `cancelled` | terminal; the item's group is left and its worktree removed |
+| `closed`, `cancelled` | terminal; the item's group is left and its clone removed |
+| `stale` | terminal; the source changed after the gate was satisfied (finding 1); re-adding the label starts a new item |
 | `failed` | a step failed; `retry` resumes it |
+| `blocked` | the secret guard stopped a publishing step (finding 4); `retry` scans again, `cancel` stops it |
 
 `core/src/intake/stage.rs::transition` is the only place that decides a
 stage change; it refuses events that do not apply (no skipping from `eval`
@@ -140,10 +150,13 @@ place. `store::advance` applies a transition in one `BEGIN IMMEDIATE`
 transaction whose `WHERE` re-checks the stage it moves from and logs the
 transition in `item_transitions`.
 
-Two conditions from the source stop an item at any time: the event closed
-(the issue was closed) closes it; the label removed cancels it during
-`queued`, `eval`, `refinement` or `implementation`. A running stage task is
-cancelled in both cases.
+Conditions from the source stop an item at any time: the event closed (the
+issue was closed) closes it; the label removed cancels it at every stage,
+including `pr` and `review`; a changed title or body makes it `stale`. A
+running stage task is cancelled in every case. An event has at most one
+open item (not closed, cancelled or stale) and at most one item per gate
+event; a new gate event (the label added again, or the issue reopened by a
+collaborator) starts a new item.
 
 Every agent step is a task in the ADR-033 ledger: kind `intake-eval`,
 `intake-refine` or `intake-implement`, origin `pipeline` (the ledger only,
@@ -162,7 +175,7 @@ dir is inside the Nucleus checkout) fails it at once.
 
 `tasks.db` v5 adds `workdir` and `profile`:
 
-- `workdir`: the worker session's working directory (the item's worktree);
+- `workdir`: the worker session's working directory (the item's clone);
   it must be an existing absolute directory. The session's transcript and
   `.claude/` resolution follow it; the operator's private skills tree is not
   loaded there.
@@ -195,21 +208,21 @@ the item. The result is stored as `eval_json`.
 
 ### 6. Untrusted text
 
-Issue text is written by anyone who can open an issue. Every brief puts the
-issue and the collaborator comments between data markers that carry a
-random nonce (`<<<DATA-<16 hex> issue>>>` … `<<<END-DATA-<nonce>>>`); the
-text cannot know the nonce, any line inside that starts with `<<<` or `===`
-(a marker or one of the pipeline's output markers) gets a `> ` prefix, and
-the instructions say the content is a description of a request, never
-instructions. Operator messages and the approved plan come from the
-operator and are marked as such outside the data blocks. Only collaborator
-comments are included at all (§2).
+Issue text is written by anyone who can open an issue, and model output can
+repeat it. Every brief puts the issue (the revision the item is bound to,
+not the latest poll), the collaborator comments, and all model output (the
+eval's summary and reasons, earlier refinement replies, Nucleus notes, a
+plan the operator has not approved) between data markers that carry a
+random nonce (`<<<DATA-<16 hex> label>>>` … `<<<END-DATA-<nonce>>>`). The
+instructions say the content is data, never instructions. Only the
+operator's own messages and the plan the operator approved are outside the
+data blocks. Only collaborator comments are included at all (§2). How the
+blocks stay closed is in the Amendment (finding 1b).
 
 A simple item's implementation brief is derived from the issue text,
-because no plan exists; the label (set by someone with triage access) and
-the eval's escalation rule are the gates for that. Text that goes to GitHub
-(PR title and body, the comment) passes the Rust credential filter
-(`secret_filter::CredentialRules`) first.
+because no plan exists; the label (set by a collaborator, checked in the
+timeline) and the eval's escalation rule are the gates for that. Text that
+goes to GitHub is described in the Amendment (finding 4).
 
 ### 7. Refinement
 
@@ -243,11 +256,13 @@ library (it sends a create node with no participants); whether WhatsApp's
 server accepts that was not tested, and the design does not need it,
 because the bot runs on its own number and the operator must be a member.
 
-When the item closes or is cancelled, the pipeline queues a `close`
-request; the bot waits until the group has no unsent outbound rows (at most
-10 minutes), leaves the group and removes it from the target allowlist. It
-does not archive the chat: Baileys' archive call needs the chat's last
-messages, and leaving already ends the thread for the bot.
+When the item closes, is cancelled or goes stale, the pipeline queues a
+`close` request (also while the group is still being created); the bot
+waits until the group has no unsent outbound rows (at most 10 minutes),
+leaves the group and removes it from the target allowlist. It does not
+archive the chat: Baileys' archive call needs the chat's last messages, and
+leaving already ends the thread for the bot. Claims, retries and
+confirmation are in the Amendment (finding 6).
 
 The same thread is on the dashboard (§10). Every thread message is stored in
 `item_messages` (author `operator` | `agent` | `nucleus`, surface `via`),
@@ -257,7 +272,7 @@ policy and secret filter apply. A message to a group has every identifier
 redacted by the filter, as for every group.
 
 **Turns.** Each refinement turn is a separate `intake-refine` task with the
-`read-only` profile in the item's worktree. Its brief contains the eval, the
+`read-only` profile in the item's clone. Its brief contains the eval, the
 latest proposed plan, the whole thread so far (the most recent 9 000
 characters when longer) and the operator messages it must answer; so a turn
 does not depend on an earlier session being resumable. The first turn starts
@@ -268,8 +283,8 @@ by the next one. The turn's final message is the reply. A plan is the text
 between `===PLAN===` and `===END PLAN===`; Nucleus stores it as the next
 plan version and appends the approval hint.
 
-**Approval.** Code decides approval from the operator's own message, never
-the model. A message whose whole text is `approve`, `approve plan`,
+**Approval.** Code decides approval from the operator's own typed message,
+never the model (who counts as the operator: Amendment, finding 5). A message whose whole text is `approve`, `approve plan`,
 `approve vN` (with `#n` in the DM; optional in the item's group) approves
 the latest plan; `approve comment`, `skip comment` and `cancel` are the
 other commands; everything else is a message. The approval is refused, with
@@ -280,28 +295,31 @@ version shown. The approved plan becomes the implementation brief.
 
 ### 8. Implementation, pull request, comment
 
-Right before implementation Nucleus fetches, resets the worktree to the
-newest `origin/<default branch>` (a plan discussed for days is built on
-current code) and switches to `nucleus/item-<n>-<slug>`. On a retry the
-existing branch and its commits are kept. The agent works with the `code`
-profile, runs the configured `test_command`, commits locally and ends with
-a summary. Then Nucleus:
+Right before implementation Nucleus reads the issue live (finding 3),
+fetches, creates the item's clone again at the newest default branch (a
+plan discussed for days is built on current code) and switches to
+`nucleus/item-<n>-<slug>`. On a retry the existing clone and its commits
+are kept. The agent works with the `code` profile, runs the configured
+`test_command`, commits locally and ends with a summary for the operator.
+Then Nucleus:
 
-1. commits anything left uncommitted;
-2. fails the item when the branch has no commit beyond the base;
-3. runs `test_command` itself (`sh -c` in the worktree, `test_timeout_minutes`,
+1. reads the agent's commits into its mirror and commits anything left
+   uncommitted there (finding 2); the result is the one commit it pushes;
+2. fails the item when that commit adds nothing beyond the base;
+3. runs `test_command` itself (`sh -c` in the clone, `test_timeout_minutes`,
    default 30) and records `passed`, `failed`, `timeout` or `not_run` with
    the end of the output;
-4. pushes the branch, looks for an existing PR for the branch
-   (`gh pr list --head`), and otherwise opens a draft PR (`gh pr create
-   --draft`) whose body holds the agent's summary, `<pr_issue_keyword> #<issue>`
-   (default `Closes`), the test result and the item marker;
+4. reads the issue live again, scans the diff and the PR text (finding 4),
+   pushes the commit to the item's branch, looks for an existing PR for the
+   branch (`gh pr list --head`), and otherwise opens a draft PR (`gh pr
+   create --draft`) with the code-owned body of finding 4;
 5. sends the PR link to the item's thread, and proposes an issue comment
    (`[intake.texts] issue_comment`).
 
 The comment is posted only after the operator approves it, in the thread
 (`#n approve comment`) or on the dashboard, where the text can be edited
-first; `skip comment` closes the item without one. Nucleus never merges and
+first, and only after a live read of the issue and a secret scan of the
+comment; `skip comment` closes the item without one. Nucleus never merges and
 never marks a PR ready.
 
 ### 9. The driver
@@ -314,8 +332,10 @@ because it does work of its own (git, `gh`, test runs) that must not block
 the WhatsApp connection or the dashboard, and because launchd restarts it
 from a clean state every minute.
 
-One tick: poll the due sources; read the operator messages the bot stored
-since the last read; then, per item, run the stage step, follow an
+One tick: poll the due sources; check the gate of changed events (and
+create items); read the operator messages the bot stored since the last
+read; ask the bot to leave active groups whose item is closed; then, per
+item, run the stage step, follow an
 immediate next step (eval done → implementation task started) at most four
 times, resolve the WhatsApp surface, send new thread messages, and clean up
 closed items. Ticks take advisory locks (`flock`, released by the OS when a
@@ -363,12 +383,13 @@ operator how to approve; it cannot approve, reply in a thread, or retry.
 - **whatsapp.db** — Rust inserts into `outbound_queue` (thread messages) and
   the new queue table `intake_group_requests`; it reads the bot's
   `intake_groups` (group state) and `intake_inbound` (operator messages,
-  read past a watermark kept in intake.db). The bot owns the schema of all
+  read past a watermark kept in intake.db, with a processing state per
+  message in intake.db's `inbound_commands`). The bot owns the schema of all
   three intake tables (`messaging/whatsapp/src/intake.ts`);
   `whatsapp_queue::open` creates the queue table only so a producer works
   before the bot booted.
-- **Worktrees** live under `[intake] work_dir` (default `~/nucleus-work`),
-  which must be outside the Nucleus checkout.
+- **Mirrors and item clones** live under `[intake] work_dir` (default
+  `~/nucleus-work`), which must be outside the Nucleus checkout.
 
 ### 13. Configuration
 
@@ -376,43 +397,47 @@ operator how to approve; it cannot approve, reply in a thread, or retry.
 `work_dir`, `label`, `min_confidence`, `test_timeout_minutes`,
 `[[intake.repos]]` (`repo`, `test_command`, `default_branch`,
 `pr_issue_keyword`), `[intake.github]` (`gh_bin`, `poll_interval_secs`,
-`collaborator_cache_secs`, `max_pages`), `[intake.whatsapp]`
+`collaborator_cache_secs`, `max_pages`, `remote_url`), `[intake.whatsapp]`
 (`refinement_groups`, `max_groups_per_day`, `group_wait_minutes`),
 `[intake.texts]` (every operator-facing text). The repos name the
-operator's projects and live only in the untracked file. The operator's
-number for group creation is the first `WHATSAPP_ALLOWED_DM_JIDS` entry,
-which must be a phone number.
+operator's projects and live only in the untracked file. The operator is
+the first `WHATSAPP_ALLOWED_DM_JIDS` entry, which must be a phone number
+(groups are created with it).
 
 ## Threat model
 
 The checks here are the ADR-033 ones (they decide what a caller may do
 through the Nucleus CLIs; they are not isolation) plus:
 
-- **Who starts work.** Only an issue with the label, which requires triage
-  or write access on the repo. Removing the label cancels an item that has
-  not reached the PR.
+- **Who starts work.** Only an issue whose label a collaborator added (read
+  in the timeline, trust checked live), with text unchanged since. The item
+  works from that text only. Removing the label cancels the item at every
+  stage; changing the text stops it (`stale`).
 - **What an agent reads.** The issue text (fenced as data) and collaborator
   comments (fenced as data). Other comments never reach an agent.
 - **What an agent can do.** Eval and refinement agents cannot run commands,
   edit files or use the web. The implementation agent edits and runs local
-  commands in its worktree; the `code` profile refuses the ordinary network
+  commands in its clone; the `code` profile refuses the ordinary network
   commands and web tools. A determined agent could still write a program
-  that opens a socket, or edit files outside its worktree: that needs an OS
+  that opens a socket, or edit files outside its clone: that needs an OS
   sandbox, which the operator deferred. Because every network step is
   Nucleus code, adding a sandbox later means only denying the agent's
-  process network and filesystem access outside the worktree.
-- **What reaches the outside.** Nucleus pushes only the item's branch, opens
-  only draft PRs, never merges, and posts a comment only after the operator
-  approved its text; GitHub text passes the credential filter. WhatsApp
+  process network and filesystem access outside the clone.
+- **What reaches the outside.** Nucleus pushes only the item's branch (one
+  commit it collected, to the configured URL, never the default branch),
+  opens only draft PRs with code-owned text, never merges, and posts a
+  comment only after the operator approved its text; the pushed diff, the
+  PR text and the comment pass the repository's secret guard first. WhatsApp
   messages go through the outbound queue (target policy, secret filter);
   intake groups are sendable only while active, and only through the drain
   (the TypeScript queue writers `ack.ts` and `enqueue-media.ts` still accept
   only configured groups).
-- **Who approves.** Only an operator message read by code (the bot verified
-  the sender is the operator, in the operator's DM or an intake group whose
-  membership tripwire has not fired), the operator's terminal, or the
-  dashboard (tailnet only). A chat session, a worker, or an agent message
-  cannot approve.
+- **Who approves.** Only an operator message read by code (typed by the
+  operator's own identity, in the operator's DM or in an intake group whose
+  membership still matches the create response), the operator's terminal,
+  or the dashboard (tailnet only). A chat session, a worker, an agent
+  message, a voice-note transcription or a forwarded message cannot
+  approve.
 
 ## Verification
 
@@ -422,7 +447,7 @@ through the Nucleus CLIs; they are not isolation) plus:
   validation, one item per event, guarded stage changes, thread dedup and
   read marks, collaborator cache; GitHub issue conversion and gate, poll
   cursor and state selection, collaborator filtering (404, other failures,
-  cache), reply without double posting; git worktree / branch / commit /
+  cache), reply without double posting; git mirror / clone / branch / commit /
   push cycle, test runs with status and timeout, work dir outside the
   checkout; brief fencing and size; the pipeline against a fake `gh`, a bare
   remote and a launcher that starts nothing: a simple issue to a draft PR and
@@ -456,6 +481,223 @@ through the Nucleus CLIs; they are not isolation) plus:
 - Not verified here (needs the live environment): polling the real
   repositories with the operator's `gh` login, real draft PRs and comments,
   and WhatsApp group creation and leaving on the live account.
+
+## Amendment: review findings (2026-09-24)
+
+An adversarial review of the first implementation found seven problems.
+This section describes the behavior that replaced each one and what is
+still not covered.
+
+### Finding 1 — untrusted edits reached an acting session
+
+**(a) Revision binding.** A poll only records events. The tick's gate check
+reads each candidate issue live: the issue, its timeline (`GET
+/repos/{repo}/issues/{n}/timeline`) and its body's last edit time (GraphQL
+`lastEditedAt`). The gate holds when the latest `labeled` event for the gate
+label has no `unlabeled` after it, the account that added it is a
+collaborator (checked live), and neither the body nor the title (a
+`renamed` event) changed after that label event. When a collaborator
+reopened the issue after the label event, the reopen is the gate event and
+its account must be a collaborator too. The item stores the title and body
+it was admitted with (`rev_title`, `rev_body`), their SHA-256
+(`revision_hash`), the gate event (`gate_event_id`, `label_event_id`,
+`gate_actor`, `gate_at`), and in `item_comments` the SHA-256 of every
+trusted comment a brief used, by comment id. Briefs use only the stored
+revision.
+
+Every step compares the latest polled title and body with the revision;
+every brief compares the comments it reads with the recorded hashes. A
+difference, a used comment that disappeared or whose author is no longer a
+collaborator, or (at an action boundary) a different label event moves the
+item to the terminal stage `stale` with `stale_reason`, shown by `nucleus
+intake list` (until a newer item of the same issue replaces it), `nucleus
+intake show`, the dashboard and a thread note. Re-adding the label produces
+a new label event, and the gate check then creates a new item from the
+current text. The same label event never produces a second item (unique
+index on event and gate event); an event has at most one open item.
+`events.gate_note` (shown by `nucleus events list`) records why a gate check
+created no item.
+
+**(b) Model output is data.** The eval's summary and reasons, earlier
+refinement replies, Nucleus notes and an unapproved plan are inside data
+blocks in every brief; only the operator's messages and the approved plan
+are outside. The fence cannot be closed from inside: line breaks
+(`\r`, U+0085, U+2028, U+2029) become `\n`, the nonce is replaced, a
+third consecutive `<` or `>` gets a space before it (so `<<<` never occurs
+inside a block), and lines that start with `===` get a `> ` prefix. A long
+thread is shortened by whole messages, so no block loses its start marker.
+
+**(c) No cached trust at an action boundary.** The collaborator cache is
+used only for display and polling filters. Every brief, the gate check and
+every action boundary check collaborator status at GitHub, and a failed
+check is an error there, not "untrusted".
+
+Limits: the approved plan is model-written text that the operator
+approved; it is the implementation brief as written. Any edit of a used
+comment stops the item, including a harmless one. The body-edit check
+relies on GitHub's `lastEditedAt` and timeline; a label removed and added
+again within one poll interval is seen at the next action boundary (the old
+item goes stale) and when the poll reports the issue changed (the new item).
+
+### Finding 2 — the privileged push ran agent-controlled git metadata
+
+Nucleus keeps one bare mirror per repo (`<work_dir>/<owner>__<name>/mirror.git`)
+and one separate clone per item (`item-<n>`; no shared git directory with
+the mirror). Before every use Nucleus writes the mirror's `config` again
+from a fixed template and removes its `hooks`, alternates, `commondir`,
+`config.worktree` and `info/attributes`; a mirror path that is a symlink or
+not a repository is created again. Fetch and push use the configured URL
+(`[intake.github] remote_url`, default `https://github.com/{repo}.git`),
+never a remote name, with `gh auth git-credential` set as the only
+credential helper. Every git command runs with `core.hooksPath=/dev/null`,
+`core.fsmonitor=false`, the credential helper list reset, the `ext::`
+transport off, `GIT_CONFIG_NOSYSTEM=1` and inherited `GIT_*` variables
+removed (author and committer identity kept).
+
+Nucleus never runs git with the item clone's configuration after an agent
+could have written it. It reads the agent's work by fetching the clone's
+`HEAD` into `refs/nucleus/item-<n>` of the mirror, requires that commit to
+descend from the default branch, and commits uncommitted changes with the
+mirror's configuration and a temporary index (`--git-dir=<mirror>
+--work-tree=<clone>`), so the clone's hooks, filters and fsmonitor never
+run. The resulting commit id is stored (`head_sha`); exactly that commit is
+scanned and pushed, with `--no-verify`, no force, to `refs/heads/<branch>`
+only. The push is refused unless the branch is the item's own
+(`nucleus/item-<n>` or `nucleus/item-<n>-<slug>`), and refused for the
+remote's default branch (read live with `ls-remote --symref`) and for
+`main`, `master`, `develop`, `development`, `trunk`, `production`,
+`release`, `gh-pages`. The first clone no longer uses `gh repo clone`.
+
+Limits: without an OS sandbox the implementation agent runs with the
+operator's user rights and can change any file between Nucleus's reset and
+its use of the mirror; the reset closes the paths the review found, it is
+not isolation. Reading from the agent's clone runs `git upload-pack` in it,
+which git's security model treats as safe for untrusted repositories.
+
+### Finding 3 — the source gate was stale at the irreversible step
+
+Right before implementation starts, before the push, and before the issue
+comment is posted, Nucleus reads the issue live (`live_state`): it must be
+open, carry the label from the same label event, set by an account that is
+a collaborator now, with the bound title, body and comments. A closed issue
+closes the item, a missing label cancels it, anything else makes it stale.
+Any read failure (network, API error, a timeline longer than `max_pages`)
+is a step error: nothing starts and nothing is pushed; after three errors
+the item fails and `retry` reads again. The label removed cancels the item
+at every stage, including `pr` and `review`. Events without an adapter
+(`nucleus events emit --accept`) have no live source; their stored event is
+checked instead.
+
+Limit: seconds pass between the live read and the push.
+
+### Finding 4 — public pull request text
+
+The draft PR title is `Nucleus #<item>: <issue title>` (one line, `@`
+replaced by the full-width `＠`). The body holds only code-owned fields:
+`<pr_issue_keyword> #<issue>` (or `Refs owner/name#N` / `Source: …`), the
+branch, the changed files as code spans (backticks and control characters
+replaced, at most 100 listed), the test command and Nucleus's result, the
+pipeline footer, `🤖 Generated with [Claude Code](https://claude.com/claude-code)`
+and the item marker. The agent's final message and raw test output are not
+published (the agent's message goes to the operator). The proposed issue
+comment's `{summary}` is at most 600 characters on one line, with
+Markdown and HTML characters escaped, `@` replaced and URLs broken.
+
+Before the push, the PR title, the body and every line the push adds (with
+the file names) go through the secret guard; the comment goes through it
+before it is posted. The guard is `tools/check-secrets.sh` run from the
+Nucleus workspace root (`.env` values, the `.claude/secret-strings`
+denylist, personal-information patterns, home paths, private skill names)
+plus the credential shapes of `secret_filter::CredentialRules`. A finding,
+or a guard that cannot run, moves the item to `blocked` with the finding
+categories (for example `pii-email`, `env-value`, `credential-…`,
+`guard-unavailable`), never the matched text, and a thread note; nothing is
+published. `retry` scans again; `cancel` stops the item.
+
+Limit: legitimate content that matches a pattern (an email address in the
+repository's code) blocks the item; there is no override.
+
+### Finding 5 — WhatsApp approval identity
+
+The operator is the first `WHATSAPP_ALLOWED_DM_JIDS` entry, normalized to
+digits. In an intake group only messages from that identity are read, with
+the same check the other groups use (digits of the phone JID, or the phone
+number the connection's LID mapping gives for an `@lid` sender). DM messages
+are routed to an item only from the operator's DM; another allowed DM
+sender's messages go to the chat session. Each routed message stores how it
+was written (`input_kind`: `text`, `voice` for a transcription, `forwarded`);
+the pipeline accepts a command only from `text` and keeps any other
+command-shaped message in the thread with a refusal note. A new group's
+membership baseline is set from the create response. A member in that
+response that is neither the bot nor the operator starts the group disabled
+and alerts the operator in DM; a later change of the member list disables
+the group (no message from it is read) and alerts the operator.
+
+Limit: an `@lid` sender whose phone number the connection does not know is
+not recognized as the operator.
+
+### Finding 6 — group lifecycle
+
+The bot claims a request with `UPDATE … SET status = 'creating'|'closing'
+WHERE id = ? AND status = 'pending'` before any WhatsApp call. A creation
+whose claim is older than 10 minutes (the bot stopped mid-call) is recorded
+as `unknown`, counts against the daily creation limit, is never repeated,
+and the operator is told to leave the group by hand if it exists. An item
+closed before the bot handles its create request gets no group; one closed
+while the create call runs gets the new group left at once. Leaving is
+retried with backoff (30 s, doubling, at most 1 hour, 8 attempts, then an
+alert); a failed leave counts as done when the bot is confirmed not to be a
+member. The bot sets `closed_at` only when it left; the pipeline sets
+`group_closed_at` only when the bot's table shows the group closed (or never
+created). The pipeline adds a close request only when none is pending, and
+every tick asks the bot to leave active groups whose item is closed,
+missing, or moved to the DM. The creation limit (`max_groups_per_day`) is
+enforced by both sides as before.
+
+Limit: for an `unknown` creation the bot does not know the group's JID and
+cannot leave it itself.
+
+### Finding 7 — lost operator commands
+
+Every operator message read from WhatsApp has a row in intake.db's
+`inbound_commands` (`received`, then `applied` or `failed`, with an attempt
+count), keyed by chat and WhatsApp message id. A command's effect (the
+stage change or item update) and its `applied` mark are one transaction; a
+plain thread message is applied by being stored, in one transaction. A
+message stored but not applied before a crash is applied on the next read.
+The read watermark moves only past messages that are applied or failed for
+good. A message that fails for another reason stops the read, so later
+messages keep their order, and is tried again next tick; after 5 attempts
+it is marked failed and the operator is told in DM.
+
+Limit: the thread note that follows a command (for example "plan approved")
+is written after the transaction; a crash between the two keeps the
+command's effect and loses the note.
+
+### Verification of the amendment
+
+Rust (`cargo test -p nucleus-core intake`, `whatsapp_queue`): the gate
+check (collaborator label, edit after the label, rename after the label,
+failed reads retried), stale on a polled edit and new item on re-labeling,
+reopen by a collaborator versus a non-collaborator, live reads before
+implementation (changed body, labeler no longer a collaborator with a
+positive cache, a network error, a label added again), before push (label
+removed, read failures never push), changed and removed comments, label
+removal in review; brief fences (marker-breaking input, model output only
+inside fences, approved plan outside); mirror, clone, collect and push
+with hooks, fsmonitor, filters and rewritten remotes in both the clone and
+the mirror, refused pushes to the default and protected branches, work not
+based on the default branch; code-owned PR text, summary escaping, a guard
+hit on the diff and on the comment, a guard that cannot run; a command
+stored before a crash applied exactly once, a failing message holding later
+ones back until given up, voice and forwarded commands refused; the v3
+migration keeping rows and foreign keys; the group closed only after the
+bot confirms, a group requested for an item cancelled meanwhile,
+reconciliation of active groups. TypeScript (`src/intake.test.ts`): operator
+identity in phone and LID form, unexpected members, claims, unknown
+creations not repeated, items closed before and during creation, a
+disabled baseline with an alert, leave retries with backoff and give-up,
+`closed_at` only after leaving, `input_kind` stored.
 
 ## Rejected alternatives
 
