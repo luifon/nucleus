@@ -9,8 +9,10 @@ import type { IntakeItem, IntakeMessage, IntakeStage } from "@/lib/api/intake";
 /** The stages in pipeline order, for the stage track. */
 export const STAGE_TRACK: readonly IntakeStage[] = ["queued", "eval", "refinement", "implementation", "pr", "review", "closed"];
 
+/** Not finished: the pipeline still works on it or waits for the
+ *  operator. `stale` is finished (only a new label starts new work). */
 export function isOpenItem(stage: IntakeStage): boolean {
-  return stage !== "closed" && stage !== "cancelled";
+  return stage !== "closed" && stage !== "cancelled" && stage !== "stale";
 }
 
 /** Stages where an agent or Nucleus is working and the list should refresh. */
@@ -26,6 +28,8 @@ export function isWorking(item: Pick<IntakeItem, "stage" | "current_task_id">): 
 export function stageKind(item: Pick<IntakeItem, "stage" | "pr_url" | "current_task_id">): StatusKind {
   switch (item.stage) {
     case "failed":
+    case "blocked":
+    case "stale":
       return "down";
     case "closed":
       return item.pr_url ? "ok" : "idle";
@@ -47,6 +51,8 @@ export function waitingOn(item: IntakeItem): string | null {
   }
   if (item.stage === "review" && item.comment_state === "proposed") return "the issue comment waits for approval";
   if (item.stage === "failed") return "failed — retry or cancel";
+  if (item.stage === "blocked") return "blocked by the secret guard — fix, then retry or cancel";
+  if (item.stage === "stale") return "stale — the issue changed; add the label again for a new item";
   return null;
 }
 
@@ -66,7 +72,7 @@ export function canDecideComment(item: Pick<IntakeItem, "stage" | "comment_state
 }
 
 export function canRetry(item: Pick<IntakeItem, "stage">): boolean {
-  return item.stage === "failed";
+  return item.stage === "failed" || item.stage === "blocked";
 }
 
 export function canCancelItem(item: Pick<IntakeItem, "stage">): boolean {

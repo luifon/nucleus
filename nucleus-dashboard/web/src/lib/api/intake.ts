@@ -26,7 +26,9 @@ export type IntakeStage =
   | "review"
   | "closed"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "stale"
+  | "blocked";
 
 /** UI-layer refinement of IntakeItem.comment_state. */
 export type CommentState = "none" | "proposed" | "approved" | "posted" | "skipped";
@@ -52,7 +54,8 @@ export type IntakeDetail = Omit<IntakeDetailWire, "item" | "messages" | "tasks">
   tasks: Task[];
 };
 
-/** Newest first. `all: false` leaves out closed and cancelled items. */
+/** Newest first. `all: false` leaves out closed and cancelled items, and
+ *  stale items a newer item of the same issue replaced. */
 export const listIntakeItems = (opts: { all?: boolean } = {}, signal?: AbortSignal) =>
   jsonGet<IntakeItem[]>(`/intake/api/list${qs({ all: opts.all ?? true })}`, signal);
 

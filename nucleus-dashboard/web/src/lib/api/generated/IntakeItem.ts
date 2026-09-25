@@ -42,6 +42,11 @@ base_ref: string | null,
  */
 impl_summary: string | null,
 /**
+ * The commit Nucleus collected from the item's clone (the agent's
+ * commits plus its uncommitted changes); exactly this commit is pushed.
+ */
+head_sha: string | null,
+/**
  * `passed`, `failed`, `timeout` or `not_run` (Nucleus's own run).
  */
 tests_status: string | null, tests_output: string | null, pr_url: string | null, comment_draft: string | null,
@@ -66,4 +71,31 @@ last_task_id: string | null,
  * Consecutive failed attempts of the current step (a fetch, a push);
  * the item fails at 3.
  */
-step_errors: number, created_at: string, updated_at: string, closed_at: string | null, };
+step_errors: number, created_at: string, updated_at: string, closed_at: string | null,
+/**
+ * The event's title and body when the gate was satisfied: the only
+ * issue text any brief uses.
+ */
+rev_title: string | null, rev_body: string | null,
+/**
+ * [`super::event::revision_hash`] of `rev_title` and `rev_body`. The
+ * item goes `stale` when the source's text no longer matches it.
+ */
+revision_hash: string | null,
+/**
+ * The source event that opened the gate (GitHub: `labeled:<id>` or
+ * `reopened:<id>`; `accept:<time>` for `nucleus events emit --accept`).
+ */
+gate_event_id: string | null,
+/**
+ * The label event the gate depends on (`labeled:<id>`).
+ */
+label_event_id: string | null,
+/**
+ * Who set the gate (GitHub: the collaborator who added the label).
+ */
+gate_actor: string | null, gate_at: string | null,
+/**
+ * Why the item stopped as `stale`.
+ */
+stale_reason: string | null, };

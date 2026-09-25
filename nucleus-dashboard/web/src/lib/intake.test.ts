@@ -51,6 +51,15 @@ function item(over: Partial<IntakeItem> = {}): IntakeItem {
     created_at: "2026-09-24T10:00:00.000Z",
     updated_at: "2026-09-24T10:00:00.000Z",
     closed_at: null,
+    head_sha: null,
+    rev_title: "Fix typo",
+    rev_body: "body",
+    revision_hash: null,
+    gate_event_id: "labeled:1",
+    label_event_id: "labeled:1",
+    gate_actor: "maintainer",
+    gate_at: "2026-09-24T09:00:00.000Z",
+    stale_reason: null,
     ...over,
   };
 }
@@ -118,5 +127,22 @@ describe("display", () => {
       wa_state: null,
     });
     expect(threadOrder([m(3), m(1), m(2)]).map((x) => x.id)).toEqual([1, 2, 3]);
+  });
+});
+
+describe("stale and blocked items", () => {
+  test("a blocked item can be retried or cancelled", () => {
+    const b = item({ stage: "blocked", error: "the secret guard found pii-email in the branch or the pull request text" });
+    expect(canRetry(b)).toBe(true);
+    expect(canCancelItem(b)).toBe(true);
+    expect(stageKind(b)).toBe("down");
+    expect(waitingOn(b)).toMatch(/secret guard/);
+  });
+  test("a stale item is finished and says how to start again", () => {
+    const s = item({ stage: "stale", stale_reason: "the issue title or body changed after the gate was satisfied" });
+    expect(canRetry(s)).toBe(false);
+    expect(canCancelItem(s)).toBe(false);
+    expect(stageKind(s)).toBe("down");
+    expect(waitingOn(s)).toMatch(/add the label again/);
   });
 });

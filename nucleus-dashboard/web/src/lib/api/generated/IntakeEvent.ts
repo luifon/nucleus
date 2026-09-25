@@ -3,4 +3,9 @@
 /**
  * A stored event (`events` table).
  */
-export type IntakeEvent = { id: number, source: string, external_id: string, project: string | null, kind: string, title: string, body: string, author: string | null, labels: Array<string>, url: string | null, state: string, created_at: string | null, updated_at: string | null, accepted: boolean, first_seen_at: string, last_seen_at: string, };
+export type IntakeEvent = { id: number, source: string, external_id: string, project: string | null, kind: string, title: string, body: string, author: string | null, labels: Array<string>, url: string | null, state: string, created_at: string | null, updated_at: string | null, accepted: boolean, first_seen_at: string, last_seen_at: string,
+/**
+ * Why the last gate check created no item (GitHub: the label was added
+ * by a non-collaborator, the text changed after the label, …).
+ */
+gate_note: string | null, };

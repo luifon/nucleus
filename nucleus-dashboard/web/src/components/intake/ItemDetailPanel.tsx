@@ -96,9 +96,32 @@ export default function ItemDetailPanel({
       </Field>
 
       {err && <div className="text-[var(--color-status-down)]">{err}</div>}
-      {item.error && (
-        <Field label={item.stage === "failed" ? `failed in ${item.failed_stage ?? "?"}` : "last error"}>
-          <Pre tone="text-[var(--color-status-down)]">{item.error}</Pre>
+      {item.stale_reason ? (
+        <Field label="stale">
+          <Pre tone="text-[var(--color-status-down)]">
+            {`${item.stale_reason}\nNothing more is done for this item. Remove and add the label again on the issue to start a new item from its current text.`}
+          </Pre>
+        </Field>
+      ) : (
+        item.error && (
+          <Field
+            label={
+              item.stage === "failed"
+                ? `failed in ${item.failed_stage ?? "?"}`
+                : item.stage === "blocked"
+                  ? `blocked in ${item.failed_stage ?? "?"}`
+                  : "last error"
+            }
+          >
+            <Pre tone="text-[var(--color-status-down)]">{item.error}</Pre>
+          </Field>
+        )
+      )}
+      {item.gate_event_id && (
+        <Field label="gate">
+          <div className="text-[var(--color-nucleus-faint)]">
+            {item.gate_event_id} by {item.gate_actor ?? "?"} at {item.gate_at ?? "?"}; bound to the issue text as it was then
+          </div>
         </Field>
       )}
 
