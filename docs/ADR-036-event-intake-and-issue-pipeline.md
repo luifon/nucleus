@@ -1,7 +1,8 @@
 # ADR-036 — Event intake and the issue pipeline
 
 **Status:** Accepted (2026-09-24) — Implemented (2026-09-24), amended after an adversarial
-review (2026-09-24, see "Amendment: review findings"); live verification pending (real `gh`
+review (2026-09-24, see "Amendment: review findings"), amended with the hidden-content hold
+(2026-09-25, see "Amendment: the hidden-content hold"); live verification pending (real `gh`
 against the configured repos, real WhatsApp group creation).
 
 **Builds on / changes:**
@@ -141,6 +142,7 @@ repo. Its stage is one of:
 | `stale` | terminal; the source changed after the gate was satisfied (finding 1); re-adding the label starts a new item |
 | `failed` | a step failed; `retry` resumes it |
 | `blocked` | the secret guard stopped a publishing step (finding 4); `retry` scans again, `cancel` stops it |
+| `held` | the issue text or a comment the item uses has content GitHub's page does not show; no agent runs until the operator releases or cancels the item (Amendment: the hidden-content hold) |
 
 `core/src/intake/stage.rs::transition` is the only place that decides a
 stage change; it refuses events that do not apply (no skipping from `eval`
@@ -355,7 +357,7 @@ implementation summary, Nucleus's test result, the PR, the proposed comment
 (editable, approve or post nothing), the stage tasks from the ledger and the
 stage log. Retry and cancel are row actions. Every confirmation uses
 `InlineConfirm`. API: `/intake/api/{list,detail,reply,approve-plan,
-approve-comment,skip-comment,cancel,retry}`; wire types are generated (Rule
+approve-comment,skip-comment,cancel,retry,release}`; wire types are generated (Rule
 12). Writes accept JSON bodies only and refuse requests a browser marks as
 cross-site, as the Tasks cancel does (ADR-033 §7).
 
@@ -363,8 +365,8 @@ cross-site, as the Tasks cancel does (ADR-033 §7).
 
 `nucleus intake tick [--poll] | list [--all] [--json] | show <n> [--json] |
 reply <n> --text T | approve-plan <n> [--version V] | approve-comment <n>
-[--text T] | skip-comment <n> | cancel <n> | retry <n> | group-resolve <n>
---left|--absent`.
+[--text T] | skip-comment <n> | cancel <n> | retry <n> | release <n> |
+group-resolve <n> --left|--absent`.
 
 `list` and `show` print JSON with `--json`. JSON is for programs and is not
 fenced; only when the caller is the WhatsApp DM session is the output (JSON
@@ -374,7 +376,7 @@ WhatsApp group creation whose outcome is unknown (finding 6).
 
 | Caller (`crate::caller`) | May |
 |---|---|
-| Operator | every command (`group-resolve` only from the operator) |
+| Operator | every command (`group-resolve` and `release` only from the operator) |
 | WhatsApp DM chat session | `list`, `show`, `cancel` (not in a turn that read an agent message) |
 | Detached process (launchd, the bot, the dashboard) | `tick` |
 | Workers, other sessions, unscoped chats, unknown | nothing |
@@ -412,7 +414,7 @@ operator how to approve; it cannot approve, reply in a thread, or retry.
 `work_dir`, `label`, `min_confidence`, `test_timeout_minutes`,
 `commit_author_name`, `commit_author_email`, `import_max_files`,
 `import_max_file_bytes`, `import_max_total_bytes`, `scan_max_bytes`,
-`[[intake.repos]]` (`repo`, `test_command`, `default_branch`,
+`hidden_content_hold` (default true), `[[intake.repos]]` (`repo`, `test_command`, `default_branch`,
 `pr_issue_keyword`), `[intake.github]` (`gh_bin`, `poll_interval_secs`,
 `collaborator_cache_secs`, `max_pages`, `remote_url`), `[intake.whatsapp]`
 (`refinement_groups`, `max_groups_per_day`, `group_wait_minutes`),
@@ -997,6 +999,179 @@ creations not repeated, items closed before and during creation, a
 disabled baseline with an alert, leave retries with backoff and give-up,
 `closed_at` only after leaving, `input_kind` stored.
 
+## Amendment: the hidden-content hold (2026-09-25)
+
+### Why
+
+The operator reads an issue on its GitHub page before adding the label. The
+page is GitHub's rendering of the Markdown; the pipeline reads the raw text
+through the API. GitHub's rendering drops some text (HTML comments, link
+reference definitions, table cells beyond the header), collapses some
+(`<details>`), shows some only on hover (link titles) or only when an image
+fails to load (alt text), removes tags and attributes it does not allow, and
+draws nothing for invisible characters. An issue author can put an
+instruction in one of those places. The operator does not see it, the label
+admits the issue, and the instruction reaches an agent that can edit files
+and run commands with no OS sandbox (§4, Threat model). The data fence (§6)
+tells the agent that the text is data, but it does not tell the operator
+that the text exists.
+
+### What is detected
+
+`core/src/intake/hidden.rs` scans the raw issue title, the raw issue body,
+and the raw body of every collaborator comment the item uses. Each finding
+has a location (`title`, `body`, `comment <id>`), a kind, a line and column
+(in characters), and the hidden text made visible: invisible characters as
+code points (`U+200B ZERO WIDTH SPACE ×2`; tag characters also as the ASCII
+text they spell), everything else as its literal source, at most 300
+characters.
+
+| Kind | What | Why it is hidden |
+|---|---|---|
+| `html_comment` | `<!-- … -->`, also unclosed, `<!-->`, `<!--->` | not rendered |
+| `invisible_characters` | every Unicode Cf character; the other default-ignorable code points; blank-rendering characters (Hangul fillers U+115F, U+1160, U+3164, U+FFA0; U+2800); line and paragraph separators; control characters other than tab, LF, CR; private-use characters | drawn as nothing (private use: a box at most) |
+| `invisible_entity` | an HTML entity that decodes to one of those (`&#8203;`, `&#x2060;`, `&zwj;`, `&shy;`, …) | GitHub decodes it; the page shows nothing |
+| `details` | a `<details>` block | collapsed until clicked |
+| `html_tag` | any tag except the bare allowlist below; declarations, processing instructions, CDATA | the sanitizer removes many tags and attributes, and with them content or its meaning |
+| `link_definition` | `[label]: url "title"` | renders as nothing; every definition is flagged, used or not |
+| `footnote_definition` | `[^label]: text` | shown only at the page bottom, and only when referenced |
+| `image_alt` | non-empty alt text of `![alt](…)` / `![alt][ref]` | not shown while the image loads |
+| `link_title` | `[a](url "title")`, also on images | shown only on hover |
+| `table_extra_cells` | cells beyond the header's column count | GFM drops them |
+| `math_styling` | `\phantom`, `\hphantom`, `\vphantom`, `\color`, `\textcolor`, `\colorbox`, `\fcolorbox`, `\pagecolor`, `\style`, `\class`, `\cssId`, `\htmlStyle`, `\htmlClass` | GitHub renders `$…$`, `$$…$$`, `` $`…`$ `` and `math` blocks; these draw nothing or can match the background |
+| `rendered_block` | a fenced block with info `mermaid`, `geojson`, `topojson` or `stl` | rendered as a picture; its source is not on the page |
+
+The invisible-character list is one table in `hidden.rs` (`INVISIBLE`),
+taken from the Unicode 16.0 Character Database (`DerivedGeneralCategory.txt`
+for Cf, `DerivedCoreProperties.txt` for `Default_Ignorable_Code_Point`,
+`UnicodeData.txt` for names) plus the blank-rendering characters above. One
+exception: a single U+FE0E or U+FE0F directly after a visible character is
+emoji presentation and is not flagged. A second selector, or one after a
+space or at the start, is.
+
+The HTML allowlist (`ALLOWED_TAGS`) holds tags GitHub renders visibly with
+their whole content: `b`, `strong`, `i`, `em`, `code`, `kbd`, `sub`, `sup`,
+`ins`, `del`, `s`, `strike`, `br`. A tag is allowed only in its bare form
+(`<b>`, `</b>`, `<br/>`), because attributes are where the sanitizer changes
+things. A nested `<sub>`/`<sup>` is flagged (each level shrinks the text
+until it cannot be read). A bare allowed tag alone on its line is flagged:
+CommonMark starts an HTML block there, which runs to the next blank line and
+turns a following code fence into raw HTML.
+
+**Code.** GitHub shows fenced code and inline code literally, so nothing but
+invisible characters is flagged inside them (invisible characters are
+invisible in code too). Deciding what is code errs toward "not code",
+because a mistake there hides a finding and a mistake the other way only adds
+one: only fences at column 0 count (a fence indented by one to three spaces
+can belong to a list item that ends before the fence's content); indented
+code blocks do not count (whether an indented line is code depends on the
+list and paragraph structure around it); inline code is paired within one
+line and one table cell (GFM splits a row into cells before it reads code
+spans, and a code span never crosses a block boundary); backticks inside an
+autolink are not code delimiters (the autolink takes precedence); a code span
+between two `$` is math, not code.
+
+**The title** is shown as plain text (GitHub escapes HTML there and does not
+decode entities), so only invisible characters are flagged in it.
+
+### The flow
+
+- **When.** The check runs in the `queued` step, before the clone (the
+  step reads and binds the comments first), and again right before every
+  agent task: the eval, each refinement turn, and the implementation (after
+  the final live read). Those are the points where the item's bound revision
+  and comments are read again, so a collaborator comment with hidden content
+  added later holds the item before the next agent step. The steps without
+  an agent (push, pull request, issue comment) do not check.
+- **Held.** Findings move the item to `held` (`stage::transition`: from
+  `queued`, `eval`, `refinement` or `implementation`). The item stores the
+  findings (`hold_json`), the stage it was held in (`hold_stage`) and a
+  fingerprint (`hold_hash`): the SHA-256 of every location that has findings
+  and its content. No task runs while the item is held; the source checks of
+  every tick still apply (closed, label removed, text edited → closed,
+  cancelled, stale). An operator message sent while an item is held in
+  refinement is kept for the turn after the release; an approval is refused.
+- **Told.** One thread message (`[intake.texts] item_held`: the counts by
+  kind, the first three findings, the dashboard, `#<n> release`,
+  `#<n> cancel`) goes through the outbound queue, so the target policy and
+  the secret filter apply. An item without a WhatsApp thread yet gets the DM
+  as its surface, so the message and `#<n> release` work there. The
+  dashboard's item page lists every finding; `nucleus intake show` prints
+  them.
+- **Release.** `nucleus intake release <n>` (the operator's terminal only,
+  like `approve-plan`), the dashboard's release button (`InlineConfirm`), or
+  `#<n> release` typed by the operator in the item's thread (the same rules
+  as the approvals, finding 5: only the operator's identity, only `text`
+  input; a voice transcription or a forwarded message is kept and refused).
+  The release reads the source live, recomputes the findings and the
+  fingerprint, and compares it with `hold_hash`. A changed title, body or
+  used comment makes the item `stale` through the live read; a fingerprint
+  that differs for another reason (a new comment with hidden content) is
+  refused and makes the item `stale` too. Otherwise the item returns to the
+  stage it was held in, with `released_hash`, `released_at`, `released_via`.
+- **After the release.** The next check with the same fingerprint lets the
+  item go on. A new comment without findings keeps the fingerprint; a new
+  one with findings holds the item again. The hidden content is not removed:
+  the operator released what was shown, and it reaches the agent inside the
+  data fence. Every brief of a released item carries a fixed, code-owned line
+  outside the fence (`briefs::RELEASED_NOTE`): the data contains content
+  hidden from the page view, and the operator released it.
+- **Cancel** works as for any open item.
+- **Off.** `[intake] hidden_content_hold = false` turns the check off; a
+  held item can still be released or cancelled.
+
+### Limits
+
+- The check finds content that GitHub does not show. It cannot find
+  content that GitHub shows but a person misses: a line far down a long
+  body, look-alike characters from another script, a link whose text differs
+  from its target, an instruction written in plain sight, very small but
+  visible text made in ways not listed above.
+- The list follows GitHub's rendering as of this amendment (cmark-gfm, the
+  sanitizer's allowlist, MathJax, the rendered fence types). A rendering
+  feature GitHub adds later is not covered until the list is extended.
+- The Markdown reading is a conservative approximation, not a CommonMark
+  parser. It errs toward flagging: indented code, code inside list items or
+  block quotes, a code span that crosses a line or contains `|`, `x<y`
+  followed by a `>` further on, emoji ZWJ sequences (U+200D is Cf) and tag
+  sequences (flag emoji of subdivisions) are flagged. A false finding costs
+  the operator one release.
+- Content in a comment the item does not use (by a non-collaborator) is not
+  scanned, because it never reaches an agent.
+- The check covers the text an agent receives from the issue. It does not
+  cover the repository the agent reads (a file in the repo can carry the
+  same kinds of content), nor text GitHub changes between the live read and
+  the agent's start (the time of one API call, as in finding 3).
+
+### Verification of the hold
+
+Detector (`cargo test -p nucleus-core intake::hidden`): one test per kind
+with positive and negative cases, including an emoji with U+FE0F (not
+flagged), `<!-- x -->` in a fence (not flagged), a zero-width space in a
+fence (flagged), `&#8203;` (flagged), a link reference definition (flagged),
+a bare `<b>` (not flagged) and `<span>` (flagged), and the code-pairing
+cases that would otherwise hide a finding (a backtick pair across lines or
+table cells, an autolink, an escaped backtick). Pipeline
+(`intake::pipeline`): an issue with an HTML comment is held before the clone
+with no task created and one DM message
+(`an_issue_with_an_html_comment_is_held_before_any_task_starts`); a release
+continues to eval and the brief carries the line
+(`a_release_continues_to_eval_and_the_brief_says_so`); a release after an
+edit, and after a new comment with hidden content, is refused and the item
+is stale (`a_release_after_an_edit_is_refused_and_the_item_goes_stale`); a
+new collaborator comment with tag characters holds an item in refinement
+before its next turn, a voice or forwarded `release` is refused and the
+typed one applied (`a_new_comment_with_hidden_content_holds_an_item_in_refinement`);
+with the hold off nothing is held (`with_the_hold_off_nothing_is_held`).
+Briefs: the line is outside the fence and the content inside
+(`a_released_item_says_so_outside_the_fence`). CLI: only the operator
+releases (`authorization_by_caller`). TypeScript: `#n release` is routed as
+`text` only from the operator's typed DM; a transcription or forward keeps
+its kind; another sender is not routed (`intake.test.ts`). Dashboard API:
+the detail exposes the findings, the release works, and a release after the
+event changed is refused with the item stale
+(`a_held_item_shows_its_findings_and_can_be_released_unless_it_changed`).
+
 ## Rejected alternatives
 
 - **Webhooks.** They need public ingress, which Nucleus does not have
@@ -1017,6 +1192,15 @@ disabled baseline with an alert, leave retries with backoff and give-up,
 - **A WhatsApp group for every item.** Simple items need no discussion, and
   automated group creation risks the account; groups exist only for items
   that reach refinement, within a daily limit.
+- **Stripping hidden content before the brief.** The operator would release
+  one text and the agent would read another; a stripped comment can also
+  change the meaning of what is left. The hold shows the content and the
+  release passes it on unchanged, as data, with a note.
+- **Rendering the Markdown with a GitHub-compatible library and diffing the
+  visible text.** It needs a full cmark-gfm plus sanitizer reimplementation
+  that tracks GitHub's changes, and still misses what the diff cannot map
+  back to a source position. A list of known hiding places with a
+  conservative reading of code is smaller and fails toward flagging.
 - **Running the pipeline inside the WhatsApp bot or the dashboard.** Git,
   `gh` and test runs would block processes that must stay responsive, and
   intake.db would get a second writer family.
