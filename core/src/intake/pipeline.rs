@@ -1389,7 +1389,19 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
             // configured identity and a code-owned message.
             let ev = store::event(&ctx.db, item.event_id).await?;
             let spec = commit_spec(ctx, item, &ev);
-            let Some(sha) = git::import(&mirror, &remote, &wt, &base_sha, item.id, &spec).await? else {
+            let limits = git::ImportLimits {
+                max_files: ctx.cfg.import_max_files,
+                max_file_bytes: ctx.cfg.import_max_file_bytes,
+                max_total_bytes: ctx.cfg.import_max_total_bytes,
+            };
+            let imported = match git::import(&mirror, &remote, &wt, &base_sha, item.id, &spec, &limits).await {
+                Ok(i) => i,
+                Err(e) => match e.downcast_ref::<git::ImportRefused>() {
+                    Some(r) => return block_because(ctx, item, format!("the agent's work was not imported: {r}")).await,
+                    None => return Err(e),
+                },
+            };
+            let Some(sha) = imported else {
                 return fail(ctx, item, "the implementation agent changed no file").await;
             };
             let tests = git::run_tests(
@@ -1504,7 +1516,17 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
         files: &files,
         test_command: repo.test_command.as_deref(),
     });
-    let added = git::added_text(&mirror, &base_sha, &sha).await?;
+    let Some(added) = git::added_text(&mirror, &base_sha, &sha, ctx.cfg.scan_max_bytes).await? else {
+        return block_because(
+            ctx,
+            item,
+            format!(
+                "the diff to publish is larger than [intake] scan_max_bytes ({} bytes); it was not scanned and nothing was published",
+                ctx.cfg.scan_max_bytes
+            ),
+        )
+        .await;
+    };
     let header = git::commit_header(&mirror, &sha).await?;
     if let Verdict::Hit(cats) = ctx.guard.scan(&format!("{title}\n{body}\n{header}\n{added}")).await {
         return block(ctx, item, "the commit or the pull request text", &cats).await;

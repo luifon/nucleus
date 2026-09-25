@@ -651,6 +651,19 @@ pub struct IntakeConfig {
     pub commit_author_name: String,
     #[serde(default = "default_intake_commit_author_email")]
     pub commit_author_email: String,
+    /// Limits checked on the agent's clone before any file is read into
+    /// git: the number of paths (tracked and untracked, not ignored), each
+    /// file's length (a sparse file counts by its length) and the total.
+    #[serde(default = "default_intake_import_max_files")]
+    pub import_max_files: usize,
+    #[serde(default = "default_intake_import_max_file_bytes")]
+    pub import_max_file_bytes: u64,
+    #[serde(default = "default_intake_import_max_total_bytes")]
+    pub import_max_total_bytes: u64,
+    /// Largest diff the secret guard reads; a longer diff blocks the item
+    /// (it is never cut and passed).
+    #[serde(default = "default_intake_scan_max_bytes")]
+    pub scan_max_bytes: usize,
     #[serde(default)]
     pub repos: Vec<IntakeRepo>,
     #[serde(default)]
@@ -820,6 +833,18 @@ fn default_intake_commit_author_name() -> String {
 fn default_intake_commit_author_email() -> String {
     "nucleus-intake@localhost".into()
 }
+fn default_intake_import_max_files() -> usize {
+    20_000
+}
+fn default_intake_import_max_file_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+fn default_intake_import_max_total_bytes() -> u64 {
+    200 * 1024 * 1024
+}
+fn default_intake_scan_max_bytes() -> usize {
+    16 * 1024 * 1024
+}
 fn default_intake_issue_keyword() -> String {
     "Closes".into()
 }
@@ -855,6 +880,10 @@ impl Default for IntakeConfig {
             test_timeout_minutes: default_intake_test_timeout_minutes(),
             commit_author_name: default_intake_commit_author_name(),
             commit_author_email: default_intake_commit_author_email(),
+            import_max_files: default_intake_import_max_files(),
+            import_max_file_bytes: default_intake_import_max_file_bytes(),
+            import_max_total_bytes: default_intake_import_max_total_bytes(),
+            scan_max_bytes: default_intake_scan_max_bytes(),
             repos: vec![],
             github: IntakeGithubConfig::default(),
             whatsapp: IntakeWhatsAppConfig::default(),

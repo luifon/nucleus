@@ -227,6 +227,14 @@ max_runtime_hours = 12
 # # and messages are never pushed). Placeholders; use your own values.
 # commit_author_name = "Nucleus issue pipeline"
 # commit_author_email = "nucleus@example.com"
+# # Limits on the agent's clone, checked before any file is read into git
+# # (a violation blocks the item): paths (tracked and untracked, not
+# # ignored), bytes per file (a sparse file counts by its length), total.
+# import_max_files = 20000
+# import_max_file_bytes = 10485760     # 10 MiB
+# import_max_total_bytes = 209715200   # 200 MiB
+# # Largest diff the secret guard reads; a longer diff blocks the item.
+# scan_max_bytes = 16777216            # 16 MiB
 #
 # [[intake.repos]]
 # repo = "owner/repo"

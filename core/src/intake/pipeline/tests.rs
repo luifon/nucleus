@@ -1265,3 +1265,37 @@ async fn a_changed_executable_blocks_the_next_privileged_step() {
     assert!(it.error.unwrap().contains("executable-changed: gh"));
     assert!(!remote_has(&f, "nucleus/item-1"), "nothing was pushed");
 }
+
+#[tokio::test]
+async fn limits_block_the_item_with_a_clear_reason() {
+    // A file over the per-file limit: blocked at the import.
+    let f = fixture().await;
+    let mut cfg = f.ctx.cfg.clone();
+    cfg.import_max_file_bytes = 100;
+    let f = Fixture { ctx: Ctx { cfg, ..f.ctx }, ..f };
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("big.txt"), "x".repeat(500)).unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.failed_stage.as_deref()), (Stage::Blocked, Some("implementation")));
+    assert!(it.error.unwrap().contains("big.txt is 500 bytes"));
+
+    // A diff over the scan limit: blocked before the push, not cut.
+    let f = fixture().await;
+    let mut cfg = f.ctx.cfg.clone();
+    cfg.scan_max_bytes = 50;
+    let f = Fixture { ctx: Ctx { cfg, ..f.ctx }, ..f };
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n".repeat(40)).unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.failed_stage.as_deref()), (Stage::Blocked, Some("pr")));
+    assert!(it.error.unwrap().contains("scan_max_bytes"));
+    assert!(!remote_has(&f, "nucleus/item-1"));
+}
