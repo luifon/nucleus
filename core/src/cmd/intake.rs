@@ -6,7 +6,8 @@
 //! items and take the operator's decisions.
 //!
 //! Who may do what (`crate::caller`):
-//! - the operator: every command;
+//! - the operator: every command (`release` of a held item only from the
+//!   operator, like `approve-plan`);
 //! - the WhatsApp DM chat session: `list`, `show`, and `cancel` (not in a
 //!   turn that read an agent message). Approvals are the operator's own
 //!   messages in the item's thread, read by code, never a session's
@@ -81,6 +82,9 @@ enum Cmd {
     Cancel { item: String },
     /// Resume a failed item at the stage it failed in.
     Retry { item: String },
+    /// Release an item held for hidden content (`show` lists what was
+    /// hidden); refused when the issue changed since.
+    Release { item: String },
     /// End an unresolved WhatsApp group creation of an item by hand: you
     /// left the group (`--left`) or checked that none exists (`--absent`).
     GroupResolve {
@@ -150,6 +154,21 @@ async fn render_show(db: &sqlx::SqlitePool, n: i64, json: bool, label: &str) -> 
         writeln!(out, "  nothing more is done for this item; remove and add the `{}` label again for a new item", label)?;
     } else if let Some(e) = &it.error {
         writeln!(out, "error: {e}")?;
+    }
+    if it.stage == "held" {
+        let found: Vec<crate::intake::hidden::Finding> =
+            it.hold_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+        writeln!(
+            out,
+            "HELD: the issue text has content GitHub's page does not show ({}). Release with `nucleus intake release {}` or cancel.",
+            crate::intake::hidden::summary(&found),
+            it.id
+        )?;
+        for f in &found {
+            writeln!(out, "  - {}", crate::intake::hidden::describe(f, 300))?;
+        }
+    } else if let Some(v) = &it.released_via {
+        writeln!(out, "hidden content released via {v} at {}", it.released_at.as_deref().unwrap_or("?"))?;
     }
     if let (Some(g), Some(a)) = (&it.gate_event_id, &it.gate_actor) {
         writeln!(out, "gate: {g} by {a} at {}", it.gate_at.as_deref().unwrap_or("?"))?;
@@ -321,6 +340,10 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             let n = item_number(&item)?;
             pipeline::retry(&ctx, n, via).await.map(|i| println!("item #{n} resumed at {}", i.stage))
         }
+        Cmd::Release { item } => {
+            let n = item_number(&item)?;
+            pipeline::release(&ctx, n, via).await.map(|i| println!("item #{n} released; it continues at {}", i.stage))
+        }
         Cmd::GroupResolve { item, left, absent } => {
             let n = item_number(&item)?;
             let how = if left { "left" } else if absent { "absent" } else { unreachable!("clap requires one") };
@@ -379,6 +402,13 @@ mod tests {
         assert!(authorize(&caller(chat.clone(), 1), &cancel()).is_err());
         assert!(authorize(&caller(chat.clone(), 0), &approve()).is_err(), "a session never approves");
         assert!(authorize(&caller(chat.clone(), 0), &Cmd::Reply { item: "1".into(), text: "x".into() }).is_err());
+        // A release is the operator's, like a plan approval.
+        let release = || Cmd::Release { item: "1".into() };
+        assert!(authorize(&caller(Role::Operator, 0), &release()).is_ok());
+        assert!(authorize(&caller(Role::Operator, 1), &release()).is_err(), "reacting to an agent message");
+        assert!(authorize(&caller(chat.clone(), 0), &release()).is_err(), "a session never releases");
+        assert!(authorize(&caller(Role::Detached, 0), &release()).is_err());
+        assert!(authorize(&caller(Role::Worker { task_id: None }, 0), &release()).is_err());
         let resolve = || Cmd::GroupResolve { item: "1".into(), left: true, absent: false };
         assert!(authorize(&caller(chat, 0), &resolve()).is_err(), "only the operator resolves a group");
         assert!(authorize(&caller(Role::Detached, 0), &resolve()).is_err());

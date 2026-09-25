@@ -590,6 +590,7 @@ tmux attach -t nucleus-tasks                        # watch the workers
 ./target/release/nucleus intake show 3              # eval, plan, thread, tasks, PR
 ./target/release/nucleus intake approve-plan 3 --version 2
 ./target/release/nucleus intake approve-comment 3   # or skip-comment / cancel / retry
+./target/release/nucleus intake release 3           # a held item: continue with the hidden content `show` lists
 ./target/release/nucleus intake tick --poll         # poll every repo now and advance items
 ./target/release/nucleus events emit --source homelab --id disk-1 --title "Disk above 90%"
 tail -f memory/intake.log
