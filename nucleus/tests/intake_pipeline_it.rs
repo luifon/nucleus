@@ -89,6 +89,7 @@ case "$*" in
   *"collaborators/maintainer"*) exit 0 ;;
   *"collaborators/"*) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
   "pr list"*) echo '[]' ;;
+  "api user") echo '{{"login":"nucleus-it"}}' ;;
   "pr create"*) echo 'https://example.invalid/acme/widget/pull/1' ;;
   "issue comment"*) echo 'https://example.invalid/acme/widget/issues/1#issuecomment-1' ;;
   *) echo "fake gh: unexpected: $*" >&2; exit 1 ;;

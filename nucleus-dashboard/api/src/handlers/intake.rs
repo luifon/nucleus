@@ -178,6 +178,7 @@ async fn ctx(s: &IntakeState) -> Result<Ctx, IntakeError> {
         launcher: Arc::new(pipeline::WorkerLauncher),
         guard: Arc::new(nucleus_core::intake::publish::ScriptGuard { workspace_root: ws.clone() }),
         tools: Arc::new(tools),
+        viewer: tokio::sync::OnceCell::new(),
     })
 }
 

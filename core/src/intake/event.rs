@@ -189,9 +189,11 @@ pub trait SourceAdapter: Send + Sync {
     /// The event's state at the source now, with the evidence of who opened
     /// its gate. Any failure is an error; the caller fails closed.
     async fn live_state(&self, event: &Event) -> Result<SourceState>;
-    /// The URL of an earlier reply that carries `marker` (a retry after a
-    /// crash must not post twice), if one exists. A read only.
-    async fn find_reply(&self, event: &Event, marker: &str) -> Result<Option<String>>;
+    /// The URL of an earlier reply that carries `marker` on a line of its
+    /// own, written by `author` (the account Nucleus posts as), if one
+    /// exists: a retry after a crash must not post twice, and a marker
+    /// copied by someone else is ignored. A read only.
+    async fn find_reply(&self, event: &Event, marker: &str, author: &str) -> Result<Option<String>>;
     /// Post `body` on the event at its source (GitHub: an issue comment),
     /// with `marker` embedded invisibly. The caller runs [`find_reply`]
     /// first and a live gate read between the two, so nothing but that

@@ -446,6 +446,9 @@ pub struct Item {
     /// `none`, `proposed`, `approved`, `posted`, `skipped`.
     pub comment_state: String,
     pub comment_url: Option<String>,
+    /// The random operation id of the issue comment (stored before it is
+    /// posted; its marker line finds an earlier post after a crash).
+    pub comment_op: Option<String>,
     /// Where the item's thread runs on WhatsApp: `none` (not yet),
     /// `pending` (group requested), `group`, `dm`.
     pub surface: String,
@@ -546,7 +549,7 @@ pub struct ItemTask {
 
 const ITEM_COLUMNS: &str = "id, event_id, repo, title, stage, failed_stage, error, classification, eval_json, \
     plan_draft, plan_version, approved_plan, approved_version, approved_at, approved_via, branch, worktree, \
-    base_ref, impl_summary, head_sha, tests_status, tests_output, pr_url, comment_draft, comment_state, comment_url, \
+    base_ref, impl_summary, head_sha, tests_status, tests_output, pr_url, comment_draft, comment_state, comment_url, comment_op, \
     surface, group_requested_at, group_jid, group_closed_at, current_task_id, last_task_id, step_errors, \
     created_at, updated_at, closed_at, rev_title, rev_body, revision_hash, gate_event_id, label_event_id, \
     gate_actor, gate_at, stale_reason, base_sha, pushed_sha";
@@ -714,6 +717,7 @@ const SETTABLE: &[&str] = &[
     "comment_draft",
     "comment_state",
     "comment_url",
+    "comment_op",
     "surface",
     "group_requested_at",
     "group_jid",

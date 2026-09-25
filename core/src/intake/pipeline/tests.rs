@@ -53,6 +53,7 @@ async fn fixture() -> Fixture {
     gh.on("repos/acme/widget/issues -f", true, "[]", "");
     gh.on("/comments", true, "[]", "");
     gh.on("pr list", true, "[]", "");
+    gh.on("api user", true, r#"{"login":"nucleus-bot"}"#, "");
     gh.on("collaborators/maintainer", true, "", "");
     gh.on("collaborators/", false, "", "gh: Not Found (HTTP 404)");
     gh.on("pr create", true, "https://example.invalid/acme/widget/pull/5\n", "");
@@ -68,6 +69,7 @@ async fn fixture() -> Fixture {
         launcher: Arc::new(NoLaunch),
         guard: Arc::new(crate::intake::publish::ScriptGuard { workspace_root: ws.clone() }),
         tools: Arc::new(crate::intake::tools::ToolPins { gh: Some(crate::intake::tools::Pin::new(&fake_gh_file(&work)).unwrap()) }),
+        viewer: tokio::sync::OnceCell::new(),
     };
     // A stand-in for tools/check-secrets.sh with the same interface: exit 2
     // and a `    - <category>:<value>` line for a hit.
@@ -1351,4 +1353,36 @@ async fn a_push_before_a_crash_is_recognized_and_not_repeated() {
     let it = item1(&f).await;
     assert_eq!((it.stage(), it.pushed_sha.as_deref()), (Stage::Review, Some(sha.as_str())));
     assert_eq!(f.gh.calls_with("pr create"), 1);
+}
+
+#[tokio::test]
+async fn forged_markers_and_foreign_pull_requests_are_ignored() {
+    let f = fixture().await;
+    // Another account opened a PR on the item's branch name.
+    let foreign = serde_json::json!([{ "url": "https://example.invalid/acme/widget/pull/99", "number": 99, "headRefName": "nucleus/item-1",
+        "headRepository": { "name": "widget" }, "headRepositoryOwner": { "login": "acme" }, "author": { "login": "intruder" } }]);
+    f.gh.set("pr list", true, &foreign.to_string(), "");
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!(it.pr_url.as_deref(), Some("https://example.invalid/acme/widget/pull/5"), "Nucleus opened its own PR");
+    assert_eq!(f.gh.calls_with("pr create"), 1);
+    // The operator approves the comment; someone else posts a comment with a
+    // copied marker first (any operation id they could guess or copy).
+    approve_comment(&f.ctx, 1, None, "cli").await.unwrap();
+    let forged = serde_json::json!([{ "id": 7, "user": { "login": "intruder" }, "created_at": "t", "html_url": "https://example.invalid/c/7",
+        "body": "<!-- nucleus-intake:item-1:comment -->" }]);
+    f.gh.set("issues/1/comments", true, &forged.to_string(), "");
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.comment_state.as_str()), (Stage::Closed, "posted"));
+    assert_eq!(f.gh.calls_with("issue comment 1"), 1, "the approved comment was posted");
+    let op = it.comment_op.unwrap();
+    assert_eq!(op.len(), 32, "a 128-bit operation id");
+    let post = f.gh.calls.lock().unwrap().iter().find(|c| c.contains("issue comment 1")).cloned().unwrap();
+    assert!(post.contains(&format!("\n<!-- nucleus-intake:item-1:comment:{op} -->")), "{post}");
 }

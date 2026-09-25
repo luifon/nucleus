@@ -65,6 +65,15 @@ pub struct Ctx {
     pub guard: Arc<dyn SecretGuard>,
     /// `git` and `gh`, pinned when this process started.
     pub tools: Arc<super::tools::ToolPins>,
+    /// The account `gh` acts as, read once per process (`gh api user`).
+    pub viewer: tokio::sync::OnceCell<String>,
+}
+
+impl Ctx {
+    /// The login of the account Nucleus posts as.
+    pub async fn viewer(&self) -> Result<&str> {
+        self.viewer.get_or_try_init(|| github::viewer(&*self.gh)).await.map(String::as_str)
+    }
 }
 
 impl Ctx {
@@ -88,6 +97,7 @@ impl Ctx {
             launcher: Arc::new(WorkerLauncher),
             guard: Arc::new(publish::ScriptGuard { workspace_root: ws.to_path_buf() }),
             tools: Arc::new(tools),
+            viewer: tokio::sync::OnceCell::new(),
         })
     }
 }
@@ -1475,6 +1485,14 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
     }
 }
 
+/// `n` random bytes from the OS, hex.
+fn random_hex(n: usize) -> Result<String> {
+    use std::io::Read;
+    let mut buf = vec![0u8; n];
+    std::fs::File::open("/dev/urandom").context("opening /dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// The one commit Nucleus publishes for an item: the configured identity
 /// and a code-owned message.
 fn commit_spec(ctx: &Ctx, item: &Item, ev: &Event) -> git::CommitSpec {
@@ -1615,7 +1633,8 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
         git::push(&mirror, &remote, &sha, &branch, item.id, &remote_default, lease.as_deref()).await?;
         store::update(&ctx.db, item.id, Stage::Pr, vec![("pushed_sha", sha.clone().into())]).await?;
     }
-    let url = match github::find_pr(&*ctx.gh, &item.repo, &branch).await? {
+    let viewer = ctx.viewer().await?.to_string();
+    let url = match github::find_pr(&*ctx.gh, &item.repo, &branch, &viewer).await? {
         Some(u) => u,
         None => {
             let _ = final_read!(ctx, item, "the pull request", first);
@@ -1661,10 +1680,24 @@ async fn step_review(ctx: &Ctx, item: &Item) -> Result<()> {
             if let Verdict::Hit(cats) = ctx.guard.scan(&draft).await {
                 return block(ctx, item, "the issue comment", &cats).await;
             }
-            let marker = format!("{}item-{}:comment", github::COMMENT_MARKER_PREFIX, item.id);
+            // A random operation id, stored before the post: its exact
+            // marker line, on a comment by the account Nucleus posts as, is
+            // the only proof of an earlier post.
+            let op = match &item.comment_op {
+                Some(op) => op.clone(),
+                None => {
+                    let op = random_hex(16)?;
+                    if !store::update(&ctx.db, item.id, Stage::Review, vec![("comment_op", op.clone().into())]).await? {
+                        return Ok(());
+                    }
+                    op
+                }
+            };
+            let marker = format!("{}item-{}:comment:{op}", github::COMMENT_MARKER_PREFIX, item.id);
+            let viewer = ctx.viewer().await?.to_string();
             // The lookup (a retry must not post twice), then a fresh read,
             // then the write.
-            let url = match a.find_reply(&ev, &marker).await? {
+            let url = match a.find_reply(&ev, &marker, &viewer).await? {
                 Some(u) => Some(u),
                 None => {
                     let _ = final_read!(ctx, item, "the issue comment", first);

@@ -485,6 +485,7 @@ pub(crate) mod tests {
             comment_draft: None,
             comment_state: "none".into(),
             comment_url: None,
+            comment_op: None,
             surface: "none".into(),
             group_requested_at: None,
             group_jid: None,

@@ -414,10 +414,13 @@ impl SourceAdapter for GithubIssues {
         })
     }
 
-    async fn find_reply(&self, event: &Event, marker: &str) -> Result<Option<String>> {
+    async fn find_reply(&self, event: &Event, marker: &str, author: &str) -> Result<Option<String>> {
         let (_, number) = parse_external_id(&event.external_id)?;
+        let line = marker_line(marker);
         for c in self.comments(number).await? {
-            if c["body"].as_str().map(|b| b.contains(marker)).unwrap_or(false) {
+            let by = c["user"]["login"].as_str().unwrap_or_default();
+            let exact = c["body"].as_str().map(|b| b.lines().any(|l| l.trim_end_matches('\r') == line)).unwrap_or(false);
+            if exact && !author.is_empty() && by.eq_ignore_ascii_case(author) {
                 return Ok(Some(c["html_url"].as_str().unwrap_or_default().to_string()));
             }
         }
@@ -426,7 +429,7 @@ impl SourceAdapter for GithubIssues {
 
     async fn post_reply(&self, event: &Event, body: &str, marker: &str) -> Result<Option<String>> {
         let (repo, number) = parse_external_id(&event.external_id)?;
-        let tagged = format!("{body}\n\n<!-- {marker} -->");
+        let tagged = format!("{body}\n\n{}", marker_line(marker));
         let file = tempfile_with(&tagged)?;
         let out = self
             .gh
@@ -442,6 +445,21 @@ impl SourceAdapter for GithubIssues {
     }
 }
 
+/// The exact line that carries `marker` in a comment.
+pub fn marker_line(marker: &str) -> String {
+    format!("<!-- {marker} -->")
+}
+
+/// The login of the account `gh` is authenticated as (`gh api user`).
+pub async fn viewer(gh: &dyn GhRunner) -> Result<String> {
+    let v = gh_json(gh, args(&["api", "user"])).await?;
+    let login = v["login"].as_str().unwrap_or_default().to_string();
+    if login.is_empty() {
+        bail!("gh api user returned no login");
+    }
+    Ok(login)
+}
+
 /// Every marker Nucleus embeds in GitHub text starts with this.
 pub const COMMENT_MARKER_PREFIX: &str = "nucleus-intake:";
 
@@ -454,14 +472,40 @@ pub fn last_url(stdout: &str) -> Option<String> {
     stdout.split_whitespace().rev().find(|t| t.starts_with("https://")).map(str::to_string)
 }
 
-/// The open or closed pull request whose head is `branch`, if any.
-pub async fn find_pr(gh: &dyn GhRunner, repo: &str, branch: &str) -> Result<Option<String>> {
+/// The open or closed pull request that is the item's own: head branch
+/// exactly `branch`, head repository exactly `repo`, opened by `author`
+/// (the account Nucleus acts as). Any other pull request on that branch
+/// name is ignored.
+pub async fn find_pr(gh: &dyn GhRunner, repo: &str, branch: &str, author: &str) -> Result<Option<String>> {
     let v = gh_json(
         gh,
-        args(&["pr", "list", "--repo", repo, "--head", branch, "--state", "all", "--json", "url,number"]),
+        args(&[
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "url,number,headRefName,headRepository,headRepositoryOwner,author",
+        ]),
     )
     .await?;
-    Ok(v.as_array().and_then(|a| a.first()).and_then(|p| p["url"].as_str()).map(str::to_string))
+    let (owner, name) = repo.split_once('/').context("repo is not owner/name")?;
+    Ok(v.as_array().and_then(|a| {
+        a.iter()
+            .find(|p| {
+                p["headRefName"].as_str() == Some(branch)
+                    && p["headRepositoryOwner"]["login"].as_str().map(|o| o.eq_ignore_ascii_case(owner)).unwrap_or(false)
+                    && p["headRepository"]["name"].as_str().map(|n| n.eq_ignore_ascii_case(name)).unwrap_or(false)
+                    && !author.is_empty()
+                    && p["author"]["login"].as_str().map(|l| l.eq_ignore_ascii_case(author)).unwrap_or(false)
+            })
+            .and_then(|p| p["url"].as_str())
+            .map(str::to_string)
+    }))
 }
 
 /// Open a DRAFT pull request. Never merges; never marks it ready.
@@ -716,7 +760,7 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(a.find_reply(&ev, "nucleus-intake:item-1:comment").await.unwrap(), None);
+        assert_eq!(a.find_reply(&ev, "nucleus-intake:item-1:comment", "nucleus-bot").await.unwrap(), None);
         let url = a.post_reply(&ev, "Draft PR open.", "nucleus-intake:item-1:comment").await.unwrap();
         assert_eq!(url.as_deref(), Some("https://example.invalid/acme/widget/issues/9#issuecomment-1"));
         assert!(gh.calls.lock().unwrap().iter().any(|c| c.contains("BODY<<Draft PR open.\n\n<!-- nucleus-intake:item-1:comment -->>>")));
@@ -727,13 +771,18 @@ pub(crate) mod tests {
                 "issues/9/comments".into(),
                 GhOut {
                     ok: true,
-                    stdout: serde_json::json!([{ "body": "x <!-- nucleus-intake:item-1:comment -->", "html_url": "https://example.invalid/c/2" }]).to_string(),
+                    stdout: serde_json::json!([
+                        { "body": "copied\n<!-- nucleus-intake:item-1:comment -->", "html_url": "https://example.invalid/c/1", "user": { "login": "someone" } },
+                        { "body": "inline <!-- nucleus-intake:item-1:comment --> text", "html_url": "https://example.invalid/c/3", "user": { "login": "nucleus-bot" } },
+                        { "body": "x\n<!-- nucleus-intake:item-1:comment -->", "html_url": "https://example.invalid/c/2", "user": { "login": "nucleus-bot" } }
+                    ]).to_string(),
                     stderr: String::new(),
                 },
             ),
         );
-        let url = a.find_reply(&ev, "nucleus-intake:item-1:comment").await.unwrap();
-        assert_eq!(url.as_deref(), Some("https://example.invalid/c/2"));
+        let url = a.find_reply(&ev, "nucleus-intake:item-1:comment", "nucleus-bot").await.unwrap();
+        assert_eq!(url.as_deref(), Some("https://example.invalid/c/2"), "only the exact line from the authenticated account");
+        assert_eq!(a.find_reply(&ev, "nucleus-intake:item-1:comment", "other").await.unwrap(), None);
         assert_eq!(gh.calls_with("issue comment 9"), 1);
     }
 
