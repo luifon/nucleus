@@ -964,7 +964,7 @@ fn worker_denylist() -> Vec<String> {
     out
 }
 
-fn worker_message(task: &Task) -> String {
+pub(crate) fn worker_message(task: &Task) -> String {
     format!(
         "[Nucleus background task {} — {:?}, kind {}, requested by {} via {}]\n\n{}",
         task.short_id(),

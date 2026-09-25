@@ -1036,7 +1036,17 @@ async fn start_task(
         &ctx.tasks_db,
         NewTask {
             kind: kind.into(),
-            title: format!("#{} {} — {}", item.id, stage.as_str(), clip(&item.title, 120)),
+            // Code-owned: the task title is typed into the worker session
+            // outside the data fence, so no issue text goes into it.
+            title: format!(
+                "Intake item #{} — {}",
+                item.id,
+                match stage {
+                    Stage::Eval => "evaluation",
+                    Stage::Refinement => "refinement",
+                    _ => "implementation",
+                }
+            ),
             brief,
             origin: "pipeline".into(),
             origin_ref: Some(format!("intake:{}", item.id)),
@@ -1266,7 +1276,7 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
                     let wd = work_dir(ctx)?;
                     let remote = remote_for(ctx, &item.repo)?;
                     let mirror = git::sync_mirror(&wd, &item.repo, &remote).await?;
-                    let b = existing.clone().unwrap_or_else(|| stage::branch_name(item.id, &item.title));
+                    let b = existing.clone().unwrap_or_else(|| stage::branch_name(item.id));
                     git::prepare_clone(&mirror, &wt, &base_ref, item.id, Some(&b)).await?;
                     store::update(&ctx.db, item.id, Stage::Implementation, vec![("branch", b.clone().into())]).await?;
                     b

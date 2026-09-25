@@ -345,25 +345,11 @@ pub fn group_subject(n: i64, title: &str) -> String {
     format!("{head}{short}")
 }
 
-/// Branch name for an item: `nucleus/item-<n>-<slug>`.
-pub fn branch_name(n: i64, title: &str) -> String {
-    let mut slug = String::new();
-    for c in title.chars().flat_map(|c| c.to_lowercase()) {
-        if c.is_ascii_alphanumeric() {
-            slug.push(c);
-        } else if !slug.ends_with('-') && !slug.is_empty() {
-            slug.push('-');
-        }
-        if slug.len() >= 40 {
-            break;
-        }
-    }
-    let slug = slug.trim_matches('-');
-    if slug.is_empty() {
-        format!("nucleus/item-{n}")
-    } else {
-        format!("nucleus/item-{n}-{slug}")
-    }
+/// Branch name for an item: `nucleus/item-<n>`. Code-owned: no part of
+/// the issue title goes into it, because the branch name is written into
+/// the implementation agent's brief outside the data fence.
+pub fn branch_name(n: i64) -> String {
+    format!("nucleus/item-{n}")
 }
 
 #[cfg(test)]
@@ -527,8 +513,6 @@ mod tests {
         let long = group_subject(12, &"word ".repeat(40));
         assert_eq!(long.chars().count(), 60);
         assert!(long.starts_with("#12 word") && long.ends_with('…'));
-        assert_eq!(branch_name(3, "Fix: README typo (again)!"), "nucleus/item-3-fix-readme-typo-again");
-        assert_eq!(branch_name(4, "¿¿"), "nucleus/item-4");
-        assert!(branch_name(5, &"a".repeat(100)).len() <= "nucleus/item-5-".len() + 40);
+        assert_eq!(branch_name(3), "nucleus/item-3");
     }
 }
