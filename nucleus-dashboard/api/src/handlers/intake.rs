@@ -116,7 +116,8 @@ struct IntakeItemReq {
 // ─── handlers ──────────────────────────────────────────────────────────────
 
 async fn read_pool(s: &IntakeState) -> Option<sqlx::SqlitePool> {
-    if !s.workspace_root.join(nucleus_core::intake::INTAKE_DB_PATH).exists() {
+    // Intake off, or never run: nothing to show (and nothing is created).
+    if !s.intake.enabled || !s.workspace_root.join(nucleus_core::intake::INTAKE_DB_PATH).exists() {
         return None;
     }
     store::open_read_only(&s.workspace_root).await.ok()
@@ -156,6 +157,9 @@ fn same_origin(headers: &HeaderMap) -> Result<(), IntakeError> {
 }
 
 async fn ctx(s: &IntakeState) -> Result<Ctx, IntakeError> {
+    if !s.intake.enabled {
+        return Err(IntakeError::Conflict("intake is disabled ([intake] enabled = false)".into()));
+    }
     let ws = &s.workspace_root;
     let tools = nucleus_core::intake::tools::ToolPins::pin(&s.intake.github.gh_bin).map_err(IntakeError::other)?;
     Ok(Ctx {
@@ -308,10 +312,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writes_need_json_and_the_same_origin() {
+    async fn disabled_intake_shows_nothing_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
         let app = router(state(dir.path()));
+        let list_req = axum::http::Request::get("/list?all=true").body(axum::body::Body::empty()).unwrap();
+        let res = app.clone().oneshot(list_req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&body[..], b"[]");
+        let cancel = axum::http::Request::post("/cancel")
+            .header("content-type", "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .body(axum::body::Body::from(r#"{"id":1}"#))
+            .unwrap();
+        assert_eq!(app.oneshot(cancel).await.unwrap().status(), StatusCode::CONFLICT);
+        assert!(!dir.path().join(nucleus_core::intake::INTAKE_DB_PATH).exists(), "no intake.db is created");
+    }
+
+    fn enabled_state(dir: &std::path::Path) -> Arc<IntakeState> {
+        let mut intake = nucleus_core::config::IntakeConfig { enabled: true, ..Default::default() };
+        intake.github.gh_bin = "sh".into();
+        Arc::new(IntakeState { workspace_root: dir.to_path_buf(), intake, tasks: Default::default() })
+    }
+
+    #[tokio::test]
+    async fn writes_need_json_and_the_same_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let app = router(enabled_state(dir.path()));
         let form = axum::http::Request::post("/approve-plan")
             .header("content-type", "application/x-www-form-urlencoded")
             .body(axum::body::Body::from("id=1&version=1"))

@@ -288,21 +288,6 @@ export class IntakeStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_inbound_msg
         ON intake_inbound(chat_id, wa_msg_id);
     `);
-    // Columns added after the first release of these tables (a table the
-    // pipeline or an older bot created).
-    this.addColumn("intake_group_requests", "attempts", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumn("intake_group_requests", "next_attempt_at", "TEXT");
-    this.addColumn("intake_group_requests", "claimed_at", "TEXT");
-    this.addColumn("intake_group_requests", "nonce", "TEXT");
-    this.addColumn("intake_groups", "members_json", "TEXT");
-    this.addColumn("intake_groups", "token", "TEXT");
-    this.addColumn("intake_groups", "checked_at", "TEXT");
-    this.addColumn("intake_inbound", "input_kind", "TEXT NOT NULL DEFAULT 'unknown'");
-  }
-
-  private addColumn(table: string, column: string, decl: string): void {
-    const cols = this.db.prepare(`SELECT name FROM pragma_table_info(?)`).all(table) as Array<{ name: string }>;
-    if (!cols.some((c) => c.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
   }
 
   /** Pending requests that are due (a close waiting for its backoff is

@@ -13,30 +13,47 @@ use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 use std::path::Path;
 
+/// The whole intake.db schema. One version: the feature was never deployed
+/// before its review rounds, so the intermediate versions were collapsed.
+///
+/// - `events`: one row per `(source, external_id)`; `changed_at` is when the
+///   content last changed, `gate_checked_at` / `gate_note` record the last
+///   gate check and why it created no item.
+/// - `items`: an event can have several items over time (the label added
+///   again, the issue reopened), at most one open (not closed, cancelled or
+///   stale) and one per gate event. Each item is bound to the revision of
+///   its event when the gate was satisfied (`rev_title`, `rev_body`,
+///   `revision_hash`) and to the gate event itself.
+/// - `item_comments`: the content hash of every trusted comment an item used.
+/// - `inbound_commands`: the processing state of every operator message read
+///   from WhatsApp; the read watermark moves only past final ones.
 const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS events (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    source        TEXT NOT NULL,
-    external_id   TEXT NOT NULL,
-    project       TEXT,
-    kind          TEXT NOT NULL,
-    title         TEXT NOT NULL,
-    body          TEXT NOT NULL,
-    author        TEXT,
-    labels_json   TEXT NOT NULL,
-    url           TEXT,
-    state         TEXT NOT NULL,
-    created_at    TEXT,
-    updated_at    TEXT,
-    raw_json      TEXT NOT NULL,
-    accepted      INTEGER NOT NULL,
-    first_seen_at TEXT NOT NULL,
-    last_seen_at  TEXT NOT NULL,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source          TEXT NOT NULL,
+    external_id     TEXT NOT NULL,
+    project         TEXT,
+    kind            TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    body            TEXT NOT NULL,
+    author          TEXT,
+    labels_json     TEXT NOT NULL,
+    url             TEXT,
+    state           TEXT NOT NULL,
+    created_at      TEXT,
+    updated_at      TEXT,
+    raw_json        TEXT NOT NULL,
+    accepted        INTEGER NOT NULL,
+    first_seen_at   TEXT NOT NULL,
+    last_seen_at    TEXT NOT NULL,
+    changed_at      TEXT,
+    gate_checked_at TEXT,
+    gate_note       TEXT,
     UNIQUE (source, external_id)
 );
 CREATE TABLE IF NOT EXISTS items (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id           INTEGER NOT NULL UNIQUE REFERENCES events(id),
+    event_id           INTEGER NOT NULL REFERENCES events(id),
     repo               TEXT NOT NULL,
     title              TEXT NOT NULL,
     stage              TEXT NOT NULL,
@@ -60,6 +77,7 @@ CREATE TABLE IF NOT EXISTS items (
     comment_draft      TEXT,
     comment_state      TEXT NOT NULL DEFAULT 'none',
     comment_url        TEXT,
+    comment_op         TEXT,
     surface            TEXT NOT NULL DEFAULT 'none',
     group_requested_at TEXT,
     group_jid          TEXT,
@@ -69,9 +87,22 @@ CREATE TABLE IF NOT EXISTS items (
     step_errors        INTEGER NOT NULL DEFAULT 0,
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL,
-    closed_at          TEXT
+    closed_at          TEXT,
+    head_sha           TEXT,
+    base_sha           TEXT,
+    pushed_sha         TEXT,
+    rev_title          TEXT,
+    rev_body           TEXT,
+    revision_hash      TEXT,
+    gate_event_id      TEXT,
+    label_event_id     TEXT,
+    gate_actor         TEXT,
+    gate_at            TEXT,
+    stale_reason       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_items_stage ON items(stage, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_items_open_event ON items(event_id) WHERE stage NOT IN ('closed', 'cancelled', 'stale');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_items_gate ON items(event_id, gate_event_id) WHERE gate_event_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS item_tasks (
     item_id    INTEGER NOT NULL REFERENCES items(id),
     task_id    TEXT NOT NULL,
@@ -101,6 +132,24 @@ CREATE TABLE IF NOT EXISTS item_transitions (
     to_stage   TEXT NOT NULL,
     reason     TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS item_comments (
+    item_id     INTEGER NOT NULL REFERENCES items(id),
+    comment_id  TEXT NOT NULL,
+    author      TEXT NOT NULL,
+    body_hash   TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (item_id, comment_id)
+);
+CREATE TABLE IF NOT EXISTS inbound_commands (
+    msg_ref     TEXT PRIMARY KEY,
+    wa_row_id   INTEGER NOT NULL,
+    item_key    TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    error       TEXT,
+    received_at TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS collaborators (
     repo       TEXT NOT NULL,
     login      TEXT NOT NULL,
@@ -113,171 +162,12 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 )";
 
-/// v2: the commit Nucleus collected from the item's clone and pushes.
-const SCHEMA_V2: &str = "ALTER TABLE items ADD COLUMN head_sha TEXT";
-
-/// v3 (finding: untrusted edits reach an acting session): an item is bound
-/// to the revision of its event at the moment the gate was satisfied, and
-/// to the gate event itself. `items` is rebuilt without `UNIQUE(event_id)`:
-/// an event gets a new item each time its gate opens again (the label is
-/// re-added, the issue reopened), and at most one open item at a time.
-/// `item_comments` binds an item to every trusted comment it used. Events
-/// record when their content last changed and when the gate was checked.
-const V3_ITEM_COLUMNS: &str = "id, event_id, repo, title, stage, failed_stage, error, classification, eval_json, \
-    plan_draft, plan_version, approved_plan, approved_version, approved_at, approved_via, branch, worktree, \
-    base_ref, impl_summary, tests_status, tests_output, pr_url, comment_draft, comment_state, comment_url, surface, \
-    group_requested_at, group_jid, group_closed_at, current_task_id, last_task_id, step_errors, created_at, \
-    updated_at, closed_at, head_sha";
-
-const SCHEMA_V3: &[&str] = &[
-    "CREATE TABLE items_v3 (
-        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-        event_id           INTEGER NOT NULL REFERENCES events(id),
-        repo               TEXT NOT NULL,
-        title              TEXT NOT NULL,
-        stage              TEXT NOT NULL,
-        failed_stage       TEXT,
-        error              TEXT,
-        classification     TEXT,
-        eval_json          TEXT,
-        plan_draft         TEXT,
-        plan_version       INTEGER NOT NULL DEFAULT 0,
-        approved_plan      TEXT,
-        approved_version   INTEGER,
-        approved_at        TEXT,
-        approved_via       TEXT,
-        branch             TEXT,
-        worktree           TEXT,
-        base_ref           TEXT,
-        impl_summary       TEXT,
-        tests_status       TEXT,
-        tests_output       TEXT,
-        pr_url             TEXT,
-        comment_draft      TEXT,
-        comment_state      TEXT NOT NULL DEFAULT 'none',
-        comment_url        TEXT,
-        surface            TEXT NOT NULL DEFAULT 'none',
-        group_requested_at TEXT,
-        group_jid          TEXT,
-        group_closed_at    TEXT,
-        current_task_id    TEXT,
-        last_task_id       TEXT,
-        step_errors        INTEGER NOT NULL DEFAULT 0,
-        created_at         TEXT NOT NULL,
-        updated_at         TEXT NOT NULL,
-        closed_at          TEXT,
-        head_sha           TEXT,
-        rev_title          TEXT,
-        rev_body           TEXT,
-        revision_hash      TEXT,
-        gate_event_id      TEXT,
-        label_event_id     TEXT,
-        gate_actor         TEXT,
-        gate_at            TEXT,
-        stale_reason       TEXT
-    )",
-    "INSERT INTO items_v3 ({cols}) SELECT {cols} FROM items",
-    "DROP TABLE items",
-    "ALTER TABLE items_v3 RENAME TO items",
-    "CREATE INDEX idx_items_stage ON items(stage, id)",
-    "CREATE UNIQUE INDEX idx_items_open_event ON items(event_id) WHERE stage NOT IN ('closed', 'cancelled', 'stale')",
-    "CREATE UNIQUE INDEX idx_items_gate ON items(event_id, gate_event_id) WHERE gate_event_id IS NOT NULL",
-    "CREATE TABLE item_comments (
-        item_id     INTEGER NOT NULL REFERENCES items(id),
-        comment_id  TEXT NOT NULL,
-        author      TEXT NOT NULL,
-        body_hash   TEXT NOT NULL,
-        recorded_at TEXT NOT NULL,
-        PRIMARY KEY (item_id, comment_id)
-    )",
-    "ALTER TABLE events ADD COLUMN changed_at TEXT",
-    "ALTER TABLE events ADD COLUMN gate_checked_at TEXT",
-    "ALTER TABLE events ADD COLUMN gate_note TEXT",
-    "UPDATE events SET changed_at = last_seen_at",
-];
-
-/// Runs [`SCHEMA_V3`] with foreign keys off (the documented SQLite
-/// procedure for rebuilding a table other tables reference), in one
-/// transaction, then checks every foreign key before committing.
-fn migrate_v3(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
-    Box::pin(async move {
-        let mut conn = pool.acquire().await?;
-        sqlx::query("PRAGMA foreign_keys = OFF").execute(&mut *conn).await?;
-        let result = async {
-            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-            let done: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'revision_hash'")
-                    .fetch_one(&mut *conn)
-                    .await?;
-            if done > 0 {
-                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
-                return Ok(());
-            }
-            let applied = async {
-                for stmt in SCHEMA_V3 {
-                    let stmt = stmt.replace("{cols}", V3_ITEM_COLUMNS);
-                    sqlx::query(&stmt).execute(&mut *conn).await.with_context(|| format!("intake.db v3: {stmt}"))?;
-                }
-                let broken: Vec<(String,)> =
-                    sqlx::query_as("SELECT \"table\" FROM pragma_foreign_key_check").fetch_all(&mut *conn).await?;
-                if !broken.is_empty() {
-                    bail!("intake.db v3 left broken foreign keys in {broken:?}");
-                }
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            match applied {
-                Ok(()) => {
-                    sqlx::query("COMMIT").execute(&mut *conn).await?;
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    Err(e)
-                }
-            }
-        }
-        .await;
-        sqlx::query("PRAGMA foreign_keys = ON").execute(&mut *conn).await?;
-        result
-    })
-}
-
-/// v4 (finding: lost operator commands): the processing state of every
-/// operator message read from WhatsApp, keyed by the message. The read
-/// watermark only moves past messages that are applied or failed for good.
-const SCHEMA_V4: &str = "CREATE TABLE inbound_commands (
-    msg_ref     TEXT PRIMARY KEY,
-    wa_row_id   INTEGER NOT NULL,
-    item_key    TEXT NOT NULL,
-    state       TEXT NOT NULL,
-    attempts    INTEGER NOT NULL DEFAULT 0,
-    error       TEXT,
-    received_at TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
-)";
-
-/// v5: the base commit an item's clone started from (the parent of the one
-/// commit Nucleus publishes for the item).
-const SCHEMA_V5: &str = "ALTER TABLE items ADD COLUMN base_sha TEXT";
-
-/// v6: the commit Nucleus last pushed to the item's branch (the next push
-/// leases on it).
-const SCHEMA_V6: &str = "ALTER TABLE items ADD COLUMN pushed_sha TEXT";
-
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(super::INTAKE_DB_PATH)).await?;
     crate::migrate::migrate(
         &pool,
-        &[
-            crate::migrate::Migration { version: 1, name: "intake baseline", step: crate::migrate::Step::Sql(SCHEMA_V1) },
-            crate::migrate::Migration { version: 2, name: "collected commit", step: crate::migrate::Step::Sql(SCHEMA_V2) },
-            crate::migrate::Migration { version: 3, name: "revision binding", step: crate::migrate::Step::Rust(migrate_v3) },
-            crate::migrate::Migration { version: 4, name: "inbound command state", step: crate::migrate::Step::Sql(SCHEMA_V4) },
-            crate::migrate::Migration { version: 5, name: "base commit", step: crate::migrate::Step::Sql(SCHEMA_V5) },
-            crate::migrate::Migration { version: 6, name: "pushed commit", step: crate::migrate::Step::Sql(SCHEMA_V6) },
-        ],
+        &[crate::migrate::Migration { version: 1, name: "intake schema", step: crate::migrate::Step::Sql(SCHEMA_V1) }],
     )
     .await
     .context("migrating intake.db")?;
@@ -1398,39 +1288,6 @@ pub(crate) mod tests {
         assert_eq!(bind_comment(&pool, it.id, "55", "dev", "h1").await.unwrap(), CommentBinding::Same);
         assert_eq!(bind_comment(&pool, it.id, "55", "dev", "h2").await.unwrap(), CommentBinding::Changed);
         assert_eq!(bound_comments(&pool, it.id).await.unwrap(), ["55"]);
-    }
-
-    #[tokio::test]
-    async fn v3_rebuilds_items_and_keeps_every_row() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(super::super::INTAKE_DB_PATH);
-        let pool = crate::db::open(&path).await.unwrap();
-        crate::migrate::migrate(
-            &pool,
-            &[
-                crate::migrate::Migration { version: 1, name: "intake baseline", step: crate::migrate::Step::Sql(SCHEMA_V1) },
-                crate::migrate::Migration { version: 2, name: "collected commit", step: crate::migrate::Step::Sql(SCHEMA_V2) },
-            ],
-        )
-        .await
-        .unwrap();
-        for sql in [
-            "INSERT INTO events (source, external_id, kind, title, body, labels_json, state, raw_json, accepted, first_seen_at, last_seen_at)
-             VALUES ('github', 'acme/widget#1', 'issue', 'T', 'B', '[]', 'open', '{}', 1, 't', 't')",
-            "INSERT INTO items (event_id, repo, title, stage, created_at, updated_at, head_sha) VALUES (1, 'acme/widget', 'T', 'eval', 't', 't', 'abc')",
-            "INSERT INTO item_messages (item_id, at, author, via, body) VALUES (1, 't', 'nucleus', 'pipeline', 'hi')",
-        ] {
-            sqlx::query(sql).execute(&pool).await.unwrap();
-        }
-        pool.close().await;
-        let pool = open(dir.path()).await.unwrap();
-        let it = item(&pool, 1).await.unwrap();
-        assert_eq!((it.stage.as_str(), it.head_sha.as_deref(), it.revision_hash), ("eval", Some("abc"), None));
-        assert_eq!(messages(&pool, 1).await.unwrap().len(), 1);
-        let fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(&pool).await.unwrap();
-        assert_eq!(fk, 1, "foreign keys are on again");
-        // Running open again is a no-op.
-        drop(open(dir.path()).await.unwrap());
     }
 
     #[tokio::test]
