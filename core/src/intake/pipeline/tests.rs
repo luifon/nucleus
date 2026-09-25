@@ -66,7 +66,17 @@ async fn fixture() -> Fixture {
         wa: crate::whatsapp_queue::open(&ws).await.unwrap(),
         gh: gh.clone(),
         launcher: Arc::new(NoLaunch),
+        guard: Arc::new(crate::intake::publish::ScriptGuard { workspace_root: ws.clone() }),
     };
+    // A stand-in for tools/check-secrets.sh with the same interface: exit 2
+    // and a `    - <category>:<value>` line for a hit.
+    std::fs::create_dir_all(ws.join("tools")).unwrap();
+    std::fs::write(
+        ws.join("tools/check-secrets.sh"),
+        "#!/usr/bin/env bash\nhay=\"$(cat)\"\ncase \"$hay\" in *FAKE-SECRET-VALUE*) echo 'hit' >&2; \
+         echo '    - value:FAKE-SECRET-VALUE' >&2; exit 2 ;; esac\nexit 0\n",
+    )
+    .unwrap();
     // The bot's own tables, as messaging/whatsapp creates them.
     for ddl in [
         "CREATE TABLE IF NOT EXISTS intake_groups (item_key TEXT PRIMARY KEY, jid TEXT, subject TEXT,
@@ -209,6 +219,8 @@ async fn simple_issue_goes_from_intake_to_a_draft_pr_and_an_approved_comment() {
     sh(&f.remote, &format!("git rev-parse --verify -q refs/heads/{branch}"));
     let create = f.gh.calls.lock().unwrap().iter().find(|c| c.contains("pr create")).cloned().unwrap();
     assert!(create.contains("--draft") && create.contains("Closes #1") && create.contains("nucleus-intake:item-1"), "{create}");
+    assert!(create.contains("- `README.md`") && create.contains("`test -f README.md` — passed"), "{create}");
+    assert!(!create.contains("Fixed the typo"), "the agent's text is not published: {create}");
     assert_eq!(f.gh.calls_with("pr merge"), 0);
 
     // Every thread message went to the DM with the item's marker.
@@ -750,4 +762,57 @@ async fn removing_the_label_stops_an_item_in_review() {
     tick(&f).await;
     assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
     assert_eq!(f.gh.calls_with("issue comment"), 0, "no comment after the label was removed");
+}
+
+#[tokio::test]
+async fn the_secret_guard_blocks_a_push_and_a_comment() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    let branch = it.branch.clone().unwrap();
+    std::fs::write(PathBuf::from(it.worktree.unwrap()).join("config.txt"), "token = FAKE-SECRET-VALUE\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.failed_stage.as_deref()), (Stage::Blocked, Some("pr")));
+    let err = it.error.unwrap();
+    assert!(err.contains("env-value") && !err.contains("FAKE-SECRET-VALUE"), "{err}");
+    assert!(!remote_has(&f, &branch) && f.gh.calls_with("pr create") == 0, "nothing was published");
+    let notes: Vec<String> = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().map(|m| m.body).collect();
+    assert!(notes.iter().any(|n| n.contains("blocked")) && notes.iter().all(|n| !n.contains("FAKE-SECRET-VALUE")));
+    // A retry scans again and blocks again; cancel stops it.
+    retry(&f.ctx, 1, "cli").await.unwrap();
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Blocked);
+    cancel(&f.ctx, 1, "cli").await.unwrap();
+
+    // A guard that cannot run blocks too.
+    let f = fixture().await;
+    std::fs::remove_file(f.ctx.ws.join("tools/check-secrets.sh")).unwrap();
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!(it.stage(), Stage::Blocked);
+    assert!(it.error.unwrap().contains("guard-unavailable"));
+
+    // The issue comment is scanned before it is posted.
+    let f = fixture().await;
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Review);
+    approve_comment(&f.ctx, 1, Some("See FAKE-SECRET-VALUE".into()), "dashboard").await.unwrap();
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.failed_stage.as_deref()), (Stage::Blocked, Some("review")));
+    assert_eq!(f.gh.calls_with("issue comment"), 0);
 }

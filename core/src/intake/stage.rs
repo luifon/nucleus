@@ -28,10 +28,14 @@ pub enum Stage {
     /// comment the item used, the label event): the item stops for good.
     /// Re-adding the label starts a new item from the current text.
     Stale,
+    /// The secret guard found something in what was about to be published
+    /// (the diff, the pull request text, the issue comment). Nothing was
+    /// published; `retry` scans again, `cancel` stops the item.
+    Blocked,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 10] = [
+    pub const ALL: [Stage; 11] = [
         Stage::Queued,
         Stage::Eval,
         Stage::Refinement,
@@ -42,6 +46,7 @@ impl Stage {
         Stage::Failed,
         Stage::Cancelled,
         Stage::Stale,
+        Stage::Blocked,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -56,6 +61,7 @@ impl Stage {
             Stage::Failed => "failed",
             Stage::Cancelled => "cancelled",
             Stage::Stale => "stale",
+            Stage::Blocked => "blocked",
         }
     }
 
@@ -88,6 +94,8 @@ pub enum StageEvent {
     SourceClosed,
     /// The source no longer matches what the item is bound to.
     Stale,
+    /// The secret guard stopped a publishing step.
+    Blocked,
     /// Resume a failed item at the stage it failed in.
     Retry { failed_in: Stage },
 }
@@ -107,6 +115,8 @@ pub fn transition(from: Stage, ev: &StageEvent) -> Result<Stage> {
         (Pr, E::PrOpened) => Review,
         (Review, E::Finished) => Closed,
         (Failed, E::Failed) => bail!("item already failed"),
+        (Pr | Review, E::Blocked) => Blocked,
+        (Blocked, E::Retry { failed_in: failed_in @ (Pr | Review) }) => *failed_in,
         (_, E::Failed) => Failed,
         (_, E::Cancel) => Cancelled,
         (_, E::SourceClosed) => Closed,
@@ -115,7 +125,7 @@ pub fn transition(from: Stage, ev: &StageEvent) -> Result<Stage> {
             // An eval is run again from the start.
             Queued | Eval => Queued,
             Refinement | Implementation | Pr | Review => *failed_in,
-            Closed | Failed | Cancelled | Stale => bail!("nothing to retry in stage {}", failed_in.as_str()),
+            Closed | Failed | Cancelled | Stale | Blocked => bail!("nothing to retry in stage {}", failed_in.as_str()),
         },
         (s, e) => bail!("{e:?} does not apply to an item in the {} stage", s.as_str()),
     };
@@ -387,6 +397,12 @@ mod tests {
             ok(s, E::Stale, Stale);
         }
         ok(Failed, E::Stale, Stale);
+        ok(Pr, E::Blocked, Blocked);
+        ok(Review, E::Blocked, Blocked);
+        ok(Blocked, E::Retry { failed_in: Pr }, Pr);
+        ok(Blocked, E::Retry { failed_in: Review }, Review);
+        ok(Blocked, E::Cancel, Cancelled);
+        ok(Blocked, E::Stale, Stale);
         ok(Failed, E::Cancel, Cancelled);
         ok(Failed, E::SourceClosed, Closed);
         ok(Failed, E::Retry { failed_in: Eval }, Queued);
@@ -415,6 +431,9 @@ mod tests {
         bad(Failed, E::Failed);
         bad(Refinement, E::Retry { failed_in: Eval });
         bad(Failed, E::Retry { failed_in: Closed });
+        bad(Implementation, E::Blocked);
+        bad(Blocked, E::Blocked);
+        bad(Blocked, E::Retry { failed_in: Eval });
         // Terminal stages never change.
         for s in [Closed, Cancelled, Stale] {
             for ev in [E::Cancel, E::Failed, E::SourceClosed, E::Stale, E::Retry { failed_in: Eval }] {

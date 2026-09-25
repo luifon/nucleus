@@ -283,8 +283,9 @@ push, do not switch or create branches, do not change remotes, and do not use th
 Nucleus pushes and opens a draft pull request after you finish.\n\
 - Change files inside this worktree only.\n\
 - If something blocks you, commit what is sound and explain the rest.\n\n\
-Your final message becomes the body of the pull request: what changed and why, the tests you \
-ran and their result, and what the reviewer must check. Start with the content, no preamble.",
+Your final message goes to the operator (it is not published): what changed and why, the \
+tests you ran and their result, and what the reviewer must check. Start with the content, no \
+preamble.",
         n = item.id,
         repo = item.repo,
         data = issue_data(&f, item, ev, d),
@@ -293,7 +294,7 @@ ran and their result, and what the reviewer must check. Start with the content, 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn event(body: &str) -> Event {
@@ -456,7 +457,7 @@ mod tests {
         assert!(i.chars().count() < crate::tasks::MAX_BRIEF_CHARS);
     }
 
-    fn test_item() -> Item {
+    pub(crate) fn test_item() -> Item {
         Item {
             id: 1,
             event_id: 1,

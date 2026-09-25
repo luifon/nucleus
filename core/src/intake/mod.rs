@@ -37,6 +37,7 @@ pub mod event;
 pub mod git;
 pub mod github;
 pub mod pipeline;
+pub mod publish;
 pub mod stage;
 pub mod store;
 

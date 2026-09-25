@@ -166,6 +166,7 @@ async fn ctx(s: &IntakeState) -> Result<Ctx, IntakeError> {
         wa: nucleus_core::whatsapp_queue::open(ws).await.map_err(IntakeError::other)?,
         gh: Arc::new(nucleus_core::intake::github::GhCli { bin: s.intake.github.gh_bin.clone() }),
         launcher: Arc::new(pipeline::WorkerLauncher),
+        guard: Arc::new(nucleus_core::intake::publish::ScriptGuard { workspace_root: ws.clone() }),
     })
 }
 

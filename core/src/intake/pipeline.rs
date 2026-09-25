@@ -15,6 +15,7 @@ use super::briefs;
 use super::event::{Discussion, Event, NewEvent, SourceAdapter};
 use super::git;
 use super::github::{self, GhRunner, GithubIssues};
+use super::publish::{self, SecretGuard, Verdict};
 use super::stage::{self, OperatorCommand, Stage, StageEvent};
 use super::store::{self, Item, NewMessage, Val};
 use super::{clip, fill};
@@ -60,6 +61,8 @@ pub struct Ctx {
     pub wa: SqlitePool,
     pub gh: Arc<dyn GhRunner>,
     pub launcher: Arc<dyn Launcher>,
+    /// Scans every diff and text before it is published.
+    pub guard: Arc<dyn SecretGuard>,
 }
 
 impl Ctx {
@@ -74,6 +77,7 @@ impl Ctx {
             wa: crate::whatsapp_queue::open(ws).await?,
             gh: Arc::new(github::GhCli { bin: settings.intake.github.gh_bin.clone() }),
             launcher: Arc::new(WorkerLauncher),
+            guard: Arc::new(publish::ScriptGuard { workspace_root: ws.to_path_buf() }),
         })
     }
 }
@@ -602,17 +606,17 @@ pub async fn cancel(ctx: &Ctx, n: i64, via: &str) -> Result<Item> {
     Ok(item)
 }
 
-/// Resume a failed item at the stage it failed in.
+/// Resume a failed or blocked item at the stage it stopped in.
 pub async fn retry(ctx: &Ctx, n: i64, via: &str) -> Result<Item> {
     let item = store::item(&ctx.db, n).await?;
-    if item.stage() != Stage::Failed {
-        return refuse(format!("Item #{n} has not failed (it is {}).", item.stage));
+    if !matches!(item.stage(), Stage::Failed | Stage::Blocked) {
+        return refuse(format!("Item #{n} has not failed and is not blocked (it is {}).", item.stage));
     }
     let failed_in = item.failed_stage.as_deref().and_then(Stage::parse).unwrap_or(Stage::Queued);
     store::advance(
         &ctx.db,
         n,
-        Stage::Failed,
+        item.stage(),
         StageEvent::Retry { failed_in },
         &format!("retry via {via}"),
         vec![("step_errors", 0i64.into()), ("current_task_id", Val::Text(None))],
@@ -718,7 +722,7 @@ async fn step_item(ctx: &Ctx, item: &Item, r: &mut TickReport) {
             Stage::Implementation => step_implementation(ctx, item).await,
             Stage::Pr => step_pr(ctx, item).await,
             Stage::Review => step_review(ctx, item).await,
-            Stage::Failed | Stage::Closed | Stage::Cancelled | Stage::Stale => Ok(()),
+            Stage::Failed | Stage::Blocked | Stage::Closed | Stage::Cancelled | Stage::Stale => Ok(()),
         }
     }
     .await;
@@ -1238,37 +1242,34 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
     }
 }
 
-/// Redact credentials from text that goes to GitHub (public).
-fn public_text(ctx: &Ctx, text: &str) -> String {
-    let r = crate::secret_filter::CredentialRules::from_workspace(&ctx.ws).redact(text);
-    if !r.hits.is_empty() {
-        tracing::warn!(count = r.hits.len(), "intake: credentials redacted from text for GitHub");
+/// The line that links the pull request to its source.
+fn pr_link(item: &Item, ev: &Event, repo: &IntakeRepo) -> String {
+    match (ev.source.as_str(), github::parse_external_id(&ev.external_id)) {
+        ("github", Ok((r, n))) if r.eq_ignore_ascii_case(&item.repo) => format!("{} #{n}", publish::plain_line(&repo.pr_issue_keyword, 20)),
+        ("github", Ok((r, n))) => format!("Refs {r}#{n}"),
+        _ => format!("Source: {}", publish::plain_line(&format!("{} {}", ev.source, ev.external_id), 200)),
     }
-    r.text
 }
 
-fn pr_body(ctx: &Ctx, item: &Item, ev: &Event, repo: &IntakeRepo) -> String {
-    let link = match (ev.source.as_str(), github::parse_external_id(&ev.external_id)) {
-        ("github", Ok((r, n))) if r.eq_ignore_ascii_case(&item.repo) => format!("{} #{n}", repo.pr_issue_keyword),
-        ("github", Ok((r, n))) => format!("Refs {r}#{n}"),
-        _ => format!("Source: {} {}", ev.source, ev.external_id),
-    };
-    let tests = match item.tests_status.as_deref() {
-        Some("not_run") | None => "not run by Nucleus (no test command configured)".to_string(),
-        Some(s) => format!(
-            "{s} (`{}`, run by Nucleus after the agent finished)\n\n<details><summary>Output (last lines)</summary>\n\n```\n{}\n```\n\n</details>",
-            repo.test_command.as_deref().unwrap_or(""),
-            clip(item.tests_output.as_deref().unwrap_or(""), 3_000)
-        ),
-    };
-    let body = format!(
-        "{summary}\n\n{link}\n\n**Tests:** {tests}\n\n---\nDraft opened by the Nucleus issue pipeline (item #{n}). Review before \
-         merging; Nucleus never merges.\n\n<!-- {marker}item-{n} -->",
-        summary = clip(item.impl_summary.as_deref().unwrap_or(""), 30_000),
-        n = item.id,
-        marker = github::COMMENT_MARKER_PREFIX,
-    );
-    public_text(ctx, &body)
+/// The secret guard found something in what a step was about to publish:
+/// the item stops in `blocked` with the finding categories.
+async fn block(ctx: &Ctx, item: &Item, what: &str, categories: &[String]) -> Result<()> {
+    let why = format!("the secret guard found {} in {what}", categories.join(", "));
+    tracing::warn!(item = item.id, why, "intake: publishing blocked");
+    if store::advance(
+        &ctx.db,
+        item.id,
+        item.stage(),
+        StageEvent::Blocked,
+        &why,
+        vec![("error", why.clone().into())],
+    )
+    .await?
+    {
+        let it = store::item(&ctx.db, item.id).await?;
+        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_blocked, &item_vars(ctx, &it))).await?;
+    }
+    Ok(())
 }
 
 async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
@@ -1283,17 +1284,28 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     let sha = item.head_sha.clone().context("the item has no collected commit")?;
     let remote = remote_for(ctx, &item.repo)?;
     let mirror = git::open_mirror(&work_dir(ctx)?, &item.repo, &remote).await?;
+    // The pull request text is built from code-owned fields; it and every
+    // line the push would publish pass the secret guard first.
+    let files = git::changed_files(&mirror, &base_ref, &sha).await?;
+    let title = publish::pr_title(item);
+    let body = publish::pr_body(&publish::PrFacts {
+        item,
+        link: pr_link(item, &ev, repo),
+        branch: &branch,
+        files: &files,
+        test_command: repo.test_command.as_deref(),
+    });
+    let added = git::added_text(&mirror, &base_ref, &sha).await?;
+    if let Verdict::Hit(cats) = ctx.guard.scan(&format!("{title}\n{body}\n{added}")).await {
+        return block(ctx, item, "the branch or the pull request text", &cats).await;
+    }
     git::push(&mirror, &remote, &sha, &branch, item.id).await?;
     let url = match github::find_pr(&*ctx.gh, &item.repo, &branch).await? {
         Some(u) => u,
-        None => {
-            let title = public_text(ctx, &clip(&item.title, 200));
-            github::create_draft_pr(&*ctx.gh, &item.repo, &branch, &base_ref, &title, &pr_body(ctx, item, &ev, repo))
-                .await?
-        }
+        None => github::create_draft_pr(&*ctx.gh, &item.repo, &branch, &base_ref, &title, &body).await?,
     };
     let can_reply = adapter_for(ctx, &ev).is_some();
-    let summary = clip(item.impl_summary.as_deref().unwrap_or(""), 1_500);
+    let summary = publish::escape_summary(item.impl_summary.as_deref().unwrap_or(""), 600);
     let comment = fill(&ctx.cfg.texts.issue_comment, &[("pr_url", &url), ("summary", &summary)]);
     let mut set = vec![("pr_url", Val::from(url.clone()))];
     if can_reply {
@@ -1326,7 +1338,10 @@ async fn step_review(ctx: &Ctx, item: &Item) -> Result<()> {
             if live_gate(ctx, item, "the issue comment").await?.is_none() {
                 return Ok(());
             }
-            let draft = public_text(ctx, item.comment_draft.as_deref().unwrap_or(""));
+            let draft = item.comment_draft.clone().unwrap_or_default();
+            if let Verdict::Hit(cats) = ctx.guard.scan(&draft).await {
+                return block(ctx, item, "the issue comment", &cats).await;
+            }
             let marker = format!("{}item-{}:comment", github::COMMENT_MARKER_PREFIX, item.id);
             let url = a.reply(&ev, &draft, &marker).await?;
             if store::advance(

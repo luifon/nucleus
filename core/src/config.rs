@@ -738,6 +738,9 @@ pub struct IntakeTexts {
     /// The item stopped because its source changed after the gate was
     /// satisfied (`{error}` says what changed; `{label}` is the gate label).
     pub item_stale: String,
+    /// The secret guard stopped a publishing step (`{error}` lists the
+    /// finding categories, never the matched text).
+    pub item_blocked: String,
     pub stage_note: String,
     pub no_plan: String,
     pub refinement_busy: String,
@@ -775,6 +778,10 @@ impl Default for IntakeTexts {
             item_stale: "⛔ Item #{n} — {title} stopped: {error}. Nothing more is done for it. To work \
                          on the issue as it is now, remove the `{label}` label and add it again; that \
                          starts a new item."
+                .into(),
+            item_blocked: "🛑 Item #{n} — {title} is blocked: {error}. Nothing was published. Fix the \
+                           cause, then retry with `nucleus intake retry {n}` or on the dashboard, or \
+                           cancel the item."
                 .into(),
             stage_note: "Item #{n} is in the {stage} stage; messages reach an agent only during \
                          refinement. Your message is saved in the item's thread."

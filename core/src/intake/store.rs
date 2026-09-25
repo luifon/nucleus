@@ -836,7 +836,7 @@ fn bind_vals<'q>(
 /// `BEGIN IMMEDIATE` transaction. Returns `false` when the item is no
 /// longer in `from` (another process moved it first).
 ///
-/// Moving to `failed` records `from` as the failed stage; a retry clears
+/// Moving to `failed` or `blocked` records `from` as the failed stage; a retry clears
 /// the failure; a terminal stage records `closed_at`.
 pub async fn advance(
     pool: &SqlitePool,
@@ -848,7 +848,7 @@ pub async fn advance(
 ) -> Result<bool> {
     let to = transition(from, &ev)?;
     let now = crate::timestamp::now();
-    if to == Stage::Failed {
+    if to == Stage::Failed || to == Stage::Blocked {
         set.push(("failed_stage", from.as_str().into()));
         if !set.iter().any(|(c, _)| *c == "error") {
             set.push(("error", reason.into()));
