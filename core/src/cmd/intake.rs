@@ -114,6 +114,76 @@ fn authorize(caller: &Caller, cmd: &Cmd) -> Result<()> {
     Ok(())
 }
 
+/// `intake show` output: JSON, or text for the terminal.
+async fn render_show(db: &sqlx::SqlitePool, n: i64, json: bool, label: &str) -> Result<String> {
+        let mut out = String::new();
+        let it = store::item(db, n).await?;
+        let ev = store::event(db, it.event_id).await?;
+        let msgs = store::messages(db, n).await?;
+        let tasks = store::item_tasks(db, n).await?;
+        let log = store::transitions(db, n).await?;
+        if json {
+            writeln!(
+                out,
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "item": it, "event": ev, "messages": msgs, "tasks": tasks, "transitions": log
+                }))?
+            )?;
+            return Ok(out);
+        }
+        writeln!(out, "#{} {} — {} ({})", it.id, it.stage, it.title, ev.external_id)?;
+        if let Some(u) = &ev.url {
+            writeln!(out, "source: {u}")?;
+        }
+        if let Some(r) = &it.stale_reason {
+            writeln!(out, "STALE: {r}")?;
+            writeln!(out, "  nothing more is done for this item; remove and add the `{}` label again for a new item", label)?;
+        } else if let Some(e) = &it.error {
+            writeln!(out, "error: {e}")?;
+        }
+        if let (Some(g), Some(a)) = (&it.gate_event_id, &it.gate_actor) {
+            writeln!(out, "gate: {g} by {a} at {}", it.gate_at.as_deref().unwrap_or("?"))?;
+        }
+        if let Some(e) = it.eval_json.as_deref().and_then(|j| serde_json::from_str::<EvalResult>(j).ok()) {
+            writeln!(out, "eval: {} (agent: {}) — {}", e.effective, e.classification, e.summary)?;
+            for r in e.reasons.iter().chain(e.escalations.iter()) {
+                writeln!(out, "  - {r}")?;
+            }
+        }
+        if let Some(p) = &it.approved_plan {
+            writeln!(out, "approved plan v{}:\n{p}", it.approved_version.unwrap_or(0))?;
+        } else if let Some(p) = &it.plan_draft {
+            writeln!(out, "proposed plan v{} (not approved):\n{p}", it.plan_version)?;
+        }
+        if let Some(b) = &it.branch {
+            writeln!(out, "branch: {b}")?;
+        }
+        if let Some(t) = &it.tests_status {
+            writeln!(out, "tests: {t}")?;
+        }
+        if let Some(u) = &it.pr_url {
+            writeln!(out, "draft PR: {u}")?;
+        }
+        if it.comment_state != "none" {
+            writeln!(out, "issue comment: {}", it.comment_state)?;
+        }
+        writeln!(out, "WhatsApp thread: {}", it.surface)?;
+        writeln!(out, "\nthread (last 15):")?;
+        for m in msgs.iter().rev().take(15).collect::<Vec<_>>().into_iter().rev() {
+            writeln!(out, "  [{} {} via {}] {}", m.at, m.author, m.via, crate::intake::clip(&m.body, 300).replace('\n', " "))?;
+        }
+        writeln!(out, "\ntasks:")?;
+        for t in &tasks {
+            writeln!(out, "  {} {}", &t.task_id[..8.min(t.task_id.len())], t.stage)?;
+        }
+        writeln!(out, "\nstages:")?;
+        for t in &log {
+            writeln!(out, "  {} {} → {} ({})", t.at, t.from_stage.as_deref().unwrap_or("-"), t.to_stage, t.reason)?;
+        }
+    Ok(out)
+}
+
 /// `list` / `show` output for a chat session: a code-owned line, then the
 /// whole output (issue titles and bodies, eval text, plans, thread
 /// messages) inside a nonce data fence.
@@ -201,73 +271,10 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             Ok(())
         }
         Cmd::Show { item, json } => {
-            let mut out = String::new();
             let n = item_number(&item)?;
-            let it = store::item(&ctx.db, n).await?;
-            let ev = store::event(&ctx.db, it.event_id).await?;
-            let msgs = store::messages(&ctx.db, n).await?;
-            let tasks = store::item_tasks(&ctx.db, n).await?;
-            let log = store::transitions(&ctx.db, n).await?;
-            if json {
-                writeln!(
-                    out,
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "item": it, "event": ev, "messages": msgs, "tasks": tasks, "transitions": log
-                    }))?
-                )?;
-                return Ok(());
-            }
-            writeln!(out, "#{} {} — {} ({})", it.id, it.stage, it.title, ev.external_id)?;
-            if let Some(u) = &ev.url {
-                writeln!(out, "source: {u}")?;
-            }
-            if let Some(r) = &it.stale_reason {
-                writeln!(out, "STALE: {r}")?;
-                writeln!(out, "  nothing more is done for this item; remove and add the `{}` label again for a new item", ctx.cfg.label)?;
-            } else if let Some(e) = &it.error {
-                writeln!(out, "error: {e}")?;
-            }
-            if let (Some(g), Some(a)) = (&it.gate_event_id, &it.gate_actor) {
-                writeln!(out, "gate: {g} by {a} at {}", it.gate_at.as_deref().unwrap_or("?"))?;
-            }
-            if let Some(e) = it.eval_json.as_deref().and_then(|j| serde_json::from_str::<EvalResult>(j).ok()) {
-                writeln!(out, "eval: {} (agent: {}) — {}", e.effective, e.classification, e.summary)?;
-                for r in e.reasons.iter().chain(e.escalations.iter()) {
-                    writeln!(out, "  - {r}")?;
-                }
-            }
-            if let Some(p) = &it.approved_plan {
-                writeln!(out, "approved plan v{}:\n{p}", it.approved_version.unwrap_or(0))?;
-            } else if let Some(p) = &it.plan_draft {
-                writeln!(out, "proposed plan v{} (not approved):\n{p}", it.plan_version)?;
-            }
-            if let Some(b) = &it.branch {
-                writeln!(out, "branch: {b}")?;
-            }
-            if let Some(t) = &it.tests_status {
-                writeln!(out, "tests: {t}")?;
-            }
-            if let Some(u) = &it.pr_url {
-                writeln!(out, "draft PR: {u}")?;
-            }
-            if it.comment_state != "none" {
-                writeln!(out, "issue comment: {}", it.comment_state)?;
-            }
-            writeln!(out, "WhatsApp thread: {}", it.surface)?;
-            writeln!(out, "\nthread (last 15):")?;
-            for m in msgs.iter().rev().take(15).collect::<Vec<_>>().into_iter().rev() {
-                writeln!(out, "  [{} {} via {}] {}", m.at, m.author, m.via, crate::intake::clip(&m.body, 300).replace('\n', " "))?;
-            }
-            writeln!(out, "\ntasks:")?;
-            for t in &tasks {
-                writeln!(out, "  {} {}", &t.task_id[..8.min(t.task_id.len())], t.stage)?;
-            }
-            writeln!(out, "\nstages:")?;
-            for t in &log {
-                writeln!(out, "  {} {} → {} ({})", t.at, t.from_stage.as_deref().unwrap_or("-"), t.to_stage, t.reason)?;
-            }
-            emit(out);
+            // JSON is for programs and stays plain; only a chat session's
+            // copy (JSON or text) is fenced, because a session reads it.
+            emit(render_show(&ctx.db, n, json, &ctx.cfg.label).await?);
             Ok(())
         }
         Cmd::Reply { item, text } => {
@@ -318,6 +325,18 @@ mod tests {
 
     fn caller(role: Role, hop: u8) -> Caller {
         Caller { role, agent: None, session_id: None, inbound_hop: hop }
+    }
+
+    #[tokio::test]
+    async fn show_json_is_valid_json() {
+        let (_d, pool) = crate::intake::store::tests::temp_db().await;
+        let (ev, _, _) = crate::intake::store::upsert_event(&pool, &crate::intake::store::tests::issue(1, &["nucleus"], "open")).await.unwrap();
+        crate::intake::store::tests::new_item(&pool, &ev, "labeled:1").await.unwrap();
+        let out = render_show(&pool, 1, true, "nucleus").await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).expect("show --json prints JSON");
+        assert_eq!(v["item"]["id"], 1);
+        let text = render_show(&pool, 1, false, "nucleus").await.unwrap();
+        assert!(text.starts_with("#1 queued"), "{text}");
     }
 
     #[test]
