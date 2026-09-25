@@ -261,6 +261,17 @@ max_runtime_hours = 12
 # probe_ms = 300000
 # alert_after_outage_ms = 1800000
 
+# ADR-027 amendment: WhatsApp link knobs. Every value is optional.
+# sent_retention_days = how long the content of sent messages is kept to
+# answer retry requests (never less than the 14-day WhatsApp resend window);
+# sent_max_rows = row cap for that table (oldest deleted first);
+# wa_version_max_age_hours = a cached WA Web version older than this is not
+# used when the version fetch fails (the bundled version is used instead).
+# [whatsapp.link]
+# sent_retention_days = 21
+# sent_max_rows = 50000
+# wa_version_max_age_hours = 168
+
 # ADR-034 usage accounting (`nucleus usage refresh`, dashboard /usage). Every
 # value is optional; the defaults read the standard transcript locations.
 # Dollar figures are estimates at API prices, not billing. The built-in price

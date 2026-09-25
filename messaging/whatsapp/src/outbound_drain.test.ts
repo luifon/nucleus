@@ -8,7 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import { BufferJSON, type AnyMessageContent, type WAMessage } from "@whiskeysockets/baileys";
 import { ChatSessionStore, IN_FLIGHT_GRACE_MS, OutboundQueueStore } from "./db.js";
-import { OutboundDrain, parseQuoted } from "./outbound_drain.js";
+import { CONNECTION_ROT_THRESHOLD, OUTBOUND_MAX_ATTEMPTS, OutboundDrain, isLinkError, parseQuoted } from "./outbound_drain.js";
+import { DatabaseSync } from "node:sqlite";
 import { buildRules } from "./secret_filter.js";
 
 const CHAT = "5511999999999@s.whatsapp.net";
@@ -26,15 +27,17 @@ interface Call {
   reject: (e: Error) => void;
 }
 
-function setup(envText = "") {
+function setup(envText = "", opts: { rotMinSpanMs?: number; linkUp?: boolean } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nucleus-drain-"));
   const dbPath = path.join(dir, "whatsapp.db");
   new ChatSessionStore(dbPath);
   const store = new OutboundQueueStore(dbPath);
   const calls: Call[] = [];
   const warnings: string[] = [];
+  const fatals: string[] = [];
   let ids = 0;
   const drain = new OutboundDrain({
+    rotMinSpanMs: opts.rotMinSpanMs ?? 0,
     store,
     resolveTarget: (t) => (t === CHAT || t === GROUP ? t : null),
     send: (jid, content, opts) =>
@@ -46,10 +49,26 @@ function setup(envText = "") {
     withheldNote: "({count} withheld)",
     mediaMaxBytes: 1024,
     log: { info() {}, warn: (_o, m) => warnings.push(m), error() {} },
-    fatal: async () => {},
+    fatal: async (m) => {
+      fatals.push(m);
+    },
     timeoutFor: () => 50,
   });
-  return { store, drain, calls, warnings };
+  if (opts.linkUp ?? true) drain.linkUp();
+  return { store, drain, calls, warnings, fatals, dbPath };
+}
+
+function attempts(dbPath: string, id: number): { attempts: number; status: string; last_error: string | null } {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db.prepare("SELECT attempts, status, last_error FROM outbound_queue WHERE id = ?").get(id) as {
+      attempts: number;
+      status: string;
+      last_error: string | null;
+    };
+  } finally {
+    db.close();
+  }
 }
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -124,4 +143,132 @@ test("the secret filter redacts credentials everywhere and withholds identifying
   assert.doesNotMatch(texts[1], /SomeClientName|someone@/, "a group message loses identifiers");
   assert.ok(t.store.status(reply) === "sent" && t.store.status(group) === "sent");
   assert.ok(t.warnings.some((w) => /withheld by the secret filter/.test(w)));
+});
+
+// ── Link gating (ADR-027 amendment, 2026-09) ─────────────────────────────
+
+/** Run one tick; settle the send it starts with `settle` while it waits. */
+async function tickSettling(t: ReturnType<typeof setup>, settle: (c: Call) => void): Promise<void> {
+  const before = t.calls.length;
+  const p = t.drain.tick();
+  await wait(5);
+  if (t.calls.length > before) settle(t.calls[t.calls.length - 1]);
+  await p;
+}
+
+const closed = () => Object.assign(new Error("Connection Closed"), { output: { statusCode: 428 } });
+
+test("isLinkError: closed/lost connections and link status codes, not message errors", () => {
+  assert.equal(isLinkError(new Error("Connection Closed")), true);
+  assert.equal(isLinkError(new Error("Connection Closed (no live socket)")), true);
+  assert.equal(isLinkError(Object.assign(new Error("Timed Out"), { output: { statusCode: 408 } })), true);
+  assert.equal(isLinkError(Object.assign(new Error("x"), { output: { statusCode: 503 } })), true);
+  assert.equal(isLinkError(new Error("not-acceptable")), false);
+  assert.equal(isLinkError(Object.assign(new Error("bad request"), { output: { statusCode: 400 } })), false);
+});
+
+test("the drain sends nothing until the link is up", async () => {
+  const t = setup("", { linkUp: false });
+  const id = t.store.enqueue({ target: CHAT, body: "hello", source: "reminder" });
+  await t.drain.tick();
+  assert.equal(t.calls.length, 0);
+  assert.equal(t.store.status(id), "pending");
+  t.drain.linkUp();
+  await tickSettling(t, (c) => c.resolve({ key: { id: c.opts.messageId } } as WAMessage));
+  assert.equal(t.calls.length, 1);
+  assert.equal(t.store.status(id), "sent");
+});
+
+test("an outage does not use up a row's attempts; the row is sent with the same id after the link returns", async () => {
+  const t = setup();
+  const id = t.store.enqueue({ target: CHAT, body: "reminder", source: "reminder" });
+  // The send fails because the socket closed; the close event follows.
+  await tickSettling(t, (c) => c.reject(closed()));
+  t.drain.linkDown();
+  const firstId = t.calls[0].opts.messageId;
+  // Before the fix the drain retried every second and failed the row after
+  // five attempts. Now nothing is sent while the link is down.
+  for (let i = 0; i < 10; i++) await t.drain.tick();
+  assert.equal(t.calls.length, 1, "no send while the link is down");
+  const row = attempts(t.dbPath, id);
+  assert.equal(row.status, "pending");
+  assert.equal(row.attempts, 0, "the link failure did not count");
+  assert.match(row.last_error ?? "", /link down; attempt not counted/);
+  t.drain.linkUp();
+  await tickSettling(t, (c) => c.resolve({ key: { id: c.opts.messageId } } as WAMessage));
+  assert.equal(t.calls.length, 2);
+  assert.equal(t.calls[1].opts.messageId, firstId, "idempotent: the same WhatsApp id");
+  assert.equal(t.store.status(id), "sent");
+  assert.equal(t.fatals.length, 0);
+});
+
+test("many link outages in a row never fail the row or exit the process", async () => {
+  const t = setup();
+  const id = t.store.enqueue({ target: CHAT, body: "reminder", source: "reminder" });
+  for (let outage = 0; outage < OUTBOUND_MAX_ATTEMPTS * 2; outage++) {
+    // Up to threshold-1 failures on a link that still reports open, then the close.
+    for (let i = 0; i < CONNECTION_ROT_THRESHOLD - 1; i++) await tickSettling(t, (c) => c.reject(closed()));
+    t.drain.linkDown();
+    t.drain.linkUp();
+  }
+  assert.equal(t.fatals.length, 0, "a close resets the rot count");
+  const row = attempts(t.dbPath, id);
+  assert.equal(row.status, "pending");
+  assert.equal(row.attempts, 0);
+});
+
+test("a send pending when the link closes is not counted, whatever error it ends with", async () => {
+  const t = setup();
+  const id = t.store.enqueue({ target: CHAT, body: "hello", source: "chat-reply" });
+  const p = t.drain.tick();
+  await wait(5);
+  t.drain.linkDown();
+  // Not a link-shaped error, but the link closed while the send was pending.
+  t.calls[0].reject(new Error("some socket error"));
+  await p;
+  const row = attempts(t.dbPath, id);
+  assert.equal(row.status, "pending");
+  assert.equal(row.attempts, 0);
+});
+
+test("a send that times out while the link closes is not counted; its late failure keeps the row pending", async () => {
+  const t = setup();
+  const id = t.store.enqueue({ target: CHAT, body: "hello", source: "chat-reply" });
+  const p = t.drain.tick();
+  await wait(5);
+  t.drain.linkDown(); // the close event arrives while the send hangs
+  await p; // times out after 50ms
+  let row = attempts(t.dbPath, id);
+  assert.equal(row.status, "in_flight", "the send may still succeed");
+  assert.equal(row.attempts, 0);
+  t.calls[0].reject(closed());
+  await wait(10);
+  row = attempts(t.dbPath, id);
+  assert.equal(row.status, "pending");
+  assert.equal(row.attempts, 0);
+  assert.equal(t.fatals.length, 0);
+});
+
+test("link failures on a link that reports open are connection rot: exit after the threshold and the time span", async () => {
+  const quick = setup();
+  quick.store.enqueue({ target: CHAT, body: "hello", source: "chat-reply" });
+  for (let i = 0; i < CONNECTION_ROT_THRESHOLD; i++) await tickSettling(quick, (c) => c.reject(closed()));
+  assert.equal(quick.fatals.length, 1, "a zombie socket still exits for a launchd respawn");
+
+  // With a span, the same failures within a few ms do not exit: the close
+  // event may not have arrived yet.
+  const spanned = setup("", { rotMinSpanMs: 60_000 });
+  spanned.store.enqueue({ target: CHAT, body: "hello", source: "chat-reply" });
+  for (let i = 0; i < CONNECTION_ROT_THRESHOLD + 2; i++) await tickSettling(spanned, (c) => c.reject(closed()));
+  assert.equal(spanned.fatals.length, 0);
+});
+
+test("a message error (not the link) still counts attempts and fails the row at the limit", async () => {
+  const t = setup();
+  const id = t.store.enqueue({ target: CHAT, body: "hello", source: "chat-reply" });
+  for (let i = 0; i < OUTBOUND_MAX_ATTEMPTS; i++) await tickSettling(t, (c) => c.reject(new Error("not-acceptable")));
+  const row = attempts(t.dbPath, id);
+  assert.equal(row.status, "failed");
+  assert.equal(row.attempts, OUTBOUND_MAX_ATTEMPTS);
+  assert.equal(t.fatals.length, 0);
 });

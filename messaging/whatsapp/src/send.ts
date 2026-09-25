@@ -13,11 +13,14 @@
 import {
   default as makeWASocket,
   useMultiFileAuthState,
-  fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
   Browsers,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
+import { installConsoleKeyFilter } from "./key_redaction.js";
+import { resolveWaVersion, waVersionCachePath } from "./wa_version.js";
+import { ChatSessionStore } from "./db.js";
+import { SentMessageStore } from "./sent_store.js";
 import path from "node:path";
 import { loadConfig } from "./config.js";
 import { refuseUnlessAllowed } from "./caller_guard.js";
@@ -25,6 +28,8 @@ import { enqueueRefusal, GroupAllowlist, isOperatorDm, resolveTarget } from "./t
 
 const log = pino({ level: process.env.NUCLEUS_LOG ?? "info" });
 const baileysLogger = pino({ level: "silent" });
+// libsignal prints Signal session state (private keys) through the console.
+installConsoleKeyFilter();
 
 /** Exit with status 3: the target is not the operator's DM or a
  *  configured group. */
@@ -56,7 +61,7 @@ async function main() {
 
   const authDir = path.join(workspaceRoot, "messaging/whatsapp/auth");
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestWaWebVersion({});
+  const { version } = await resolveWaVersion({ cachePath: waVersionCachePath(workspaceRoot), maxAgeMs: config.link.waVersionMaxAgeMs, log });
 
   const sock = makeWASocket({
     version,
@@ -94,6 +99,14 @@ async function main() {
           log.info({ jid, len: message.length }, "send: dispatching message");
           const sent = await sock.sendMessage(jid, { text: message });
           log.info({ id: sent?.key.id, jid }, "send: ok");
+          // The bot answers later retry requests for this message from the
+          // stored content (sent_store.ts); best-effort.
+          try {
+            new ChatSessionStore(config.dbPath);
+            new SentMessageStore(config.dbPath, { retentionMs: config.link.sentRetentionMs }).record(sent);
+          } catch (e) {
+            log.warn({ err: (e as Error).message }, "send: could not store the sent message");
+          }
           // Give the server a moment to flush before we close.
           await new Promise((r) => setTimeout(r, 1500));
           // end() closes the socket without invalidating the linked device —

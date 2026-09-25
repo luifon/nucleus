@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseToml, turnsConfig } from "./config.js";
+import { linkConfig, parseToml, turnsConfig } from "./config.js";
 import { DEFAULT_TEXTS } from "./texts.js";
 
 test("parseToml nests dotted table names", () => {
@@ -44,6 +44,22 @@ test("turnsConfig applies overrides and keeps defaults for the rest", () => {
   assert.equal(d.texts.ack, "⏳ Working on it…");
   assert.equal(d.ackAfterMs, 30_000);
   assert.equal(d.progressMaxChars, 160);
+});
+
+test("linkConfig: 21-day retention and 7-day version age by default; overrides apply", () => {
+  const d = linkConfig({});
+  assert.equal(d.sentRetentionMs, 21 * 24 * 3_600_000);
+  assert.equal(d.sentMaxRows, 50_000);
+  assert.equal(d.waVersionMaxAgeMs, 168 * 3_600_000);
+  const t = parseToml(`
+[whatsapp.link]
+sent_retention_days = 30
+wa_version_max_age_hours = 24
+`);
+  const c = linkConfig(t.whatsapp.link);
+  assert.equal(c.sentRetentionMs, 30 * 24 * 3_600_000);
+  assert.equal(c.waVersionMaxAgeMs, 24 * 3_600_000);
+  assert.equal(c.sentMaxRows, 50_000);
 });
 
 test("every default text is English (no Portuguese left in code-owned texts)", () => {

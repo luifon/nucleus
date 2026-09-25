@@ -1,6 +1,35 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ConnectionSupervisor, DEFAULT_BREAKER, classifyClose, type BreakerConfig } from "./breaker.js";
+import { Boom } from "@hapi/boom";
+import {
+  ConnectionSupervisor,
+  DEFAULT_BREAKER,
+  DETAIL_MAX_CHARS,
+  classifyClose,
+  describeDisconnect,
+  type BreakerConfig,
+} from "./breaker.js";
+
+test("describeDisconnect: the error message and its data, buffers summarized, bounded", () => {
+  assert.equal(describeDisconnect(undefined), null);
+  const stream = new Boom("Stream Errored (conflict)", {
+    statusCode: 440,
+    data: { tag: "stream:error", attrs: {}, content: [{ tag: "conflict", attrs: { type: "replaced" } }] },
+  });
+  assert.deepEqual(JSON.parse(describeDisconnect(stream)!), {
+    message: "Stream Errored (conflict)",
+    data: { tag: "stream:error", attrs: {}, content: [{ tag: "conflict", attrs: { type: "replaced" } }] },
+  });
+  const withBytes = new Boom("Connection Failure", { statusCode: 401, data: { reason: "x", blob: Buffer.alloc(64) } });
+  assert.deepEqual(JSON.parse(describeDisconnect(withBytes)!).data, { reason: "x", blob: "<64 bytes>" });
+  const plain = describeDisconnect(new Error("Connection Closed"));
+  assert.deepEqual(JSON.parse(plain!), { message: "Connection Closed", data: null });
+  const circular: any = { a: 1 };
+  circular.self = circular;
+  assert.match(describeDisconnect(new Boom("loop", { data: circular }))!, /\[circular\]/);
+  const big = describeDisconnect(new Boom("big", { data: { s: "x".repeat(10_000) } }))!;
+  assert.equal(big.length, DETAIL_MAX_CHARS);
+});
 
 const CFG: BreakerConfig = {
   ladderMs: [1_000, 2_000, 5_000, 15_000, 60_000, 300_000],

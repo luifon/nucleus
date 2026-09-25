@@ -213,6 +213,8 @@ export interface Config {
   breaker: import("./breaker.js").BreakerConfig;
   /** ADR-033 turn engine knobs ([whatsapp.turns] in nucleus.toml). */
   turns: import("./chat_engine.js").TurnsConfig;
+  /** ADR-027 amendment: link knobs ([whatsapp.link] in nucleus.toml). */
+  link: LinkConfig;
   /** ADR-033: the `nucleus` binary (tasks CLI, skill review). */
   nucleusBin: string | null;
   /** ADR-036: issue-pipeline groups ([intake.whatsapp] in nucleus.toml). */
@@ -286,6 +288,7 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
     jobsDbPath: path.join(workspaceRoot, "memory/jobs.db"),
     breaker: breakerConfig(parsed.whatsapp?.breaker ?? {}),
     turns: turnsConfig(parsed.whatsapp?.turns ?? {}, parsed.whatsapp?.texts ?? {}),
+    link: linkConfig(parsed.whatsapp?.link ?? {}),
     nucleusBin: findNucleusBin(workspaceRoot),
     intake: intakeConfig(parsed.intake?.whatsapp ?? {}),
   };
@@ -316,6 +319,27 @@ export function turnsConfig(
     ceilingMs: (pos(t.turn_ceiling_hours) ?? 6) * 3_600_000,
     permissionStallMs: (pos(t.permission_stall_secs) ?? 120) * 1000,
     texts: textsFrom(texts),
+  };
+}
+
+/** ADR-027 amendment: sent-message retention for retry requests and the WA
+ *  Web version cache age. */
+export interface LinkConfig {
+  /** sent_messages retention; raised to the upstream resend window if lower. */
+  sentRetentionMs: number;
+  sentMaxRows: number;
+  /** A cached WA Web version older than this is not used. */
+  waVersionMaxAgeMs: number;
+}
+
+/** [whatsapp.link] overrides layered over the defaults. */
+export function linkConfig(t: Record<string, unknown>): LinkConfig {
+  const pos = (v: unknown): number | null =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+  return {
+    sentRetentionMs: (pos(t.sent_retention_days) ?? 21) * 24 * 3_600_000,
+    sentMaxRows: pos(t.sent_max_rows) ?? 50_000,
+    waVersionMaxAgeMs: (pos(t.wa_version_max_age_hours) ?? 168) * 3_600_000,
   };
 }
 
