@@ -98,4 +98,8 @@ gate_actor: string | null, gate_at: string | null,
 /**
  * Why the item stopped as `stale`.
  */
-stale_reason: string | null, };
+stale_reason: string | null,
+/**
+ * The base commit the item's clone started from.
+ */
+base_sha: string | null, };

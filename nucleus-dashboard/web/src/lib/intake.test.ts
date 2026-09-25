@@ -60,6 +60,7 @@ function item(over: Partial<IntakeItem> = {}): IntakeItem {
     gate_actor: "maintainer",
     gate_at: "2026-09-24T09:00:00.000Z",
     stale_reason: null,
+    base_sha: null,
     ...over,
   };
 }
