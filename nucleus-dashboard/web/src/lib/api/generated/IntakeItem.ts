@@ -102,4 +102,8 @@ stale_reason: string | null,
 /**
  * The base commit the item's clone started from.
  */
-base_sha: string | null, };
+base_sha: string | null,
+/**
+ * The commit Nucleus last pushed to the item's branch.
+ */
+pushed_sha: string | null, };
