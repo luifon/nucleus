@@ -116,71 +116,71 @@ fn authorize(caller: &Caller, cmd: &Cmd) -> Result<()> {
 
 /// `intake show` output: JSON, or text for the terminal.
 async fn render_show(db: &sqlx::SqlitePool, n: i64, json: bool, label: &str) -> Result<String> {
-        let mut out = String::new();
-        let it = store::item(db, n).await?;
-        let ev = store::event(db, it.event_id).await?;
-        let msgs = store::messages(db, n).await?;
-        let tasks = store::item_tasks(db, n).await?;
-        let log = store::transitions(db, n).await?;
-        if json {
-            writeln!(
-                out,
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "item": it, "event": ev, "messages": msgs, "tasks": tasks, "transitions": log
-                }))?
-            )?;
-            return Ok(out);
+    let mut out = String::new();
+    let it = store::item(db, n).await?;
+    let ev = store::event(db, it.event_id).await?;
+    let msgs = store::messages(db, n).await?;
+    let tasks = store::item_tasks(db, n).await?;
+    let log = store::transitions(db, n).await?;
+    if json {
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "item": it, "event": ev, "messages": msgs, "tasks": tasks, "transitions": log
+            }))?
+        )?;
+        return Ok(out);
+    }
+    writeln!(out, "#{} {} — {} ({})", it.id, it.stage, it.title, ev.external_id)?;
+    if let Some(u) = &ev.url {
+        writeln!(out, "source: {u}")?;
+    }
+    if let Some(r) = &it.stale_reason {
+        writeln!(out, "STALE: {r}")?;
+        writeln!(out, "  nothing more is done for this item; remove and add the `{}` label again for a new item", label)?;
+    } else if let Some(e) = &it.error {
+        writeln!(out, "error: {e}")?;
+    }
+    if let (Some(g), Some(a)) = (&it.gate_event_id, &it.gate_actor) {
+        writeln!(out, "gate: {g} by {a} at {}", it.gate_at.as_deref().unwrap_or("?"))?;
+    }
+    if let Some(e) = it.eval_json.as_deref().and_then(|j| serde_json::from_str::<EvalResult>(j).ok()) {
+        writeln!(out, "eval: {} (agent: {}) — {}", e.effective, e.classification, e.summary)?;
+        for r in e.reasons.iter().chain(e.escalations.iter()) {
+            writeln!(out, "  - {r}")?;
         }
-        writeln!(out, "#{} {} — {} ({})", it.id, it.stage, it.title, ev.external_id)?;
-        if let Some(u) = &ev.url {
-            writeln!(out, "source: {u}")?;
-        }
-        if let Some(r) = &it.stale_reason {
-            writeln!(out, "STALE: {r}")?;
-            writeln!(out, "  nothing more is done for this item; remove and add the `{}` label again for a new item", label)?;
-        } else if let Some(e) = &it.error {
-            writeln!(out, "error: {e}")?;
-        }
-        if let (Some(g), Some(a)) = (&it.gate_event_id, &it.gate_actor) {
-            writeln!(out, "gate: {g} by {a} at {}", it.gate_at.as_deref().unwrap_or("?"))?;
-        }
-        if let Some(e) = it.eval_json.as_deref().and_then(|j| serde_json::from_str::<EvalResult>(j).ok()) {
-            writeln!(out, "eval: {} (agent: {}) — {}", e.effective, e.classification, e.summary)?;
-            for r in e.reasons.iter().chain(e.escalations.iter()) {
-                writeln!(out, "  - {r}")?;
-            }
-        }
-        if let Some(p) = &it.approved_plan {
-            writeln!(out, "approved plan v{}:\n{p}", it.approved_version.unwrap_or(0))?;
-        } else if let Some(p) = &it.plan_draft {
-            writeln!(out, "proposed plan v{} (not approved):\n{p}", it.plan_version)?;
-        }
-        if let Some(b) = &it.branch {
-            writeln!(out, "branch: {b}")?;
-        }
-        if let Some(t) = &it.tests_status {
-            writeln!(out, "tests: {t}")?;
-        }
-        if let Some(u) = &it.pr_url {
-            writeln!(out, "draft PR: {u}")?;
-        }
-        if it.comment_state != "none" {
-            writeln!(out, "issue comment: {}", it.comment_state)?;
-        }
-        writeln!(out, "WhatsApp thread: {}", it.surface)?;
-        writeln!(out, "\nthread (last 15):")?;
-        for m in msgs.iter().rev().take(15).collect::<Vec<_>>().into_iter().rev() {
-            writeln!(out, "  [{} {} via {}] {}", m.at, m.author, m.via, crate::intake::clip(&m.body, 300).replace('\n', " "))?;
-        }
-        writeln!(out, "\ntasks:")?;
-        for t in &tasks {
-            writeln!(out, "  {} {}", &t.task_id[..8.min(t.task_id.len())], t.stage)?;
-        }
-        writeln!(out, "\nstages:")?;
-        for t in &log {
-            writeln!(out, "  {} {} → {} ({})", t.at, t.from_stage.as_deref().unwrap_or("-"), t.to_stage, t.reason)?;
-        }
+    }
+    if let Some(p) = &it.approved_plan {
+        writeln!(out, "approved plan v{}:\n{p}", it.approved_version.unwrap_or(0))?;
+    } else if let Some(p) = &it.plan_draft {
+        writeln!(out, "proposed plan v{} (not approved):\n{p}", it.plan_version)?;
+    }
+    if let Some(b) = &it.branch {
+        writeln!(out, "branch: {b}")?;
+    }
+    if let Some(t) = &it.tests_status {
+        writeln!(out, "tests: {t}")?;
+    }
+    if let Some(u) = &it.pr_url {
+        writeln!(out, "draft PR: {u}")?;
+    }
+    if it.comment_state != "none" {
+        writeln!(out, "issue comment: {}", it.comment_state)?;
+    }
+    writeln!(out, "WhatsApp thread: {}", it.surface)?;
+    writeln!(out, "\nthread (last 15):")?;
+    for m in msgs.iter().rev().take(15).collect::<Vec<_>>().into_iter().rev() {
+        writeln!(out, "  [{} {} via {}] {}", m.at, m.author, m.via, crate::intake::clip(&m.body, 300).replace('\n', " "))?;
+    }
+    writeln!(out, "\ntasks:")?;
+    for t in &tasks {
+        writeln!(out, "  {} {}", &t.task_id[..8.min(t.task_id.len())], t.stage)?;
+    }
+    writeln!(out, "\nstages:")?;
+    for t in &log {
+        writeln!(out, "  {} {} → {} ({})", t.at, t.from_stage.as_deref().unwrap_or("-"), t.to_stage, t.reason)?;
+    }
     Ok(out)
 }
 
