@@ -388,7 +388,11 @@ operator how to approve; it cannot approve, reply in a thread, or retry.
 
 - **intake.db** — every write through `nucleus_core::intake` inside the
   `nucleus` binary (CLI, tick, the dashboard's write routes). Dashboard reads
-  use `open_read_only`.
+  use `open_read_only`. The schema has one version: the feature was never
+  deployed before its review rounds, so no intake.db and no whatsapp.db
+  intake table existed anywhere, and the intermediate migrations were
+  collapsed (round 4). The dashboard shows empty lists, refuses writes and
+  creates no intake.db when intake is disabled or the database is missing.
 - **whatsapp.db** — Rust inserts into `outbound_queue` (thread messages) and
   the new queue table `intake_group_requests`; it reads the bot's
   `intake_groups` (group state) and `intake_inbound` (operator messages,
@@ -615,33 +619,60 @@ the remote's default branch (read live with `ls-remote --symref` during
 preparation) and for `main`, `master`, `develop`, `development`, `trunk`,
 `production`, `release`, `gh-pages`.
 
-**Round 3: bounded import.** Before `git add` reads any file, the clone is
-checked: a walk that follows no symlink and skips `.git` directories
-refuses FIFOs, sockets and devices; the paths git would consider (tracked
-and untracked, not ignored) are listed through a bounded reader and checked
-with `lstat` against `[intake] import_max_files` (default 20 000),
-`import_max_file_bytes` (default 10 MiB; a sparse file counts by its
-length) and `import_max_total_bytes` (default 200 MiB). Import writes git
-objects into a temporary object directory, with the mirror's objects as an
-alternate, and moves them into the mirror only when the commit exists; a
-failed import leaves no index and no loose object. Staged submodule entries
-(mode 160000) must equal the base's: an unchanged base submodule is kept;
-an added, deleted or moved one is refused. Every refusal blocks the item
-with its reason.
+**Bounded import (rounds 3 and 4).** A walk that follows no symlink and
+skips `.git` directories refuses FIFOs, sockets and devices anywhere in the
+clone. The paths git would import (tracked and untracked, not ignored) are
+listed, as bytes, through a bounded reader; listing reads directory entries
+and the clone's ignore files, no file content. Each listed path is then
+copied into a private snapshot directory next to the temporary object
+directory: every path component is opened relative to its parent's
+descriptor with `O_NOFOLLOW` (a symlinked parent is refused); a regular
+file is checked on its opened descriptor (`fstat`: a regular file with one
+hard link) and copied by streaming, counting bytes as they are read against
+`[intake] import_max_file_bytes` (default 10 MiB) and
+`import_max_total_bytes` (default 200 MiB), so a sparse file or a file that
+grows during the copy is refused when it passes the limit; a symlink is
+recreated as a symlink from `readlinkat`; the number of paths is capped by
+`import_max_files` (default 20 000). `git add` runs only against the
+snapshot. Paths stay bytes end to end, so a name that is not UTF-8 is
+imported unchanged (APFS itself refuses such names). Staged submodule
+entries (mode 160000) must equal the base's, a base submodule directory
+that holds a repository is refused, and `.gitmodules` must stay
+byte-identical to the base when the base has submodules or either tree has
+the file. New objects are written into a temporary object directory (the
+mirror's objects as an alternate), packed there, and installed as `.pack`
+(and `.rev`) then `.idx` last, each by rename: git ignores a pack without
+its index, so a crash leaves nothing half-visible. Scratch directories
+(snapshot, index, objects) are removed after every import, and ones older
+than six hours are swept when the mirror is opened. Every refusal blocks
+the item with its reason.
 
-**Round 3: pinned executables.** `git` and `gh` are resolved once to
-canonical absolute paths (symlinks followed to the real file); every Nucleus
-git command runs that path, never a `PATH` lookup. When a tick (or a
-dashboard action) process starts, before it reads anything a worker wrote,
-it records the SHA-256 of both files. Before each privileged network step
-(fetch, push, pull request, comment) the hashes are checked again; a change
-blocks the item and the step does not run.
+**Pinned executables (rounds 3 and 4).** `git` and `gh` are resolved once
+to canonical absolute paths (symlinks followed to the real file) and pinned
+by SHA-256: git at its first use in the process, gh when the pipeline
+context opens, before anything a worker wrote is read. Every git and gh
+process intake starts goes through one function (`Pin::command`) that
+checks the hash immediately before it creates the process, local git
+operations included; the `gh` that git runs as credential helper is checked
+before the git process that may run it; the secret guard script's `git` is
+a link to the pinned git. A changed file is refused (the process is not
+started) and the item is blocked. With intake enabled and a repo
+configured, a `gh` that cannot be resolved stops the tick with the reason;
+nothing falls back to a bare name. Only canonical paths are stored.
 
-**Round 3: leased pushes.** The first push of an item only creates
-`refs/heads/nucleus/item-<n>` (`--force-with-lease=<ref>:` with an empty
-expected value): it fails when the branch exists with any commit. Nucleus
-records the commit it pushed (`items.pushed_sha`); a later push leases on
-exactly that commit and fails when the branch holds anything else.
+**Bounded test output (round 4).** Nucleus's own test run drains stdout
+and stderr at once into a buffer that keeps the last 256 KiB, runs the
+command in its own process group, and on timeout kills the whole group and
+reaps the shell.
+
+**Leased pushes (rounds 3 and 4).** Before pushing, Nucleus reads the exact
+remote ref `refs/heads/nucleus/item-<n>` (`ls-remote`, pinned git, trusted
+configuration, configured URL). When it already holds the commit to push (a
+push that happened before a crash), `pushed_sha` is recorded and the step
+continues without pushing; when it holds another commit Nucleus did not
+record, or moved after Nucleus's last push, the item is blocked. The first
+push only creates the ref (`--force-with-lease=<ref>:` with an empty
+expected value); a later push leases on exactly the recorded commit.
 
 Limits: without an OS sandbox the implementation agent runs with the
 operator's user rights and can change files between Nucleus's checks and
@@ -670,8 +701,14 @@ with nothing between that read and the write:
 - the push: read, then the push;
 - the pull request: after the push, the PR lookup (`gh pr list --head`,
   so a retry does not open a second PR), then a read, then `gh pr create`;
+  the lookup matches only a PR whose head is exactly the item branch in the
+  configured repository and whose author is the account `gh` is
+  authenticated as (`gh api user`, read once per process);
 - the comment: the comments-list lookup (so a retry does not post twice),
-  then a read, then `gh issue comment`.
+  then a read, then `gh issue comment`; each comment has a random 128-bit
+  operation id, stored before the post and embedded as an exact marker
+  line, and the lookup matches only that exact line on a comment written
+  by the authenticated account.
 
 Each read requires the issue to be open, carry the label from the same
 label event, set by an account that is a collaborator now, with the bound
@@ -717,7 +754,11 @@ categories (for example `pii-email`, `env-value`, `credential-…`,
 `guard-unavailable`), never the matched text, and a thread note; nothing is
 published. `retry` scans again; `cancel` stops the item.
 
-The diff is read through a bounded reader. One longer than `[intake]
+The diff parser counts `---` / `+++` as file headers only outside a hunk
+(after `diff --git`, before the first `@@`), so an added line whose content
+starts with `++` is kept; the whole bounded raw diff (removed lines
+included) is passed to the guard as well, so a parsing mistake cannot hide
+an added line. The diff is read through a bounded reader. One longer than `[intake]
 scan_max_bytes` (default 16 MiB) blocks the item with that reason: it is
 never cut and passed to the guard. (The guard script reads its whole input,
 so the bound is what keeps its memory bounded.)
@@ -747,13 +788,15 @@ not recognized as the operator.
 ### Finding 6 — group lifecycle
 
 The bot claims a request with `UPDATE … SET status = 'creating'|'closing'
-WHERE id = ? AND status = 'pending'` before any WhatsApp call. Before the
-create call it generates a random 64-bit recovery nonce, stores it with the
-request, and puts it at the end of the group subject (` ~<16 hex>`).
+WHERE id = ? AND status = 'pending'` before any WhatsApp call. A create
+claim stores a random 64-bit recovery nonce in the same statement, so a
+`creating` row always has its nonce; the nonce goes at the end of the group
+subject (` ~<16 hex>`). `calling_at` is written right before the create
+call, after every check that can refuse it.
 
 A failed creation is `fallback` only when nothing was created for certain:
 a 4xx answer from WhatsApp other than 408, or a call that was never sent (no
-live connection, or a claim that stopped before its nonce was stored).
+live connection, or a stuck claim without `calling_at`).
 Anything else (a timeout, a closed or lost connection, a server error, an
 unrecognized error, or a claim older than 10 minutes because the bot
 stopped mid-call) is `unknown`. An unknown creation is never repeated,
@@ -805,6 +848,30 @@ is written after the transaction; a crash between the two keeps the
 command's effect and loses the note.
 
 ### Verification of the amendment
+
+Round 4: an added line `++<guard hit>` blocks the push and the parser keeps
+it (`an_added_line_starting_with_plus_plus_is_scanned`,
+`added_lines_starting_with_plus_plus_are_kept`); endless test output is
+stopped at the timeout with its tail kept and the whole process group
+killed (`tests_run_with_a_status_and_a_limit`); a file that grows while
+copied, a hard-linked file, a symlinked parent, a sparse file and too many
+files are refused (`a_file_that_grows_while_copied_is_refused`,
+`the_snapshot_refuses_hard_links_and_symlinked_parents`,
+`oversized_trees_and_special_files_are_refused_before_git_add`); a push made
+before a crash is recognized and an unrecorded branch blocks the item
+(`a_push_before_a_crash_is_recognized_and_not_repeated`,
+`an_existing_branch_is_never_overwritten_by_the_first_push`); a changed git
+is refused at the first local git call (`core/tests/intake_git_pin.rs`) and
+a missing gh stops intake (`tools.rs`); a forged marker from another author
+and a PR by another account are ignored
+(`forged_markers_and_foreign_pull_requests_are_ignored`); a claim and its
+nonce are one write (`intake.test.ts`); a changed submodule URL is refused
+(`gitmodules_must_stay_as_in_the_base`); objects arrive as one pack and old
+scratch is swept (`objects_arrive_as_one_pack_and_old_scratch_is_swept`);
+paths stay bytes (`non_utf8_file_names_survive_an_import`); the dashboard
+with intake disabled or no database shows nothing and writes nothing
+(`disabled_intake_shows_nothing_and_writes_nothing`,
+`a_missing_database_is_an_empty_list`).
 
 Round 3: a label removed right after the push stops the item before
 `gh pr create` and keeps the pushed branch recorded
