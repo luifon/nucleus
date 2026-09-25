@@ -564,20 +564,28 @@ JSON-parsed numbers.
 - Thread messages reach WhatsApp only through `outbound_queue` (target
   policy, secret filter). Intake groups are created and left only by the
   bot (`messaging/whatsapp/src/intake.ts`), within `[intake.whatsapp]
-  max_groups_per_day`.
+  max_groups_per_day`. A group creation with an unknown result is never
+  counted as closed; only the bot leaving it or the operator running
+  `nucleus intake group-resolve` closes it.
 - Every write to `memory/intake.db` goes through `nucleus_core::intake`.
   Nucleus keeps one bare mirror per repo and one clone per item under
   `[intake] work_dir`, outside this checkout. Nucleus's own git commands
   run with no global or system config (`GIT_CONFIG_GLOBAL=/dev/null`,
   `GIT_CONFIG_NOSYSTEM=1`), hooks disabled, the mirror's config rewritten,
   an HTTPS remote URL from `nucleus.toml` and gh as the only credential
-  helper. Nucleus never runs git against an item clone: it imports the
+  helper. `git` and `gh` run from canonical paths pinned by SHA-256 when the
+  process starts and checked again before every fetch, push, PR and comment.
+  Nucleus never runs git against an item clone: it imports the
   clone's file tree into the mirror as one commit with the configured
-  identity and a code-owned message. Do not add a git step that breaks this.
-- For implementation start, every push and every comment, Nucleus reads the
-  issue live (open, label added by a collaborator, no edit since) before
-  preparing and again as the last step before the action, and fails closed
-  if the two reads differ. Task titles and branch names are code-owned;
+  identity and a code-owned message, after checking file types, counts and
+  sizes (`[intake] import_max_*`) and that base submodules are unchanged.
+  The first push only creates `nucleus/item-<n>`; later pushes lease on the
+  recorded commit. Do not add a git step that breaks this.
+- Nucleus reads the issue live (open, label added by a collaborator, no
+  edit since) before preparing and again right before every write: worker
+  start, push, PR creation (after the PR lookup) and comment (after the
+  comments lookup). The last read is the authorization point; a difference
+  from the first read fails closed. Task titles and branch names are code-owned;
   issue text reaches a session only inside the data fence. The PR body is built from code-owned fields, and the
   diff and all public text pass `tools/check-secrets.sh` first.
 
