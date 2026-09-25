@@ -23,6 +23,11 @@
 // whatsapp.log.<n> (the workspace root defaults to three levels above this
 // script). --dry-run reports the counts and writes nothing.
 //
+// Run it only while the WhatsApp bot is stopped. The lsof check refuses a
+// file that another process has open for writing, but that check and the
+// final rename are separate steps: a writer that opens the file between
+// them can lose its line or keep writing into the replaced inode.
+//
 // A file that any process has open for writing (lsof; the running bot's
 // stdout is one of these files) is refused: the script exits 3, names the
 // file and the pid, and writes nothing. Stop the bot first. --force replaces

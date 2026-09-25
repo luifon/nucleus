@@ -73,17 +73,21 @@ export class SentMessageStore {
   }
 
   /** Delete messages older than the retention, then the oldest rows beyond
-   *  the row cap. Returns how many rows were deleted. */
+   *  the row cap — but the cap never deletes a message younger than the
+   *  upstream resend window (SENT_MIN_RETENTION_MS), so a resend request
+   *  inside that window is always answerable. Returns how many rows were
+   *  deleted. */
   prune(nowMs = Date.now()): number {
     const cutoff = new Date(nowMs - this.retentionMs).toISOString();
     const aged = this.db.prepare(`DELETE FROM sent_messages WHERE sent_at < ?`).run(cutoff);
+    const protectedFrom = new Date(nowMs - SENT_MIN_RETENTION_MS).toISOString();
     const capped = this.db
       .prepare(
-        `DELETE FROM sent_messages WHERE id IN (
+        `DELETE FROM sent_messages WHERE sent_at < ? AND id IN (
            SELECT id FROM sent_messages ORDER BY sent_at DESC, id DESC LIMIT -1 OFFSET ?
          )`,
       )
-      .run(this.maxRows);
+      .run(protectedFrom, this.maxRows);
     return Number(aged.changes) + Number(capped.changes);
   }
 }

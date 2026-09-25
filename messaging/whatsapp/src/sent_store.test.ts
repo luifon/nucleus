@@ -79,15 +79,25 @@ test("a configured retention below the upstream window is raised to it", () => {
   assert.ok(sent.get("DAY10"));
 });
 
-test("the row cap deletes the oldest rows first", () => {
+test("the row cap deletes the oldest rows first, but only past the resend window", () => {
   const { dbPath } = setup();
   const sent = new SentMessageStore(dbPath, { maxRows: 3 });
   const now = Date.now();
-  for (let i = 0; i < 5; i++) at(sent, `M${i}`, now - (5 - i) * 60_000);
+  const past = now - SENT_MIN_RETENTION_MS - 3_600_000; // older than the window
+  for (let i = 0; i < 5; i++) at(sent, `M${i}`, past - (5 - i) * 60_000);
   assert.equal(sent.prune(now), 2);
   assert.equal(sent.get("M0"), undefined);
   assert.equal(sent.get("M1"), undefined);
   for (const id of ["M2", "M3", "M4"]) assert.ok(sent.get(id));
+});
+
+test("the row cap never deletes a message inside the resend window", () => {
+  const { dbPath } = setup();
+  const sent = new SentMessageStore(dbPath, { maxRows: 3 });
+  const now = Date.now();
+  for (let i = 0; i < 5; i++) at(sent, `R${i}`, now - (5 - i) * 60_000);
+  assert.equal(sent.prune(now), 0);
+  for (let i = 0; i < 5; i++) assert.ok(sent.get(`R${i}`), `R${i} kept`);
 });
 
 test("prune removes messages older than the retention", () => {
