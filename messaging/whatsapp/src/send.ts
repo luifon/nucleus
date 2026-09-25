@@ -61,7 +61,7 @@ async function main() {
 
   const authDir = path.join(workspaceRoot, "messaging/whatsapp/auth");
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await resolveWaVersion({ cachePath: waVersionCachePath(workspaceRoot), log });
+  const { version } = await resolveWaVersion({ cachePath: waVersionCachePath(workspaceRoot), maxAgeMs: config.link.waVersionMaxAgeMs, log });
 
   const sock = makeWASocket({
     version,
@@ -103,7 +103,7 @@ async function main() {
           // stored content (sent_store.ts); best-effort.
           try {
             new ChatSessionStore(config.dbPath);
-            new SentMessageStore(config.dbPath).record(sent);
+            new SentMessageStore(config.dbPath, { retentionMs: config.link.sentRetentionMs }).record(sent);
           } catch (e) {
             log.warn({ err: (e as Error).message }, "send: could not store the sent message");
           }

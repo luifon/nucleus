@@ -7,21 +7,41 @@
 // it gets the content from the socket's `getMessage` callback. Without it the
 // retry fails and the recipient shows "waiting for this message". The
 // per-socket cache Baileys keeps is lost on every reconnect, so the bot
-// stores the content here, in whatsapp.db, for SENT_RETENTION_MS.
+// stores the content here, in whatsapp.db.
+//
+// Retention: WhatsApp accepts resend requests for messages up to
+// PLACEHOLDER_MAX_AGE_SECONDS old (14 days in Baileys 7.0.0-rc14), so the
+// content is kept for SENT_RETENTION_MS (21 days) by default, and never for
+// less than that upstream window. `[whatsapp.link] sent_retention_days`
+// changes it. The table is also capped at `sent_max_rows` rows (oldest
+// deleted first) so a burst of sends cannot grow it without limit.
 //
 // Schema: `sent_messages`, created by ChatSessionStore (db.ts).
 
 import { DatabaseSync } from "node:sqlite";
-import { proto, type WAMessage } from "@whiskeysockets/baileys";
+import { PLACEHOLDER_MAX_AGE_SECONDS, proto, type WAMessage } from "@whiskeysockets/baileys";
 
-export const SENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+export const SENT_RETENTION_MS = 21 * DAY_MS;
+export const SENT_MAX_ROWS = 50_000;
+/** The shortest retention allowed: the upstream resend window. */
+export const SENT_MIN_RETENTION_MS = PLACEHOLDER_MAX_AGE_SECONDS * 1000;
+
+export interface SentStoreOptions {
+  retentionMs?: number;
+  maxRows?: number;
+}
 
 export class SentMessageStore {
   private db: DatabaseSync;
+  readonly retentionMs: number;
+  readonly maxRows: number;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, opts: SentStoreOptions = {}) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(`PRAGMA journal_mode = WAL;`);
+    this.retentionMs = Math.max(opts.retentionMs ?? SENT_RETENTION_MS, SENT_MIN_RETENTION_MS);
+    this.maxRows = Math.max(1, Math.floor(opts.maxRows ?? SENT_MAX_ROWS));
   }
 
   /** Store a sent message. A message without an id, a chat or content is
@@ -52,10 +72,18 @@ export class SentMessageStore {
     }
   }
 
-  /** Delete messages older than `retentionMs`. Returns how many. */
-  prune(retentionMs = SENT_RETENTION_MS, nowMs = Date.now()): number {
-    const cutoff = new Date(nowMs - retentionMs).toISOString();
-    const res = this.db.prepare(`DELETE FROM sent_messages WHERE sent_at < ?`).run(cutoff);
-    return Number(res.changes);
+  /** Delete messages older than the retention, then the oldest rows beyond
+   *  the row cap. Returns how many rows were deleted. */
+  prune(nowMs = Date.now()): number {
+    const cutoff = new Date(nowMs - this.retentionMs).toISOString();
+    const aged = this.db.prepare(`DELETE FROM sent_messages WHERE sent_at < ?`).run(cutoff);
+    const capped = this.db
+      .prepare(
+        `DELETE FROM sent_messages WHERE id IN (
+           SELECT id FROM sent_messages ORDER BY sent_at DESC, id DESC LIMIT -1 OFFSET ?
+         )`,
+      )
+      .run(this.maxRows);
+    return Number(aged.changes) + Number(capped.changes);
   }
 }

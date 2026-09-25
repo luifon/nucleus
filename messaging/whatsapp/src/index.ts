@@ -36,7 +36,7 @@ import { record as recordDiary } from "./diary.js";
 import { ConnectionSupervisor, DEFAULT_BREAKER, describeDisconnect } from "./breaker.js";
 import { installConsoleKeyFilter, makeBaileysLogger } from "./key_redaction.js";
 import { SentMessageStore } from "./sent_store.js";
-import { resolveWaVersion, waVersionCachePath } from "./wa_version.js";
+import { invalidateWaVersion, resolveWaVersion, waVersionCachePath } from "./wa_version.js";
 import NodeCache from "@cacheable/node-cache";
 
 // libsignal prints Signal session state (private keys included) through the
@@ -321,7 +321,7 @@ async function main() {
   const outbound = new OutboundQueueStore(config.dbPath);
   // Sent-message content for Baileys retry requests (getMessage), kept 7
   // days; pruned at boot and daily.
-  const sent = new SentMessageStore(config.dbPath);
+  const sent = new SentMessageStore(config.dbPath, { retentionMs: config.link.sentRetentionMs, maxRows: config.link.sentMaxRows });
   const pruneSent = () => {
     try {
       const n = sent.prune();
@@ -644,10 +644,12 @@ async function connect(bot: Bot): Promise<void> {
 
   // Pin to WhatsApp Web's currently-published protocol version (Rule 8). A
   // stale version causes a 405 login loop, so a failed fetch reuses the last
-  // fetched version (wa_version.ts), never the library's bundled one when a
-  // fetched one exists.
+  // fetched version while it is younger than the age limit (wa_version.ts);
+  // a 405 close invalidates it (the close handler below).
+  const versionCache = waVersionCachePath(config.workspaceRoot);
   const { version, source, error: versionError } = await resolveWaVersion({
-    cachePath: waVersionCachePath(config.workspaceRoot),
+    cachePath: versionCache,
+    maxAgeMs: config.link.waVersionMaxAgeMs,
     log,
   });
   log.info({ version, source, err: versionError }, "whatsapp: protocol version");
@@ -745,6 +747,13 @@ async function connect(bot: Bot): Promise<void> {
       // The breaker never touches auth state and never exits the process —
       // launchd stays the outer supervision layer for crashes only.
       const outcome = supervisor.onClose(reason);
+      // 405: the server refused this protocol version. Drop it from the
+      // cache so the next connection fetches again or uses the bundled
+      // version, instead of offering the refused version on every probe.
+      if (reason === 405) {
+        invalidateWaVersion(versionCache, version);
+        log.warn({ version, source }, "whatsapp: server refused the protocol version (405) — cached version invalidated");
+      }
       try {
         store.recordConnectionEvent(outcome.cls, reason, outcome.uptimeMs, detail);
       } catch (e) {
