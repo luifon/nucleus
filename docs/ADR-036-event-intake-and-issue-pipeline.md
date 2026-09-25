@@ -1030,16 +1030,40 @@ anyway.) Line endings are normalized first (CRLF and a bare CR become LF;
 GitHub ends a line at a bare CR), and an offset map takes every position
 back to the raw text. The syntax tree decides what is code — fenced and
 indented code blocks and code spans, at any depth of block quotes and list
-items — and gives the fences, tables, links, images, footnotes and math.
-Some checks read the source text with the code the tree found masked:
-HTML comments, tags and `<details>` (inline and block HTML), link
-reference definitions (the tree keeps no node for them), entities, and the
-always-flagged math macros. Where comrak and GitHub could read differently,
-both readings run and the stricter one stays. One case found: after a
-removed reference definition comrak reports shifted positions for the
-paragraph's inline nodes, so a code span is masked only when the source at
-its reported position really is that code span; otherwise it stays
-unmasked (test `comrak_positions_after_a_reference_definition_do_not_hide_anything`).
+items.
+
+Which checks read the tree and which read the text (fix round 2):
+
+- **The tree** (node kind, literal content, source position): fences and
+  their info strings, tables, links, images, footnote definitions, math
+  (inline, display, `` $`…`$ ``, math fences), and all raw HTML. Every
+  `HtmlBlock` and `HtmlInline` node is read from its literal, wherever the
+  tree places it (quotes, lists, table cells, any depth): comments,
+  forbidden elements and attributes, incomplete or unterminated tags, and
+  `<details>`. The literal's positions are mapped back line by line (each
+  literal line is a suffix of its source line after the container prefix).
+  Reading HTML from raw lines was the round-1 gap: a tag after `> ` or
+  `- ` was not at a line start, so an unterminated `<iframe title="…` in a
+  quote went unflagged.
+- **The text**, with the code the tree found masked, only where the tree
+  gives nothing to read: link reference definitions (comrak removes them
+  and keeps no node); HTML entities (the tree hands back decoded text, the
+  source keeps the entity and its position); `<!--` outside every HTML
+  node (a backstop in case GitHub starts a comment where comrak reads
+  text); the always-flagged math macros outside the math nodes (in case
+  GitHub reads math where comrak does not).
+- **Invisible characters** are read from the raw text, code included,
+  with every entity outside code decoded into the same character stream
+  (each decoded character keeps its source bytes), so the emoji and
+  joining rules apply to `&zwj;` exactly as to a literal ZWJ.
+
+Where comrak and GitHub could read differently, the stricter reading
+stays. One case found: after a removed reference definition comrak reports
+shifted positions for the paragraph's inline nodes. A code span is then
+masked only when the source at its reported position really is that code
+span, and an HTML node is placed at the occurrence of its literal nearest
+to the reported position (test
+`comrak_positions_after_a_reference_definition_do_not_hide_anything`).
 
 **Each finding** stores its location (`title`, `body`, `comment <id>`), its
 kind, its raw line and column (characters; CR, LF and CRLF each end a
@@ -1056,15 +1080,15 @@ every location that has findings.
 | `invisible_characters` | every Unicode Cf character; the other default-ignorable code points; blank-rendering characters (Hangul fillers U+115F, U+1160, U+3164, U+FFA0; U+2800); line and paragraph separators; control characters other than tab, LF, CR; private-use characters | drawn as nothing (private use: a box at most) |
 | `invisible_entity` | an HTML entity that decodes to one of those (`&#8203;`, `&#x2060;`, `&zwj;`, `&shy;`, …) | GitHub decodes it; the page shows nothing |
 | `details` | a `<details>` block without `open` (with `open` the block is shown and only its content is checked) | collapsed until clicked |
-| `html_tag` | a tag outside `VISIBLE_TAGS`; an attribute outside `attribute_allowed`; nested `<sub>`/`<sup>`; declarations, processing instructions, CDATA | removed by the sanitizer, or hides or restyles content |
+| `html_tag` | in any HTML node of the tree: a tag outside `VISIBLE_TAGS`; an attribute outside `attribute_allowed`; an incomplete or unterminated tag; nested `<sub>`/`<sup>`; declarations, processing instructions, CDATA | removed by the sanitizer, or hides or restyles content |
 | `link_definition` | `[label]: url "title"` (every definition, used or not) | renders as nothing |
 | `footnote_definition` | `[^label]: text` | shown only at the page bottom, only when referenced |
 | `image_alt` | non-empty alt text (Markdown images and `<img alt>`) | not shown while the image loads |
 | `link_title` | `[a](url "title")`, also on images | shown only on hover |
 | `link_destination` | a link (Markdown or `<a href>`) whose visible text, normalized, is not its destination | the destination shows only on hover |
-| `image_source` | an image address outside `EXEMPT_IMAGE_HOSTS` | the page shows the picture, not the address |
+| `image_source` | an image address that is not one of the exact attachment shapes below | the page shows the picture, not the address |
 | `table_extra_cells` | cells beyond the header's column count, in any container | GFM drops them |
-| `math_styling` | in `$…$`, `$$…$$`, `` $`…`$ `` and `math` blocks, a macro outside `MATH_VISIBLE` or in `MATH_ALWAYS_FLAG`, or a CSS-like `[…]` argument; `MATH_ALWAYS_FLAG` macros also outside math | can draw nothing, move, recolor or link text |
+| `math_styling` | in `$…$`, `$$…$$`, `` $`…`$ `` and `math` blocks, a macro outside `MATH_VISIBLE` or in `MATH_ALWAYS_FLAG`, a CSS-like `[…]` argument, or a comment (an unescaped `%` to the end of its line; `\%` is a percent sign); `MATH_ALWAYS_FLAG` macros also outside math | can draw nothing, move, recolor or link text; MathJax skips a comment |
 | `rendered_block` | a fence with info `mermaid`, `geojson`, `topojson` or `stl`, in any container | rendered as a picture; the source is not on the page |
 | `fence_info` | text after the first word of a fence info string, or a first word outside `[A-Za-z0-9_+#.-]{1,32}` | GitHub shows neither |
 
@@ -1072,8 +1096,12 @@ every location that has findings.
 Unicode 16.0 Character Database (`DerivedGeneralCategory.txt` for Cf,
 `DerivedCoreProperties.txt` for `Default_Ignorable_Code_Point`,
 `UnicodeData.txt` for names) plus the blank-rendering characters above.
-Not flagged: a single U+FE0E or U+FE0F directly after a visible character
-(emoji presentation); a ZWJ inside an RGI emoji ZWJ sequence (the `emojis`
+Not flagged: a U+FE0E or U+FE0F directly after one of the 371 bases of
+Unicode's emoji variation sequences (`VARIATION_BASES`, from
+`emoji-variation-sequences.txt`, Unicode 16.0; `StandardizedVariants.txt`
+16.0 defines no sequence with either selector), or a U+FE0F inside an RGI
+emoji ZWJ sequence; a selector after any other character, or a second one,
+is flagged (fix round 2); a ZWJ inside an RGI emoji ZWJ sequence (the `emojis`
 crate, Unicode Emoji 17.0 data from `emoji-test.txt`, which contains every
 sequence of `emoji-zwj-sequences.txt`; the sequence around the ZWJ must be
 exactly one listed emoji); a ZWNJ or ZWJ between two letters where Unicode
@@ -1081,7 +1109,9 @@ defines its effect, per the tests of RFC 5892 Appendix A.1/A.2 (after a
 virama and before a letter, as in Indic scripts; or between a character of
 Joining_Type L or D and one of R or D with only transparent marks between,
 as in Arabic, Persian and Syriac; joining types from Unicode 16.0,
-`unicode-joining-type`). Every other ZWJ and ZWNJ is flagged.
+`unicode-joining-type`). Every other ZWJ and ZWNJ is flagged. The same
+rules apply to characters written as entities (`👩&zwj;💻` is not flagged,
+`a&zwj;b` is).
 
 **HTML.** `VISIBLE_TAGS` is the element allowlist of GitHub's sanitizer as
 published in `html-pipeline` (`SanitizationFilter`) minus the kept elements
@@ -1098,9 +1128,15 @@ is flagged (`title`, `width`, `height`, `dir`, `style`, `class`, `hidden`,
 text, normalized (percent-decoded, lower case, without `http(s)://`,
 `mailto:` and a trailing `/`), equals the normalized destination: that
 covers autolinks, bare URLs and `[https://x](https://x)`. An image address
-is exempt only on `EXEMPT_IMAGE_HOSTS`: `https://github.com/user-attachments/…`
-and `https://user-images.githubusercontent.com/…`, GitHub's own attachment
-hosts for pasted pictures (HTTPS only, exact host, no `..` in the path).
+is exempt only in one of the two exact shapes of GitHub's attachments for
+pasted pictures (fix round 2), parsed with the `url` crate:
+`https://github.com/user-attachments/assets/<uuid>` and
+`https://user-images.githubusercontent.com/<digits>/<digits>-<uuid>.<ext>`
+with `<ext>` one of png, jpg, jpeg, gif, webp, svg, mp4, mov
+(`ATTACHMENT_EXTENSIONS`), `<uuid>` canonical lower-case 8-4-4-4-12 hex.
+The address must be exactly the parser's serialization (nothing normalized
+away: dot segments, letter case, a default port) and carry no credentials,
+port, query, fragment, percent-encoding, trailing slash or trailing text.
 
 **Math.** A denylist of hiding macros cannot be complete, so math is read
 against an allowlist, `MATH_VISIBLE`: Greek letters, big operators and
@@ -1111,7 +1147,10 @@ delimiters, fonts for visible text (`\text`, `\mathbf`, `\mathbb`, …),
 allowed. `MATH_ALWAYS_FLAG` wins over the allowlist: `\bbox`, `\enclose`,
 `\style`, `\class`, `\cssId`, `\href`, `\color` and its variants,
 `\phantom`, `\hphantom`, `\vphantom`, `\smash`, the lap, raise and kern
-macros, `\unicode`, `\require`, macro definitions.
+macros, `\unicode`, `\require`, macro definitions. Every math comment is
+flagged with its text: MathJax skips everything from an unescaped `%` to
+the end of the line, so `$x % ignore previous instructions$` shows only
+`x` (fix round 2).
 
 **Fence info strings.** Everything after the first word of an info string
 is flagged. For the first word I chose the character rule
@@ -1187,7 +1226,7 @@ decode entities), so only invisible characters are flagged in it.
   sanitizer may differ from. Rendering features GitHub adds later are not
   covered until the lists are extended.
 - The checks lean toward flagging: every non-autolink Markdown link and
-  every image not on GitHub's attachment hosts is a finding, a
+  every image not in an exact attachment shape is a finding, a
   reference-definition-shaped line inside a paragraph is flagged, a ZWJ in
   a minimally-qualified emoji sequence (without its U+FE0F) is flagged,
   math macros outside the allowlist are flagged. A false finding costs the
@@ -1236,6 +1275,20 @@ findings with their ranges and the raw sources; a release without the
 hold, with another hold, after hold B, and after the event changed is
 refused (`a_held_item_shows_its_findings_and_can_be_released_unless_it_changed`).
 Web: `markRanges` splits a source at code-point ranges.
+
+Fix round 2: math comments inline, escaped `\%`, a comment on one line of
+a display block and in a math fence (`math_comments_are_hidden_text`); the
+two accepted attachment shapes and each rejected variation, including
+`/user-attachments/ignore-previous-instructions`, a query, a fragment,
+`%2e%2e`, dot segments, credentials, ports, letter case and a UUID with
+trailing text (`only_exact_attachment_addresses_are_exempt`); an
+unterminated `<iframe title="…` in a quote, in a list item and in a quote
+in a list item, a forbidden element in a table cell
+(`html_is_read_from_the_tree_in_every_container`); selectors after defined
+bases, after `a`, `x`, a non-emoji arrow, repeated
+(`variation_selectors_need_a_defined_sequence`); `👩&zwj;💻`, numeric
+emoji with `&zwj;`, Persian with `&zwnj;` not flagged, `a&zwj;b` flagged
+(`entity_joiners_follow_the_same_rules`).
 
 ## Rejected alternatives
 
