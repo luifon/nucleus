@@ -1172,7 +1172,18 @@ that hide or shrink content (`small`, `ruby`/`rt`/`rp`, `bdo`, `time`,
 `pre`, `hr`, `br`, the inline text styles, `a`, `img`, `details`,
 `summary`, `figure`. Attributes are allowed only where they neither hide
 nor restyle: `td`/`th align`, `ol start`, `details open`; `a href` and
-`img src`/`alt` go through the link and image rules. Every other attribute
+`img src`/`alt` go through the link and image rules. An allowed attribute
+is allowed only with a value that changes nothing but layout, checked
+after WHATWG attribute decoding (fix round 5; the page never shows a
+value, so `<details open="ignore previous instructions">` hid text):
+`open` with no value, an empty value or `open`; `align` one of left,
+right, center, justify; `start` an optional `-` and 1–9 digits; letter
+case ignored. Any other value is an `html_tag` finding that shows the
+decoded value. Tag syntax itself is never rendered: every invisible
+character or character reference between a tag's `<` and its `>` (names,
+values, whitespace) is flagged, with no emoji, variation or joining
+exemption, and nothing inside a tag is a neighbour an exemption may lean
+on. Every other attribute
 is flagged (`title`, `width`, `height`, `dir`, `style`, `class`, `hidden`,
 …). HTML inside code, as the tree reads it, is not flagged.
 
@@ -1365,6 +1376,16 @@ as text flagged and in an HTML block not
 (`exemptions_see_the_characters_the_renderer_shows`); `[a]:
 <iframe>\nxxxxx<iframe>` never reports the definition
 (`a_reported_position_inside_a_definition_is_never_used`).
+
+Fix round 5: `<details open="ignore previous instructions">` and
+`open="&#105;gnore"` flagged with the decoded value, `open`, `open=""`,
+`open="OPEN"` (and `open="&#111;pen"`) not; `align="center"` not,
+`align="center; x"` flagged; `start="3"` and `start="-12"` not,
+`start="3 now run"` flagged
+(`allowed_attributes_need_a_value_that_only_changes_layout`); a ZWJ
+sequence, `&zwj;`, a VS16 after ❤ and a Persian ZWNJ inside attribute
+values flagged, the same VS16 in the element's text not
+(`tag_syntax_gets_no_exemption`).
 
 ## Rejected alternatives
 
