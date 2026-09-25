@@ -14,17 +14,34 @@
 //! enables for issues (tables, strikethrough, autolinks, task lists,
 //! footnotes, `$` and `` $` `` math, alerts) and source positions on. The
 //! syntax tree decides what is code (fenced and indented code blocks and
-//! code spans, inside block quotes and list items too), and gives the
-//! fences, tables, links, images, footnotes and math. Line endings are
+//! code spans, inside block quotes and list items too). Line endings are
 //! normalized to LF first (a bare CR ends a line for GitHub); an offset map
-//! takes every finding back to the raw text. Some checks also read the
-//! source text around the code the tree found (HTML comments, tags,
-//! `<details>`, link reference definitions, entities, hiding math macros):
-//! the tree has no node for a reference definition, and comrak reports
-//! wrong inline positions after one, so a code span is masked only when the
-//! source at its reported position is really that code span. Where comrak
-//! and GitHub could disagree, both readings run and the stricter result
-//! stays.
+//! takes every finding back to the raw text.
+//!
+//! Which checks read the tree, and which read the text:
+//!
+//! - **The tree** (node kind, literal content, source position): fences
+//!   and their info strings, tables, links, images, footnote definitions,
+//!   math (inline, display, `` $`…`$ ``, math fences), and all raw HTML —
+//!   every `HtmlBlock` and `HtmlInline` node, wherever it sits (quotes,
+//!   lists, tables, any depth), is read from its literal: comments,
+//!   forbidden elements and attributes, incomplete or unterminated tags,
+//!   `<details>`.
+//! - **The text**, with the code the tree found masked, only where the tree
+//!   gives nothing to read: link reference definitions (comrak removes them
+//!   and keeps no node), HTML entities (the tree hands back decoded text;
+//!   the source keeps the entity and its position), `<!--` outside every
+//!   HTML node (a backstop in case GitHub starts a comment where comrak
+//!   reads text), and the always-flagged math macros outside the math nodes
+//!   (in case GitHub reads math where comrak does not).
+//! - **Invisible characters** are read from the raw text, code included,
+//!   with entities outside code decoded into the same character stream, so
+//!   the emoji and joining rules see `&zwj;` as a ZWJ.
+//!
+//! comrak reports wrong inline positions after a removed reference
+//! definition, so a code span is masked only when the source at its
+//! reported position is really that code span. Where comrak and GitHub
+//! could disagree, the stricter reading stays.
 //!
 //! **What is flagged** is listed by [`Kind`]. Invisible characters are
 //! flagged everywhere, code included (they are invisible in code too).
@@ -218,12 +235,67 @@ pub fn attribute_allowed(tag: &str, attr: &str) -> bool {
     )
 }
 
-/// Image hosts whose pictures are the normal pasted attachments of GitHub
-/// issues: `https://github.com/user-attachments/…` (current uploads) and
-/// `https://user-images.githubusercontent.com/…` (older uploads). An image
-/// from anywhere else is flagged with its address.
-pub const EXEMPT_IMAGE_HOSTS: &[(&str, &str)] =
-    &[("github.com", "/user-attachments/"), ("user-images.githubusercontent.com", "/")];
+/// The only image addresses that are not flagged: GitHub's own attachment
+/// URLs for pictures pasted into an issue, in their exact shapes.
+///
+/// - `https://github.com/user-attachments/assets/<uuid>`
+/// - `https://user-images.githubusercontent.com/<digits>/<digits>-<uuid>.<ext>`
+///   with `<ext>` in [`ATTACHMENT_EXTENSIONS`]
+///
+/// `<uuid>` is canonical lower-case 8-4-4-4-12 hex. Anything else is
+/// flagged: credentials, a port, a query, a fragment, percent-encoding or
+/// dot segments in the path, a trailing slash or trailing text.
+pub const EXEMPT_IMAGE_HOSTS: &[&str] = &["github.com", "user-images.githubusercontent.com"];
+
+/// File extensions of the older attachment host.
+pub const ATTACHMENT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "mp4", "mov"];
+
+/// Base characters of the emoji variation sequences: each one followed by
+/// U+FE0E (text style) or U+FE0F (emoji style) is a sequence Unicode
+/// defines. Source: `emoji-variation-sequences.txt`, Unicode 16.0 (the same
+/// 371 bases for both selectors). `StandardizedVariants.txt` 16.0 defines
+/// no sequence with U+FE0E or U+FE0F, so it adds none.
+const VARIATION_BASES: &[u32] = &[
+    0x0023, 0x002A, 0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037, 0x0038, 0x0039,
+    0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x2194, 0x2195, 0x2196, 0x2197, 0x2198, 0x2199,
+    0x21A9, 0x21AA, 0x231A, 0x231B, 0x2328, 0x23CF, 0x23E9, 0x23EA, 0x23EB, 0x23EC, 0x23ED, 0x23EE,
+    0x23EF, 0x23F0, 0x23F1, 0x23F2, 0x23F3, 0x23F8, 0x23F9, 0x23FA, 0x24C2, 0x25AA, 0x25AB, 0x25B6,
+    0x25C0, 0x25FB, 0x25FC, 0x25FD, 0x25FE, 0x2600, 0x2601, 0x2602, 0x2603, 0x2604, 0x260E, 0x2611,
+    0x2614, 0x2615, 0x2618, 0x261D, 0x2620, 0x2622, 0x2623, 0x2626, 0x262A, 0x262E, 0x262F, 0x2638,
+    0x2639, 0x263A, 0x2640, 0x2642, 0x2648, 0x2649, 0x264A, 0x264B, 0x264C, 0x264D, 0x264E, 0x264F,
+    0x2650, 0x2651, 0x2652, 0x2653, 0x265F, 0x2660, 0x2663, 0x2665, 0x2666, 0x2668, 0x267B, 0x267E,
+    0x267F, 0x2692, 0x2693, 0x2694, 0x2695, 0x2696, 0x2697, 0x2699, 0x269B, 0x269C, 0x26A0, 0x26A1,
+    0x26A7, 0x26AA, 0x26AB, 0x26B0, 0x26B1, 0x26BD, 0x26BE, 0x26C4, 0x26C5, 0x26C8, 0x26CE, 0x26CF,
+    0x26D1, 0x26D3, 0x26D4, 0x26E9, 0x26EA, 0x26F0, 0x26F1, 0x26F2, 0x26F3, 0x26F4, 0x26F5, 0x26F7,
+    0x26F8, 0x26F9, 0x26FA, 0x26FD, 0x2702, 0x2705, 0x2708, 0x2709, 0x270A, 0x270B, 0x270C, 0x270D,
+    0x270F, 0x2712, 0x2714, 0x2716, 0x271D, 0x2721, 0x2728, 0x2733, 0x2734, 0x2744, 0x2747, 0x274C,
+    0x274E, 0x2753, 0x2754, 0x2755, 0x2757, 0x2763, 0x2764, 0x2795, 0x2796, 0x2797, 0x27A1, 0x27B0,
+    0x27BF, 0x2934, 0x2935, 0x2B05, 0x2B06, 0x2B07, 0x2B1B, 0x2B1C, 0x2B50, 0x2B55, 0x3030, 0x303D,
+    0x3297, 0x3299, 0x1F004, 0x1F170, 0x1F171, 0x1F17E, 0x1F17F, 0x1F202, 0x1F21A, 0x1F22F,
+    0x1F237, 0x1F30D, 0x1F30E, 0x1F30F, 0x1F315, 0x1F31C, 0x1F321, 0x1F324, 0x1F325, 0x1F326,
+    0x1F327, 0x1F328, 0x1F329, 0x1F32A, 0x1F32B, 0x1F32C, 0x1F336, 0x1F378, 0x1F37D, 0x1F393,
+    0x1F396, 0x1F397, 0x1F399, 0x1F39A, 0x1F39B, 0x1F39E, 0x1F39F, 0x1F3A7, 0x1F3AC, 0x1F3AD,
+    0x1F3AE, 0x1F3C2, 0x1F3C4, 0x1F3C6, 0x1F3CA, 0x1F3CB, 0x1F3CC, 0x1F3CD, 0x1F3CE, 0x1F3D4,
+    0x1F3D5, 0x1F3D6, 0x1F3D7, 0x1F3D8, 0x1F3D9, 0x1F3DA, 0x1F3DB, 0x1F3DC, 0x1F3DD, 0x1F3DE,
+    0x1F3DF, 0x1F3E0, 0x1F3ED, 0x1F3F3, 0x1F3F5, 0x1F3F7, 0x1F408, 0x1F415, 0x1F41F, 0x1F426,
+    0x1F43F, 0x1F441, 0x1F442, 0x1F446, 0x1F447, 0x1F448, 0x1F449, 0x1F44D, 0x1F44E, 0x1F453,
+    0x1F46A, 0x1F47D, 0x1F4A3, 0x1F4B0, 0x1F4B3, 0x1F4BB, 0x1F4BF, 0x1F4CB, 0x1F4DA, 0x1F4DF,
+    0x1F4E4, 0x1F4E5, 0x1F4E6, 0x1F4EA, 0x1F4EB, 0x1F4EC, 0x1F4ED, 0x1F4F7, 0x1F4F9, 0x1F4FA,
+    0x1F4FB, 0x1F4FD, 0x1F508, 0x1F50D, 0x1F512, 0x1F513, 0x1F549, 0x1F54A, 0x1F550, 0x1F551,
+    0x1F552, 0x1F553, 0x1F554, 0x1F555, 0x1F556, 0x1F557, 0x1F558, 0x1F559, 0x1F55A, 0x1F55B,
+    0x1F55C, 0x1F55D, 0x1F55E, 0x1F55F, 0x1F560, 0x1F561, 0x1F562, 0x1F563, 0x1F564, 0x1F565,
+    0x1F566, 0x1F567, 0x1F56F, 0x1F570, 0x1F573, 0x1F574, 0x1F575, 0x1F576, 0x1F577, 0x1F578,
+    0x1F579, 0x1F587, 0x1F58A, 0x1F58B, 0x1F58C, 0x1F58D, 0x1F590, 0x1F5A5, 0x1F5A8, 0x1F5B1,
+    0x1F5B2, 0x1F5BC, 0x1F5C2, 0x1F5C3, 0x1F5C4, 0x1F5D1, 0x1F5D2, 0x1F5D3, 0x1F5DC, 0x1F5DD,
+    0x1F5DE, 0x1F5E1, 0x1F5E3, 0x1F5E8, 0x1F5EF, 0x1F5F3, 0x1F5FA, 0x1F610, 0x1F687, 0x1F68D,
+    0x1F691, 0x1F694, 0x1F698, 0x1F6AD, 0x1F6B2, 0x1F6B9, 0x1F6BA, 0x1F6BC, 0x1F6CB, 0x1F6CD,
+    0x1F6CE, 0x1F6CF, 0x1F6E0, 0x1F6E1, 0x1F6E2, 0x1F6E3, 0x1F6E4, 0x1F6E5, 0x1F6E9, 0x1F6F0,
+    0x1F6F3,
+];
+
+fn is_variation_base(c: char) -> bool {
+    VARIATION_BASES.binary_search(&(c as u32)).is_ok()
+}
 
 /// Fence info words GitHub renders as a picture instead of showing the
 /// source: Mermaid diagrams, GeoJSON/TopoJSON maps, STL 3D models.
@@ -496,46 +568,90 @@ fn joiner_in_script(chars: &[char], i: usize) -> bool {
     matches!(before, Some(J::LeftJoining | J::DualJoining)) && matches!(after, Some(J::RightJoining | J::DualJoining))
 }
 
-/// Runs of invisible characters in `text`. Not flagged: a single U+FE0E or
-/// U+FE0F right after a visible character (emoji presentation), a ZWJ inside
-/// an RGI emoji ZWJ sequence, and a ZWNJ or ZWJ where [`joiner_in_script`]
-/// holds.
-fn invisible_runs(text: &str, out: &mut Vec<Raw>) {
-    let idx: Vec<(usize, char)> = text.char_indices().collect();
-    let chars: Vec<char> = idx.iter().map(|(_, c)| *c).collect();
-    let hidden = |k: usize| -> bool {
-        let c = chars[k];
-        if invisible_name(c).is_none() {
+/// True when the character at `k` is hidden content. Not hidden: a U+FE0E
+/// or U+FE0F right after one of the [`VARIATION_BASES`] (a variation
+/// sequence Unicode defines) or inside an RGI emoji ZWJ sequence; a ZWJ
+/// inside an RGI emoji ZWJ sequence; a ZWNJ or ZWJ where
+/// [`joiner_in_script`] holds. `chars` is the text as GitHub renders it:
+/// entities outside code already decoded.
+fn hidden_at(chars: &[char], k: usize) -> bool {
+    let c = chars[k];
+    if invisible_name(c).is_none() {
+        return false;
+    }
+    if c == '\u{FE0E}' || c == '\u{FE0F}' {
+        if k > 0 && is_variation_base(chars[k - 1]) {
             return false;
         }
-        if c == '\u{FE0E}' || c == '\u{FE0F}' {
-            let prev_visible = k > 0 && !chars[k - 1].is_whitespace() && invisible_name(chars[k - 1]).is_none();
-            let prev_zwj_emoji = k > 0 && chars[k - 1] == ZWJ && zwj_in_emoji(&chars, k - 1);
-            if prev_visible || prev_zwj_emoji {
-                return false;
+        let in_sequence = (k + 1 < chars.len() && chars[k + 1] == ZWJ && zwj_in_emoji(chars, k + 1))
+            || (k >= 2 && chars[k - 2] == ZWJ && zwj_in_emoji(chars, k - 2));
+        if c == '\u{FE0F}' && in_sequence {
+            return false;
+        }
+        return true;
+    }
+    if c == ZWJ && zwj_in_emoji(chars, k) {
+        return false;
+    }
+    if (c == ZWJ || c == ZWNJ) && joiner_in_script(chars, k) {
+        return false;
+    }
+    true
+}
+
+/// One character of the text as GitHub renders it, with its source bytes:
+/// an entity outside code is one decoded character.
+#[derive(Debug, Clone, Copy)]
+struct Unit {
+    c: char,
+    at: usize,
+    end: usize,
+    entity: bool,
+}
+
+/// The characters of `text`, literal (`decode = false`, the title) or with
+/// entities outside the `code` ranges decoded.
+fn units(text: &str, code: &[(usize, usize)], decode: bool) -> Vec<Unit> {
+    let b = text.as_bytes();
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if decode && b[i] == b'&' && !escaped(b, i) && !inside(code, i) {
+            if let Some((c, len)) = entity_at(text, i) {
+                out.push(Unit { c, at: i, end: i + len, entity: true });
+                i += len;
+                continue;
             }
         }
-        if c == ZWJ && zwj_in_emoji(&chars, k) {
-            return false;
-        }
-        if (c == ZWJ || c == ZWNJ) && joiner_in_script(&chars, k) {
-            return false;
-        }
-        true
-    };
+        let c = text[i..].chars().next().expect("a char boundary");
+        out.push(Unit { c, at: i, end: i + c.len_utf8(), entity: false });
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// Invisible characters in a character stream: runs of literal ones, and
+/// each entity that decodes to one.
+fn invisible_findings(text: &str, us: &[Unit], out: &mut Vec<Raw>) {
+    let chars: Vec<char> = us.iter().map(|u| u.c).collect();
+    let hidden: Vec<bool> = (0..chars.len()).map(|k| hidden_at(&chars, k)).collect();
     let mut k = 0;
-    while k < chars.len() {
-        if !hidden(k) {
+    while k < us.len() {
+        if !hidden[k] {
+            k += 1;
+            continue;
+        }
+        if us[k].entity {
+            let src = &text[us[k].at..us[k].end];
+            out.push(raw(Kind::InvisibleEntity, us[k].at, us[k].end, format!("{src} → {}", code_point(chars[k]))));
             k += 1;
             continue;
         }
         let s = k;
-        while k < chars.len() && hidden(k) {
+        while k < us.len() && hidden[k] && !us[k].entity {
             k += 1;
         }
-        let at = idx[s].0;
-        let end = idx.get(k).map(|(b, _)| *b).unwrap_or(text.len());
-        out.push(Raw { kind: Kind::InvisibleCharacters, at, end, text: describe_run(&chars[s..k]) });
+        out.push(raw(Kind::InvisibleCharacters, us[s].at, us[k - 1].end, describe_run(&chars[s..k])));
     }
 }
 
@@ -669,6 +785,69 @@ struct Tree {
     literal: Vec<(usize, usize)>,
     /// Inline and block math, already checked from the tree.
     math: Vec<(usize, usize)>,
+    /// Every raw HTML node, in document order.
+    html: Vec<HtmlNode>,
+}
+
+/// A raw HTML node: its literal (container prefixes removed) and, for each
+/// literal byte and one past the end, the source byte it came from.
+struct HtmlNode {
+    literal: String,
+    map: Vec<usize>,
+    range: (usize, usize),
+}
+
+impl HtmlNode {
+    fn src(&self, i: usize) -> usize {
+        self.map[i.min(self.map.len() - 1)]
+    }
+}
+
+/// An HTML node at the reported range `a..b`. When the source there does
+/// not start with the literal's first line (comrak shifts inline positions
+/// after a removed reference definition), the node is placed at the
+/// occurrence of that line nearest to the reported start; its findings
+/// keep their text either way.
+fn html_node(text: &str, starts: &[usize], a: usize, b: usize, literal: String) -> HtmlNode {
+    let first = literal.split('\n').next().unwrap_or("");
+    let mut at = a;
+    if !first.is_empty() && !text[a.min(text.len())..].starts_with(first) {
+        if let Some(p) = text.match_indices(first).map(|(p, _)| p).min_by_key(|p| p.abs_diff(a)) {
+            at = p;
+        }
+    }
+    let line = starts.partition_point(|s| *s <= at);
+    let map = html_map(text, starts, at, line, &literal);
+    let end = if at == a { b } else { map.last().copied().unwrap_or(at) };
+    HtmlNode { map, literal, range: (at, end.max(at)) }
+}
+
+/// Map each byte of an HTML node's `literal` back to the source: literal
+/// line k comes from source line `first_line + k`, as a suffix of it (the
+/// container prefix is what was removed), and the first line starts at
+/// `start`. A line that is not a suffix of its source line (a tab expanded
+/// in the prefix) maps to its source line's start.
+fn html_map(text: &str, starts: &[usize], start: usize, first_line: usize, literal: &str) -> Vec<usize> {
+    let mut map = Vec::with_capacity(literal.len() + 1);
+    let mut first = true;
+    for (line_no, piece) in (first_line..).zip(literal.split_inclusive('\n')) {
+        let body = piece.strip_suffix('\n').unwrap_or(piece);
+        let ls = starts.get(line_no.saturating_sub(1)).copied().unwrap_or(text.len());
+        let le = text[ls.min(text.len())..].find('\n').map(|x| ls + x).unwrap_or(text.len());
+        let base = if first {
+            start
+        } else if text[ls.min(le)..le].ends_with(body) {
+            le - body.len()
+        } else {
+            ls
+        };
+        for j in 0..piece.len() {
+            map.push((base + j).min(text.len()));
+        }
+        first = false;
+    }
+    map.push(map.last().map(|x| (x + 1).min(text.len())).unwrap_or(start));
+    map
 }
 
 fn comrak_options() -> comrak::Options<'static> {
@@ -784,6 +963,8 @@ fn tree_scan(text: &str, out: &mut Vec<Raw>) -> Tree {
                     out.push(raw(Kind::ImageSource, a, b, shown(&l.url)));
                 }
             }
+            NodeValue::HtmlBlock(hb) => t.html.push(html_node(text, &starts, a, b, hb.literal)),
+            NodeValue::HtmlInline(lit) => t.html.push(html_node(text, &starts, a, b, lit)),
             NodeValue::FootnoteDefinition(_) => {
                 out.push(raw(Kind::FootnoteDefinition, a, b, shown(slice(text, a, b))));
             }
@@ -833,27 +1014,68 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// An image address on [`EXEMPT_IMAGE_HOSTS`] over HTTPS.
-fn image_exempt(url: &str) -> bool {
-    let Some(rest) = url.trim().strip_prefix("https://") else { return false };
-    let (host, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let host = host.to_ascii_lowercase();
-    !path.contains("..")
-        && !path.contains('\\')
-        && EXEMPT_IMAGE_HOSTS.iter().any(|(h, p)| host == *h && path.starts_with(p) && path.len() > p.len())
+/// Canonical lower-case 8-4-4-4-12 hexadecimal UUID.
+fn is_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && parts.iter().zip([8, 4, 4, 4, 12]).all(|(p, n)| {
+            p.len() == n && p.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        })
+}
+
+/// An image address in one of the exact attachment shapes of
+/// [`EXEMPT_IMAGE_HOSTS`]. Parsed with the `url` crate; the address must be
+/// exactly the parser's serialization (so nothing was normalized away: dot
+/// segments, letter case, a default port) and carry no credentials, port,
+/// query, fragment or percent-encoding.
+fn image_exempt(raw_url: &str) -> bool {
+    if raw_url.contains(['%', '\\']) || raw_url.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Ok(u) = url::Url::parse(raw_url) else { return false };
+    if u.as_str() != raw_url
+        || u.scheme() != "https"
+        || !u.username().is_empty()
+        || u.password().is_some()
+        || u.port().is_some()
+        || u.query().is_some()
+        || u.fragment().is_some()
+    {
+        return false;
+    }
+    let segs: Vec<&str> = u.path().split('/').skip(1).collect();
+    if segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+        return false;
+    }
+    match (u.host_str(), segs.as_slice()) {
+        (Some("github.com"), ["user-attachments", "assets", id]) => is_uuid(id),
+        (Some("user-images.githubusercontent.com"), [user, file]) => {
+            let Some((stem, ext)) = file.rsplit_once('.') else { return false };
+            let Some((num, id)) = stem.split_once('-') else { return false };
+            let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+            digits(user) && digits(num) && is_uuid(id) && ATTACHMENT_EXTENSIONS.contains(&ext)
+        }
+        _ => false,
+    }
 }
 
 /// Why a math source is flagged: the macros outside [`MATH_VISIBLE`] (or in
-/// [`MATH_ALWAYS_FLAG`]) and CSS-like optional arguments; `None` when it
-/// only draws visible symbols.
+/// [`MATH_ALWAYS_FLAG`]), CSS-like optional arguments, and comments (an
+/// unescaped `%` to the end of its line; `\%` is a percent sign); `None`
+/// when it only draws visible symbols.
 fn math_problems(src: &str) -> Option<String> {
     let b = src.as_bytes();
     let mut bad: Vec<String> = Vec::new();
+    let mut comments: Vec<String> = Vec::new();
     let mut i = 0;
     while i < b.len() {
+        // MathJax skips everything from an unescaped `%` to the line end.
+        if b[i] == b'%' {
+            let end = src[i..].find('\n').map(|x| i + x).unwrap_or(src.len());
+            comments.push(src[i..end].to_string());
+            i = end;
+            continue;
+        }
         if b[i] != b'\\' {
             i += 1;
             continue;
@@ -879,7 +1101,14 @@ fn math_problems(src: &str) -> Option<String> {
         }
         i += 1 + n;
     }
-    (!bad.is_empty()).then(|| format!("macros {}", bad.join(", ")))
+    let mut why = Vec::new();
+    if !bad.is_empty() {
+        why.push(format!("macros {}", bad.join(", ")));
+    }
+    for c in comments {
+        why.push(format!("comment {:?}", shown(&c)));
+    }
+    (!why.is_empty()).then(|| why.join("; "))
 }
 
 // ── source-text checks (around the code the tree found) ──────────────────
@@ -900,9 +1129,9 @@ fn masked(text: &str, ranges: &[(usize, usize)]) -> String {
     String::from_utf8(b).unwrap_or_else(|_| text.to_string())
 }
 
-/// HTML comments; returns their ranges.
-fn html_comments(m: &str, text: &str, out: &mut Vec<Raw>) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
+/// `<!--` outside every HTML node the tree found (a backstop: GitHub could
+/// start a comment where comrak reads text).
+fn text_comments(m: &str, text: &str, html: &[(usize, usize)], out: &mut Vec<Raw>) {
     let mut from = 0;
     while let Some(rel) = m[from..].find("<!--") {
         let p = from + rel;
@@ -917,11 +1146,11 @@ fn html_comments(m: &str, text: &str, out: &mut Vec<Raw>) -> Vec<(usize, usize)>
                 None => m.len(),
             }
         };
-        out.push(raw(Kind::HtmlComment, p, end, shown(slice(text, p, end))));
-        ranges.push((p, end));
+        if !inside(html, p) {
+            out.push(raw(Kind::HtmlComment, p, end, shown(slice(text, p, end))));
+        }
         from = end;
     }
-    ranges
 }
 
 /// One parsed tag: name (lower case), whether it closes, attributes (name
@@ -931,11 +1160,13 @@ struct Tag {
     closing: bool,
     attrs: Vec<(String, String)>,
     end: usize,
+    unterminated: bool,
 }
 
-/// Parse the tag at `i` (`m[i] == '<'`); `None` when it is not a tag.
-/// Without a closing `>` a tag counts only at the start of a line, where
-/// CommonMark can start an HTML block with it.
+/// Parse the tag at `i` (`m[i] == '<'`, `m` an HTML node's literal); `None`
+/// when it is not a tag. A tag without its closing `>` (or with an
+/// unterminated quoted value) is returned up to the end of its line and
+/// marked `unterminated`: in an HTML node the sanitizer drops what follows.
 fn parse_tag(m: &str, i: usize) -> Option<Tag> {
     let b = m.as_bytes();
     let closing = b.get(i + 1) == Some(&b'/');
@@ -956,8 +1187,10 @@ fn parse_tag(m: &str, i: usize) -> Option<Tag> {
         }
         match b.get(j) {
             None => break,
-            Some(b'>') => return Some(Tag { name, closing, attrs, end: j + 1 }),
-            Some(b'/') if b.get(j + 1) == Some(&b'>') => return Some(Tag { name, closing, attrs, end: j + 2 }),
+            Some(b'>') => return Some(Tag { name, closing, attrs, end: j + 1, unterminated: false }),
+            Some(b'/') if b.get(j + 1) == Some(&b'>') => {
+                return Some(Tag { name, closing, attrs, end: j + 2, unterminated: false })
+            }
             Some(b'<') => break,
             _ => {}
         }
@@ -998,61 +1231,41 @@ fn parse_tag(m: &str, i: usize) -> Option<Tag> {
         }
         attrs.push((an, value));
     }
-    // No `>`: only at the start of a line (an HTML block start).
-    let ls = m[..i].rfind('\n').map(|x| x + 1).unwrap_or(0);
-    let lead = &m[ls..i];
-    (lead.len() <= 3 && lead.bytes().all(|c| c == b' ')).then(|| Tag {
-        name,
-        closing,
-        attrs,
-        end: m[i..].find('\n').map(|x| i + x).unwrap_or(m.len()),
-    })
+    Some(Tag { name, closing, attrs, end: m[i..].find('\n').map(|x| i + x).unwrap_or(m.len()), unterminated: true })
 }
 
-/// `<details>` blocks without `open`, nested ones included in the outer.
-fn details(m: &str, text: &str, comments: &[(usize, usize)], out: &mut Vec<Raw>) {
+/// The end of the `<details>` element whose open tag starts at source byte
+/// `p`: after its matching `</details>` (nested ones counted), or the end.
+fn details_end(m: &str, p: usize) -> usize {
     let lower = m.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(rel) = lower[from..].find("<details") {
-        let p = from + rel;
-        from = p + 8;
-        if inside(comments, p) {
-            continue;
-        }
-        let Some(tag) = parse_tag(m, p) else { continue };
-        if tag.name != "details" || tag.closing || tag.attrs.iter().any(|(a, _)| a == "open") {
-            continue;
-        }
-        let mut depth = 1;
-        let mut i = tag.end;
-        let mut end = m.len();
-        while i < lower.len() {
-            let open = lower[i..].find("<details").map(|x| i + x);
-            let close = lower[i..].find("</details").map(|x| i + x);
-            match (open, close) {
-                (Some(o), Some(c)) if o < c => {
-                    depth += 1;
-                    i = o + 8;
-                }
-                (_, Some(c)) => {
-                    depth -= 1;
-                    i = c + 9;
-                    if depth == 0 {
-                        end = lower[c..].find('>').map(|x| c + x + 1).unwrap_or(m.len());
-                        break;
-                    }
-                }
-                _ => break,
+    let mut depth = 1;
+    let mut i = p + 8;
+    while i < lower.len() {
+        let open = lower[i..].find("<details").map(|x| i + x);
+        let close = lower[i..].find("</details").map(|x| i + x);
+        match (open, close) {
+            (Some(o), Some(c)) if o < c => {
+                depth += 1;
+                i = o + 8;
             }
+            (_, Some(c)) => {
+                depth -= 1;
+                i = c + 9;
+                if depth == 0 {
+                    return lower[c..].find('>').map(|x| c + x + 1).unwrap_or(m.len());
+                }
+            }
+            _ => break,
         }
-        out.push(raw(Kind::Details, p, end, shown(slice(text, p, end))));
-        from = end.max(p + 8);
     }
+    m.len()
 }
 
-/// Visible text between `from` and the closing `</name>` (tags removed).
+/// Visible text between source byte `from` and the closing `</name>`
+/// (tags removed), read from the masked source (a label follows an inline
+/// `<a>` node as text).
 fn element_text(m: &str, from: usize, name: &str) -> Option<String> {
-    let lower = m[from..].to_ascii_lowercase();
+    let lower = m[from.min(m.len())..].to_ascii_lowercase();
     let close = lower.find(&format!("</{name}>")).or_else(|| {
         lower.match_indices(&format!("</{name}")).map(|(i, _)| i).find(|&i| {
             lower.as_bytes().get(i + 2 + name.len()).is_some_and(|c| c.is_ascii_whitespace())
@@ -1072,89 +1285,114 @@ fn element_text(m: &str, from: usize, name: &str) -> Option<String> {
     Some(s)
 }
 
-/// Raw HTML: tags outside [`VISIBLE_TAGS`], attributes outside
-/// [`attribute_allowed`], `<a href>` whose text is not its address, `<img>`
-/// alt text and addresses, nested `<sub>`/`<sup>`, and declarations,
-/// processing instructions and CDATA (removed by the sanitizer).
-fn html_tags(m: &str, text: &str, comments: &[(usize, usize)], out: &mut Vec<Raw>) {
-    let b = m.as_bytes();
-    let lower = m.to_ascii_lowercase();
+/// Raw HTML, read from every HTML node of the tree: comments; tags outside
+/// [`VISIBLE_TAGS`]; attributes outside [`attribute_allowed`]; incomplete or
+/// unterminated tags; `<details>` without `open`; `<a href>` whose text is
+/// not its address; `<img>` alt text and addresses; nested `<sub>`/`<sup>`;
+/// declarations, processing instructions and CDATA (removed by the
+/// sanitizer). `m` is the masked source (for labels and `<details>` ends),
+/// `text` the unmasked source.
+fn tree_html(nodes: &[HtmlNode], m: &str, text: &str, out: &mut Vec<Raw>) {
     let mut small_depth = 0i32;
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'<' || inside(comments, i) {
-            i += 1;
-            continue;
-        }
-        let rest = &lower[i..];
-        if rest.starts_with("<!--") {
-            i += 4;
-            continue;
-        }
-        let special_end = if rest.starts_with("<?") {
-            Some(rest.find("?>").map(|x| i + x + 2))
-        } else if rest.starts_with("<![cdata[") {
-            Some(rest.find("]]>").map(|x| i + x + 3))
-        } else if rest.len() > 2 && rest.as_bytes()[1] == b'!' && rest.as_bytes()[2].is_ascii_alphabetic() {
-            Some(rest.find('>').map(|x| i + x + 1))
-        } else {
-            None
-        };
-        if let Some(end) = special_end {
-            let end = end.unwrap_or_else(|| m[i..].find('\n').map(|x| i + x).unwrap_or(m.len()));
-            out.push(raw(Kind::HtmlTag, i, end, shown(slice(text, i, end))));
-            i = end.max(i + 1);
-            continue;
-        }
-        let Some(tag) = parse_tag(m, i) else {
-            i += 1;
-            continue;
-        };
-        let src = shown(slice(text, i, tag.end));
-        let name = tag.name.as_str();
-        if !VISIBLE_TAGS.contains(&name) {
-            out.push(raw(Kind::HtmlTag, i, tag.end, src));
-            i = tag.end;
-            continue;
-        }
-        let mut bad_attr = false;
-        for (a, v) in &tag.attrs {
-            match (name, a.as_str()) {
-                ("a", "href") => {
-                    let label = element_text(m, tag.end, "a").unwrap_or_default();
-                    if !same_destination(&label, v) {
-                        out.push(raw(Kind::LinkDestination, i, tag.end, format!("{} (shown as {:?})", shown(v), shown(label.trim()))));
-                    }
-                }
-                ("img", "src") => {
-                    if !image_exempt(v) {
-                        out.push(raw(Kind::ImageSource, i, tag.end, shown(v)));
-                    }
-                }
-                ("img", "alt") => {
-                    if !v.trim().is_empty() {
-                        out.push(raw(Kind::ImageAlt, i, tag.end, shown(v)));
-                    }
-                }
-                _ if attribute_allowed(name, a) => {}
-                _ => bad_attr = true,
+    for node in nodes {
+        let lit = node.literal.as_str();
+        let b = lit.as_bytes();
+        let lower = lit.to_ascii_lowercase();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'<' {
+                i += 1;
+                continue;
             }
-        }
-        let mut flag = bad_attr;
-        if name == "sub" || name == "sup" {
-            if tag.closing {
-                small_depth = (small_depth - 1).max(0);
+            let rest = &lower[i..];
+            if rest.starts_with("<!--") {
+                let r = &lit[i + 4..];
+                let end = if r.starts_with('>') {
+                    i + 5
+                } else if r.starts_with("->") {
+                    i + 6
+                } else {
+                    r.find("-->").map(|e| i + 4 + e + 3).unwrap_or(lit.len())
+                };
+                out.push(raw(Kind::HtmlComment, node.src(i), node.src(end), shown(&lit[i..end])));
+                i = end;
+                continue;
+            }
+            let special_end = if rest.starts_with("<?") {
+                Some(rest.find("?>").map(|x| i + x + 2))
+            } else if rest.starts_with("<![cdata[") {
+                Some(rest.find("]]>").map(|x| i + x + 3))
+            } else if rest.len() > 2 && rest.as_bytes()[1] == b'!' && rest.as_bytes()[2].is_ascii_alphabetic() {
+                Some(rest.find('>').map(|x| i + x + 1))
             } else {
-                if small_depth > 0 {
-                    flag = true; // nested: shrinks text until unreadable
-                }
-                small_depth += 1;
+                None
+            };
+            if let Some(end) = special_end {
+                let end = end.unwrap_or(lit.len());
+                out.push(raw(Kind::HtmlTag, node.src(i), node.src(end), shown(&lit[i..end])));
+                i = end.max(i + 1);
+                continue;
             }
+            let Some(tag) = parse_tag(lit, i) else {
+                i += 1;
+                continue;
+            };
+            let (sa, se) = (node.src(i), node.src(tag.end));
+            let src = shown(&lit[i..tag.end]);
+            let name = tag.name.as_str();
+            if tag.unterminated {
+                out.push(raw(Kind::HtmlTag, sa, se, format!("unterminated tag: {src}")));
+                i = tag.end.max(i + 1);
+                continue;
+            }
+            if !VISIBLE_TAGS.contains(&name) {
+                out.push(raw(Kind::HtmlTag, sa, se, src));
+                i = tag.end;
+                continue;
+            }
+            if name == "details" && !tag.closing && !tag.attrs.iter().any(|(a, _)| a == "open") {
+                let end = details_end(m, sa);
+                out.push(raw(Kind::Details, sa, end, shown(slice(text, sa, end))));
+            }
+            let mut bad_attr = false;
+            for (a, v) in &tag.attrs {
+                match (name, a.as_str()) {
+                    ("a", "href") => {
+                        let label = element_text(m, se, "a").unwrap_or_default();
+                        if !same_destination(&label, v) {
+                            out.push(raw(Kind::LinkDestination, sa, se, format!("{} (shown as {:?})", shown(v), shown(label.trim()))));
+                        }
+                    }
+                    ("img", "src") => {
+                        if !image_exempt(v) {
+                            out.push(raw(Kind::ImageSource, sa, se, shown(v)));
+                        }
+                    }
+                    ("img", "alt") => {
+                        if !v.trim().is_empty() {
+                            out.push(raw(Kind::ImageAlt, sa, se, shown(v)));
+                        }
+                    }
+                    _ if attribute_allowed(name, a) => {}
+                    _ => bad_attr = true,
+                }
+            }
+            let mut flag = bad_attr;
+            if name == "sub" || name == "sup" {
+                if tag.closing {
+                    small_depth = (small_depth - 1).max(0);
+                } else {
+                    if small_depth > 0 {
+                        flag = true; // nested: shrinks text until unreadable
+                    }
+                    small_depth += 1;
+                }
+            }
+            if flag {
+                out.push(raw(Kind::HtmlTag, sa, se, src));
+            }
+            i = tag.end.max(i + 1);
         }
-        if flag {
-            out.push(raw(Kind::HtmlTag, i, tag.end, src));
-        }
-        i = tag.end;
     }
 }
 
@@ -1272,58 +1510,47 @@ const INVISIBLE_ENTITIES: &[(&str, char)] = &[
     ("ic", '\u{2063}'),
 ];
 
-/// HTML entities (decimal, hexadecimal, named) that decode to an invisible
-/// character, outside code (inside code GitHub shows them literally).
-fn entities(m: &str, out: &mut Vec<Raw>) {
-    let b = m.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'&' || escaped(b, i) {
-            i += 1;
-            continue;
-        }
-        let Some(rel) = b[i + 1..b.len().min(i + 40)].iter().position(|c| *c == b';') else {
-            i += 1;
-            continue;
-        };
-        let body = &m[i + 1..i + 1 + rel];
-        let decoded = if let Some(num) = body.strip_prefix('#') {
-            let v = if let Some(hex) = num.strip_prefix(['x', 'X']) {
-                (!hex.is_empty() && hex.len() <= 6 && hex.bytes().all(|c| c.is_ascii_hexdigit()))
-                    .then(|| u32::from_str_radix(hex, 16).ok())
-                    .flatten()
-            } else {
-                (!num.is_empty() && num.len() <= 7 && num.bytes().all(|c| c.is_ascii_digit()))
-                    .then(|| num.parse::<u32>().ok())
-                    .flatten()
-            };
-            v.and_then(char::from_u32)
+/// The entity at `i` (`text[i] == '&'`) and its length: decimal,
+/// hexadecimal, [`INVISIBLE_ENTITIES`], and the few named ones that matter
+/// for the characters around an invisible one. Others stay literal.
+fn entity_at(text: &str, i: usize) -> Option<(char, usize)> {
+    let b = text.as_bytes();
+    let rel = b[i + 1..b.len().min(i + 40)].iter().position(|c| *c == b';')?;
+    let body = &text[i + 1..i + 1 + rel];
+    let c = if let Some(num) = body.strip_prefix('#') {
+        let v = if let Some(hex) = num.strip_prefix(['x', 'X']) {
+            (!hex.is_empty() && hex.len() <= 6 && hex.bytes().all(|c| c.is_ascii_hexdigit()))
+                .then(|| u32::from_str_radix(hex, 16).ok())
+                .flatten()
         } else {
-            INVISIBLE_ENTITIES.iter().find(|(n, _)| *n == body).map(|(_, c)| *c)
+            (!num.is_empty() && num.len() <= 7 && num.bytes().all(|c| c.is_ascii_digit())).then(|| num.parse::<u32>().ok()).flatten()
         };
-        match decoded {
-            Some(c) if c != '\0' && invisible_name(c).is_some() => {
-                let end = i + 2 + rel;
-                out.push(raw(Kind::InvisibleEntity, i, end, format!("{} → {}", &m[i..end], code_point(c))));
-                i = end;
-            }
-            _ => i += 1,
+        v.and_then(char::from_u32).filter(|c| *c != '\0')?
+    } else {
+        match body {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            "nbsp" => '\u{A0}',
+            _ => INVISIBLE_ENTITIES.iter().find(|(n, _)| *n == body).map(|(_, c)| *c)?,
         }
-    }
+    };
+    Some((c, rel + 2))
 }
 
 /// Every finding of one Markdown text (normalized).
 fn scan_markdown_raw(text: &str) -> Vec<Raw> {
     let mut out = Vec::new();
-    invisible_runs(text, &mut out);
     let tree = tree_scan(text, &mut out);
+    invisible_findings(text, &units(text, &tree.literal, true), &mut out);
     let m = masked(text, &tree.literal);
-    let comments = html_comments(&m, text, &mut out);
-    details(&m, text, &comments, &mut out);
-    html_tags(&m, text, &comments, &mut out);
+    tree_html(&tree.html, &m, text, &mut out);
+    let html_ranges: Vec<(usize, usize)> = tree.html.iter().map(|h| h.range).collect();
+    text_comments(&m, text, &html_ranges, &mut out);
     definitions(&m, text, &mut out);
     hiding_macros(&m, text, &tree.math, &mut out);
-    entities(&m, &mut out);
     out.sort_by_key(|r| (r.at, r.kind, r.end));
     out.dedup_by(|x, y| x.kind == y.kind && x.at == y.at);
     out
@@ -1376,7 +1603,7 @@ fn locate(location: &str, raw_text: &str, norm: &Normalized, found: Vec<Raw>) ->
 pub fn scan_title(title: &str) -> Vec<Finding> {
     let norm = normalize(title);
     let mut found = Vec::new();
-    invisible_runs(&norm.text, &mut found);
+    invisible_findings(&norm.text, &units(&norm.text, &[], false), &mut found);
     locate("title", title, &norm, found)
 }
 

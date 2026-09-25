@@ -1652,6 +1652,7 @@ dependencies = [
  "ts-rs",
  "unicode-joining-type",
  "unicode-normalization",
+ "url",
  "uuid",
 ]
 

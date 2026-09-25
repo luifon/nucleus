@@ -34,6 +34,7 @@ unicode-normalization = "0.1"
 comrak = { version = "0.55", default-features = false }
 emojis = "0.9"
 unicode-joining-type = "1"
+url = "2"
 rustix = { version = "1", features = ["fs"] }
 sha2 = "0.10"
 async-trait = { workspace = true }
