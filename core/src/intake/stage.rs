@@ -33,10 +33,14 @@ pub enum Stage {
     /// changed. Nothing was published; `retry` checks again, `cancel` stops
     /// the item.
     Blocked,
+    /// The issue text or a comment the item uses has content that GitHub's
+    /// page does not show (an HTML comment, invisible characters, …). No
+    /// agent runs until the operator releases the item or cancels it.
+    Held,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 11] = [
+    pub const ALL: [Stage; 12] = [
         Stage::Queued,
         Stage::Eval,
         Stage::Refinement,
@@ -48,6 +52,7 @@ impl Stage {
         Stage::Cancelled,
         Stage::Stale,
         Stage::Blocked,
+        Stage::Held,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -63,6 +68,7 @@ impl Stage {
             Stage::Cancelled => "cancelled",
             Stage::Stale => "stale",
             Stage::Blocked => "blocked",
+            Stage::Held => "held",
         }
     }
 
@@ -99,6 +105,12 @@ pub enum StageEvent {
     Blocked,
     /// Resume a failed item at the stage it failed in.
     Retry { failed_in: Stage },
+    /// Hidden content was found before an agent step: the item waits for
+    /// the operator.
+    Hold,
+    /// The operator released a held item; it continues at the stage it was
+    /// held in.
+    Release { held_in: Stage },
 }
 
 /// The stage `from` moves to on `ev`, or an error when the event does not
@@ -119,6 +131,8 @@ pub fn transition(from: Stage, ev: &StageEvent) -> Result<Stage> {
         (Queued | Eval | Refinement | Implementation | Pr | Review, E::Blocked) => Blocked,
         (Blocked, E::Retry { failed_in: Queued | Eval }) => Queued,
         (Blocked, E::Retry { failed_in: failed_in @ (Refinement | Implementation | Pr | Review) }) => *failed_in,
+        (Queued | Eval | Refinement | Implementation, E::Hold) => Held,
+        (Held, E::Release { held_in: held_in @ (Queued | Eval | Refinement | Implementation) }) => *held_in,
         (_, E::Failed) => Failed,
         (_, E::Cancel) => Cancelled,
         (_, E::SourceClosed) => Closed,
@@ -126,7 +140,7 @@ pub fn transition(from: Stage, ev: &StageEvent) -> Result<Stage> {
         (Failed, E::Retry { failed_in }) => match failed_in {
             // An eval is run again from the start.
             Queued | Eval => Queued,
-            Refinement | Implementation | Pr | Review => *failed_in,
+            Refinement | Implementation | Pr | Review | Held => *failed_in,
             Closed | Failed | Cancelled | Stale | Blocked => bail!("nothing to retry in stage {}", failed_in.as_str()),
         },
         (s, e) => bail!("{e:?} does not apply to an item in the {} stage", s.as_str()),
@@ -291,6 +305,8 @@ pub enum OperatorCommand {
     ApproveComment,
     SkipComment,
     Cancel,
+    /// Release an item held for hidden content.
+    Release,
     /// Anything else: a message for the refinement agent or the thread.
     Message,
 }
@@ -309,6 +325,7 @@ pub fn parse_command(text: &str) -> OperatorCommand {
         ["approve", "comment"] => OperatorCommand::ApproveComment,
         ["skip", "comment"] => OperatorCommand::SkipComment,
         ["cancel"] | ["cancel", "item"] => OperatorCommand::Cancel,
+        ["release"] | ["release", "item"] => OperatorCommand::Release,
         _ => OperatorCommand::Message,
     }
 }
@@ -402,6 +419,14 @@ mod tests {
         ok(Failed, E::Retry { failed_in: Implementation }, Implementation);
         ok(Failed, E::Retry { failed_in: Pr }, Pr);
         ok(Failed, E::Retry { failed_in: Review }, Review);
+        for s in [Queued, Eval, Refinement, Implementation] {
+            ok(s, E::Hold, Held);
+            ok(Held, E::Release { held_in: s }, s);
+        }
+        ok(Held, E::Cancel, Cancelled);
+        ok(Held, E::Stale, Stale);
+        ok(Held, E::SourceClosed, Closed);
+        ok(Failed, E::Retry { failed_in: Held }, Held);
     }
 
     #[test]
@@ -425,6 +450,13 @@ mod tests {
         bad(Failed, E::Blocked);
         bad(Blocked, E::Blocked);
         bad(Blocked, E::Retry { failed_in: Closed });
+        // Only a stage before an agent step holds; a release returns there.
+        bad(Pr, E::Hold);
+        bad(Review, E::Hold);
+        bad(Held, E::Hold);
+        bad(Refinement, E::Release { held_in: Refinement });
+        bad(Held, E::Release { held_in: Pr });
+        bad(Held, E::PlanApproved);
         // Terminal stages never change.
         for s in [Closed, Cancelled, Stale] {
             for ev in [E::Cancel, E::Failed, E::SourceClosed, E::Stale, E::Retry { failed_in: Eval }] {
@@ -496,6 +528,8 @@ mod tests {
         assert_eq!(parse_command("approve comment"), ApproveComment);
         assert_eq!(parse_command("skip comment."), SkipComment);
         assert_eq!(parse_command("cancel"), Cancel);
+        assert_eq!(parse_command("Release"), Release);
+        assert_eq!(parse_command("release the item now"), Message);
         assert_eq!(parse_command("I approve of the idea but change step 2"), Message);
         assert_eq!(parse_command("approve vX"), Message);
         assert_eq!(parse_command("please cancel the second step"), Message);

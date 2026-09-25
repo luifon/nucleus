@@ -162,12 +162,33 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 )";
 
+/// The hidden-content hold (ADR-036, "The hidden-content hold"): what an
+/// item was held for, and what the operator released.
+///
+/// - `hold_stage`: the stage the item was held in (a release returns there).
+/// - `hold_json`: the findings ([`super::hidden::Finding`] list, JSON).
+/// - `hold_hash`: [`super::hidden::fingerprint`] of what the findings were
+///   computed on; a release is refused when the source no longer matches.
+/// - `released_hash`: the fingerprint the operator released; a later check
+///   with the same fingerprint lets the item continue.
+const SCHEMA_V2: &str = "
+ALTER TABLE items ADD COLUMN hold_stage TEXT;
+ALTER TABLE items ADD COLUMN hold_json TEXT;
+ALTER TABLE items ADD COLUMN hold_hash TEXT;
+ALTER TABLE items ADD COLUMN held_at TEXT;
+ALTER TABLE items ADD COLUMN released_hash TEXT;
+ALTER TABLE items ADD COLUMN released_at TEXT;
+ALTER TABLE items ADD COLUMN released_via TEXT";
+
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(super::INTAKE_DB_PATH)).await?;
     crate::migrate::migrate(
         &pool,
-        &[crate::migrate::Migration { version: 1, name: "intake schema", step: crate::migrate::Step::Sql(SCHEMA_V1) }],
+        &[
+            crate::migrate::Migration { version: 1, name: "intake schema", step: crate::migrate::Step::Sql(SCHEMA_V1) },
+            crate::migrate::Migration { version: 2, name: "hidden-content hold", step: crate::migrate::Step::Sql(SCHEMA_V2) },
+        ],
     )
     .await
     .context("migrating intake.db")?;
@@ -175,7 +196,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// True when `pool` (a read-only intake.db) has the full schema: the
 /// migration ledger records [`SCHEMA_VERSION`] and the item tables exist.
@@ -512,6 +533,19 @@ pub struct Item {
     pub base_sha: Option<String>,
     /// The commit Nucleus last pushed to the item's branch.
     pub pushed_sha: Option<String>,
+    /// The stage a held item was held in (a release returns there).
+    pub hold_stage: Option<String>,
+    /// The hidden-content findings the item was last held for
+    /// ([`super::hidden::Finding`] list, JSON).
+    pub hold_json: Option<String>,
+    /// [`super::hidden::fingerprint`] of what the findings were computed on.
+    pub hold_hash: Option<String>,
+    pub held_at: Option<String>,
+    /// The fingerprint the operator released: the item continues while the
+    /// hidden content it carries is exactly this.
+    pub released_hash: Option<String>,
+    pub released_at: Option<String>,
+    pub released_via: Option<String>,
 }
 
 impl Item {
@@ -577,7 +611,8 @@ const ITEM_COLUMNS: &str = "id, event_id, repo, title, stage, failed_stage, erro
     base_ref, impl_summary, head_sha, tests_status, tests_output, pr_url, comment_draft, comment_state, comment_url, comment_op, \
     surface, group_requested_at, group_jid, group_closed_at, current_task_id, last_task_id, step_errors, \
     created_at, updated_at, closed_at, rev_title, rev_body, revision_hash, gate_event_id, label_event_id, \
-    gate_actor, gate_at, stale_reason, base_sha, pushed_sha";
+    gate_actor, gate_at, stale_reason, base_sha, pushed_sha, hold_stage, hold_json, hold_hash, held_at, \
+    released_hash, released_at, released_via";
 
 /// What a new item is bound to: the event's revision and the gate event.
 #[derive(Debug, Clone)]
@@ -755,6 +790,13 @@ const SETTABLE: &[&str] = &[
     "stale_reason",
     "base_sha",
     "pushed_sha",
+    "hold_stage",
+    "hold_json",
+    "hold_hash",
+    "held_at",
+    "released_hash",
+    "released_at",
+    "released_via",
 ];
 
 fn set_clause(set: &[(&str, Val)], first_param: usize) -> Result<String> {

@@ -1,8 +1,8 @@
 //! The pipeline driver (ADR-036): [`tick`] polls the sources, reads
 //! operator replies, and advances every open item one step; the operator
 //! actions ([`approve_plan`], [`approve_comment`], [`skip_comment`],
-//! [`reply`], [`cancel`], [`retry`]) are the functions the CLI, the
-//! dashboard and the WhatsApp path call.
+//! [`reply`], [`cancel`], [`retry`], [`release`]) are the functions the CLI,
+//! the dashboard and the WhatsApp path call.
 //!
 //! Concurrency: a tick takes an advisory lock per part (`poll`,
 //! `inbound`) and per item (`item-<n>`), under `memory/intake-locks/`, and
@@ -15,6 +15,7 @@ use super::briefs;
 use super::event::{Discussion, Event, NewEvent, SourceAdapter};
 use super::git;
 use super::github::{self, GhRunner, GithubIssues};
+use super::hidden;
 use super::publish::{self, SecretGuard, Verdict};
 use super::stage::{self, OperatorCommand, Stage, StageEvent};
 use super::store::{self, Item, NewMessage, Val};
@@ -526,7 +527,11 @@ pub async fn operator_text(ctx: &Ctx, item: &Item, text: &str, msg_ref: &str, in
     }
     let cmd = stage::parse_command(text);
     let typed = input_kind == "text";
-    let for_agent = cmd == OperatorCommand::Message && item.stage() == Stage::Refinement;
+    // A message for an item held during refinement is read by the turn that
+    // runs after the release.
+    let in_refinement = item.stage() == Stage::Refinement
+        || (item.stage() == Stage::Held && item.hold_stage.as_deref() == Some(Stage::Refinement.as_str()));
+    let for_agent = cmd == OperatorCommand::Message && in_refinement;
     let message = NewMessage {
         author: "operator",
         via: "whatsapp",
@@ -538,7 +543,7 @@ pub async fn operator_text(ctx: &Ctx, item: &Item, text: &str, msg_ref: &str, in
     if cmd == OperatorCommand::Message {
         // Stored and applied in one transaction.
         store::add_message_caused(&ctx.db, item.id, message, Some(msg_ref)).await?;
-        if item.stage() != Stage::Refinement {
+        if !in_refinement {
             note_once(ctx, item.id, &fill_vars(&ctx.cfg.texts.stage_note, &item_vars(ctx, item)), &format!("stage-note:{msg_ref}"))
                 .await?;
         }
@@ -559,6 +564,7 @@ pub async fn operator_text(ctx: &Ctx, item: &Item, text: &str, msg_ref: &str, in
             OperatorCommand::ApproveComment => approve_comment_caused(ctx, item.id, None, "whatsapp", cause).await.map(|_| ()),
             OperatorCommand::SkipComment => skip_comment_caused(ctx, item.id, "whatsapp", cause).await.map(|_| ()),
             OperatorCommand::Cancel => cancel_caused(ctx, item.id, "whatsapp", cause).await.map(|_| ()),
+            OperatorCommand::Release => release_caused(ctx, item.id, "whatsapp", cause).await.map(|_| ()),
             OperatorCommand::Message => unreachable!("handled above"),
         }
     };
@@ -756,6 +762,65 @@ pub async fn retry(ctx: &Ctx, n: i64, via: &str) -> Result<Item> {
     store::item(&ctx.db, n).await
 }
 
+/// Release an item held for hidden content: it continues at the stage it
+/// was held in, and its briefs say that the operator released the hidden
+/// content. The release is bound to what the operator was shown: the issue
+/// is read again now, and when the issue or a comment the item uses changed
+/// since the findings were computed, the release is refused and the item
+/// goes stale (a changed title, body or used comment) like any other edit.
+pub async fn release(ctx: &Ctx, n: i64, via: &str) -> Result<Item> {
+    release_caused(ctx, n, via, None).await
+}
+
+async fn release_caused(ctx: &Ctx, n: i64, via: &str, cause: Option<&str>) -> Result<Item> {
+    let item = store::item(&ctx.db, n).await?;
+    if item.stage() != Stage::Held {
+        return refuse(format!("Item #{n} is not held (it is {}); there is nothing to release.", item.stage));
+    }
+    let (Some(shown), Some(held_in)) = (item.hold_hash.clone(), item.hold_stage.as_deref().and_then(Stage::parse)) else {
+        return refuse(format!("Item #{n} has no record of what it was held for; cancel it and add the label again."));
+    };
+    let d = match live_gate(ctx, &item, "the release", None).await? {
+        Gate::Pass { discussion, .. } => discussion,
+        Gate::Stopped | Gate::Changed => {
+            let now = store::item(&ctx.db, n).await?;
+            return refuse(format!(
+                "Item #{n} was not released: {}. It is {} now.",
+                now.stale_reason.or(now.error).unwrap_or_else(|| "its source changed".into()),
+                now.stage
+            ));
+        }
+    };
+    let (title, body) = revision_text(&item);
+    let findings = hidden::scan_revision(title, body, &d.trusted);
+    if hidden::fingerprint(title, body, &d.trusted, &findings) != shown {
+        let why = "the issue or a comment it uses changed after the hidden content was shown; the release was refused";
+        mark_stale(ctx, &item, why).await?;
+        return refuse(format!("Item #{n} was not released: {why}. It is stale now."));
+    }
+    let moved = store::advance_caused(
+        &ctx.db,
+        n,
+        Stage::Held,
+        StageEvent::Release { held_in },
+        &format!("released via {via}"),
+        vec![
+            ("released_hash", shown.into()),
+            ("released_at", crate::timestamp::now().into()),
+            ("released_via", via.into()),
+        ],
+        cause,
+    )
+    .await?;
+    if !moved {
+        return refuse(format!("Item #{n} changed while releasing; look at it again."));
+    }
+    let item = store::item(&ctx.db, n).await?;
+    note(ctx, n, &fill_item(&ctx.cfg.texts.item_released, &item_vars(ctx, &item), &[("via", via)])).await?;
+    tracing::info!(item = n, via, "intake: held item released");
+    Ok(item)
+}
+
 async fn stop_task(ctx: &Ctx, item: &Item) {
     if let Some(t) = &item.current_task_id {
         if let Ok(task) = tasks::get(&ctx.tasks_db, t, &Scope::Operator).await {
@@ -853,7 +918,7 @@ async fn step_item(ctx: &Ctx, item: &Item, r: &mut TickReport) {
             Stage::Implementation => step_implementation(ctx, item).await,
             Stage::Pr => step_pr(ctx, item).await,
             Stage::Review => step_review(ctx, item).await,
-            Stage::Failed | Stage::Blocked | Stage::Closed | Stage::Cancelled | Stage::Stale => Ok(()),
+            Stage::Failed | Stage::Blocked | Stage::Held | Stage::Closed | Stage::Cancelled | Stage::Stale => Ok(()),
         }
     }
     .await;
@@ -977,6 +1042,70 @@ fn revision_mismatch(item: &Item, title: &str, body: &str) -> Option<String> {
         }
         Some(_) => None,
     }
+}
+
+/// The title and body the item is bound to.
+fn revision_text(item: &Item) -> (&str, &str) {
+    (item.rev_title.as_deref().unwrap_or(&item.title), item.rev_body.as_deref().unwrap_or(""))
+}
+
+/// The hidden-content check, run before every agent step (and before the
+/// clone): scan the bound title and body and the comments the step uses.
+/// Returns `true` when the step may go on: the hold is off, nothing is
+/// hidden, or the operator released exactly this hidden content. Otherwise
+/// the item moves to `held` and the operator gets the findings; returns
+/// `false`.
+async fn hold_check(ctx: &Ctx, item: &Item, d: &Discussion) -> Result<bool> {
+    if !ctx.cfg.hidden_content_hold {
+        return Ok(true);
+    }
+    let (title, body) = revision_text(item);
+    let findings = hidden::scan_revision(title, body, &d.trusted);
+    if findings.is_empty() {
+        return Ok(true);
+    }
+    let fp = hidden::fingerprint(title, body, &d.trusted, &findings);
+    if item.released_hash.as_deref() == Some(fp.as_str()) {
+        return Ok(true);
+    }
+    hold(ctx, item, &findings, &fp).await?;
+    Ok(false)
+}
+
+/// Findings listed in the WhatsApp message; the dashboard shows all.
+const HELD_MESSAGE_FINDINGS: usize = 3;
+
+async fn hold(ctx: &Ctx, item: &Item, findings: &[hidden::Finding], fp: &str) -> Result<()> {
+    let kinds = hidden::summary(findings);
+    let mut set = vec![
+        ("hold_json", Val::from(serde_json::to_string(findings)?)),
+        ("hold_hash", fp.into()),
+        ("held_at", crate::timestamp::now().into()),
+        ("hold_stage", item.stage.clone().into()),
+        ("current_task_id", Val::Text(None)),
+    ];
+    // The operator is told in the DM, where `#<n> release` routes to the
+    // item, when the item has no WhatsApp thread yet.
+    if item.surface == "none" {
+        set.push(("surface", "dm".into()));
+    }
+    let reason = format!("held: {} piece(s) of content GitHub's page does not show ({kinds})", findings.len());
+    if store::advance(&ctx.db, item.id, item.stage(), StageEvent::Hold, &reason, set).await? {
+        tracing::warn!(item = item.id, kinds, "intake: item held for hidden content");
+        let it = store::item(&ctx.db, item.id).await?;
+        let mut lines: Vec<String> =
+            findings.iter().take(HELD_MESSAGE_FINDINGS).map(|f| format!("- {}", hidden::describe(f, 120))).collect();
+        if findings.len() > HELD_MESSAGE_FINDINGS {
+            lines.push(format!("- … and {} more", findings.len() - HELD_MESSAGE_FINDINGS));
+        }
+        let text = fill_item(
+            &ctx.cfg.texts.item_held,
+            &item_vars(ctx, &it),
+            &[("count", &findings.len().to_string()), ("kinds", &kinds), ("findings", &lines.join("\n"))],
+        );
+        note_once(ctx, item.id, &text, &format!("held:{}:{fp}", item.id)).await?;
+    }
+    Ok(())
 }
 
 /// What a live read of the source saw, beyond what the item is bound to:
@@ -1212,6 +1341,19 @@ fn remote_for(ctx: &Ctx, repo: &str) -> Result<git::Remote> {
 /// Fetch the repo into the mirror and create the item's clone at the newest
 /// default branch; move to `eval`.
 async fn step_queued(ctx: &Ctx, item: &Item) -> Result<()> {
+    // The hidden-content check comes first: before the clone and before any
+    // agent. It binds the comments it reads, so a later edit of one stops
+    // the item.
+    if ctx.cfg.hidden_content_hold {
+        let ev = store::event(&ctx.db, item.event_id).await?;
+        let d = match bound_discussion(ctx, item, &ev).await? {
+            Ok(d) => d,
+            Err(why) => return mark_stale(ctx, item, &why).await,
+        };
+        if !hold_check(ctx, item, &d).await? {
+            return Ok(());
+        }
+    }
     let repo = repo_cfg(ctx, item)?;
     let wd = work_dir(ctx)?;
     let remote = remote_for(ctx, &item.repo)?;
@@ -1246,6 +1388,9 @@ async fn step_eval(ctx: &Ctx, item: &Item) -> Result<()> {
                 Ok(d) => d,
                 Err(why) => return mark_stale(ctx, item, &why).await,
             };
+            if !hold_check(ctx, item, &d).await? {
+                return Ok(());
+            }
             let brief = briefs::eval_brief(item, &ev, &d, ctx.cfg.min_confidence);
             start_task(ctx, item, Stage::Eval, "intake-eval", brief, &worktree(item)?, WorkerProfile::ReadOnly).await?;
             Ok(())
@@ -1378,6 +1523,9 @@ async fn step_refinement(ctx: &Ctx, item: &Item) -> Result<()> {
                 Ok(d) => d,
                 Err(why) => return mark_stale(ctx, item, &why).await,
             };
+            if !hold_check(ctx, item, &d).await? {
+                return Ok(());
+            }
             let up_to = pending.unwrap_or(0);
             let brief = briefs::refinement_brief(item, &ev, &d, &thread, up_to);
             let task =
@@ -1429,6 +1577,9 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
             let ev = store::event(&ctx.db, item.event_id).await?;
             let item = store::item(&ctx.db, item.id).await?;
             let d = final_read!(ctx, &item, "implementation", first);
+            if !hold_check(ctx, &item, &d).await? {
+                return Ok(());
+            }
             let brief = briefs::implementation_brief(&item, &ev, &d, &branch, &base_ref, repo.test_command.as_deref());
             start_task(ctx, &item, Stage::Implementation, "intake-implement", brief, &wt, WorkerProfile::Code).await?;
             Ok(())
