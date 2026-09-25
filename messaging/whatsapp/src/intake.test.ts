@@ -230,11 +230,13 @@ test("a request is claimed once, and a creation whose outcome is unknown is neve
   const store = new IntakeStore(db);
   request(db, "1", "create", "#1 a");
   const [req] = store.pendingRequests();
-  assert.equal(store.claim(req.id, "creating"), true);
-  assert.equal(store.claim(req.id, "creating"), false, "a second pass does not claim it");
   const nonce = newNonce();
   assert.match(nonce, /^[0-9a-f]{16}$/);
-  store.setNonce(req.id, nonce);
+  assert.equal(store.claimCreate(req.id, nonce), true);
+  assert.equal(store.claimCreate(req.id, newNonce()), false, "a second pass does not claim it");
+  const row = new DatabaseSync(db).prepare(`SELECT status, nonce FROM intake_group_requests WHERE id = ?`).get(req.id) as any;
+  assert.deepEqual([row.status, row.nonce], ["creating", nonce], "the claim and the nonce are one write");
+  store.markCalling(req.id);
   // The bot stopped mid-creation: after the stuck-claim limit the request is
   // recorded as unknown with its nonce; create is not called again.
   const { api, calls } = fakeApi();
@@ -251,10 +253,10 @@ test("a request is claimed once, and a creation whose outcome is unknown is neve
   await ex.tick();
   assert.equal(store.group("1")?.status, "unknown", "not found is not evidence of absence");
   assert.equal(calls.length, 0);
-  // A claim stuck before the nonce was stored never called create.
+  // A claim stuck before the create call was marked never called create.
   request(db, "2", "create", "#2 b");
   const r2 = store.pendingRequests().find((r) => r.itemKey === "2")!;
-  store.claim(r2.id, "creating", now);
+  store.claimCreate(r2.id, newNonce(), now);
   now += 11 * 60 * 1000;
   await ex.tick();
   assert.equal(store.group("2")?.status, "fallback");

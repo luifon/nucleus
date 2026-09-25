@@ -253,7 +253,8 @@ export class IntakeStore {
         attempts    INTEGER NOT NULL DEFAULT 0,
         next_attempt_at TEXT,
         claimed_at  TEXT,
-        nonce       TEXT
+        nonce       TEXT,
+        calling_at  TEXT
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_group_requests_dedup
         ON intake_group_requests(dedup_key) WHERE dedup_key IS NOT NULL;
@@ -348,22 +349,42 @@ export class IntakeStore {
     return r !== undefined;
   }
 
-  /** Store a creation's recovery nonce (before the create call). */
-  setNonce(id: number, nonce: string): void {
-    this.db.prepare(`UPDATE intake_group_requests SET nonce = ? WHERE id = ?`).run(nonce, id);
+  /** Claim a pending create request and store its recovery nonce, in one
+   *  statement: a `creating` row always has its nonce. */
+  claimCreate(id: number, nonce: string, nowMs = Date.now()): boolean {
+    const res = this.db
+      .prepare(`UPDATE intake_group_requests SET status = 'creating', claimed_at = ?, nonce = ? WHERE id = ? AND status = 'pending'`)
+      .run(new Date(nowMs).toISOString(), nonce, id);
+    return Number(res.changes) === 1;
+  }
+
+  /** Record that the create call is about to be made (after every check
+   *  that can refuse it). A `creating` row without it provably never
+   *  called WhatsApp. */
+  markCalling(id: number, nowMs = Date.now()): void {
+    this.db.prepare(`UPDATE intake_group_requests SET calling_at = ? WHERE id = ?`).run(new Date(nowMs).toISOString(), id);
   }
 
   /** Claims older than `STUCK_CLAIM_MS`: left by a bot that stopped. */
-  stuckClaims(nowMs = Date.now()): Array<{ id: number; itemKey: string; action: string; subject: string | null; nonce: string | null }> {
+  stuckClaims(
+    nowMs = Date.now(),
+  ): Array<{ id: number; itemKey: string; action: string; subject: string | null; nonce: string | null; called: boolean }> {
     const before = new Date(nowMs - STUCK_CLAIM_MS).toISOString();
     return (
       this.db
         .prepare(
-          `SELECT id, item_key, action, subject, nonce FROM intake_group_requests
+          `SELECT id, item_key, action, subject, nonce, calling_at FROM intake_group_requests
             WHERE status IN ('creating', 'closing') AND claimed_at IS NOT NULL AND claimed_at < ?`,
         )
         .all(before) as any[]
-    ).map((r) => ({ id: r.id, itemKey: r.item_key, action: r.action, subject: r.subject, nonce: r.nonce ?? null }));
+    ).map((r) => ({
+      id: r.id,
+      itemKey: r.item_key,
+      action: r.action,
+      subject: r.subject,
+      nonce: r.nonce ?? null,
+      called: r.calling_at != null,
+    }));
   }
 
   /** A stuck `closing` claim becomes pending again (leaving is safe to
@@ -579,9 +600,9 @@ export class GroupExecutor {
   private reconcileClaims(): void {
     const { store, log } = this.d;
     for (const c of store.stuckClaims(this.now())) {
-      if (c.action === "create" && !c.nonce) {
-        // The nonce is stored before the create call: without one, the call
-        // was never made.
+      if (c.action === "create" && !c.called) {
+        // `calling_at` is written right before the create call: without it,
+        // the call was provably never made.
         store.recordGroup(c.itemKey, { jid: null, subject: c.subject, status: "fallback", reason: "the bot stopped before creating the group" });
         store.finishRequest(c.id, "failed", "stopped before the create call");
       } else if (c.action === "create") {
@@ -725,7 +746,9 @@ export class GroupExecutor {
 
   private async create(req: GroupRequest): Promise<void> {
     const { store, config, log } = this.d;
-    if (!store.claim(req.id, "creating", this.now())) return;
+    // The claim and the nonce are one write.
+    const nonce = newNonce();
+    if (!store.claimCreate(req.id, nonce, this.now())) return;
     const existing = store.group(req.itemKey);
     if (existing) {
       store.finishRequest(req.id, "done", `already ${existing.status}`);
@@ -743,11 +766,10 @@ export class GroupExecutor {
     }
     const operator = this.d.operatorJid();
     if (!operator) return fallback("no operator number (WHATSAPP_ALLOWED_DM_JIDS) to add");
-    // The nonce is stored before the call, so a stopped bot can recover
-    // the group by it.
-    const nonce = newNonce();
-    store.setNonce(req.id, nonce);
+    // The nonce was stored with the claim, so a stopped bot can recover the
+    // group by it.
     const subject = subjectWithNonce(req.subject ?? `#${req.itemKey}`, nonce);
+    store.markCalling(req.id, this.now());
     let g: { jid: string; members: string[] };
     try {
       g = await this.d.api.create(subject, [operator]);

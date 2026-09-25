@@ -113,7 +113,8 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             attempts    INTEGER NOT NULL DEFAULT 0,
             next_attempt_at TEXT,
             claimed_at  TEXT,
-            nonce       TEXT
+            nonce       TEXT,
+            calling_at  TEXT
         )
         "#,
     )
