@@ -84,7 +84,7 @@ import { makeVaultManifestHook } from "./docstore_vault.js";
 import { transcribe } from "./transcribe.js";
 import { GroupAllowlist, resolveTarget } from "./target_policy.js";
 import { handleBrainDump, sweepExpiredPlans, type BraindumpDeps } from "./braindump_flow.js";
-import { GroupExecutor, IntakeStore, routeDm, stripGroupMarker } from "./intake.js";
+import { GroupExecutor, IntakeStore, isOperatorId, routeDm, stripGroupMarker, type InputKind } from "./intake.js";
 import { planCapture, applyPlan, interpretResponse, BRAINDUMP_TMUX_SESSION } from "./braindump.js";
 
 // Every tmux session this process spawns claude windows into. Defined once
@@ -590,10 +590,25 @@ async function main() {
         if (!sock) throw new Error("no live connection");
         await withTimeout(sock.groupLeave(jid), 30_000);
       },
+      isMember: async (jid) => {
+        const sock = liveSock;
+        if (!sock) return null;
+        try {
+          const meta = await withTimeout(sock.groupMetadata(jid), 30_000);
+          const self = selfIds();
+          return meta.participants.some((p: { id: string }) => self.some((id) => normalizeSenderId(id) === normalizeSenderId(p.id)));
+        } catch (e) {
+          // WhatsApp refuses group metadata to a non-member.
+          return /forbidden|not-authorized|item-not-found|403|404/i.test((e as Error).message) ? false : null;
+        }
+      },
     },
-    operatorJid: () => {
-      const first = config.allowedDmSenders.values().next();
-      return first.done ? null : `${first.value}@s.whatsapp.net`;
+    operatorJid: () => (config.operatorId ? `${config.operatorId}@s.whatsapp.net` : null),
+    isOperator: (jid) => isOperatorId(jid, config.operatorId, pnForLid),
+    selfIds,
+    seedMembers: (jid, members, reason) => store.seedMembers(jid, members, reason),
+    alertOperator: (text, dedupKey) => {
+      outbound.enqueue({ target: "dm", source: "intake", body: text, dedupKey });
     },
     onActive: (jid) => groupAllowlist?.addIntake([jid]),
     onClosed: (jid) => groupAllowlist?.removeIntake(jid),
@@ -958,6 +973,17 @@ function resolveOutboundTarget(target: string, config: Config, store: ChatSessio
  *  null when the bot hasn't yet seen a mapping for this contact — in
  *  that case the user should put the LID directly in the env (it's
  *  surfaced in the "ignoring" log line). */
+/** The phone JID of a LID, from the live connection's LID mapping. */
+async function pnForLid(lid: string): Promise<string | null | undefined> {
+  return liveSock?.signalRepository?.lidMapping?.getPNForLID?.(lid);
+}
+
+/** The bot's own ids on the live connection (phone JID and LID). */
+function selfIds(): string[] {
+  const u = liveSock?.user as { id?: string; lid?: string } | undefined;
+  return [u?.id, u?.lid].filter((x): x is string => typeof x === "string" && x.length > 0);
+}
+
 async function isSenderAllowed(
   sock: WASocket,
   participant: string,
@@ -1016,9 +1042,10 @@ async function handleMessage(sock: WASocket, msg: WAMessage, bot: Bot): Promise<
     //     adds the bot could spam it.
     const participant = msg.key.participant ?? "";
     // ADR-036: an issue-pipeline group has the bot and the operator only;
-    // the operator is recognized by the DM allowlist too.
+    // only the operator's own identity (the first WHATSAPP_ALLOWED_DM_JIDS
+    // entry, phone or LID form) is read there.
     const senders =
-      role === "intake" ? new Set([...config.allowedSenders, ...config.allowedDmSenders]) : config.allowedSenders;
+      role === "intake" ? new Set(config.operatorId ? [config.operatorId] : []) : config.allowedSenders;
     const senderOk = await isSenderAllowed(sock, participant, senders);
     if (!senderOk) {
       log.warn(
@@ -1043,6 +1070,17 @@ async function handleMessage(sock: WASocket, msg: WAMessage, bot: Bot): Promise<
     const { disabled, reason } = store.observeMembers(chatId, memberIds);
     if (disabled) {
       log.warn({ chatId, reason }, "whatsapp: group disabled — manual re-enable required");
+      if (role === "intake") {
+        // ADR-036: the baseline is the create response; a changed member
+        // list means someone else can see and write in the item's group.
+        const item = bot.intakeStore.itemForGroup(chatId);
+        bot.outbound.enqueue({
+          target: "dm",
+          source: "intake",
+          body: `Item #${item ?? "?"}: its WhatsApp group's member list changed. Messages and commands from that group are ignored; use the DM (#${item ?? "n"} …) or the dashboard.`,
+          dedupKey: `intake:group-tripped:${chatId}`,
+        });
+      }
       return;
     }
   } else {
@@ -1097,13 +1135,14 @@ async function dispatchInbound(
 ): Promise<void> {
   const { config, engine, plansStore, docStore, jobStore, outbound } = bot;
 
-  // ADR-036: every message in an issue-pipeline group belongs to its item.
+  // ADR-036: every operator message in an issue-pipeline group belongs to
+  // its item (the sender check above admitted only the operator).
   if (role === "intake") {
     const itemKey = bot.intakeStore.itemForGroup(chatId);
     if (!itemKey) return;
-    const text = await messageText(sock, msg, chatId, outbound);
-    if (text === null) return;
-    routeToItem(bot, itemKey, chatId, msg, stripGroupMarker(text, itemKey));
+    const got = await messageText(sock, msg, chatId, outbound);
+    if (got === null) return;
+    routeToItem(bot, itemKey, chatId, msg, stripGroupMarker(got.text, itemKey), got.kind);
     return;
   }
 
@@ -1170,15 +1209,17 @@ async function dispatchInbound(
 
   if (!text.trim()) return;
 
-  // ADR-036: a DM message for an issue-pipeline item (it starts with the
-  // item's #n marker, or it replies to a message the pipeline sent for the
-  // item) goes to the item's thread, not to the chat session.
-  if (role === "dm") {
+  // ADR-036: an operator DM message for an issue-pipeline item (it starts
+  // with the item's #n marker, or it replies to a message the pipeline sent
+  // for the item) goes to the item's thread, not to the chat session. Only
+  // the operator's own DM is routed; another allowed DM sender's message
+  // goes to the chat session as before.
+  if (role === "dm" && (await isOperatorId(chatId, config.operatorId, pnForLid))) {
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? null;
     const quotedItem = quoted ? bot.intakeStore.itemForSentMessage(quoted) : null;
     const routed = routeDm(text, quotedItem, (n) => bot.intakeStore.hasDmThread(n));
     if (routed) {
-      routeToItem(bot, routed.item, chatId, msg, routed.text);
+      routeToItem(bot, routed.item, chatId, msg, routed.text, inputKind === "voice" ? "voice" : typedKind(msg));
       return;
     }
   }
@@ -1204,15 +1245,26 @@ async function dispatchInbound(
   log.info({ chatId, ref, duplicate }, "whatsapp: message handed to the turn engine");
 }
 
+/** ADR-036: `text` for a message the operator typed, `forwarded` for a
+ *  forwarded one. */
+function typedKind(msg: WAMessage): InputKind {
+  const m = msg.message as Record<string, any> | null | undefined;
+  const forwarded = m
+    ? Object.values(m).some((v) => v && typeof v === "object" && v.contextInfo?.isForwarded)
+    : false;
+  return forwarded ? "forwarded" : "text";
+}
+
 /** ADR-036: the text of a message for an issue-pipeline item — the text or
- *  caption, or a voice memo's transcription. Null when there is none (a
- *  transcription failure is noted in the chat). */
+ *  caption (`text`, or `forwarded`), or a voice memo's transcription
+ *  (`voice`; never a command). Null when there is none (a transcription
+ *  failure is noted in the chat). */
 async function messageText(
   sock: WASocket,
   msg: WAMessage,
   chatId: string,
   outbound: OutboundQueueStore,
-): Promise<string | null> {
+): Promise<{ text: string; kind: InputKind } | null> {
   if (msg.message?.audioMessage) {
     try {
       const buffer = (await downloadMediaMessage(msg, "buffer", {}, {
@@ -1220,7 +1272,7 @@ async function messageText(
         reuploadRequest: sock.updateMediaMessage,
       })) as Buffer;
       const t = (await transcribe(buffer)).text.trim();
-      return t || null;
+      return t ? { text: t, kind: "voice" } : null;
     } catch (e) {
       outbound.enqueue({
         target: chatId,
@@ -1232,21 +1284,22 @@ async function messageText(
     }
   }
   const t = extractText(msg).trim();
-  return t || null;
+  return t ? { text: t, kind: typedKind(msg) } : null;
 }
 
 /** ADR-036: hand an operator message to the issue pipeline. The row in
  *  `intake_inbound` is the durable hand-off; the tick reads it (and runs
  *  at once here, and every minute from launchd). */
-function routeToItem(bot: Bot, itemKey: string, chatId: string, msg: WAMessage, text: string): void {
+function routeToItem(bot: Bot, itemKey: string, chatId: string, msg: WAMessage, text: string, inputKind: InputKind): void {
   if (!text) return;
   const fresh = bot.intakeStore.recordInbound({
     itemKey,
     chatId,
     waMsgId: msg.key.id ?? `${Date.now()}`,
     text,
+    inputKind,
   });
-  log.info({ chatId, item: itemKey, fresh }, "whatsapp: message routed to an issue-pipeline item");
+  log.info({ chatId, item: itemKey, fresh, inputKind }, "whatsapp: message routed to an issue-pipeline item");
   if (fresh) runNucleus(bot.config, ["intake", "tick"]);
 }
 

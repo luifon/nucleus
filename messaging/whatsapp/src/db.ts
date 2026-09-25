@@ -354,6 +354,20 @@ export class ChatSessionStore {
     }
   }
 
+  /** ADR-036: set a group's membership baseline from a known-good list
+   *  (the group-create response), instead of the first list observed on a
+   *  message. With `disabledReason`, the group starts disabled. */
+  seedMembers(chatId: string, memberIds: string[], disabledReason: string | null = null): void {
+    const json = JSON.stringify([...memberIds].sort());
+    this.db
+      .prepare(
+        `INSERT INTO chat_state (chat_id, members_seen, disabled, disabled_reason, updated_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(chat_id) DO UPDATE SET members_seen = excluded.members_seen, disabled = excluded.disabled,
+           disabled_reason = excluded.disabled_reason, updated_at = excluded.updated_at`,
+      )
+      .run(chatId, json, disabledReason ? 1 : 0, disabledReason, new Date().toISOString());
+  }
+
   /** Track group membership; if it grows, flip disabled and require manual re-enable. */
   observeMembers(chatId: string, memberIds: string[]): { disabled: boolean; reason?: string } {
     const sorted = [...memberIds].sort();

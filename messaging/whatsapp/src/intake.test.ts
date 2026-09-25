@@ -10,13 +10,18 @@ import path from "node:path";
 import { ChatSessionStore, OutboundQueueStore } from "./db.js";
 import { parseToml } from "./config.js";
 import {
+  closeBackoffMs,
   GroupExecutor,
   groupBudgetAllows,
   intakeConfig,
   IntakeStore,
+  isOperatorId,
+  MAX_CLOSE_ATTEMPTS,
   routeDm,
   stripGroupMarker,
+  unexpectedMembers,
   type GroupApi,
+  type GroupExecutorDeps,
 } from "./intake.js";
 import { GroupAllowlist, resolveTarget, type TargetConfig } from "./target_policy.js";
 import { DatabaseSync } from "node:sqlite";
@@ -44,6 +49,31 @@ function request(db: string, item: string, action: "create" | "close", subject: 
 }
 
 const quiet = { info: () => {}, warn: () => {} };
+const BOT = ["55119", "88888888"].join("");
+const WA = ["s", "whatsapp", "net"].join(".");
+const OP_LID = ["1234567", "89012345"].join("");
+const STRANGER = ["55119", "77777777"].join("");
+
+/** Executor deps with the operator and the bot as the only known ids. */
+function deps(store: IntakeStore, api: GroupApi, over: Partial<GroupExecutorDeps> = {}) {
+  const alerts: string[] = [];
+  const seeded: Array<{ jid: string; members: string[]; reason: string | null }> = [];
+  const d: GroupExecutorDeps = {
+    store,
+    api,
+    config: intakeConfig({}),
+    operatorJid: () => `${OP}@s.whatsapp.net`,
+    isOperator: (jid) => isOperatorId(jid, OP, async (lid) => (lid === `${OP_LID}@lid` ? `${OP}@s.whatsapp.net` : null)),
+    selfIds: () => [`${BOT}:3@${WA}`],
+    seedMembers: (jid, members, reason) => seeded.push({ jid, members, reason }),
+    alertOperator: (text) => alerts.push(text),
+    onActive: () => {},
+    onClosed: () => {},
+    log: quiet,
+    ...over,
+  };
+  return { d, alerts, seeded };
+}
 
 function fakeApi() {
   const calls: string[] = [];
@@ -52,7 +82,7 @@ function fakeApi() {
     create: async (subject, participants) => {
       calls.push(`create ${subject} ${participants.join(",")}`);
       n += 1;
-      return { jid: `12036300000000000${n}@g.us`, members: [...participants, "bot"] };
+      return { jid: `12036300000000000${n}@g.us`, members: [...participants, `${BOT}@s.whatsapp.net`] };
     },
     leave: async (jid) => {
       calls.push(`leave ${jid}`);
@@ -87,8 +117,10 @@ test("DM messages go to an item by its marker or by a quoted pipeline message", 
 test("operator messages are stored once and quoted messages map to their item", () => {
   const db = tmpDb();
   const store = new IntakeStore(db);
-  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi" }), true);
-  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi" }), false);
+  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi", inputKind: "voice" }), true);
+  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi", inputKind: "text" }), false);
+  const kind = new DatabaseSync(db).prepare(`SELECT input_kind FROM intake_inbound WHERE wa_msg_id = 'm1'`).get() as { input_kind: string };
+  assert.equal(kind.input_kind, "voice", "how the message was written is stored");
   const out = new OutboundQueueStore(db);
   const id = out.enqueue({ target: "dm", body: "[#2] plan", source: "intake:2", dedupKey: "intake:2:m1" });
   out.markInFlight(id, "WAMSG1");
@@ -104,15 +136,8 @@ test("the executor creates a group with the operator only, within the budget", a
   const store = new IntakeStore(db);
   const { api, calls } = fakeApi();
   const active: string[] = [];
-  const ex = new GroupExecutor({
-    store,
-    api,
-    config: intakeConfig({ max_groups_per_day: 1 }),
-    operatorJid: () => `${OP}@s.whatsapp.net`,
-    onActive: (j) => active.push(j),
-    onClosed: () => {},
-    log: quiet,
-  });
+  const { d, seeded } = deps(store, api, { config: intakeConfig({ max_groups_per_day: 1 }), onActive: (j) => active.push(j) });
+  const ex = new GroupExecutor(d);
   request(db, "1", "create", "#1 Fix the typo");
   request(db, "2", "create", "#2 Another");
   await ex.tick();
@@ -120,6 +145,7 @@ test("the executor creates a group with the operator only, within the budget", a
   assert.equal(store.group("1")?.status, "active");
   assert.equal(active.length, 1);
   assert.equal(store.itemForGroup(active[0]), "1");
+  assert.deepEqual(seeded, [{ jid: active[0], members: [`${OP}@s.whatsapp.net`, `${BOT}@s.whatsapp.net`], reason: null }], "baseline from the create response");
   const second = store.group("2");
   assert.equal(second?.status, "fallback");
   assert.match(second?.reason ?? "", /limit of 1 new groups/);
@@ -139,15 +165,7 @@ test("a failed creation falls back to the DM and is not retried", async () => {
     },
     leave: async () => {},
   };
-  const ex = new GroupExecutor({
-    store,
-    api,
-    config: intakeConfig({}),
-    operatorJid: () => `${OP}@s.whatsapp.net`,
-    onActive: () => {},
-    onClosed: () => {},
-    log: quiet,
-  });
+  const ex = new GroupExecutor(deps(store, api).d);
   request(db, "4", "create", "#4 x");
   await ex.tick();
   assert.equal(store.group("4")?.status, "fallback");
@@ -160,15 +178,7 @@ test("a group is left only after its last messages went out", async () => {
   const store = new IntakeStore(db);
   const { api, calls } = fakeApi();
   const closed: string[] = [];
-  const ex = new GroupExecutor({
-    store,
-    api,
-    config: intakeConfig({}),
-    operatorJid: () => `${OP}@s.whatsapp.net`,
-    onActive: () => {},
-    onClosed: (j) => closed.push(j),
-    log: quiet,
-  });
+  const ex = new GroupExecutor(deps(store, api, { onClosed: (j) => closed.push(j) }).d);
   request(db, "5", "create", "#5 y");
   await ex.tick();
   const jid = store.group("5")!.jid!;
@@ -182,6 +192,135 @@ test("a group is left only after its last messages went out", async () => {
   assert.equal(store.group("5")?.status, "closed");
   assert.deepEqual(closed, [jid]);
   assert.equal(calls.at(-1), `leave ${jid}`);
+});
+
+test("only the operator's own identity counts, in phone or LID form", async () => {
+  const pn = async (lid: string) => (lid === `${OP_LID}@lid` ? `${OP}@s.whatsapp.net` : null);
+  assert.equal(await isOperatorId(`${OP}@s.whatsapp.net`, OP, pn), true);
+  assert.equal(await isOperatorId(`${OP}:12@${WA}`, OP, pn), true, "any device");
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, OP, pn), true, "LID mapped to the operator's number");
+  assert.equal(await isOperatorId(`${STRANGER}@s.whatsapp.net`, OP, pn), false);
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, OP, async () => { throw new Error("no mapping"); }), false);
+  assert.equal(await isOperatorId(`${OP}@s.whatsapp.net`, null, pn), false, "no operator configured");
+  const isOp = (j: string) => isOperatorId(j, OP, pn);
+  assert.deepEqual(await unexpectedMembers([`${OP_LID}@lid`, `${BOT}@s.whatsapp.net`], [`${BOT}:3@${WA}`], isOp), []);
+  assert.deepEqual(await unexpectedMembers([`${OP}@s.whatsapp.net`, `${STRANGER}@s.whatsapp.net`], [BOT], isOp), [`${STRANGER}@s.whatsapp.net`]);
+});
+
+test("a request is claimed once, and a creation whose outcome is unknown is never repeated", async () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  request(db, "1", "create", "#1 a");
+  const [req] = store.pendingRequests();
+  assert.equal(store.claim(req.id, "creating"), true);
+  assert.equal(store.claim(req.id, "creating"), false, "a second pass does not claim it");
+  // The bot stopped mid-creation: after the stuck-claim limit the request is
+  // recorded as unknown and the operator told; create is not called again.
+  const { api, calls } = fakeApi();
+  const t0 = Date.now();
+  const { d, alerts } = deps(store, api, { nowMs: () => t0 + 11 * 60 * 1000 });
+  await new GroupExecutor(d).tick();
+  assert.equal(calls.length, 0);
+  assert.equal(store.group("1")?.status, "unknown");
+  assert.match(alerts[0], /may exist/);
+  assert.equal(store.createdTimes().length, 1, "an unknown outcome counts against the daily limit");
+});
+
+test("an item closed before or during group creation ends without a group", async () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  const { api, calls } = fakeApi();
+  // Closed before the bot handled the create request: no group.
+  request(db, "2", "create", "#2 b");
+  request(db, "2", "close", null);
+  const ex = new GroupExecutor(deps(store, api).d);
+  await ex.tick();
+  assert.equal(calls.length, 0);
+  assert.equal(store.group("2")?.status, "fallback");
+  // Closed while the create call ran: the new group is left at once.
+  const racing: GroupApi = {
+    create: async (subject, participants) => {
+      request(db, "3", "close", null);
+      return api.create(subject, participants);
+    },
+    leave: api.leave,
+  };
+  request(db, "3", "create", "#3 c");
+  const closed: string[] = [];
+  await new GroupExecutor(deps(store, racing, { onClosed: (j) => closed.push(j) }).d).tick();
+  assert.equal(store.group("3")?.status, "closed");
+  assert.equal(calls.filter((c) => c.startsWith("leave")).length, 1);
+  assert.equal(closed.length, 1);
+});
+
+test("a new group with an unexpected member starts disabled and alerts the operator", async () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  const api: GroupApi = {
+    create: async () => ({ jid: GROUP, members: [`${OP}@s.whatsapp.net`, `${BOT}@s.whatsapp.net`, `${STRANGER}@s.whatsapp.net`] }),
+    leave: async () => {},
+  };
+  const { d, alerts, seeded } = deps(store, api);
+  request(db, "4", "create", "#4 d");
+  await new GroupExecutor(d).tick();
+  assert.equal(seeded.length, 1);
+  assert.match(seeded[0].reason ?? "", /unexpected members/);
+  assert.match(alerts[0], /1 member\(s\) besides the bot and you/);
+});
+
+test("leaving is retried with backoff and closed_at is set only when the bot left", async () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  let fail = true;
+  let member: boolean | null = null;
+  const api: GroupApi = {
+    create: async () => ({ jid: GROUP, members: [`${OP}@s.whatsapp.net`, `${BOT}@s.whatsapp.net`] }),
+    leave: async () => {
+      if (fail) throw new Error("timed out");
+    },
+    isMember: async () => member,
+  };
+  let now = Date.parse("2026-09-24T12:00:00Z");
+  const { d, alerts } = deps(store, api, { nowMs: () => now });
+  const ex = new GroupExecutor(d);
+  request(db, "5", "create", "#5 e", new Date(now).toISOString());
+  await ex.tick();
+  request(db, "5", "close", null, new Date(now).toISOString());
+  await ex.tick();
+  const row = () => new DatabaseSync(db).prepare(`SELECT status, attempts, next_attempt_at FROM intake_group_requests WHERE action = 'close'`).get() as any;
+  assert.equal(store.group("5")?.status, "active", "not closed while leaving fails");
+  assert.equal(row().attempts, 1);
+  assert.equal(row().next_attempt_at, new Date(now + closeBackoffMs(1)).toISOString());
+  await ex.tick();
+  assert.equal(row().attempts, 1, "not retried before the backoff");
+  now += closeBackoffMs(1);
+  await ex.tick();
+  assert.equal(row().attempts, 2);
+  // The bot is confirmed out of the group: closed.
+  member = false;
+  now += closeBackoffMs(2);
+  await ex.tick();
+  assert.equal(store.group("5")?.status, "closed");
+  const closedAt = (new DatabaseSync(db).prepare(`SELECT closed_at FROM intake_groups WHERE item_key = '5'`).get() as any).closed_at;
+  assert.ok(closedAt);
+  // A close that keeps failing is given up after MAX_CLOSE_ATTEMPTS.
+  const db2 = tmpDb();
+  const store2 = new IntakeStore(db2);
+  let now2 = Date.parse("2026-09-24T12:00:00Z");
+  const x = deps(store2, { ...api, isMember: async () => null }, { nowMs: () => now2 });
+  const ex2 = new GroupExecutor(x.d);
+  request(db2, "6", "create", "#6 f", new Date(now2).toISOString());
+  await ex2.tick();
+  request(db2, "6", "close", null, new Date(now2).toISOString());
+  for (let i = 1; i <= MAX_CLOSE_ATTEMPTS; i++) {
+    await ex2.tick();
+    now2 += closeBackoffMs(i);
+  }
+  const r2 = new DatabaseSync(db2).prepare(`SELECT status FROM intake_group_requests WHERE action = 'close'`).get() as any;
+  assert.equal(r2.status, "failed");
+  assert.equal(store2.group("6")?.status, "active");
+  assert.match(x.alerts[0], /Leave the group by hand/);
+  assert.equal(alerts.length, 0);
 });
 
 test("intake groups are sendable while active and not after", () => {

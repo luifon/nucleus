@@ -170,6 +170,10 @@ export interface Config {
    *  the group path. Match happens after normalizing the inbound DM's
    *  chatId user-part to digits. */
   allowedDmSenders: Set<string>;
+  /** The operator: the first WHATSAPP_ALLOWED_DM_JIDS entry, normalized to
+   *  digits (ADR-005b). The only identity whose issue-pipeline commands
+   *  count (ADR-036); null when the list is empty. */
+  operatorId: string | null;
   /** Per-sender authorization: only messages whose participant matches
    *  one of these IDs are processed, even inside an allowlisted group.
    *  Holds normalized digit-only user parts; comparison is against the
@@ -262,6 +266,7 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
         .map(normalizeSenderId)
         .filter((s) => s.length > 0),
     ),
+    operatorId: splitCsv(process.env.WHATSAPP_ALLOWED_DM_JIDS).map(normalizeSenderId).find((s) => s.length > 0) ?? null,
     allowedSenders: new Set(
       splitCsv(process.env.WHATSAPP_ALLOWED_SENDERS)
         .map(normalizeSenderId)
