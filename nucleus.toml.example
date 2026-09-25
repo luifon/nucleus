@@ -208,6 +208,47 @@ max_runtime_hours = 12
 # failures); the result is not sent again. {reason} = the recorded reason.
 # delivery_failed = "⚠️ Task {id} — {title}: the result message was not confirmed as delivered ({reason}). …"
 
+# ADR-036 event intake and issue pipeline (`nucleus intake`, dashboard
+# /intake). Off unless enabled and at least one repo is listed. An issue enters
+# the pipeline when it carries `label` (only people with triage or write
+# access can set labels). `nucleus intake tick` runs every minute from launchd
+# (tools/launchd/intake-tick.plist.example) and polls each repo every
+# poll_interval_secs with `gh` (the operator's gh login; no public ingress).
+# work_dir holds one clone per repo and one git worktree per item; it must be
+# outside this checkout. The repos name your projects: list them here, in the
+# untracked nucleus.toml, never in a committed file.
+# [intake]
+# enabled = true
+# work_dir = "~/nucleus-work"
+# label = "nucleus"
+# min_confidence = 0.7          # a "simple" eval below this goes to refinement
+# test_timeout_minutes = 30     # Nucleus's own test run before the draft PR
+#
+# [[intake.repos]]
+# repo = "owner/repo"
+# test_command = "cargo test --workspace"   # run in the worktree with sh -c
+# # default_branch = "main"                 # default: the remote's HEAD
+# # pr_issue_keyword = "Closes"             # or "Refs" to link without closing
+#
+# [intake.github]
+# gh_bin = "/opt/homebrew/bin/gh"   # launchd has no shell PATH (Rule 5)
+# poll_interval_secs = 300
+# collaborator_cache_secs = 3600
+#
+# Items that need a plan get a WhatsApp group with the bot and the operator.
+# Creating groups automatically from a personal account can trigger WhatsApp's
+# anti-spam checks: keep max_groups_per_day low. Past the limit, or with
+# refinement_groups = false, the item's thread runs in the DM, marked #<n>.
+# [intake.whatsapp]
+# refinement_groups = true
+# max_groups_per_day = 3
+# group_wait_minutes = 15
+#
+# Operator-facing texts; placeholders are listed in core/src/config.rs
+# (IntakeTexts).
+# [intake.texts]
+# approve_hint = "Reply `#{n} approve` to approve plan v{version}, …"
+
 # ADR-027 WhatsApp connection circuit breaker. Defaults are sane; every
 # value is optional. ladder_ms = reconnect backoff per consecutive quick
 # failure; open_threshold failures within window_ms open the circuit

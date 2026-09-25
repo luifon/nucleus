@@ -33,6 +33,7 @@ This ADR redesigns the reminders subsystem to subsume all of those — one model
 - **what** — a body string, the message that gets delivered
 - **when** — a cron expression, evaluated in the operator's local timezone (`NUCLEUS_TZ`); for one-shot use a cron pattern that matches a single calendar date plus a `one_shot` flag that prevents re-firing
 - **who** — one or more channels (Discord home, the WhatsApp conversational group, the WhatsApp brain-dump group, WhatsApp DM, Calendar)
+  - *Note (ADR-036):* the WhatsApp groups the issue pipeline creates per item are not reminder channels. They exist only while their item is open, and the pipeline writes to them itself through the outbound queue.
 
 The `reminders due` polling worker is the single execution engine. The dedicated end-of-day subcommand and its `StartCalendarInterval` plist are removed. Default reminders (anything "this is just how Nucleus operates") get inserted by a seeder on binary startup, idempotently — the same pattern news-fetcher uses for default sources.
 

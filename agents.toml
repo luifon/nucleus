@@ -152,6 +152,17 @@ schedule      = "* * * * *"
 log_path      = "memory/reminders.log"
 diary_key     = "reminders"
 
+[[agent]]
+name          = "intake-tick"
+class         = "infra"
+launch        = "launchd-cron"
+runtime       = "rust"
+launchd_label = "dev.nucleus.intake-tick"
+# ADR-036 issue pipeline driver (StartInterval 60 in the plist). It drives no
+# session itself: its agent steps are task workers (the `tasks` agent).
+schedule      = "* * * * *"
+log_path      = "memory/intake.log"
+
 # ── ephemeral (on-demand, spawned by reminders-tick) ──
 
 [[agent]]

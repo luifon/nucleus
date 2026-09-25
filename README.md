@@ -18,6 +18,7 @@ brain is your existing Claude subscription — no separate API billing.
 | **nucleus-dashboard** | Single operator app subsuming dashboard widgets, chat against your PARA vault, the public news API, and every admin surface (agents, skills, diary, reminders, vault writes, usage) at `nucleus.<your-domain>`. See ADR-015/016/034. |
 | **Distiller** | Single daily 4am pass (consolidated per ADR-016; absorbed the old preference learner) that promotes diary observations to long-term memory (PROMOTE / MERGE / ARCHIVE / DROP, Mem0-style ops). |
 | **Reminders** | Ask either bot "remind me at 16:45 about dentist" → Claude schedules via the `reminders` CLI. Once-per-minute polling delivers to one or more channels (`discord-home`, `whatsapp-dm` via the bot-drained outbound queue, `calendar`). Supports `--at` (one-shot) and `--cron` (recurring) with pause/resume + per-channel retry. |
+| **Issue pipeline** | Issues labeled for Nucleus on the configured repos become items: a read-only eval agent classifies them; complex ones are discussed with you in a WhatsApp group (or the DM) and on the dashboard until you approve a plan; an implementation agent works in a git worktree; Nucleus pushes and opens a draft PR and comments on the issue only with your approval. It never merges. See ADR-036. |
 
 ## Architecture at a glance
 
@@ -511,6 +512,7 @@ nucleus/
 - `docs/ADR-032-repo-private-skills-tree.md` — operator-private skills in the gitignored `.nucleus/.claude/skills/`, loaded via `--add-dir`; rejected alternatives
 - `docs/ADR-034-usage-accounting.md` — token and estimated-cost accounting for every Claude Code and Codex session: parsing and dedupe rules, cost-state reconciliation, price table, project and Nucleus attribution, `/usage` surface
 - `docs/ADR-033-turn-engine-and-task-ledger.md` — WhatsApp turn engine (real end of turn, mid-turn messages, ack/progress, quoted replies via the queue, typed input everywhere, outbound idempotency and secret filter) + the background task ledger (`nucleus tasks`, per-chat scopes)
+- `docs/ADR-036-event-intake-and-issue-pipeline.md` — source-agnostic event intake (`nucleus events`, GitHub adapter polled with `gh`) and the issue pipeline: label gate, collaborator-only comments, eval → refinement → implementation → draft PR, WhatsApp groups with a daily limit, the dashboard Intake page
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
@@ -581,6 +583,16 @@ EOF
 ./target/release/nucleus tasks output <id>          # result (or latest progress)
 ./target/release/nucleus tasks cancel <id>
 tmux attach -t nucleus-tasks                        # watch the workers
+
+# Issue pipeline (ADR-036). launchd runs `intake tick` every minute; the DM
+# session answers "how is item 3 going?" with the read-only commands.
+./target/release/nucleus intake list                # open items (--all for closed)
+./target/release/nucleus intake show 3              # eval, plan, thread, tasks, PR
+./target/release/nucleus intake approve-plan 3 --version 2
+./target/release/nucleus intake approve-comment 3   # or skip-comment / cancel / retry
+./target/release/nucleus intake tick --poll         # poll every repo now and advance items
+./target/release/nucleus events emit --source homelab --id disk-1 --title "Disk above 90%"
+tail -f memory/intake.log
 
 # Give the WhatsApp DM session context without a message from you (ADR-021/033)
 ./target/release/nucleus session-send --to whatsapp-dm --from main --message "<brief>"
