@@ -39,43 +39,88 @@ function isSessionEntry(v: object): boolean {
   );
 }
 
-function isPlainContainer(v: object): boolean {
-  if (Array.isArray(v)) return true;
-  const proto = Object.getPrototypeOf(v);
-  return proto === Object.prototype || proto === null || isSessionEntry(v);
+/** How deep the redactor walks. Deeper objects are replaced, not printed. */
+export const REDACT_MAX_DEPTH = 8;
+export const DEPTH_REDACTED = "[redacted: nested too deep]";
+
+/** Values printed as they are: they cannot hold key-named fields. Raw bytes
+ *  are key material only under a key-named field, which is replaced. */
+function isLeafObject(v: object): boolean {
+  return ArrayBuffer.isView(v) || v instanceof ArrayBuffer || v instanceof Date || v instanceof RegExp;
 }
 
-/** Whether `v` holds key material within `depth` levels. */
-export function hasKeyMaterial(v: unknown, depth = 6, seen = new WeakSet<object>()): boolean {
-  if (v === null || typeof v !== "object" || depth < 0) return false;
-  if (seen.has(v)) return false;
+/** Own enumerable entries of any other object: plain objects, arrays, class
+ *  instances and Errors alike (fail closed: an unknown class may hold keys). */
+function entriesOf(v: object): Array<[string, unknown]> {
+  if (v instanceof Map) return [...v.entries()].map(([k, x]) => [String(k), x]);
+  if (v instanceof Set) return [...v.values()].map((x, i) => [String(i), x]);
+  const entries = Object.entries(v);
+  // An Error's `cause` is not enumerable, and the console prints it.
+  if (v instanceof Error && Object.prototype.hasOwnProperty.call(v, "cause") && !entries.some(([k]) => k === "cause")) {
+    entries.push(["cause", (v as { cause?: unknown }).cause]);
+  }
+  return entries;
+}
+
+/** Whether `v` holds key material, or may hold it beyond REDACT_MAX_DEPTH
+ *  (then true: fail closed). */
+export function hasKeyMaterial(v: unknown, depth = REDACT_MAX_DEPTH, seen = new WeakSet<object>()): boolean {
+  if (v === null || typeof v !== "object") return false;
+  if (seen.has(v)) return false; // its first visit already answered for it
   seen.add(v);
   if (isSessionEntry(v)) return true;
-  if (!isPlainContainer(v)) return false;
-  for (const [k, child] of Object.entries(v)) {
+  if (isLeafObject(v)) return false;
+  const entries = entriesOf(v);
+  if (depth <= 0) return entries.length > 0;
+  for (const [k, child] of entries) {
     if (KEY_FIELD.test(k)) return true;
     if (hasKeyMaterial(child, depth - 1, seen)) return true;
   }
   return false;
 }
 
-/** A copy of `v` with the values of key-named fields replaced, and every
- *  SessionEntry replaced by a marker. Values without key material are
- *  returned unchanged (same reference); Errors, Buffers and class
- *  instances other than SessionEntry are not walked. */
-export function redactKeyMaterial<T>(v: T, depth = 6, seen = new WeakSet<object>()): T {
-  if (v === null || typeof v !== "object" || depth < 0) return v;
-  if (seen.has(v as object)) return v;
-  seen.add(v as object);
-  if (isSessionEntry(v as object)) return SESSION_REDACTED as unknown as T;
-  if (!isPlainContainer(v as object)) return v;
-  if (!hasKeyMaterial(v, depth)) return v;
-  if (Array.isArray(v)) return v.map((c) => redactKeyMaterial(c, depth - 1, seen)) as unknown as T;
-  const out: Record<string, unknown> = {};
-  for (const [k, child] of Object.entries(v as Record<string, unknown>)) {
-    out[k] = KEY_FIELD.test(k) ? REDACTED : redactKeyMaterial(child, depth - 1, seen);
+/** A redacted copy of `v`: the values of key-named fields replaced, every
+ *  SessionEntry replaced by a marker, and objects nested deeper than
+ *  REDACT_MAX_DEPTH replaced. A value with no key material is returned
+ *  unchanged (same reference). Otherwise every object in the graph is copied
+ *  once: a shared reference or a cycle reuses the same redacted copy, so no
+ *  path through the result reaches an original object that holds keys.
+ *  Errors keep their message and stack; their own fields are redacted. */
+export function redactKeyMaterial<T>(v: T): T {
+  if (!hasKeyMaterial(v)) return v;
+  return redactInto(v, REDACT_MAX_DEPTH, new WeakMap()) as T;
+}
+
+function redactInto(v: unknown, depth: number, memo: WeakMap<object, unknown>): unknown {
+  if (v === null || typeof v !== "object") return v;
+  const known = memo.get(v);
+  if (known !== undefined) return known;
+  if (isSessionEntry(v)) {
+    memo.set(v, SESSION_REDACTED);
+    return SESSION_REDACTED;
   }
-  return out as T;
+  if (isLeafObject(v)) return v;
+  if (depth <= 0) {
+    memo.set(v, DEPTH_REDACTED);
+    return DEPTH_REDACTED;
+  }
+  let out: Record<string, unknown> | unknown[];
+  if (Array.isArray(v)) {
+    out = [];
+  } else if (v instanceof Error) {
+    const e = new Error(v.message);
+    e.name = v.name;
+    if (v.stack) e.stack = v.stack;
+    out = e as unknown as Record<string, unknown>;
+  } else {
+    out = {};
+  }
+  // Registered before the children, so a cycle back to `v` gets this copy.
+  memo.set(v, out);
+  for (const [k, child] of entriesOf(v)) {
+    (out as Record<string, unknown>)[k] = KEY_FIELD.test(k) ? REDACTED : redactInto(child, depth - 1, memo);
+  }
+  return out;
 }
 
 /** The console arguments with key material removed. A libsignal session

@@ -10,6 +10,7 @@ import { Console } from "node:console";
 import { Writable } from "node:stream";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
+import util from "node:util";
 import {
   SESSION_REDACTED,
   installConsoleKeyFilter,
@@ -106,6 +107,77 @@ test("redactKeyMaterial replaces a SessionEntry nested in a log object", () => {
   const red = redactKeyMaterial({ jid: "j", session: entry }) as any;
   assert.equal(red.session, SESSION_REDACTED);
   assert.equal(red.jid, "j");
+});
+
+/** Every string reachable from `v` (through any path, cycles included). */
+function reachableText(v: unknown, seen = new Set<unknown>()): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v !== "object") return String(v);
+  if (seen.has(v)) return "";
+  seen.add(v);
+  if (Buffer.isBuffer(v)) return v.toString("hex");
+  let s = util.inspect(v, { depth: 0 });
+  const keys = new Set([...Object.keys(v), ...(v instanceof Error ? ["cause", "message", "stack"] : [])]);
+  for (const k of keys) s += " " + reachableText((v as any)[k], seen);
+  return s;
+}
+
+test("a session referenced twice is redacted on every path (shared reference)", () => {
+  const { entry, secrets } = syntheticSession();
+  const red = redactKeyMaterial({ a: entry, b: entry, c: [entry] }) as any;
+  assert.equal(red.a, SESSION_REDACTED);
+  assert.equal(red.b, SESSION_REDACTED, "the second path must not reach the original");
+  assert.equal(red.c[0], SESSION_REDACTED);
+  const text = reachableText(red);
+  for (const s of secrets) assert.ok(!text.includes(Buffer.from(s, "base64").toString("hex")));
+  // Shared key-bearing plain objects too.
+  const creds = { privKey: "SECRETPRIV", pub: "p" };
+  const shared = redactKeyMaterial({ x: { creds }, y: { creds } }) as any;
+  assert.equal(shared.x.creds.privKey, "[redacted]");
+  assert.equal(shared.y.creds.privKey, "[redacted]");
+  assert.equal(shared.x.creds, shared.y.creds, "one copy per original");
+  assert.doesNotMatch(reachableText(shared), /SECRETPRIV/);
+});
+
+test("a cycle reuses the redacted copy and never exposes the original", () => {
+  const node: any = { name: "n", inner: { rootKey: "SECRETROOT" } };
+  node.self = node;
+  node.inner.back = node;
+  const red = redactKeyMaterial(node) as any;
+  assert.notEqual(red, node);
+  assert.equal(red.self, red, "the cycle points to the copy");
+  assert.equal(red.inner.back, red);
+  assert.equal(red.inner.rootKey, "[redacted]");
+  assert.doesNotMatch(reachableText(red), /SECRETROOT/);
+  assert.doesNotMatch(util.inspect(red, { depth: 10 }), /SECRETROOT/);
+});
+
+test("an Error carrying a key is redacted: own fields and cause; message and stack kept", () => {
+  const err: any = new Error("decrypt failed");
+  err.data = { session: { privKey: "SECRETERR" } };
+  const withCause = new Error("outer", { cause: { chainKey: "SECRETCAUSE" } });
+  const [r1, r2] = sanitizeConsoleArgs([err, withCause]) as any[];
+  assert.ok(r1 instanceof Error);
+  assert.equal(r1.message, "decrypt failed");
+  assert.equal(r1.stack, err.stack);
+  assert.equal((r1 as any).data.session.privKey, "[redacted]");
+  assert.equal(err.data.session.privKey, "SECRETERR", "the original is not modified");
+  const printed = util.format(r1, r2);
+  assert.doesNotMatch(printed, /SECRETERR|SECRETCAUSE/);
+  // An Error without key material is passed through unchanged.
+  const plain = new Error("plain");
+  assert.equal(sanitizeConsoleArgs([plain])[0], plain);
+});
+
+test("class instances and deep nesting fail closed", () => {
+  class Holder {
+    constructor(public inner: unknown) {}
+  }
+  const red = redactKeyMaterial({ h: new Holder({ privKey: "SECRETCLASS" }) }) as any;
+  assert.doesNotMatch(util.inspect(red, { depth: 10 }), /SECRETCLASS/);
+  let deep: any = { privKey: "SECRETDEEP" };
+  for (let i = 0; i < 20; i++) deep = { next: deep };
+  assert.doesNotMatch(util.inspect(redactKeyMaterial(deep), { depth: 50 }), /SECRETDEEP/);
 });
 
 test("the Baileys logger writes to its file with key material redacted", () => {
