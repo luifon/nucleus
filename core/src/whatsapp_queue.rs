@@ -369,6 +369,24 @@ pub async fn request_intake_close(pool: &SqlitePool, item_key: &str) -> Result<b
     Ok(res.rows_affected() == 1)
 }
 
+/// Ask the bot to mark item `item_key`'s unresolved group creation closed,
+/// as the operator decided by hand (`left` or `absent`).
+pub async fn request_intake_resolve(pool: &SqlitePool, item_key: &str, how: &str) -> Result<i64> {
+    if !matches!(how, "left" | "absent") {
+        anyhow::bail!("unknown resolution {how:?}");
+    }
+    let res = sqlx::query(
+        "INSERT INTO intake_group_requests (item_key, action, subject, enqueued_at, status, dedup_key)
+         VALUES (?1, 'resolve', ?2, ?3, 'pending', NULL)",
+    )
+    .bind(item_key)
+    .bind(how)
+    .bind(crate::timestamp::now())
+    .execute(pool)
+    .await?;
+    Ok(res.last_insert_rowid())
+}
+
 /// Every group the bot has as `active` (item key, JID).
 pub async fn active_intake_groups(pool: &SqlitePool) -> Result<Vec<(String, String)>> {
     if !table_exists(pool, "intake_groups").await? {
@@ -384,8 +402,8 @@ pub async fn active_intake_groups(pool: &SqlitePool) -> Result<Vec<(String, Stri
 pub struct IntakeGroup {
     /// `active`, `fallback` (WhatsApp refused it: the thread runs in the
     /// DM), `unknown` (the creation's outcome is not known; it may exist),
-    /// `absent` (an unknown creation confirmed never to have happened),
-    /// `closed` (the bot confirmed it left).
+    /// `quarantined` (found by its recovery nonce, never used, being left),
+    /// `closed` (the bot confirmed it left, or the operator resolved it).
     pub status: String,
     pub jid: Option<String>,
     pub reason: Option<String>,

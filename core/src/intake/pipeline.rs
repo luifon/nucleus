@@ -692,6 +692,25 @@ async fn cancel_caused(ctx: &Ctx, n: i64, via: &str, cause: Option<&str>) -> Res
     Ok(item)
 }
 
+/// The operator ends an unresolved group creation of item `n` by hand:
+/// `left` (the operator left the group) or `absent` (no such group exists).
+/// The bot applies it (`resolve` request); this is the only way to a closed
+/// group without the bot confirming it left.
+pub async fn group_resolve(ctx: &Ctx, n: i64, how: &str) -> Result<()> {
+    if !matches!(how, "left" | "absent") {
+        bail!("resolve a group as left or absent, not {how:?}");
+    }
+    let key = n.to_string();
+    match crate::whatsapp_queue::intake_group(&ctx.wa, &key).await? {
+        Some(g) if matches!(g.status.as_str(), "unknown" | "quarantined") => {}
+        Some(g) => return refuse(format!("Item #{n}'s group is {}, not unresolved; nothing to resolve.", g.status)),
+        None => return refuse(format!("Item #{n} has no group record; nothing to resolve.")),
+    }
+    crate::whatsapp_queue::request_intake_resolve(&ctx.wa, &key, how).await?;
+    tracing::info!(item = n, how, "intake: group resolution requested by the operator");
+    Ok(())
+}
+
 /// Resume a failed or blocked item at the stage it stopped in.
 pub async fn retry(ctx: &Ctx, n: i64, via: &str) -> Result<Item> {
     let item = store::item(&ctx.db, n).await?;
@@ -1677,13 +1696,13 @@ async fn sync_surface(ctx: &Ctx, item: &Item) -> Result<()> {
 /// bot's own table shows the group closed, or shows that none was created.
 async fn settle_group(ctx: &Ctx, item: &Item) -> Result<()> {
     let key = item.id.to_string();
-    // Confirmed gone: the bot left it (`closed`), WhatsApp refused to create
-    // it (`fallback`), or the participating-groups list showed it never
-    // existed (`absent`). `active`, `unknown` (the creation may have
-    // happened) and no row (the create request is still pending) are not.
+    // Confirmed gone: the bot left it, or the operator resolved it by hand
+    // (`closed`), or WhatsApp refused to create it (`fallback`). `active`,
+    // `unknown` (the creation may have happened), `quarantined` (found,
+    // being left) and no row (the create request is still pending) are not.
     let confirmed = matches!(
         crate::whatsapp_queue::intake_group(&ctx.wa, &key).await?,
-        Some(g) if matches!(g.status.as_str(), "closed" | "fallback" | "absent")
+        Some(g) if matches!(g.status.as_str(), "closed" | "fallback")
     );
     if confirmed {
         store::update(&ctx.db, item.id, item.stage(), vec![("group_closed_at", crate::timestamp::now().into())]).await?;

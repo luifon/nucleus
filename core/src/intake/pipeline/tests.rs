@@ -1178,10 +1178,23 @@ async fn an_unknown_group_is_never_counted_as_closed() {
         tick(&f).await;
     }
     assert!(item1(&f).await.group_closed_at.is_none(), "an unknown creation stays unresolved");
-    // The bot found it absent from the groups it participates in.
-    sqlx::query("UPDATE intake_groups SET status = 'absent' WHERE item_key = '1'").execute(&f.ctx.wa).await.unwrap();
+    sqlx::query("UPDATE intake_groups SET status = 'quarantined' WHERE item_key = '1'").execute(&f.ctx.wa).await.unwrap();
+    tick(&f).await;
+    assert!(item1(&f).await.group_closed_at.is_none(), "a quarantined group is not closed either");
+    // The operator resolves it by hand; the bot applies it.
+    assert!(group_resolve(&f.ctx, 1, "sideways").await.is_err());
+    group_resolve(&f.ctx, 1, "absent").await.unwrap();
+    let (action, how): (String, String) =
+        sqlx::query_as("SELECT action, subject FROM intake_group_requests WHERE action = 'resolve'").fetch_one(&f.ctx.wa).await.unwrap();
+    assert_eq!((action.as_str(), how.as_str()), ("resolve", "absent"));
+    sqlx::query("UPDATE intake_groups SET status = 'closed', reason = 'resolved by the operator' WHERE item_key = '1'")
+        .execute(&f.ctx.wa)
+        .await
+        .unwrap();
     tick(&f).await;
     assert!(item1(&f).await.group_closed_at.is_some());
+    let e = group_resolve(&f.ctx, 1, "left").await.unwrap_err();
+    assert!(e.downcast_ref::<Refusal>().is_some(), "nothing left to resolve");
 }
 
 #[tokio::test]

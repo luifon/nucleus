@@ -81,6 +81,15 @@ enum Cmd {
     Cancel { item: String },
     /// Resume a failed item at the stage it failed in.
     Retry { item: String },
+    /// End an unresolved WhatsApp group creation of an item by hand: you
+    /// left the group (`--left`) or checked that none exists (`--absent`).
+    GroupResolve {
+        item: String,
+        #[arg(long, conflicts_with = "absent", required_unless_present = "absent")]
+        left: bool,
+        #[arg(long)]
+        absent: bool,
+    },
 }
 
 fn authorize(caller: &Caller, cmd: &Cmd) -> Result<()> {
@@ -312,6 +321,13 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             let n = item_number(&item)?;
             pipeline::retry(&ctx, n, via).await.map(|i| println!("item #{n} resumed at {}", i.stage))
         }
+        Cmd::GroupResolve { item, left, absent } => {
+            let n = item_number(&item)?;
+            let how = if left { "left" } else if absent { "absent" } else { unreachable!("clap requires one") };
+            pipeline::group_resolve(&ctx, n, how)
+                .await
+                .map(|_| println!("item #{n}: group marked {how}; the WhatsApp bot applies it"))
+        }
     };
     match result {
         Err(e) if e.downcast_ref::<Refusal>().is_some() => bail!("{e}"),
@@ -362,7 +378,11 @@ mod tests {
         assert!(authorize(&caller(chat.clone(), 0), &cancel()).is_ok());
         assert!(authorize(&caller(chat.clone(), 1), &cancel()).is_err());
         assert!(authorize(&caller(chat.clone(), 0), &approve()).is_err(), "a session never approves");
-        assert!(authorize(&caller(chat, 0), &Cmd::Reply { item: "1".into(), text: "x".into() }).is_err());
+        assert!(authorize(&caller(chat.clone(), 0), &Cmd::Reply { item: "1".into(), text: "x".into() }).is_err());
+        let resolve = || Cmd::GroupResolve { item: "1".into(), left: true, absent: false };
+        assert!(authorize(&caller(chat, 0), &resolve()).is_err(), "only the operator resolves a group");
+        assert!(authorize(&caller(Role::Detached, 0), &resolve()).is_err());
+        assert!(authorize(&caller(Role::Operator, 0), &resolve()).is_ok());
         assert!(authorize(&caller(Role::Detached, 0), &tick()).is_ok());
         assert!(authorize(&caller(Role::Detached, 0), &show()).is_err());
         for role in [
