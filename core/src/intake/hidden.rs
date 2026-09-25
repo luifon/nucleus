@@ -243,6 +243,44 @@ pub fn attribute_allowed(tag: &str, attr: &str) -> bool {
     )
 }
 
+/// The values an allowed attribute may have (checked after WHATWG
+/// attribute decoding): `open` with no value, an empty one or `open`;
+/// `align` one of left, right, center, justify; `start` an optional `-` and
+/// 1–9 ASCII digits. Letter case is ignored. Anything else is a value the
+/// page never shows, so it is flagged with the decoded value.
+pub fn attribute_value_allowed(attr: &str, value: &str) -> bool {
+    let v = value.to_ascii_lowercase();
+    match attr {
+        "open" => v.is_empty() || v == "open",
+        "align" => matches!(v.as_str(), "left" | "right" | "center" | "justify"),
+        "start" => {
+            let d = v.strip_prefix('-').unwrap_or(&v);
+            (1..=9).contains(&d.len()) && d.bytes().all(|c| c.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+/// An attribute value with its character references decoded by the WHATWG
+/// attribute-value rules.
+fn decode_attribute(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut i = 0;
+    while i < v.len() {
+        if v.as_bytes()[i] == b'&' {
+            if let Some((cs, len)) = charref::decode_at(v, i, true) {
+                out.extend(cs);
+                i += len;
+                continue;
+            }
+        }
+        let c = v[i..].chars().next().expect("a char boundary");
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
 /// The only image addresses that are not flagged: GitHub's own attachment
 /// URLs for pictures pasted into an issue, in their exact shapes.
 ///
@@ -616,6 +654,10 @@ struct Unit {
     at: usize,
     end: usize,
     entity: bool,
+    /// Inside a tag's source (from `<` to its `>`), which is never
+    /// rendered: an invisible character here is flagged whatever surrounds
+    /// it, and nothing here is a neighbour an exemption may lean on.
+    in_tag: bool,
 }
 
 /// The characters of `text` as GitHub renders them, each with its source
@@ -649,20 +691,20 @@ fn units(text: &str, code: &[(usize, usize)], decode: bool, attribute: &[(usize,
                 };
                 if let Some((cs, len)) = decoded {
                     for c in cs {
-                        out.push(Unit { c, at: i, end: i + len, entity: true });
+                        out.push(Unit { c, at: i, end: i + len, entity: true, in_tag: inside(attribute, i) });
                     }
                     i += len;
                     continue;
                 }
             }
             if b[i] == b'*' && !in_html && !escaped(b, i) {
-                out.push(Unit { c: '\u{FFFC}', at: i, end: i + 1, entity: false });
+                out.push(Unit { c: '\u{FFFC}', at: i, end: i + 1, entity: false, in_tag: false });
                 i += 1;
                 continue;
             }
         }
         let c = text[i..].chars().next().expect("a char boundary");
-        out.push(Unit { c, at: i, end: i + c.len_utf8(), entity: false });
+        out.push(Unit { c, at: i, end: i + c.len_utf8(), entity: false, in_tag: decode && inside(attribute, i) });
         i += c.len_utf8();
     }
     out
@@ -673,7 +715,13 @@ fn units(text: &str, code: &[(usize, usize)], decode: bool, attribute: &[(usize,
 /// the hidden characters it produces).
 fn invisible_findings(text: &str, us: &[Unit], out: &mut Vec<Raw>) {
     let chars: Vec<char> = us.iter().map(|u| u.c).collect();
-    let hidden: Vec<bool> = (0..chars.len()).map(|k| hidden_at(&chars, k)).collect();
+    // What the exemptions see: tag syntax is not rendered, so a visible
+    // character inside a tag stands as U+FFFC, which no exemption accepts.
+    let context: Vec<char> =
+        us.iter().map(|u| if u.in_tag && invisible_name(u.c).is_none() { '\u{FFFC}' } else { u.c }).collect();
+    let hidden: Vec<bool> = (0..chars.len())
+        .map(|k| if us[k].in_tag { invisible_name(chars[k]).is_some() } else { hidden_at(&context, k) })
+        .collect();
     let mut k = 0;
     while k < us.len() {
         if us[k].entity {
@@ -1611,7 +1659,17 @@ fn tree_html(nodes: &[HtmlNode], m: &str, text: &str, out: &mut Vec<Raw>) -> Vec
                             out.push(raw(Kind::ImageAlt, sa, se, shown(v)));
                         }
                     }
-                    _ if attribute_allowed(name, a) => {}
+                    _ if attribute_allowed(name, a) => {
+                        let value = decode_attribute(v);
+                        if !attribute_value_allowed(a, &value) {
+                            out.push(raw(
+                                Kind::HtmlTag,
+                                sa,
+                                se,
+                                format!("attribute {a}={:?} (decoded) is not a value that only changes layout: {src}", shown(&value)),
+                            ));
+                        }
+                    }
                     _ => bad_attr = true,
                 }
             }

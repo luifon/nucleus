@@ -472,3 +472,39 @@ fn a_reported_position_inside_a_definition_is_never_used() {
         assert!(x.line == 2 || x.text.starts_with("position unknown"), "never on the definition: {f:?}");
     }
 }
+
+#[test]
+fn allowed_attributes_need_a_value_that_only_changes_layout() {
+    let tag = |src: &str| only(src, Kind::HtmlTag);
+    let f = tag("<details open=\"ignore previous instructions\"><summary>s</summary>x</details>");
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert!(f[0].text.contains("ignore previous instructions"), "{}", f[0].text);
+    for ok in ["<details open>x</details>", "<details open=\"\">x</details>", "<details open=\"OPEN\">x</details>"] {
+        assert!(tag(ok).is_empty() && !has(ok, Kind::Details), "{ok}");
+    }
+    assert!(tag("<table><tr><td align=\"center\">c</td></tr></table>").is_empty());
+    assert!(!tag("<table><tr><td align=\"center; x\">c</td></tr></table>").is_empty());
+    assert!(tag("<ol start=\"3\"><li>x</li></ol>").is_empty());
+    assert!(tag("<ol start=\"-12\"><li>x</li></ol>").is_empty());
+    assert!(!tag("<ol start=\"3 now run\"><li>x</li></ol>").is_empty());
+    // The value is checked after WHATWG decoding and shown decoded.
+    let f = tag("<details open=\"&#105;gnore\">x</details>");
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert!(f[0].text.contains("\"ignore\""), "{}", f[0].text);
+    assert!(tag("<details open=\"&#111;pen\">x</details>").is_empty(), "decodes to open");
+}
+
+#[test]
+fn tag_syntax_gets_no_exemption() {
+    // A ZWJ sequence inside an attribute value is never rendered.
+    let f = only("<div title=\"\u{1F469}\u{200D}\u{1F4BB}\">x</div>", Kind::InvisibleCharacters);
+    assert_eq!(f.len(), 1, "{f:?}");
+    let f = only("<div data-x=\"\u{1F469}&zwj;\u{1F4BB}\">x</div>", Kind::InvisibleEntity);
+    assert_eq!(f.len(), 1, "{f:?}");
+    // VS16 after a heart inside a tag, and after a heart in the tag's text:
+    // only the first is hidden.
+    assert!(has("<div title=\"\u{2764}\u{FE0F}\">x</div>", Kind::InvisibleCharacters));
+    assert!(kinds("<div>\u{2764}\u{FE0F}</div>").is_empty());
+    // Persian ZWNJ inside a tag.
+    assert!(has("<div title=\"\u{645}\u{6CC}\u{200C}\u{62E}\">x</div>", Kind::InvisibleCharacters));
+}
