@@ -295,17 +295,19 @@ version shown. The approved plan becomes the implementation brief.
 
 ### 8. Implementation, pull request, comment
 
-Right before implementation Nucleus reads the issue live (finding 3),
-fetches, creates the item's clone again at the newest default branch (a
-plan discussed for days is built on current code) and switches to
-`nucleus/item-<n>-<slug>`. On a retry the existing clone and its commits
-are kept. The agent works with the `code` profile, runs the configured
-`test_command`, commits locally and ends with a summary for the operator.
+Right before implementation Nucleus reads the issue live, fetches,
+creates the item's clone again at the newest default branch (a plan
+discussed for days is built on current code), switches to
+`nucleus/item-<n>`, and reads the issue again before it starts the agent
+(finding 3). On a retry the existing clone is kept. The agent works with
+the `code` profile, runs the configured `test_command`, may commit locally
+(its commits are not published) and ends with a summary for the operator.
 Then Nucleus:
 
-1. reads the agent's commits into its mirror and commits anything left
-   uncommitted there (finding 2); the result is the one commit it pushes;
-2. fails the item when that commit adds nothing beyond the base;
+1. imports the clone's file tree into its mirror as one commit on the base
+   with a fixed identity and a code-owned message (finding 2); none of the
+   agent's commits is used;
+2. fails the item when the tree equals the base;
 3. runs `test_command` itself (`sh -c` in the clone, `test_timeout_minutes`,
    default 30) and records `passed`, `failed`, `timeout` or `not_run` with
    the end of the output;
@@ -395,6 +397,7 @@ operator how to approve; it cannot approve, reply in a thread, or retry.
 
 `[intake]` in `nucleus.toml` (see `nucleus.toml.example`): `enabled`,
 `work_dir`, `label`, `min_confidence`, `test_timeout_minutes`,
+`commit_author_name`, `commit_author_email`,
 `[[intake.repos]]` (`repo`, `test_command`, `default_branch`,
 `pr_issue_keyword`), `[intake.github]` (`gh_bin`, `poll_interval_secs`,
 `collaborator_cache_secs`, `max_pages`, `remote_url`), `[intake.whatsapp]`
@@ -527,6 +530,13 @@ third consecutive `<` or `>` gets a space before it (so `<<<` never occurs
 inside a block), and lines that start with `===` get a `> ` prefix. A long
 thread is shortened by whole messages, so no block loses its start marker.
 
+Nothing outside the fence carries issue text either: stage task titles,
+which the worker session receives in its header, are code-owned (`Intake
+item #<n> — evaluation | refinement | implementation`), and so are branch
+names (`nucleus/item-<n>`), which the implementation brief names. When the
+WhatsApp DM session runs `nucleus intake list` or `show`, the whole output
+is printed inside a data fence with a code-owned line in front.
+
 **(c) No cached trust at an action boundary.** The collaborator cache is
 used only for display and polling filters. Every brief, the gate check and
 every action boundary check collaborator status at GitHub, and a failed
@@ -546,49 +556,88 @@ and one separate clone per item (`item-<n>`; no shared git directory with
 the mirror). Before every use Nucleus writes the mirror's `config` again
 from a fixed template and removes its `hooks`, alternates, `commondir`,
 `config.worktree` and `info/attributes`; a mirror path that is a symlink or
-not a repository is created again. Fetch and push use the configured URL
-(`[intake.github] remote_url`, default `https://github.com/{repo}.git`),
-never a remote name, with `gh auth git-credential` set as the only
-credential helper. Every git command runs with `core.hooksPath=/dev/null`,
-`core.fsmonitor=false`, the credential helper list reset, the `ext::`
-transport off, `GIT_CONFIG_NOSYSTEM=1` and inherited `GIT_*` variables
-removed (author and committer identity kept).
+not a repository is created again.
 
-Nucleus never runs git with the item clone's configuration after an agent
-could have written it. It reads the agent's work by fetching the clone's
-`HEAD` into `refs/nucleus/item-<n>` of the mirror, requires that commit to
-descend from the default branch, and commits uncommitted changes with the
-mirror's configuration and a temporary index (`--git-dir=<mirror>
---work-tree=<clone>`), so the clone's hooks, filters and fsmonitor never
-run. The resulting commit id is stored (`head_sha`); exactly that commit is
-scanned and pushed, with `--no-verify`, no force, to `refs/heads/<branch>`
-only. The push is refused unless the branch is the item's own
-(`nucleus/item-<n>` or `nucleus/item-<n>-<slug>`), and refused for the
-remote's default branch (read live with `ls-remote --symref`) and for
-`main`, `master`, `develop`, `development`, `trunk`, `production`,
-`release`, `gh-pages`. The first clone no longer uses `gh repo clone`.
+**No configuration the agent can write.** The implementation agent runs as
+the same OS user as Nucleus, so it can edit `~/.gitconfig` and
+`~/.config/git/*`. Every git command Nucleus runs has
+`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
+`GIT_ATTR_NOSYSTEM=1`, `core.attributesFile=/dev/null`,
+`core.excludesFile=/dev/null`, `core.hooksPath=/dev/null`,
+`core.fsmonitor=false`, the credential helper list reset, the `ext::`
+transport off, and no inherited `GIT_*` variable. The only configuration
+file git reads is the mirror's template.
+
+**Credentials Nucleus owns.** Remotes must be HTTPS (`[intake.github]
+remote_url`, default `https://github.com/{repo}.git`; a local absolute path
+is accepted for tests). The only credential helper is
+`!<gh> auth git-credential`, with `<gh>` the absolute path of
+`[intake.github] gh_bin` (a bare name is resolved through `PATH`). SSH is
+not supported: git would need an ssh command, and the only place git reads
+one from is a configuration file. Fetch and push name the configured URL,
+never a remote name.
+
+**No git against the agent's clone.** After an agent could have written the
+clone, Nucleus runs no git command against it: no fetch or `upload-pack`
+from it, and no command with its `.git` as git directory. `git::import`
+reads only the clone's file tree: `git --git-dir=<mirror>
+--work-tree=<clone>` with a Nucleus-owned temporary index, `read-tree` of
+the base commit, then `add --all`. Git never reads or stores a path named
+`.git`, so the clone's repository (a directory, a file or a symlink named
+`.git`) is ignored. Symlinks are stored as symlinks (their target text),
+never followed. A clone path that is not a real directory (for example a
+symlink to another directory) and a nested repository (a gitlink) are
+refused. The clone's `.gitignore` files decide which untracked files are
+left out (they can only leave content out). Its `.gitattributes` can name
+`filter`, `diff` and `merge` drivers but cannot define them; import checks
+that the trusted configuration defines none, so a named driver resolves to
+nothing and the file's bytes are imported unchanged.
+
+**One code-owned commit.** Import creates exactly one commit: the imported
+tree on the base commit the clone started from (`items.base_sha`, recorded
+when the clone was prepared), with author and committer `[intake]
+commit_author_name` / `commit_author_email` and a code-owned message
+(`Implement #<issue>` and a `Nucleus-Item: <n>` trailer). None of the
+agent's commits, authors, dates or messages is read or published. A tree
+equal to the base fails the item. The commit id is stored (`head_sha`);
+exactly that commit is scanned and pushed, with `--no-verify`, no force, to
+`refs/heads/<branch>` only. Branch names are code-owned (`nucleus/item-<n>`).
+The push is refused unless the branch is the item's own, and refused for
+the remote's default branch (read live with `ls-remote --symref` during
+preparation) and for `main`, `master`, `develop`, `development`, `trunk`,
+`production`, `release`, `gh-pages`.
 
 Limits: without an OS sandbox the implementation agent runs with the
-operator's user rights and can change any file between Nucleus's reset and
-its use of the mirror; the reset closes the paths the review found, it is
-not isolation. Reading from the agent's clone runs `git upload-pack` in it,
-which git's security model treats as safe for untrusted repositories.
+operator's user rights and can change files between Nucleus's checks and
+its use of them (for example replace the clone directory after the check).
+The `gh` credential helper reads gh's own configuration, which the agent
+can also write; a changed gh configuration can at most make authentication
+fail or use another account's token for the configured URL.
 
 ### Finding 3 — the source gate was stale at the irreversible step
 
-Right before implementation starts, before the push, and before the issue
-comment is posted, Nucleus reads the issue live (`live_state`): it must be
-open, carry the label from the same label event, set by an account that is
-a collaborator now, with the bound title, body and comments. A closed issue
-closes the item, a missing label cancels it, anything else makes it stale.
-Any read failure (network, API error, a timeline longer than `max_pages`)
-is a step error: nothing starts and nothing is pushed; after three errors
-the item fails and `retry` reads again. The label removed cancels the item
-at every stage, including `pr` and `review`. Events without an adapter
-(`nucleus events emit --accept`) have no live source; their stored event is
-checked instead.
+Implementation start, the push and the issue comment each read the issue
+live twice (`live_gate`). The first read comes before the step's
+preparation (mirror sync, clone, import, secret scan, reading the remote's
+default branch); the second read is the last step before the action, with
+no other network or long-running work between it and `start_task`, `push`
+or posting the comment. Each read requires the issue to be open, carry the
+label from the same label event, set by an account that is a collaborator
+now, with the bound title, body and comments: a closed issue closes the
+item, a missing label cancels it, anything else makes it stale. The second
+read must also see the same revision as the first: the issue's
+`updated_at`, its `lastEditedAt`, the label event and the (id, hash) of
+every trusted comment. Any difference means the issue changed during the
+preparation: the step does nothing, records why in `error`, and starts
+again at the next tick. Any read failure (network, API error, a timeline
+longer than `max_pages`) is a step error: nothing starts and nothing is
+pushed; after three errors the item fails and `retry` reads again. The
+label removed cancels the item at every stage, including `pr` and
+`review`. Events without an adapter (`nucleus events emit --accept`) have
+no live source; their stored event is checked instead.
 
-Limit: seconds pass between the live read and the push.
+Limit: the push itself, and the pull request call after it, still follow
+the second read by the time these calls take.
 
 ### Finding 4 — public pull request text
 
@@ -603,8 +652,9 @@ published (the agent's message goes to the operator). The proposed issue
 comment's `{summary}` is at most 600 characters on one line, with
 Markdown and HTML characters escaped, `@` replaced and URLs broken.
 
-Before the push, the PR title, the body and every line the push adds (with
-the file names) go through the secret guard; the comment goes through it
+Before the push, the PR title, the body, the commit's author line and
+message, and every line the commit adds relative to its base (with every
+file name it touches, and symlink targets) go through the secret guard; the comment goes through it
 before it is posted. The guard is `tools/check-secrets.sh` run from the
 Nucleus workspace root (`.env` values, the `.claude/secret-strings`
 denylist, personal-information patterns, home paths, private skill names)
@@ -639,23 +689,37 @@ not recognized as the operator.
 ### Finding 6 — group lifecycle
 
 The bot claims a request with `UPDATE … SET status = 'creating'|'closing'
-WHERE id = ? AND status = 'pending'` before any WhatsApp call. A creation
-whose claim is older than 10 minutes (the bot stopped mid-call) is recorded
-as `unknown`, counts against the daily creation limit, is never repeated,
-and the operator is told to leave the group by hand if it exists. An item
-closed before the bot handles its create request gets no group; one closed
-while the create call runs gets the new group left at once. Leaving is
-retried with backoff (30 s, doubling, at most 1 hour, 8 attempts, then an
-alert); a failed leave counts as done when the bot is confirmed not to be a
-member. The bot sets `closed_at` only when it left; the pipeline sets
-`group_closed_at` only when the bot's table shows the group closed (or never
-created). The pipeline adds a close request only when none is pending, and
-every tick asks the bot to leave active groups whose item is closed,
-missing, or moved to the DM. The creation limit (`max_groups_per_day`) is
-enforced by both sides as before.
+WHERE id = ? AND status = 'pending'` before any WhatsApp call. Every
+creation ends the group subject with a code-owned token derived from the
+request id (` ~r<id>`).
 
-Limit: for an `unknown` creation the bot does not know the group's JID and
-cannot leave it itself.
+A failed creation is `fallback` only when nothing was created for certain:
+a 4xx answer from WhatsApp other than 408, or a call that was never sent
+(no live connection). Anything else (a timeout, a closed or lost
+connection, a server error, an unrecognized error, or a claim older than 10
+minutes because the bot stopped mid-call) is `unknown`. An unknown
+creation is never repeated, never treated as closed, and keeps counting
+against `max_groups_per_day`. Two minutes after it became unknown, and then
+every two minutes, the bot lists the groups it participates in
+(`groupFetchAllParticipating`): a group whose subject ends with the token is
+recorded with its JID and a membership baseline from the list, and the
+pipeline then asks the bot to leave it once its item no longer uses it (the
+thread moved to the DM when the creation became unknown); a list without it
+marks the creation `absent`. A failed listing changes nothing. An unknown
+creation still unresolved after one hour is reported to the operator in DM.
+
+An item closed before the bot handles its create request gets no group; one
+closed while the create call runs gets the new group left at once. Leaving
+is retried with backoff (30 s, doubling, at most 1 hour, 8 attempts, then an
+alert); a failed leave counts as done when the bot is confirmed not to be a
+member. The bot sets `closed_at` only when it left. The pipeline sets
+`group_closed_at` only when the bot's table shows the group `closed`,
+`fallback` or `absent`, never for `unknown`. The pipeline adds a close
+request only when none is pending, and every tick asks the bot to leave
+active groups whose item is closed, missing, or moved to the DM.
+
+Limit: a group whose subject was changed by hand (so the token is gone)
+cannot be found; the one-hour report tells the operator to check.
 
 ### Finding 7 — lost operator commands
 
@@ -675,6 +739,28 @@ is written after the transaction; a crash between the two keeps the
 command's effect and loses the note.
 
 ### Verification of the amendment
+
+Round 2 (after a second review): an issue title with fence-escape and
+instruction text reaches the typed worker message only inside the fence
+(`an_issue_title_reaches_workers_only_inside_the_fence`, and
+`session_output_is_fenced` for the CLI); global git configuration in a
+temporary HOME (URL rewrite, ssh command, fsmonitor, hooks path, global
+attributes with a required filter, global ignore) has no effect
+(`core/tests/intake_git_home.rs`); malicious configuration, hooks, filters
+and drivers in the agent clone's `.git` and in the mirror are never used,
+a nested repository and a clone replaced by a symlink are refused, a `.git`
+file is ignored, a symlink is stored as a symlink (`git.rs` tests); an
+agent commit whose author, email and message carry a guard-hit value, and
+an empty commit, publish none of that metadata, and an empty change
+publishes nothing (`only_one_code_owned_commit_is_published`); an issue
+changed during the secret scan stops the push, and an edited body during
+the scan makes the item stale (`a_change_during_the_scan_stops_the_push`);
+a group creation that timed out but happened is found by its token and
+left, a missing one becomes absent, an unresolvable one stays unknown and
+is reported (`intake.test.ts`), and the pipeline never counts an unknown
+group as closed (`an_unknown_group_is_never_counted_as_closed`).
+
+Round 1:
 
 Rust (`cargo test -p nucleus-core intake`, `whatsapp_queue`): the gate
 check (collaborator label, edit after the label, rename after the label,
