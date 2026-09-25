@@ -61,7 +61,7 @@ async fn global_git_config_has_no_effect() {
     std::fs::write(wt.join("a.txt"), "two\n").unwrap();
     std::fs::write(wt.join("b.txt"), "new\n").unwrap();
     let spec = CommitSpec { author_name: "Pipeline".into(), author_email: "pipeline@example.invalid".into(), message: "Implement #1".into() };
-    let limits = git::ImportLimits { max_files: 1000, max_file_bytes: 1 << 20, max_total_bytes: 8 << 20 };
+    let limits = git::ImportLimits { max_files: 1000, max_file_bytes: 1 << 20, max_total_bytes: 8 << 20, max_ignore_bytes: 1 << 16 };
     let sha = git::import(&mirror, &remote, &wt, &base, 1, &spec, &limits).await.unwrap().unwrap();
     let mut files = git::changed_files(&mirror, &base, &sha).await.unwrap();
     files.sort();

@@ -509,8 +509,10 @@ pub struct ImportLimits {
     pub max_files: usize,
     /// Largest file, by its length (a sparse file counts by its length).
     pub max_file_bytes: u64,
-    /// Sum of all file lengths.
+    /// Sum of all file lengths (ignore files included).
     pub max_total_bytes: u64,
+    /// Largest ignore file (`.gitignore`) read to decide what is ignored.
+    pub max_ignore_bytes: u64,
 }
 
 /// Import the agent's file tree into the mirror as one commit on
@@ -554,7 +556,7 @@ pub async fn import(
     let scratch = mirror.join(format!("{SCRATCH_PREFIX}{item}-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(scratch.join("objects"))?;
     std::fs::create_dir_all(scratch.join("tree"))?;
-    let result = import_in(mirror, wt, &root, base_sha, item, spec, limits, &scratch).await;
+    let result = import_in(mirror, &root, base_sha, item, spec, limits, &scratch).await;
     let _ = std::fs::remove_dir_all(&scratch);
     result
 }
@@ -562,7 +564,6 @@ pub async fn import(
 #[allow(clippy::too_many_arguments)]
 async fn import_in(
     mirror: &Path,
-    wt: &Path,
     root: &std::os::fd::OwnedFd,
     base_sha: &str,
     item: i64,
@@ -583,33 +584,31 @@ async fn import_in(
     if !out.ok {
         bail!("git read-tree failed: {}", out.stderr);
     }
-    let base_links = gitlinks(&mirror_ok(mirror, &["ls-tree", "-r", "-z", base_sha]).await?, true);
-
-    // Special files (FIFO, socket, device) anywhere in the clone, found by
-    // a walk that follows no symlink and skips `.git` directories.
-    special_files(wt, limits.max_files.saturating_mul(50).max(100_000))?;
-
-    // The paths git would import (tracked and untracked, not ignored),
-    // listed as bytes through a bounded reader. Listing reads directory
-    // entries and the clone's ignore files; no file content.
+    // The base tree, read through the capped reader.
     let cap = limits.max_files.saturating_mul(1024).saturating_add(1 << 20);
-    let pre_clone = vec![format!("--git-dir={}", mirror.display()), format!("--work-tree={}", wt.display())];
-    let listed = run_capped(mirror, &pre_clone, &["ls-files", "-z", "--cached", "--others", "--exclude-standard"], &env, cap).await?;
-    let Some(listed) = listed else {
-        refuse!("the clone has more than {} files; nothing was imported", limits.max_files);
+    let Some(base_listing) =
+        run_capped(mirror, &[format!("--git-dir={}", mirror.display())], &["ls-tree", "-r", "-z", base_sha], &[], cap).await?
+    else {
+        refuse!("the base tree lists more than the import limits allow; nothing was imported");
     };
-    let paths = split_paths(&listed);
-    if paths.len() > limits.max_files {
-        refuse!("the clone has {} files, more than the limit of {}; nothing was imported", paths.len(), limits.max_files);
-    }
+    let base = BaseTree::parse(&base_listing);
+    let base_links = gitlinks(&String::from_utf8_lossy(&base_listing), true);
 
-    // The private snapshot: every listed path copied with descriptor-
-    // relative, no-follow operations and read limits (snapshot.rs).
+    // Walk the clone ourselves (no git command reads it): descriptor-
+    // relative, no-follow, one directory level at a time. Ignore files go
+    // into a private rules directory under their own limit; `git
+    // check-ignore --no-index` decides, from those copies only, which
+    // entries of the next level are ignored; ignored directories are not
+    // entered (unless the base tracks something inside them).
+    let rules = scratch.join("rules");
+    std::fs::create_dir_all(&rules)?;
     let mut budget = super::snapshot::Budget { files: 0, bytes: 0 };
-    for p in &paths {
-        let rel: &[u8] = p.strip_suffix(b"/").unwrap_or(p);
-        let is_link = base_links.iter().any(|(path, _)| path.as_bytes() == rel);
-        super::snapshot::copy_path(root, rel, &snapshot, limits, &mut budget, is_link)?;
+    let candidates = walk_clone(mirror, root, &rules, &base, limits, &mut budget).await?;
+
+    // The private snapshot: every candidate copied with descriptor-
+    // relative, no-follow operations and read limits (snapshot.rs).
+    for (rel, gitlink) in &candidates {
+        super::snapshot::copy_path(root, rel, &snapshot, limits, &mut budget, *gitlink)?;
     }
 
     // git add reads only the snapshot.
@@ -668,12 +667,6 @@ async fn import_in(
     install_pack(mirror, &scratch.join("objects")).await?;
     mirror_ok(mirror, &["update-ref", &item_ref(item), &sha]).await?;
     Ok(Some(sha))
-}
-
-/// NUL-separated paths of `ls-files -z`, kept as bytes (a name that is not
-/// UTF-8 is not changed).
-fn split_paths(listed: &[u8]) -> Vec<&[u8]> {
-    listed.split(|b| *b == 0).filter(|p| !p.is_empty()).collect()
 }
 
 /// Every loose object id in an object directory.
@@ -739,32 +732,170 @@ async fn install_pack(mirror: &Path, objects: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Refuse a FIFO, socket or device file anywhere under `root` (symlinks
-/// are not followed; `.git` directories are skipped). The walk stops after
-/// `max_entries` entries.
-fn special_files(root: &Path, max_entries: usize) -> Result<()> {
-    use std::os::unix::fs::FileTypeExt;
-    let mut stack = vec![root.to_path_buf()];
-    let mut seen = 0usize;
-    while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).with_context(|| format!("reading {}", d.display()))? {
-            let e = e?;
-            seen += 1;
-            if seen > max_entries {
-                refuse!("the clone has more than {max_entries} entries on disk; nothing was imported");
+/// The paths of the base tree: tracked files and links, their parent
+/// directories, and submodule paths.
+struct BaseTree {
+    tracked: std::collections::HashSet<Vec<u8>>,
+    dirs: std::collections::HashSet<Vec<u8>>,
+    gitlinks: std::collections::HashSet<Vec<u8>>,
+}
+
+impl BaseTree {
+    /// From `ls-tree -r -z` output (records `mode type id\tpath`).
+    fn parse(listing: &[u8]) -> BaseTree {
+        let mut t = BaseTree { tracked: Default::default(), dirs: Default::default(), gitlinks: Default::default() };
+        for rec in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let Some(tab) = rec.iter().position(|b| *b == b'\t') else { continue };
+            let (head, path) = (&rec[..tab], rec[tab + 1..].to_vec());
+            if head.starts_with(b"160000 ") {
+                t.gitlinks.insert(path.clone());
             }
-            let t = e.file_type()?; // does not follow symlinks
-            let rel = e.path().strip_prefix(root).map(|p| p.display().to_string()).unwrap_or_default();
-            if t.is_dir() {
-                if e.file_name() != ".git" {
-                    stack.push(e.path());
+            let mut end = path.len();
+            while let Some(p) = path[..end].iter().rposition(|b| *b == b'/') {
+                t.dirs.insert(path[..p].to_vec());
+                end = p;
+            }
+            t.tracked.insert(path);
+        }
+        t
+    }
+}
+
+fn join_rel(parent: &[u8], name: &[u8]) -> Vec<u8> {
+    if parent.is_empty() {
+        name.to_vec()
+    } else {
+        [parent, b"/", name].concat()
+    }
+}
+
+/// Walk the clone and return the paths to import (with a flag for base
+/// submodule directories). See [`import`].
+async fn walk_clone(
+    mirror: &Path,
+    root: &std::os::fd::OwnedFd,
+    rules: &Path,
+    base: &BaseTree,
+    limits: &ImportLimits,
+    budget: &mut super::snapshot::Budget,
+) -> Result<Vec<(Vec<u8>, bool)>> {
+    use super::snapshot::Kind;
+    use std::os::unix::ffi::OsStrExt;
+    let max_entries = limits.max_files.saturating_mul(50).max(100_000);
+    let mut seen = 0usize;
+    let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
+    // (directory, whether only base-tracked paths are kept below it)
+    let mut level: Vec<(Vec<u8>, bool)> = vec![(Vec::new(), false)];
+    while !level.is_empty() {
+        let mut children: Vec<(Vec<u8>, Kind, bool, bool)> = Vec::new(); // rel, kind, tracked_only parent, is repo dir
+        for (dir, tracked_only) in &level {
+            let fd = super::snapshot::open_rel_dir(root, dir)?;
+            let (entries, _) = super::snapshot::read_entries(&fd)?;
+            for (name, kind) in entries {
+                seen += 1;
+                if seen > max_entries {
+                    refuse!("the clone has more than {max_entries} entries on disk; nothing was imported");
                 }
-            } else if t.is_fifo() || t.is_socket() || t.is_block_device() || t.is_char_device() {
-                refuse!("{rel} is not a regular file or a symlink (a FIFO, socket or device); nothing was imported");
+                let rel = join_rel(dir, &name);
+                if name == b".gitignore" && kind == Kind::File && !tracked_only {
+                    super::snapshot::copy_ignore_file(&fd, &rel, &rules.join(std::ffi::OsStr::from_bytes(&rel)), limits.max_ignore_bytes, limits, budget)?;
+                }
+                let mut repo = false;
+                if kind == Kind::Dir {
+                    std::fs::create_dir_all(rules.join(std::ffi::OsStr::from_bytes(&rel)))?;
+                    let sub = super::snapshot::open_rel_dir(root, &rel)?;
+                    repo = super::snapshot::read_entries(&sub)?.1;
+                }
+                children.push((rel, kind, *tracked_only, repo));
             }
         }
+        let asked: Vec<&[u8]> = children.iter().filter(|c| !c.2).map(|c| c.0.as_slice()).collect();
+        let ignored = check_ignore(mirror, rules, &asked).await?;
+        let mut next = Vec::new();
+        for (rel, kind, tracked_only, repo) in children {
+            let is_ignored = tracked_only || ignored.contains(&rel);
+            let tracked = base.tracked.contains(&rel);
+            match kind {
+                Kind::Dir if base.gitlinks.contains(&rel) => out.push((rel, true)),
+                Kind::Dir => {
+                    let holds_tracked = base.dirs.contains(&rel);
+                    if is_ignored && !holds_tracked {
+                        continue;
+                    }
+                    if repo {
+                        refuse!("the clone contains a nested repository at {}; Nucleus does not publish one", String::from_utf8_lossy(&rel));
+                    }
+                    next.push((rel, is_ignored));
+                }
+                Kind::File | Kind::Symlink => {
+                    if !is_ignored || tracked {
+                        out.push((rel, false));
+                    }
+                }
+                Kind::Special => {
+                    if !is_ignored || tracked {
+                        refuse!("{} is not a regular file or a symlink (a FIFO, socket or device); nothing was imported", String::from_utf8_lossy(&rel));
+                    }
+                }
+            }
+            if out.len() > limits.max_files {
+                refuse!("the clone has more than {} files; nothing was imported", limits.max_files);
+            }
+        }
+        level = next;
     }
-    Ok(())
+    Ok(out)
+}
+
+/// The paths among `paths` that the ignore files in `rules` exclude
+/// (`git check-ignore --no-index --stdin -z`, pinned git, trusted
+/// configuration, no global excludes file). Directories exist in `rules` as
+/// empty directories so that directory-only patterns apply. Input is
+/// written and output read concurrently; the output is capped by the input
+/// size.
+async fn check_ignore(mirror: &Path, rules: &Path, paths: &[&[u8]]) -> Result<std::collections::HashSet<Vec<u8>>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if paths.is_empty() {
+        return Ok(Default::default());
+    }
+    let input: Vec<u8> = paths.iter().flat_map(|p| p.iter().copied().chain(std::iter::once(0))).collect();
+    let cap = input.len() + 4096;
+    let mut cmd = git_command(
+        mirror,
+        &[format!("--git-dir={}", mirror.display()), format!("--work-tree={}", rules.display())],
+        &["check-ignore", "--no-index", "--stdin", "-z"],
+        &[],
+    )?;
+    cmd.current_dir(rules).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().context("running git check-ignore")?;
+    let mut stdin = child.stdin.take().context("no stdin")?;
+    let writer = tokio::spawn(async move {
+        let r = stdin.write_all(&input).await;
+        drop(stdin);
+        r
+    });
+    let mut stdout = child.stdout.take().context("no stdout")?;
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 1 << 16];
+    loop {
+        let n = stdout.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > cap {
+            let _ = child.kill().await;
+            bail!("git check-ignore printed more than it was given");
+        }
+    }
+    let _ = writer.await;
+    let out = child.wait_with_output().await?;
+    // Exit 1: no path is ignored.
+    match out.status.code() {
+        Some(0) | Some(1) => {}
+        _ => bail!("git check-ignore failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+    }
+    Ok(buf.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| p.to_vec()).collect())
 }
 
 /// Submodule entries (mode 160000) of `ls-tree -r -z` (`tree` true) or
@@ -1111,7 +1242,7 @@ mod tests {
         (d, root, remote)
     }
 
-    const LIMITS: ImportLimits = ImportLimits { max_files: 1000, max_file_bytes: 1 << 20, max_total_bytes: 8 << 20 };
+    const LIMITS: ImportLimits = ImportLimits { max_files: 1000, max_file_bytes: 1 << 20, max_total_bytes: 8 << 20, max_ignore_bytes: 1 << 16 };
 
     fn object_files(mirror: &Path) -> usize {
         walk_files(&mirror.join("objects")).unwrap().len()
@@ -1294,7 +1425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_snapshot_refuses_hard_links_and_symlinked_parents() {
+    async fn the_snapshot_refuses_hard_links_and_never_follows_symlinks() {
         let (_d, root, remote) = fixture();
         let seed = root.join("seed");
         sh(&seed, "mkdir dir && echo f > dir/f.txt && git add dir && git commit -qm dir && git push -q origin HEAD:main");
@@ -1308,12 +1439,63 @@ mod tests {
         let e = import(&mirror, &remote, &wt, &base, 8, &spec(), &LIMITS).await.unwrap_err();
         assert!(e.downcast_ref::<ImportRefused>().unwrap().0.contains("linked.txt has more than one hard link"), "{e:#}");
         std::fs::remove_file(wt.join("linked.txt")).unwrap();
-        // A tracked directory replaced by a symlink to elsewhere.
+        // A tracked directory replaced by a symlink to elsewhere: stored as a
+        // symlink, never followed (nothing from the target is read).
         std::fs::remove_dir_all(wt.join("dir")).unwrap();
         std::os::unix::fs::symlink(&seed, wt.join("dir")).unwrap();
-        let e = import(&mirror, &remote, &wt, &base, 8, &spec(), &LIMITS).await.unwrap_err();
+        let sha = import(&mirror, &remote, &wt, &base, 8, &spec(), &LIMITS).await.unwrap().unwrap();
+        assert!(out(&mirror, &["--git-dir=.", "ls-tree", &sha, "dir"]).starts_with("120000 "));
+        let all = out(&mirror, &["--git-dir=.", "ls-tree", "-r", "--name-only", &sha]);
+        assert!(!all.contains("dir/"), "{all}");
+    }
+
+    #[tokio::test]
+    async fn a_huge_sparse_gitignore_is_refused_without_being_parsed() {
+        let (_d, root, remote) = fixture();
+        let work = root.join("work");
+        let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
+        let wt = worktree_path(&work, "acme/widget", 12);
+        let (base, _) = prepare_clone(&mirror, &wt, "main", 12, Some("nucleus/item-12")).await.unwrap();
+        std::fs::create_dir_all(wt.join("deep")).unwrap();
+        std::fs::File::create(wt.join("deep/.gitignore")).unwrap().set_len(4 << 30).unwrap();
+        let started = std::time::Instant::now();
+        let e = import(&mirror, &remote, &wt, &base, 12, &spec(), &LIMITS).await.unwrap_err();
         let why = e.downcast_ref::<ImportRefused>().map(|r| r.0.clone()).unwrap_or_else(|| format!("{e:#}"));
-        assert!(why.contains("symlink") || why.contains("dir"), "{why}");
+        assert!(why.contains("deep/.gitignore") && why.contains("per-file limit"), "{why}");
+        assert!(started.elapsed() < Duration::from_secs(10), "refused quickly: {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn ignore_rules_match_git_and_tracked_files_stay() {
+        let (_d, root, remote) = fixture();
+        let seed = root.join("seed");
+        // The base tracks vendor.log although *.log is ignored.
+        sh(&seed, "printf '*.log\\n!keep.log\\nbuild/\\n' > .gitignore && echo v1 > vendor.log && git add .gitignore && git add -f vendor.log && git commit -qm rules && git push -q origin HEAD:main");
+        let work = root.join("work");
+        let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
+        let wt = worktree_path(&work, "acme/widget", 13);
+        let (base, _) = prepare_clone(&mirror, &wt, "main", 13, Some("nucleus/item-13")).await.unwrap();
+        sh(
+            &wt,
+            "echo a > a.log && echo k > keep.log && mkdir -p sub build/inner && printf 'secret.txt\\n' > sub/.gitignore \
+             && echo s > sub/secret.txt && echo o > sub/ok.txt && echo b > build/out.bin && mkfifo build/inner/pipe \
+             && echo v2 > vendor.log",
+        );
+        // What git itself would add, for comparison.
+        let git_view = std::process::Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        let mut expected: Vec<String> = String::from_utf8_lossy(&git_view.stdout).lines().map(str::to_string).collect();
+        expected.push("vendor.log".into());
+        expected.sort();
+        let sha = import(&mirror, &remote, &wt, &base, 13, &spec(), &LIMITS).await.unwrap().unwrap();
+        let mut changed = changed_files(&mirror, &base, &sha).await.unwrap();
+        changed.sort();
+        assert_eq!(changed, expected, "the same files git would add, plus the tracked vendor.log");
+        assert_eq!(changed, ["keep.log", "sub/.gitignore", "sub/ok.txt", "vendor.log"]);
+        assert_eq!(out(&mirror, &["--git-dir=.", "show", &format!("{sha}:vendor.log")]), "v2\n", "a tracked file matching a rule is imported");
     }
 
     #[tokio::test]
@@ -1369,8 +1551,9 @@ mod tests {
         let (_d, root, remote) = fixture();
         let seed = root.join("seed");
         // Listing keeps bytes whatever the file system allows.
-        let listed = b"a.txt\0caf\xe9.txt\0dir/\xff\xfe\0";
-        assert_eq!(split_paths(listed), [&b"a.txt"[..], &b"caf\xe9.txt"[..], &b"dir/\xff\xfe"[..]]);
+        let listed = b"100644 blob 0123\ta.txt\0100644 blob 4567\tdir/caf\xe9.txt\0";
+        let t = BaseTree::parse(listed);
+        assert!(t.tracked.contains(&b"dir/caf\xe9.txt"[..].to_vec()) && t.dirs.contains(&b"dir"[..].to_vec()));
         assert_eq!(crate::intake::snapshot::dest_of(Path::new("/s"), b"caf\xe9.txt").as_os_str().as_bytes(), b"/s/caf\xe9.txt");
         let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
         if let Err(e) = std::fs::write(seed.join(name), "latin-1 name\n") {

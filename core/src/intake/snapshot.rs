@@ -159,6 +159,95 @@ pub fn copy_path(root: &OwnedFd, rel: &[u8], dest_root: &Path, limits: &ImportLi
     }
 }
 
+/// Open the directory `rel` (bytes, `/`-separated; empty for the root)
+/// below `root`, one component at a time with `O_NOFOLLOW`. A component
+/// that is a symlink or not a directory is refused.
+pub fn open_rel_dir(root: &OwnedFd, rel: &[u8]) -> Result<OwnedFd> {
+    let mut cur = open_dir(root, b".").context("opening the clone")?;
+    for d in rel.split(|b| *b == b'/').filter(|p| !p.is_empty()) {
+        cur = match open_dir(&cur, d) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::NOTDIR) => {
+                refuse!("{} is a symlink or not a directory; nothing was imported", show(rel))
+            }
+            Err(e) => return Err(e).with_context(|| format!("opening {}", show(rel))),
+        };
+    }
+    Ok(cur)
+}
+
+/// What the walk found in one directory entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Dir,
+    File,
+    Symlink,
+    Special,
+}
+
+/// The entries of directory `dir` (names as bytes; `.`, `..` and `.git`
+/// left out), each with its type from `statat` without following symlinks,
+/// and whether the directory holds a `.git` entry (a repository).
+pub fn read_entries(dir: &OwnedFd) -> Result<(Vec<(Vec<u8>, Kind)>, bool)> {
+    let mut out = Vec::new();
+    let mut has_git = false;
+    let mut d = rustix::fs::Dir::read_from(dir)?;
+    while let Some(e) = d.read() {
+        let e = e?;
+        let name = e.file_name().to_bytes().to_vec();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if name == b".git" {
+            has_git = true;
+            continue;
+        }
+        let st = match rustix::fs::statat(dir, OsStr::from_bytes(&name), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => st,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(e) => return Err(e).context("reading a directory entry"),
+        };
+        let kind = match FileType::from_raw_mode(st.st_mode) {
+            FileType::Directory => Kind::Dir,
+            FileType::Symlink => Kind::Symlink,
+            FileType::RegularFile => Kind::File,
+            _ => Kind::Special,
+        };
+        out.push((name, kind));
+    }
+    Ok((out, has_git))
+}
+
+/// Copy the ignore file `name` of directory `dir` (at `rel` in the clone)
+/// into the rules directory, with its own byte limit (`max`), counted
+/// toward the total budget. Checked on the opened descriptor: a regular
+/// file with one hard link.
+pub fn copy_ignore_file(dir: &OwnedFd, rel: &[u8], dest: &Path, max: u64, limits: &ImportLimits, budget: &mut Budget) -> Result<()> {
+    let name = rel.rsplit(|b| *b == b'/').next().unwrap_or(rel);
+    let fd = match rustix::fs::openat(
+        dir,
+        OsStr::from_bytes(name),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(e) => refuse!("{} cannot be opened as a regular file ({e}); nothing was imported", show(rel)),
+    };
+    let fst = rustix::fs::fstat(&fd)?;
+    if FileType::from_raw_mode(fst.st_mode) != FileType::RegularFile || fst.st_nlink > 1 {
+        refuse!("{} is not a regular file with one link; nothing was imported", show(rel));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let out = std::fs::File::create(dest)?;
+    let left = limits.max_total_bytes.saturating_sub(budget.bytes);
+    let n = copy_limited(std::fs::File::from(fd), &out, rel, max, left)?;
+    budget.bytes = budget.bytes.checked_add(n).context("byte count overflow")?;
+    Ok(())
+}
+
 /// Open the clone's root directory (refused when it is a symlink).
 pub fn open_root(wt: &Path) -> Result<OwnedFd> {
     rustix::fs::openat(rustix::fs::CWD, wt, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
@@ -194,7 +283,7 @@ mod tests {
         std::os::unix::fs::symlink(&long, clone.join("long")).unwrap();
         std::os::unix::fs::symlink("short", clone.join("short")).unwrap();
         let root = open_root(&clone).unwrap();
-        let limits = ImportLimits { max_files: 10, max_file_bytes: 500, max_total_bytes: 1000 };
+        let limits = ImportLimits { max_files: 10, max_file_bytes: 500, max_total_bytes: 1000, max_ignore_bytes: 100 };
         let mut b = Budget { files: 0, bytes: 0 };
         let e = copy_path(&root, b"long", &snap, &limits, &mut b, false).unwrap_err();
         assert!(e.downcast_ref::<ImportRefused>().unwrap().0.contains("longer than the per-file limit"));
