@@ -120,20 +120,31 @@ pub struct PartLock {
     _file: std::fs::File,
 }
 
-/// Take lock `name` without waiting; `None` when another process holds it.
+/// Take lock `name`; `None` when another process holds it. A few short
+/// retries (about 200 ms in total) absorb a lock that only looks held: a
+/// child process this process is starting holds a copy of every descriptor
+/// between its fork and its exec (close-on-exec closes it then).
 pub fn try_lock(ws: &Path, name: &str) -> Result<Option<PartLock>> {
     let dir = ws.join("memory/intake-locks");
     std::fs::create_dir_all(&dir)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(format!("{name}.lock")))?;
-    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(PartLock { _file: file })),
-        Err(e) if e == rustix::io::Errno::WOULDBLOCK || e == rustix::io::Errno::AGAIN => Ok(None),
-        Err(e) => Err(anyhow!("locking {name}: {e}")),
+    for attempt in 0..20 {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{name}.lock")))?;
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(Some(PartLock { _file: file })),
+            Err(e) if e == rustix::io::Errno::WOULDBLOCK || e == rustix::io::Errno::AGAIN => {
+                drop(file);
+                if attempt < 19 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            Err(e) => return Err(anyhow!("locking {name}: {e}")),
+        }
     }
+    Ok(None)
 }
 
 // ── tick ─────────────────────────────────────────────────────────────────
