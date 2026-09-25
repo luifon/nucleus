@@ -826,22 +826,45 @@ pub async fn added_text(mirror: &Path, base_sha: &str, sha: &str, max_bytes: usi
         return Ok(None);
     };
     let diff = String::from_utf8_lossy(&raw);
+    let mut out = diff_additions(&diff);
+    // The whole bounded diff goes to the guard as well (removed lines
+    // included), so a parsing mistake cannot hide an added line.
+    out.push_str("\n--- full diff ---\n");
+    out.push_str(&diff);
+    Ok(Some(out))
+}
+
+/// The file names and added lines of a `git diff -U0` text. `---` / `+++`
+/// are file headers only outside a hunk (after `diff --git`, before the
+/// first `@@`); inside a hunk every line starting with `+` is an added line,
+/// including one whose content starts with `++`.
+pub fn diff_additions(diff: &str) -> String {
     let mut out = String::new();
+    let mut in_hunk = false;
     for l in diff.lines() {
-        if let Some(path) = l.strip_prefix("--- a/") {
-            out.push_str("file: ");
-            out.push_str(path);
-            out.push('\n');
-        } else if let Some(path) = l.strip_prefix("+++ b/") {
-            out.push_str("file: ");
-            out.push_str(path);
-            out.push('\n');
-        } else if l.starts_with('+') && !l.starts_with("+++") {
-            out.push_str(&l[1..]);
+        if l.starts_with("diff --git ") {
+            in_hunk = false;
+            continue;
+        }
+        if !in_hunk {
+            if let Some(path) = l.strip_prefix("--- a/").or_else(|| l.strip_prefix("+++ b/")) {
+                out.push_str("file: ");
+                out.push_str(path);
+                out.push('\n');
+            } else if l.starts_with("@@") {
+                in_hunk = true;
+            }
+            continue;
+        }
+        if l.starts_with("@@") {
+            continue;
+        }
+        if let Some(added) = l.strip_prefix('+') {
+            out.push_str(added);
             out.push('\n');
         }
     }
-    Ok(Some(out))
+    out
 }
 
 /// Refuse to push to anything but the item's own branch
@@ -1203,6 +1226,17 @@ mod tests {
         sh(&wt, "mkdir vendor && cd vendor && git init -q && git -c user.email=a@example.invalid -c user.name=A commit -q --allow-empty -m v");
         let e = import(&mirror, &remote, &wt, &base, 7, &spec(), &LIMITS).await.unwrap_err();
         assert!(format!("{e:#}").contains("nested repository at vendor"), "{e:#}");
+    }
+
+    #[test]
+    fn added_lines_starting_with_plus_plus_are_kept() {
+        let diff = "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n-old\n+++HIDDEN\n+normal\n\
+                    diff --git a/y b/y\nnew file mode 100644\n--- /dev/null\n+++ b/y\n@@ -0,0 +1 @@\n+--- a/fake\n";
+        let out = diff_additions(diff);
+        assert!(out.contains("file: x\n") && out.contains("file: y\n"), "{out}");
+        assert!(out.contains("\n++HIDDEN\n") && out.contains("\nnormal\n"), "{out}");
+        assert!(out.contains("--- a/fake"), "an added line that looks like a header is an added line: {out}");
+        assert!(!out.contains("old"), "{out}");
     }
 
     #[test]

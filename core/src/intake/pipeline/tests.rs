@@ -1312,3 +1312,17 @@ async fn limits_block_the_item_with_a_clear_reason() {
     assert!(it.error.unwrap().contains("scan_max_bytes"));
     assert!(!remote_has(&f, "nucleus/item-1"));
 }
+
+#[tokio::test]
+async fn an_added_line_starting_with_plus_plus_is_scanned() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("notes.txt"), "++FAKE-SECRET-VALUE\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!(it.stage(), Stage::Blocked, "{:?}", it.error);
+    assert!(!remote_has(&f, "nucleus/item-1"));
+}
