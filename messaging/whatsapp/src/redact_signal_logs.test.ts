@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import util from "node:util";
-import { execFileSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
@@ -115,31 +115,108 @@ test("key-named fields outside a block are redacted; other lines are not touched
   assert.equal(out.split("\n")[2], "keyboard: <Buffer 01>");
 });
 
-test("the CLI: dry run reports and writes nothing; the real run rewrites in place (same inode) and is idempotent", () => {
+function workspace() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nucleus-redact-"));
   fs.mkdirSync(path.join(root, "memory"));
   const { text, secrets } = syntheticLog();
   const files = ["whatsapp.log", "whatsapp.log.0"].map((n) => path.join(root, "memory", n));
-  for (const f of files) fs.writeFileSync(f, text);
+  for (const f of files) fs.writeFileSync(f, text, { mode: 0o640 });
+  for (const f of files) fs.chmodSync(f, 0o640);
   fs.writeFileSync(path.join(root, "memory", "other.log"), text);
-  const env = { ...process.env, NUCLEUS_WORKSPACE_ROOT: root };
-  const inode = fs.statSync(files[0]).ino;
+  return { root, text, secrets, files, env: { ...process.env, NUCLEUS_WORKSPACE_ROOT: root } };
+}
 
-  const dry = execFileSync(process.execPath, [SCRIPT, "--dry-run"], { env, encoding: "utf8" });
-  assert.match(dry, /\[dry-run\] total: 2 files, 6 session blocks/);
-  for (const f of files) assert.equal(fs.readFileSync(f, "utf8"), text, "dry run wrote nothing");
+/** Run the script; returns exit status and output instead of throwing. */
+function run(args: string[], env: NodeJS.ProcessEnv) {
+  const r = spawnSync(process.execPath, [SCRIPT, ...args], { env, encoding: "utf8" });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
 
-  const real = execFileSync(process.execPath, [SCRIPT], { env, encoding: "utf8" });
-  assert.match(real, /rewritten/);
-  for (const f of files) {
+test("the CLI: dry run writes nothing; the real run replaces each file (temp + rename, mode kept) and is idempotent", () => {
+  const w = workspace();
+  const dry = run(["--dry-run"], w.env);
+  assert.equal(dry.status, 0);
+  assert.match(dry.stdout, /\[dry-run\] total: 2 files, 6 session blocks/);
+  for (const f of w.files) assert.equal(fs.readFileSync(f, "utf8"), w.text, "dry run wrote nothing");
+
+  const real = run([], w.env);
+  assert.equal(real.status, 0, real.stderr);
+  assert.match(real.stdout, /rewritten/);
+  for (const f of w.files) {
     const out = fs.readFileSync(f, "utf8");
-    for (const s of secrets) assert.ok(!out.includes(s));
+    for (const s of w.secrets) assert.ok(!out.includes(s));
     assert.ok(out.includes(PINO_B));
+    assert.equal(fs.statSync(f).mode & 0o777, 0o640, "mode preserved");
   }
-  assert.equal(fs.statSync(files[0]).ino, inode, "same file: an open descriptor keeps working");
-  assert.equal(fs.readFileSync(path.join(root, "memory", "other.log"), "utf8"), text, "only whatsapp.log*");
+  assert.deepEqual(
+    fs.readdirSync(path.join(w.root, "memory")).filter((n) => n.includes("redact")),
+    [],
+    "no temp file left behind",
+  );
+  assert.equal(fs.readFileSync(path.join(w.root, "memory", "other.log"), "utf8"), w.text, "only whatsapp.log*");
 
-  const second = execFileSync(process.execPath, [SCRIPT], { env, encoding: "utf8" });
-  assert.match(second, /total: 2 files, 6 session blocks, 0 key values, 0 lines changed/);
-  assert.match(second, /— unchanged/);
+  const second = run([], w.env);
+  assert.match(second.stdout, /total: 2 files, 6 session blocks, 0 key values, 0 lines changed/);
+  assert.match(second.stdout, /— unchanged/);
 });
+
+test("a file open for writing by another process is refused (pid named, nothing written) unless --force", async () => {
+  const w = workspace();
+  // A child process holding whatsapp.log open for append, as the bot's stdout is.
+  const holder = spawn(
+    process.execPath,
+    ["-e", `require("fs").openSync(${JSON.stringify(w.files[0])}, "a"); console.log("ready"); setInterval(() => {}, 1000);`],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
+  try {
+    await new Promise<void>((resolve, reject) => {
+      holder.stdout!.once("data", () => resolve());
+      holder.once("error", reject);
+    });
+    const refused = run([], w.env);
+    assert.equal(refused.status, 3);
+    assert.match(refused.stderr, new RegExp(`refused: .*whatsapp\\.log is open for writing by pid ${holder.pid}`));
+    assert.match(refused.stderr, /Nothing was written/);
+    for (const f of w.files) assert.equal(fs.readFileSync(f, "utf8"), w.text, "no file was touched, not even the free one");
+
+    const dry = run(["--dry-run"], w.env);
+    assert.equal(dry.status, 0);
+    assert.match(dry.stderr, new RegExp(`warning: .*pid ${holder.pid}`));
+
+    const forced = run(["--force"], w.env);
+    assert.equal(forced.status, 0, forced.stderr);
+    for (const s of w.secrets) assert.ok(!fs.readFileSync(w.files[0], "utf8").includes(s));
+  } finally {
+    holder.kill();
+  }
+});
+
+test("lsof unavailable: every file counts as open and the run is refused", () => {
+  const w = workspace();
+  const r = run([], { ...w.env, NUCLEUS_LSOF: "/nonexistent/lsof" });
+  assert.equal(r.status, 3);
+  assert.match(r.stderr, /cannot check for writers/);
+  for (const f of w.files) assert.equal(fs.readFileSync(f, "utf8"), w.text);
+});
+
+test("a file that changes while it is processed is left as it was", () => {
+  const w = workspace();
+  assert.throws(
+    () => mod.processFile(w.files[0], { dryRun: false, beforeRename: () => fs.appendFileSync(w.files[0], "late line\n") }),
+    /changed while it was processed/,
+  );
+  assert.equal(fs.readFileSync(w.files[0], "utf8"), w.text + "late line\n", "the appended line survives");
+  assert.deepEqual(fs.readdirSync(path.join(w.root, "memory")).filter((n) => n.includes("redact")), []);
+});
+
+test("writersOf parses lsof field output: only w/u access counts", () => {
+  const w = workspace();
+  // A fake lsof printing a reader and a writer.
+  const fake = path.join(w.root, "fake-lsof.sh");
+  fs.writeFileSync(fake, "#!/bin/sh\nprintf 'p100\\ncreader\\nf3\\nar\\np200\\ncwriter\\nf1\\naw\\np300\\ncboth\\nf4\\nau\\n'\n", { mode: 0o755 });
+  assert.deepEqual(mod.writersOf(w.files[0], fake), [
+    { pid: 200, command: "writer" },
+    { pid: 300, command: "both" },
+  ]);
+});
+

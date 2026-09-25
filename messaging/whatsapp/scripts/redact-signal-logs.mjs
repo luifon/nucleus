@@ -17,21 +17,28 @@
 // Usage (from the workspace root):
 //   node messaging/whatsapp/scripts/redact-signal-logs.mjs --dry-run
 //   node messaging/whatsapp/scripts/redact-signal-logs.mjs
-//   node messaging/whatsapp/scripts/redact-signal-logs.mjs [--dry-run] <file>...
+//   node messaging/whatsapp/scripts/redact-signal-logs.mjs [--dry-run] [--force] <file>...
 //
 // With no files: $NUCLEUS_WORKSPACE_ROOT/memory/whatsapp.log and
 // whatsapp.log.<n> (the workspace root defaults to three levels above this
 // script). --dry-run reports the counts and writes nothing.
 //
-// Files are rewritten in place (same inode): the running bot keeps its file
-// descriptor, and no copy with the keys is left behind. A file that grows
-// while it is processed is read again, up to 5 times. Lines the bot appends
-// in the moment between the last read and the write can be lost, so run it
-// while the bot is stopped when possible. Running it twice changes nothing
-// the second time.
+// A file that any process has open for writing (lsof; the running bot's
+// stdout is one of these files) is refused: the script exits 3, names the
+// file and the pid, and writes nothing. Stop the bot first. --force replaces
+// the file anyway; the writing process then writes to the old, deleted file
+// until it reopens its log. If lsof cannot run, every file counts as open.
+//
+// Each file is written to a temp file in the same directory, with the same
+// mode, and renamed over the original, so no partial file ever exists. The
+// rename happens only if the file's size and modification time did not
+// change while it was processed; otherwise the file is left as it was and
+// the script exits 1. The old file content is not kept anywhere. Running the
+// script twice changes nothing the second time.
 
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const MARK = "[redacted]";
@@ -122,32 +129,70 @@ export function defaultFiles(workspaceRoot) {
     .map((n) => path.join(dir, n));
 }
 
-/** Process one file. Writes in place (same inode) unless dryRun. */
-export function processFile(file, { dryRun }) {
-  for (let round = 0; round < 5; round++) {
-    const before = fs.readFileSync(file);
-    const text = before.toString("utf8");
-    const { text: redacted, stats } = redactText(text);
-    if (dryRun || redacted === text) return { file, written: false, ...stats };
-    const fd = fs.openSync(file, "r+");
+
+/** Processes that have `file` open for writing, from `lsof -F pan`
+ *  (macOS/BSD field output: p<pid>, c<command>, a<access r|w|u>).
+ *  Throws when lsof cannot run: the caller refuses unless --force. */
+export function writersOf(file, lsof = "lsof") {
+  const res = spawnSync(lsof, ["-F", "pca", "--", file], { encoding: "utf8" });
+  if (res.error) throw new Error(`cannot run ${lsof}: ${res.error.message}`);
+  // lsof exits 1 when no process has the file open.
+  if (res.status !== 0 && res.status !== 1) throw new Error(`${lsof} failed (exit ${res.status}): ${res.stderr.trim()}`);
+  const writers = [];
+  let pid = null;
+  let command = "";
+  for (const line of res.stdout.split("\n")) {
+    const tag = line[0];
+    const val = line.slice(1);
+    if (tag === "p") {
+      pid = Number(val);
+      command = "";
+    } else if (tag === "c") {
+      command = val;
+    } else if (tag === "a" && (val === "w" || val === "u") && pid !== null) {
+      if (!writers.some((w) => w.pid === pid)) writers.push({ pid, command });
+    }
+  }
+  return writers;
+}
+
+/** Process one file. Unless dryRun, writes the redacted text to a temp file
+ *  in the same directory with the same mode and renames it over the file,
+ *  only when the file's size and mtime did not change while it was
+ *  processed (a file that changed is left as it was, and an error is
+ *  thrown). */
+export function processFile(file, { dryRun, beforeRename }) {
+  const before = fs.statSync(file);
+  const text = fs.readFileSync(file, "utf8");
+  const { text: redacted, stats } = redactText(text);
+  if (dryRun || redacted === text) return { file, written: false, ...stats };
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.redact-${process.pid}.tmp`);
+  try {
+    fs.writeFileSync(tmp, redacted, { mode: before.mode & 0o7777, flag: "wx" });
+    fs.chmodSync(tmp, before.mode & 0o7777);
+    const fd = fs.openSync(tmp, "r");
     try {
-      // Grown since the read: process the whole file again.
-      if (fs.fstatSync(fd).size !== before.length) continue;
-      const buf = Buffer.from(redacted, "utf8");
-      fs.writeSync(fd, buf, 0, buf.length, 0);
-      fs.ftruncateSync(fd, buf.length);
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
     }
-    return { file, written: true, ...stats };
+    beforeRename?.(); // test hook: simulate a write during processing
+    const after = fs.statSync(file);
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ino !== before.ino) {
+      throw new Error(`${file} changed while it was processed; nothing written — stop the writer and run again`);
+    }
+    fs.renameSync(tmp, file);
+  } finally {
+    fs.rmSync(tmp, { force: true });
   }
-  throw new Error(`${file}: kept growing while it was processed; stop the bot and run again`);
+  return { file, written: true, ...stats };
 }
 
 function main(argv) {
+  const known = new Set(["--dry-run", "--force"]);
   const dryRun = argv.includes("--dry-run");
-  const unknown = argv.filter((a) => a.startsWith("--") && a !== "--dry-run");
+  const force = argv.includes("--force");
+  const unknown = argv.filter((a) => a.startsWith("--") && !known.has(a));
   if (unknown.length) {
     console.error(`unknown option(s): ${unknown.join(" ")}`);
     process.exit(2);
@@ -160,17 +205,54 @@ function main(argv) {
     console.error("no log files found");
     process.exit(1);
   }
-  const totals = { blocks: 0, truncatedBlocks: 0, values: 0, linesChanged: 0, lines: 0 };
+
+  // Refuse before writing anything when a process has a file open for
+  // writing: replacing the file would send that process's later lines to
+  // the old, deleted file.
+  const busy = [];
   for (const f of files) {
-    const r = processFile(f, { dryRun });
+    let writers;
+    try {
+      writers = writersOf(f, process.env.NUCLEUS_LSOF ?? "lsof");
+    } catch (e) {
+      busy.push({ file: f, detail: `${e.message} (cannot check for writers)` });
+      continue;
+    }
+    if (writers.length) {
+      busy.push({ file: f, detail: `open for writing by ${writers.map((w) => `pid ${w.pid}${w.command ? ` (${w.command})` : ""}`).join(", ")}` });
+    }
+  }
+  for (const b of busy) {
+    const prefix = dryRun ? "[dry-run] warning: " : force ? "warning (--force): " : "refused: ";
+    console.error(`${prefix}${b.file} is ${b.detail}`);
+  }
+  if (busy.length && !dryRun && !force) {
+    console.error(
+      "Nothing was written. Stop the process that writes the file (for the bot: its launchd service) and run again, or pass --force to replace the file anyway (that process then writes to the old, deleted file until it reopens it).",
+    );
+    process.exit(3);
+  }
+
+  const totals = { blocks: 0, truncatedBlocks: 0, values: 0, linesChanged: 0, lines: 0 };
+  let failed = 0;
+  for (const f of files) {
+    let r;
+    try {
+      r = processFile(f, { dryRun });
+    } catch (e) {
+      failed += 1;
+      console.error(`error: ${e.message}`);
+      continue;
+    }
     for (const k of Object.keys(totals)) totals[k] += r[k];
     console.log(
       `${dryRun ? "[dry-run] " : ""}${f}: ${r.blocks} session blocks, ${r.values} key values, ${r.linesChanged} of ${r.lines} lines changed${r.truncatedBlocks ? `, ${r.truncatedBlocks} block(s) cut off at end of file` : ""}${r.written ? " — rewritten" : dryRun ? "" : " — unchanged"}`,
     );
   }
   console.log(
-    `${dryRun ? "[dry-run] " : ""}total: ${files.length} files, ${totals.blocks} session blocks, ${totals.values} key values, ${totals.linesChanged} lines changed`,
+    `${dryRun ? "[dry-run] " : ""}total: ${files.length} files, ${totals.blocks} session blocks, ${totals.values} key values, ${totals.linesChanged} lines changed${failed ? `, ${failed} failed` : ""}`,
   );
+  if (failed) process.exit(1);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
