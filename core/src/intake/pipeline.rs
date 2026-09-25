@@ -160,6 +160,9 @@ pub async fn tick(ctx: &Ctx, force_poll: bool) -> Result<TickReport> {
         if let Err(e) = ingest_whatsapp(ctx).await {
             r.errors.push(format!("reading WhatsApp replies: {e:#}"));
         }
+        if let Err(e) = reconcile_groups(ctx).await {
+            r.errors.push(format!("reconciling WhatsApp groups: {e:#}"));
+        }
     }
     let mut ids: Vec<i64> = store::active_item_ids(&ctx.db).await?;
     ids.extend(cleanup_candidates(&ctx.db).await?);
@@ -1488,13 +1491,45 @@ async fn sync_surface(ctx: &Ctx, item: &Item) -> Result<()> {
             }
         }
     } else if item.surface == "dm" && item.group_requested_at.is_some() && item.group_closed_at.is_none() {
-        // A group created after the thread moved to the DM is not used.
-        if let Some(g) = crate::whatsapp_queue::intake_group(&ctx.wa, &key).await? {
-            if g.status == "active" {
-                crate::whatsapp_queue::request_intake_group(&ctx.wa, &key, "close", None).await?;
-                store::update(&ctx.db, item.id, item.stage(), vec![("group_closed_at", crate::timestamp::now().into())])
-                    .await?;
-            }
+        // A group created after the thread moved to the DM is not used: it
+        // is left (confirmed by the bot, see `settle_group`).
+        settle_group(ctx, item).await?;
+    }
+    Ok(())
+}
+
+/// Make sure the item's group is gone: ask the bot to leave an active (or
+/// still being created) group, and record `group_closed_at` only when the
+/// bot's own table shows the group closed, or shows that none was created.
+async fn settle_group(ctx: &Ctx, item: &Item) -> Result<()> {
+    let key = item.id.to_string();
+    let confirmed = match crate::whatsapp_queue::intake_group(&ctx.wa, &key).await? {
+        Some(g) if g.status == "active" => false,
+        Some(_) => true, // closed, fallback (never created), unknown (the operator was told)
+        None => false,   // the create request is still pending: wait for it
+    };
+    if confirmed {
+        store::update(&ctx.db, item.id, item.stage(), vec![("group_closed_at", crate::timestamp::now().into())]).await?;
+    } else {
+        crate::whatsapp_queue::request_intake_close(&ctx.wa, &key).await?;
+    }
+    Ok(())
+}
+
+/// Active groups whose item is closed, missing or no longer uses its group
+/// (a periodic check, independent of the item's own cleanup): ask the bot
+/// to leave them.
+async fn reconcile_groups(ctx: &Ctx) -> Result<()> {
+    for (key, _jid) in crate::whatsapp_queue::active_intake_groups(&ctx.wa).await? {
+        let stale = match key.parse::<i64>().ok() {
+            Some(n) => match store::item(&ctx.db, n).await {
+                Ok(it) => it.stage().is_terminal() || it.surface == "dm",
+                Err(_) => true,
+            },
+            None => true,
+        };
+        if stale && crate::whatsapp_queue::request_intake_close(&ctx.wa, &key).await? {
+            tracing::info!(item = %key, "intake: asked the bot to leave a group whose item is closed");
         }
     }
     Ok(())
@@ -1554,19 +1589,18 @@ async fn flush_whatsapp(ctx: &Ctx, item: &Item) -> Result<()> {
 async fn cleanup_candidates(db: &SqlitePool) -> Result<Vec<i64>> {
     Ok(sqlx::query_scalar(
         "SELECT id FROM items WHERE stage IN ('closed','cancelled','stale')
-            AND ((surface = 'group' AND group_closed_at IS NULL) OR worktree IS NOT NULL
+            AND ((group_requested_at IS NOT NULL AND group_closed_at IS NULL) OR worktree IS NOT NULL
                  OR EXISTS (SELECT 1 FROM item_messages m WHERE m.item_id = items.id AND m.wa_state IS NULL))",
     )
     .fetch_all(db)
     .await?)
 }
 
-/// A closed or cancelled item: leave its group (after its last messages,
-/// the bot waits for them), remove its worktree.
+/// A closed, cancelled or stale item: leave its group (the bot sends the
+/// last messages first and confirms), remove its clone.
 async fn cleanup(ctx: &Ctx, item: &Item) -> Result<()> {
-    if item.surface == "group" && item.group_closed_at.is_none() {
-        crate::whatsapp_queue::request_intake_group(&ctx.wa, &item.id.to_string(), "close", None).await?;
-        store::update(&ctx.db, item.id, item.stage(), vec![("group_closed_at", crate::timestamp::now().into())]).await?;
+    if item.group_requested_at.is_some() && item.group_closed_at.is_none() {
+        settle_group(ctx, item).await?;
     }
     if let Some(wt) = item.worktree.as_deref().map(PathBuf::from) {
         git::remove_clone(&wt)?;

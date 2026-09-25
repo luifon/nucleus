@@ -914,3 +914,85 @@ async fn commands_must_be_typed() {
     tick(&f).await;
     assert_eq!(item1(&f).await.stage(), Stage::Implementation);
 }
+
+async fn close_requests(f: &Fixture, item: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT status FROM intake_group_requests WHERE item_key = ?1 AND action = 'close' ORDER BY id")
+        .bind(item)
+        .fetch_all(&f.ctx.wa)
+        .await
+        .unwrap()
+}
+
+/// Item #1 in refinement with a group requested (no group yet).
+async fn group_pending(f: &Fixture) {
+    accept(f, 1).await;
+    tick(f).await;
+    finish_current(f, TaskStatus::Done, Some(&eval_output("feature")), None).await;
+    tick(f).await;
+    assert_eq!(item1(f).await.surface, "pending");
+}
+
+#[tokio::test]
+async fn the_group_counts_as_closed_only_when_the_bot_confirms() {
+    let f = fixture().await;
+    group_pending(&f).await;
+    let group = format!("{}@{}", "120363000000000002", "g.us");
+    sqlx::query("INSERT INTO intake_groups (item_key, jid, status, created_at) VALUES ('1', ?1, 'active', 't')")
+        .bind(&group)
+        .execute(&f.ctx.wa)
+        .await
+        .unwrap();
+    tick(&f).await;
+    assert_eq!(item1(&f).await.surface, "group");
+    cancel(&f.ctx, 1, "cli").await.unwrap();
+    tick(&f).await;
+    tick(&f).await;
+    assert_eq!(close_requests(&f, "1").await, ["pending"], "one close request, repeated ticks add none");
+    assert!(item1(&f).await.group_closed_at.is_none(), "not closed until the bot confirms");
+    // The bot left.
+    sqlx::query("UPDATE intake_groups SET status = 'closed', closed_at = 't2' WHERE item_key = '1'").execute(&f.ctx.wa).await.unwrap();
+    sqlx::query("UPDATE intake_group_requests SET status = 'done' WHERE action = 'close'").execute(&f.ctx.wa).await.unwrap();
+    tick(&f).await;
+    assert!(item1(&f).await.group_closed_at.is_some());
+}
+
+#[tokio::test]
+async fn an_item_cancelled_while_its_group_is_created_gets_the_group_left() {
+    let f = fixture().await;
+    group_pending(&f).await;
+    cancel(&f.ctx, 1, "cli").await.unwrap();
+    tick(&f).await;
+    assert_eq!(close_requests(&f, "1").await, ["pending"], "the bot leaves the group once it exists");
+    assert!(item1(&f).await.group_closed_at.is_none());
+    // The bot saw the close first and created nothing.
+    sqlx::query("INSERT INTO intake_groups (item_key, status, reason, created_at) VALUES ('1', 'fallback', 'closed before', 't')")
+        .execute(&f.ctx.wa)
+        .await
+        .unwrap();
+    tick(&f).await;
+    assert!(item1(&f).await.group_closed_at.is_some());
+}
+
+#[tokio::test]
+async fn reconciliation_leaves_active_groups_of_closed_or_missing_items() {
+    let f = fixture().await;
+    group_pending(&f).await;
+    let g1 = format!("{}@{}", "120363000000000003", "g.us");
+    let g7 = format!("{}@{}", "120363000000000004", "g.us");
+    for (key, jid) in [("1", &g1), ("7", &g7)] {
+        sqlx::query("INSERT INTO intake_groups (item_key, jid, status, created_at) VALUES (?1, ?2, 'active', 't')")
+            .bind(key)
+            .bind(jid)
+            .execute(&f.ctx.wa)
+            .await
+            .unwrap();
+    }
+    tick(&f).await;
+    assert_eq!(close_requests(&f, "7").await, ["pending"], "no item #7");
+    assert!(close_requests(&f, "1").await.is_empty(), "item #1 is open and uses its group");
+    // A close that failed for good while the group is still active is asked
+    // again.
+    sqlx::query("UPDATE intake_group_requests SET status = 'failed' WHERE item_key = '7'").execute(&f.ctx.wa).await.unwrap();
+    tick(&f).await;
+    assert_eq!(close_requests(&f, "7").await, ["failed", "pending"]);
+}

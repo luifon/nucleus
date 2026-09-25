@@ -109,11 +109,24 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             status      TEXT    NOT NULL DEFAULT 'pending',
             result      TEXT,
             handled_at  TEXT,
-            dedup_key   TEXT
+            dedup_key   TEXT,
+            attempts    INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            claimed_at  TEXT
         )
         "#,
     )
     .execute(&pool)
+    .await?;
+    add_columns_if_missing(
+        &pool,
+        "intake_group_requests",
+        &[
+            ("attempts", "attempts INTEGER NOT NULL DEFAULT 0"),
+            ("next_attempt_at", "next_attempt_at TEXT"),
+            ("claimed_at", "claimed_at TEXT"),
+        ],
+    )
     .await?;
     for ddl in [
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_group_requests_dedup ON intake_group_requests(dedup_key) WHERE dedup_key IS NOT NULL",
@@ -337,11 +350,41 @@ pub async fn request_intake_group(pool: &SqlitePool, item_key: &str, action: &st
     Ok(sqlx::query_scalar("SELECT id FROM intake_group_requests WHERE dedup_key = ?1").bind(&key).fetch_one(pool).await?)
 }
 
+/// Ask the bot to leave item `item_key`'s group, unless a close request for
+/// it is already pending or being handled. The bot retries a failed leave
+/// with backoff; a request that failed for good (or finished while the
+/// group did not exist yet) can be asked again. Returns true when a request
+/// was added.
+pub async fn request_intake_close(pool: &SqlitePool, item_key: &str) -> Result<bool> {
+    let res = sqlx::query(
+        "INSERT INTO intake_group_requests (item_key, action, subject, enqueued_at, status, dedup_key)
+         SELECT ?1, 'close', NULL, ?2, 'pending', NULL
+          WHERE NOT EXISTS (SELECT 1 FROM intake_group_requests
+                             WHERE item_key = ?1 AND action = 'close' AND status IN ('pending', 'closing'))",
+    )
+    .bind(item_key)
+    .bind(crate::timestamp::now())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Every group the bot has as `active` (item key, JID).
+pub async fn active_intake_groups(pool: &SqlitePool) -> Result<Vec<(String, String)>> {
+    if !table_exists(pool, "intake_groups").await? {
+        return Ok(vec![]);
+    }
+    Ok(sqlx::query_as("SELECT item_key, jid FROM intake_groups WHERE status = 'active' AND jid IS NOT NULL")
+        .fetch_all(pool)
+        .await?)
+}
+
 /// The bot's record of an item's group (`intake_groups`).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct IntakeGroup {
     /// `active`, `fallback` (not created: the thread runs in the DM),
-    /// `closed`.
+    /// `unknown` (the bot stopped while creating it; it may exist), `closed`
+    /// (the bot confirmed it left).
     pub status: String,
     pub jid: Option<String>,
     pub reason: Option<String>,
@@ -526,6 +569,11 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(request_intake_group(&pool, "3", "close", None).await.unwrap(), a);
         assert!(request_intake_group(&pool, "3", "rename", None).await.is_err());
+        // One pending close at a time; another after it finished.
+        assert!(request_intake_close(&pool, "4").await.unwrap());
+        assert!(!request_intake_close(&pool, "4").await.unwrap());
+        sqlx::query("UPDATE intake_group_requests SET status = 'failed' WHERE item_key = '4'").execute(&pool).await.unwrap();
+        assert!(request_intake_close(&pool, "4").await.unwrap());
         // Before the bot created its tables, nothing is there to read.
         assert!(intake_group(&pool, "3").await.unwrap().is_none());
         assert!(intake_inbound_after(&pool, 0, 10).await.unwrap().is_empty());
