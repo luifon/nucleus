@@ -148,13 +148,16 @@ pub async fn tick(ctx: &Ctx, force_poll: bool) -> Result<TickReport> {
     }
     if let Some(_l) = try_lock(&ctx.ws, "poll")? {
         poll_sources(ctx, force_poll, &mut r).await;
+        if let Err(e) = admit_events(ctx, &mut r).await {
+            r.errors.push(format!("admitting events: {e:#}"));
+        }
     }
     if let Some(_l) = try_lock(&ctx.ws, "inbound")? {
         if let Err(e) = ingest_whatsapp(ctx).await {
             r.errors.push(format!("reading WhatsApp replies: {e:#}"));
         }
     }
-    let mut ids: Vec<i64> = store::list_items(&ctx.db, true, 1_000).await?.iter().map(|i| i.id).collect();
+    let mut ids: Vec<i64> = store::active_item_ids(&ctx.db).await?;
     ids.extend(cleanup_candidates(&ctx.db).await?);
     ids.sort_unstable();
     ids.dedup();
@@ -215,11 +218,29 @@ fn adapter_for(ctx: &Ctx, ev: &Event) -> Option<GithubIssues> {
     ctx.cfg.repo(&repo).map(|r| github_adapter(ctx, r))
 }
 
-async fn discussion(ctx: &Ctx, ev: &Event) -> Result<Discussion> {
-    match adapter_for(ctx, ev) {
-        Some(a) => a.discussion(ev).await,
-        None => Ok(Discussion::default()),
+/// The trusted discussion of the item's event, bound to the item: every
+/// comment's content is recorded on first use and compared on every later
+/// read. `Err(reason)` inside the result means a comment the item used
+/// changed or disappeared (the item must go stale). Collaborator status is
+/// checked live (never from the cache): every brief is built from it.
+async fn bound_discussion(ctx: &Ctx, item: &Item, ev: &Event) -> Result<std::result::Result<Discussion, String>> {
+    let Some(a) = adapter_for(ctx, ev) else { return Ok(Ok(Discussion::default())) };
+    let d = a.discussion(ev, true).await?;
+    for c in &d.trusted {
+        let hash = super::event::comment_hash(&c.body);
+        if store::bind_comment(&ctx.db, item.id, &c.id, &c.author, &hash).await? == store::CommentBinding::Changed {
+            return Ok(Err(format!("comment {} by {} changed after the item used it", c.id, c.author)));
+        }
     }
+    let present: std::collections::HashSet<&str> = d.trusted.iter().map(|c| c.id.as_str()).collect();
+    for id in store::bound_comments(&ctx.db, item.id).await? {
+        if !present.contains(id.as_str()) {
+            return Ok(Err(format!(
+                "comment {id}, which the item used, was removed or its author is no longer a collaborator"
+            )));
+        }
+    }
+    Ok(Ok(d))
 }
 
 async fn poll_sources(ctx: &Ctx, force: bool, r: &mut TickReport) {
@@ -262,26 +283,121 @@ async fn poll_one(ctx: &Ctx, a: &dyn SourceAdapter, r: &mut TickReport) -> Resul
     Ok(n)
 }
 
-/// Store an event (deduplicated) and create its item when it passed its
-/// source's gate, is open, and names a configured repo. Returns the new
-/// item, if one was created. Changes to an existing item's event (closed,
-/// label removed) are acted on by the item's own step.
+/// Store an event (deduplicated). GitHub events become items only through
+/// [`admit_events`], which checks the gate at the source. An event from a
+/// source without an adapter (`nucleus events emit --accept`, the
+/// operator's terminal) becomes an item when it is accepted, open, on a
+/// configured repo, has no open item, and its gate just opened (first
+/// report, or it was not accepted and open before). Returns the new item,
+/// if one was created. Changes to an existing item's event (closed, label
+/// removed, text edited) are acted on by the item's own step.
 pub async fn record_event(ctx: &Ctx, e: &NewEvent) -> Result<(Event, Option<Item>)> {
-    let (ev, _) = store::upsert_event(&ctx.db, e).await?;
-    if !ev.accepted || ev.state != "open" {
+    let (ev, kind, prev) = store::upsert_event(&ctx.db, e).await?;
+    if ev.source == "github" || !ev.accepted || ev.state != "open" {
         return Ok((ev, None));
     }
     let Some(repo) = ev.project.as_deref().and_then(|p| ctx.cfg.repo(p)) else {
         return Ok((ev, None));
     };
-    if store::item_for_event(&ctx.db, ev.id).await?.is_some() {
+    let opened_now = match (kind, &prev) {
+        (store::Upsert::Inserted, _) => true,
+        (_, Some(p)) => !(p.accepted && p.state == "open"),
+        _ => false,
+    };
+    if !opened_now || store::open_item_for_event(&ctx.db, ev.id).await?.is_some() {
         return Ok((ev, None));
     }
-    let item = store::create_item(&ctx.db, &ev, &repo.repo).await?;
+    let now = crate::timestamp::now();
+    let gate = format!("accept:{now}");
+    let item = store::create_item(
+        &ctx.db,
+        &store::NewItem {
+            event: &ev,
+            repo: &repo.repo,
+            rev_title: &ev.title,
+            rev_body: &ev.body,
+            gate_event_id: &gate,
+            label_event_id: None,
+            gate_actor: "operator",
+            gate_at: &now,
+        },
+    )
+    .await?;
     if let Some(i) = &item {
         tracing::info!(item = i.id, event = %ev.external_id, "intake: new item");
     }
     Ok((ev, item))
+}
+
+/// Create items for GitHub events whose gate is open at the source. For
+/// each accepted, open event with no open item that changed since its last
+/// check, the issue is read live: the latest label event (and a reopen
+/// after it) must come from collaborators (checked live), the text must
+/// not have changed after the label was added, and the gate event must not
+/// have produced an item before. The item is bound to the live title and
+/// body. A failed read leaves the event for the next tick.
+async fn admit_events(ctx: &Ctx, r: &mut TickReport) -> Result<()> {
+    let projects: Vec<String> = ctx.cfg.repos.iter().map(|r| r.repo.clone()).collect();
+    for ev in store::gate_candidates(&ctx.db, "github", &projects).await? {
+        match admit_one(ctx, &ev).await {
+            Ok(Some(item)) => {
+                tracing::info!(item = item.id, event = %ev.external_id, "intake: new item");
+                r.new_items.push(item.id);
+            }
+            Ok(None) => {}
+            Err(e) => r.errors.push(format!("checking the gate of {}: {e:#}", ev.external_id)),
+        }
+    }
+    Ok(())
+}
+
+async fn admit_one(ctx: &Ctx, ev: &Event) -> Result<Option<Item>> {
+    let Some(a) = adapter_for(ctx, ev) else { return Ok(None) };
+    let refuse = |note: String| async move {
+        tracing::info!(event = %ev.external_id, note, "intake: no item");
+        store::set_gate_checked(&ctx.db, ev.id, Some(&note)).await.map(|_| None)
+    };
+    let st = a.live_state(ev).await?;
+    if !st.open || !st.accepted {
+        return refuse("the issue is not open with the label at GitHub".into()).await;
+    }
+    let Some(g) = st.gate else {
+        return refuse("the timeline has no event that added the label".into()).await;
+    };
+    if !g.trusted {
+        return refuse(format!(
+            "the label was added by {} (or the issue reopened by {}), and that account is not a collaborator",
+            g.label_actor, g.opener
+        ))
+        .await;
+    }
+    if let Some(prior) = store::items_for_event(&ctx.db, ev.id).await?.into_iter().find(|i| i.gate_event_id.as_deref() == Some(&g.event_id)) {
+        return refuse(format!("this label event already produced item #{}; add the label again for a new item", prior.id)).await;
+    }
+    if st.edited_after_gate {
+        return refuse("the title or body changed after the label was added; remove and add the label again".into()).await;
+    }
+    let Some(repo) = ev.project.as_deref().and_then(|p| ctx.cfg.repo(p)) else { return Ok(None) };
+    store::set_event_content(&ctx.db, ev.id, &st.title, &st.body).await?;
+    let ev = store::event(&ctx.db, ev.id).await?;
+    let item = store::create_item(
+        &ctx.db,
+        &store::NewItem {
+            event: &ev,
+            repo: &repo.repo,
+            rev_title: &st.title,
+            rev_body: &st.body,
+            gate_event_id: &g.event_id,
+            label_event_id: Some(&g.label_event_id),
+            gate_actor: &g.label_actor,
+            gate_at: &g.label_at,
+        },
+    )
+    .await?;
+    if item.is_none() {
+        return refuse("the event already has an open item".into()).await;
+    }
+    Ok(item)
 }
 
 // ── operator replies from WhatsApp ───────────────────────────────────────
@@ -520,7 +636,6 @@ async fn stop_task(ctx: &Ctx, item: &Item) {
 // ── item steps ───────────────────────────────────────────────────────────
 
 fn item_vars(ctx: &Ctx, item: &Item) -> Vec<(&'static str, String)> {
-    let _ = ctx;
     vec![
         ("n", item.id.to_string()),
         ("title", item.title.clone()),
@@ -530,6 +645,7 @@ fn item_vars(ctx: &Ctx, item: &Item) -> Vec<(&'static str, String)> {
         ("error", item.error.clone().unwrap_or_default()),
         ("classification", item.classification.clone().unwrap_or_default()),
         ("failed_in", item.failed_stage.clone().unwrap_or_default()),
+        ("label", ctx.cfg.label.clone()),
     ]
 }
 
@@ -579,30 +695,20 @@ fn event_ref(ev: &Event) -> String {
 async fn step_item(ctx: &Ctx, item: &Item, r: &mut TickReport) {
     let before = item.stage.clone();
     let res = async {
-        // The source changed under the item: closed, or the gate label removed.
+        // The source changed under the item: closed, the gate label
+        // removed (at every stage), or the text the item is bound to
+        // edited. The stored event is what the last poll saw; the live
+        // source is read again before every irreversible step.
         if !item.stage().is_terminal() {
             let ev = store::event(&ctx.db, item.event_id).await?;
             if ev.state == "closed" {
                 return close_by_source(ctx, item, "the issue was closed at its source").await;
             }
-            if !ev.accepted
-                && matches!(item.stage(), Stage::Queued | Stage::Eval | Stage::Refinement | Stage::Implementation)
-            {
-                stop_task(ctx, item).await;
-                if store::advance(
-                    &ctx.db,
-                    item.id,
-                    item.stage(),
-                    StageEvent::Cancel,
-                    "the gate label was removed",
-                    vec![("current_task_id", Val::Text(None))],
-                )
-                .await?
-                {
-                    let it = store::item(&ctx.db, item.id).await?;
-                    note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &it))).await?;
-                }
-                return Ok(());
+            if !ev.accepted {
+                return cancel_by_source(ctx, item, "the gate label was removed").await;
+            }
+            if let Some(why) = revision_mismatch(item, &ev.title, &ev.body) {
+                return mark_stale(ctx, item, &why).await;
             }
         }
         match item.stage() {
@@ -612,7 +718,7 @@ async fn step_item(ctx: &Ctx, item: &Item, r: &mut TickReport) {
             Stage::Implementation => step_implementation(ctx, item).await,
             Stage::Pr => step_pr(ctx, item).await,
             Stage::Review => step_review(ctx, item).await,
-            Stage::Failed | Stage::Closed | Stage::Cancelled => Ok(()),
+            Stage::Failed | Stage::Closed | Stage::Cancelled | Stage::Stale => Ok(()),
         }
     }
     .await;
@@ -676,6 +782,116 @@ async fn close_by_source(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
         note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_closed, &item_vars(ctx, &it))).await?;
     }
     Ok(())
+}
+
+/// The label left the event: the item is cancelled at whatever stage it is.
+async fn cancel_by_source(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
+    stop_task(ctx, item).await;
+    if store::advance(
+        &ctx.db,
+        item.id,
+        item.stage(),
+        StageEvent::Cancel,
+        why,
+        vec![("current_task_id", Val::Text(None)), ("error", why.into())],
+    )
+    .await?
+    {
+        let it = store::item(&ctx.db, item.id).await?;
+        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &it))).await?;
+    }
+    Ok(())
+}
+
+/// The source no longer matches what the item is bound to: stop it for
+/// good. Re-adding the label starts a new item.
+async fn mark_stale(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
+    stop_task(ctx, item).await;
+    if store::advance(
+        &ctx.db,
+        item.id,
+        item.stage(),
+        StageEvent::Stale,
+        why,
+        vec![("current_task_id", Val::Text(None)), ("error", why.into()), ("stale_reason", why.into())],
+    )
+    .await?
+    {
+        tracing::warn!(item = item.id, why, "intake: item is stale");
+        let it = store::item(&ctx.db, item.id).await?;
+        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_stale, &item_vars(ctx, &it))).await?;
+    }
+    Ok(())
+}
+
+/// Why `title`/`body` do not match the revision the item is bound to.
+fn revision_mismatch(item: &Item, title: &str, body: &str) -> Option<String> {
+    match item.revision_hash.as_deref() {
+        None => Some("the item is bound to no revision of its issue".into()),
+        Some(h) if h != super::event::revision_hash(title, body) => {
+            Some("the issue title or body changed after the gate was satisfied".into())
+        }
+        Some(_) => None,
+    }
+}
+
+/// Read the source live right before an irreversible step (`what`):
+/// the issue must be open, carry the label from the same label event,
+/// set by an account that is a collaborator now, with the bound title,
+/// body and comments. Returns the verified discussion, or `None` when the
+/// item was stopped (closed, cancelled or stale). A failed read is an
+/// error: the step does not run and is retried (fail closed).
+async fn live_gate(ctx: &Ctx, item: &Item, what: &str) -> Result<Option<Discussion>> {
+    let ev = store::event(&ctx.db, item.event_id).await?;
+    let Some(a) = adapter_for(ctx, &ev) else {
+        // No adapter (an operator-accepted event): the stored event is the
+        // only record of the source.
+        if ev.state != "open" {
+            close_by_source(ctx, item, "the event is closed").await?;
+            return Ok(None);
+        }
+        if !ev.accepted {
+            cancel_by_source(ctx, item, "the event is no longer accepted").await?;
+            return Ok(None);
+        }
+        if let Some(why) = revision_mismatch(item, &ev.title, &ev.body) {
+            mark_stale(ctx, item, &why).await?;
+            return Ok(None);
+        }
+        return Ok(Some(Discussion::default()));
+    };
+    let st = a.live_state(&ev).await.with_context(|| format!("reading the issue live before {what}"))?;
+    if !st.open {
+        close_by_source(ctx, item, &format!("the issue was closed at its source (read before {what})")).await?;
+        return Ok(None);
+    }
+    if !st.accepted {
+        cancel_by_source(ctx, item, &format!("the gate label was removed (read before {what})")).await?;
+        return Ok(None);
+    }
+    let stale = if let Some(why) = revision_mismatch(item, &st.title, &st.body) {
+        Some(why)
+    } else {
+        match &st.gate {
+            None => Some("the timeline no longer shows who added the label".to_string()),
+            Some(g) if Some(g.label_event_id.as_str()) != item.label_event_id.as_deref() => {
+                Some("the label was removed and added again; a new item takes over".into())
+            }
+            Some(g) if !g.trusted => Some(format!("{} added the label and is no longer a collaborator", g.label_actor)),
+            Some(_) => None,
+        }
+    };
+    if let Some(why) = stale {
+        mark_stale(ctx, item, &format!("{why} (read before {what})")).await?;
+        return Ok(None);
+    }
+    match bound_discussion(ctx, item, &ev).await? {
+        Ok(d) => Ok(Some(d)),
+        Err(why) => {
+            mark_stale(ctx, item, &format!("{why} (read before {what})")).await?;
+            Ok(None)
+        }
+    }
 }
 
 fn repo_cfg<'a>(ctx: &'a Ctx, item: &Item) -> Result<&'a IntakeRepo> {
@@ -798,7 +1014,10 @@ async fn step_eval(ctx: &Ctx, item: &Item) -> Result<()> {
     match task_state(ctx, item).await? {
         TaskState::None => {
             let ev = store::event(&ctx.db, item.event_id).await?;
-            let d = discussion(ctx, &ev).await?;
+            let d = match bound_discussion(ctx, item, &ev).await? {
+                Ok(d) => d,
+                Err(why) => return mark_stale(ctx, item, &why).await,
+            };
             let brief = briefs::eval_brief(item, &ev, &d, ctx.cfg.min_confidence);
             start_task(ctx, item, Stage::Eval, "intake-eval", brief, &worktree(item)?, WorkerProfile::ReadOnly).await?;
             Ok(())
@@ -927,7 +1146,10 @@ async fn step_refinement(ctx: &Ctx, item: &Item) -> Result<()> {
                 return Ok(()); // waiting for the operator
             }
             let ev = store::event(&ctx.db, item.event_id).await?;
-            let d = discussion(ctx, &ev).await?;
+            let d = match bound_discussion(ctx, item, &ev).await? {
+                Ok(d) => d,
+                Err(why) => return mark_stale(ctx, item, &why).await,
+            };
             let up_to = pending.unwrap_or(0);
             let brief = briefs::refinement_brief(item, &ev, &d, &thread, up_to);
             let task =
@@ -946,6 +1168,8 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
     let wt = worktree(item)?;
     match task_state(ctx, item).await? {
         TaskState::None => {
+            // The irreversible part starts here: read the source live.
+            let Some(d) = live_gate(ctx, item, "implementation").await? else { return Ok(()) };
             let base_ref = item.base_ref.clone().context("the item has no base branch")?;
             let branch = match &item.branch {
                 Some(b) if wt.join(".git").is_dir() => b.clone(),
@@ -964,7 +1188,6 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
                 }
             };
             let ev = store::event(&ctx.db, item.event_id).await?;
-            let d = discussion(ctx, &ev).await?;
             let item = store::item(&ctx.db, item.id).await?;
             let brief = briefs::implementation_brief(&item, &ev, &d, &branch, &base_ref, repo.test_command.as_deref());
             start_task(ctx, &item, Stage::Implementation, "intake-implement", brief, &wt, WorkerProfile::Code).await?;
@@ -1052,6 +1275,10 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     let repo = repo_cfg(ctx, item)?;
     let branch = item.branch.clone().context("the item has no branch")?;
     let base_ref = item.base_ref.clone().context("the item has no base branch")?;
+    // Nothing is pushed unless the source, read now, still matches.
+    if live_gate(ctx, item, "push").await?.is_none() {
+        return Ok(());
+    }
     let ev = store::event(&ctx.db, item.event_id).await?;
     let sha = item.head_sha.clone().context("the item has no collected commit")?;
     let remote = remote_for(ctx, &item.repo)?;
@@ -1096,6 +1323,9 @@ async fn step_review(ctx: &Ctx, item: &Item) -> Result<()> {
     match item.comment_state.as_str() {
         "approved" => {
             let a = adapter_for(ctx, &ev).context("the event's source has no reply channel")?;
+            if live_gate(ctx, item, "the issue comment").await?.is_none() {
+                return Ok(());
+            }
             let draft = public_text(ctx, item.comment_draft.as_deref().unwrap_or(""));
             let marker = format!("{}item-{}:comment", github::COMMENT_MARKER_PREFIX, item.id);
             let url = a.reply(&ev, &draft, &marker).await?;
@@ -1230,7 +1460,7 @@ async fn flush_whatsapp(ctx: &Ctx, item: &Item) -> Result<()> {
 
 async fn cleanup_candidates(db: &SqlitePool) -> Result<Vec<i64>> {
     Ok(sqlx::query_scalar(
-        "SELECT id FROM items WHERE stage IN ('closed','cancelled')
+        "SELECT id FROM items WHERE stage IN ('closed','cancelled','stale')
             AND ((surface = 'group' AND group_closed_at IS NULL) OR worktree IS NOT NULL
                  OR EXISTS (SELECT 1 FROM item_messages m WHERE m.item_id = items.id AND m.wa_state IS NULL))",
     )

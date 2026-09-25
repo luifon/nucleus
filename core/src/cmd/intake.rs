@@ -193,8 +193,14 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             if let Some(u) = &ev.url {
                 println!("source: {u}");
             }
-            if let Some(e) = &it.error {
+            if let Some(r) = &it.stale_reason {
+                println!("STALE: {r}");
+                println!("  nothing more is done for this item; remove and add the `{}` label again for a new item", ctx.cfg.label);
+            } else if let Some(e) = &it.error {
                 println!("error: {e}");
+            }
+            if let (Some(g), Some(a)) = (&it.gate_event_id, &it.gate_actor) {
+                println!("gate: {g} by {a} at {}", it.gate_at.as_deref().unwrap_or("?"));
             }
             if let Some(e) = it.eval_json.as_deref().and_then(|j| serde_json::from_str::<EvalResult>(j).ok()) {
                 println!("eval: {} (agent: {}) — {}", e.effective, e.classification, e.summary);

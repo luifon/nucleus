@@ -718,7 +718,7 @@ pub struct IntakeWhatsAppConfig {
 /// `{n}` item number, `{title}`, `{ref}` (`owner/name#12`), `{url}`,
 /// `{stage}`, `{version}`, `{error}`, `{pr_url}`, `{tests}`, `{comment}`,
 /// `{summary}`, `{classification}`, `{failed_in}` (the stage a failed item
-/// failed in). Operator commands start with `#{n}`: in the
+/// failed in), `{label}` (the gate label). Operator commands start with `#{n}`: in the
 /// DM the marker routes the message to the item; in the item's group it is
 /// optional.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -735,6 +735,9 @@ pub struct IntakeTexts {
     pub item_failed: String,
     pub item_cancelled: String,
     pub item_closed: String,
+    /// The item stopped because its source changed after the gate was
+    /// satisfied (`{error}` says what changed; `{label}` is the gate label).
+    pub item_stale: String,
     pub stage_note: String,
     pub no_plan: String,
     pub refinement_busy: String,
@@ -769,6 +772,10 @@ impl Default for IntakeTexts {
                 .into(),
             item_cancelled: "⏹ Item #{n} — {title} cancelled.".into(),
             item_closed: "Item #{n} — {title} is closed: {error}".into(),
+            item_stale: "⛔ Item #{n} — {title} stopped: {error}. Nothing more is done for it. To work \
+                         on the issue as it is now, remove the `{label}` label and add it again; that \
+                         starts a new item."
+                .into(),
             stage_note: "Item #{n} is in the {stage} stage; messages reach an agent only during \
                          refinement. Your message is saved in the item's thread."
                 .into(),

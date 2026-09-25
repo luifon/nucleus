@@ -6,7 +6,7 @@
 //! the operator's authentication. Every call goes through [`GhRunner`], so
 //! tests run against a fake.
 
-use super::event::{Comment, Discussion, Event, NewEvent, PollBatch, SourceAdapter};
+use super::event::{Comment, Discussion, Event, GateEvidence, NewEvent, PollBatch, SourceAdapter, SourceState};
 use anyhow::{bail, Context, Result};
 use sqlx::SqlitePool;
 use std::path::Path;
@@ -119,15 +119,19 @@ impl GithubIssues {
     /// True when `login` is a collaborator of the repo (`GET
     /// /repos/{repo}/collaborators/{login}` answers 204). A 404 is "no";
     /// any other failure is an error, and the caller treats the author as
-    /// untrusted without caching the answer.
-    pub async fn is_collaborator(&self, login: &str) -> Result<bool> {
-        if let Some(c) =
-            super::store::cached_collaborator(&self.db, &self.repo, login, self.collaborator_cache_secs).await?
-        {
-            return Ok(c);
-        }
+    /// untrusted without caching the answer. With `live`, the cache is not
+    /// read (the answer is still stored): every action boundary asks
+    /// GitHub now, and the cache serves display and polling only.
+    pub async fn is_collaborator(&self, login: &str, live: bool) -> Result<bool> {
         if login.is_empty() || !login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '[' || c == ']') {
             return Ok(false);
+        }
+        if !live {
+            if let Some(c) =
+                super::store::cached_collaborator(&self.db, &self.repo, login, self.collaborator_cache_secs).await?
+            {
+                return Ok(c);
+            }
         }
         let out = self
             .gh
@@ -144,32 +148,108 @@ impl GithubIssues {
         Ok(trusted)
     }
 
-    async fn comments(&self, number: u64) -> Result<Vec<serde_json::Value>> {
+    async fn pages(&self, path: &str) -> Result<Vec<serde_json::Value>> {
         let mut all = Vec::new();
-        for page in 1..=self.max_pages.max(1) {
-            let v = gh_json(
-                &*self.gh,
-                args(&[
-                    "api",
-                    "-X",
-                    "GET",
-                    &format!("repos/{}/issues/{number}/comments", self.repo),
-                    "-f",
-                    "per_page=100",
-                    "-f",
-                    &format!("page={page}"),
-                ]),
-            )
-            .await?;
-            let arr = v.as_array().cloned().unwrap_or_default();
+        let max = self.max_pages.max(1);
+        for page in 1..=max {
+            let v = gh_json(&*self.gh, args(&["api", "-X", "GET", path, "-f", "per_page=100", "-f", &format!("page={page}")])).await?;
+            let arr = v.as_array().cloned().with_context(|| format!("{path} did not return a list"))?;
             let n = arr.len();
             all.extend(arr);
             if n < 100 {
-                break;
+                return Ok(all);
             }
         }
-        Ok(all)
+        bail!("{path} has more than {} pages; raise [intake.github] max_pages", max)
     }
+
+    async fn comments(&self, number: u64) -> Result<Vec<serde_json::Value>> {
+        self.pages(&format!("repos/{}/issues/{number}/comments", self.repo)).await
+    }
+
+    /// When the issue's body was last edited (GraphQL `lastEditedAt`;
+    /// `None` when it never was).
+    async fn last_edited_at(&self, number: u64) -> Result<Option<String>> {
+        let (owner, name) = self.repo.split_once('/').context("repo is not owner/name")?;
+        let v = gh_json(
+            &*self.gh,
+            args(&[
+                "api",
+                "graphql",
+                "-f",
+                "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){lastEditedAt}}}",
+                "-f",
+                &format!("owner={owner}"),
+                "-f",
+                &format!("name={name}"),
+                "-F",
+                &format!("number={number}"),
+            ]),
+        )
+        .await?;
+        let issue = &v["data"]["repository"]["issue"];
+        if !issue.is_object() {
+            bail!("the GraphQL answer for issue {number} has no issue: {v}");
+        }
+        Ok(issue["lastEditedAt"].as_str().map(str::to_string))
+    }
+}
+
+/// One timeline event that matters for the gate.
+#[derive(Debug, Clone)]
+struct TimelineEvent {
+    id: String,
+    event: String,
+    actor: String,
+    label: String,
+    created_at: String,
+}
+
+fn timeline_events(items: &[serde_json::Value]) -> Vec<TimelineEvent> {
+    items
+        .iter()
+        .filter_map(|v| {
+            let event = v["event"].as_str()?;
+            if !matches!(event, "labeled" | "unlabeled" | "reopened" | "closed" | "renamed") {
+                return None;
+            }
+            let id = match &v["id"] {
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                _ => v["node_id"].as_str()?.to_string(),
+            };
+            Some(TimelineEvent {
+                id,
+                event: event.to_string(),
+                actor: v["actor"]["login"].as_str().unwrap_or_default().to_string(),
+                label: v["label"]["name"].as_str().unwrap_or_default().to_string(),
+                created_at: crate::timestamp::to_sortable(v["created_at"].as_str().unwrap_or_default()),
+            })
+        })
+        .collect()
+}
+
+/// The label event that holds the gate open now (the latest `labeled`
+/// event for the gate label with no `unlabeled` after it), and the event
+/// that opened the gate: that label event, or the latest reopen after it.
+fn gate_events<'a>(events: &'a [TimelineEvent], gate_label: &str) -> Option<(&'a TimelineEvent, &'a TimelineEvent)> {
+    let mut label: Option<&TimelineEvent> = None;
+    let mut opener: Option<&TimelineEvent> = None;
+    for e in events {
+        match e.event.as_str() {
+            "labeled" if e.label.eq_ignore_ascii_case(gate_label) => {
+                label = Some(e);
+                opener = Some(e);
+            }
+            "unlabeled" if e.label.eq_ignore_ascii_case(gate_label) => {
+                label = None;
+                opener = None;
+            }
+            "reopened" if label.is_some() => opener = Some(e),
+            _ => {}
+        }
+    }
+    Some((label?, opener?))
 }
 
 #[async_trait::async_trait]
@@ -237,7 +317,7 @@ impl SourceAdapter for GithubIssues {
 
     /// Comments whose authors are collaborators of the repo; every other
     /// comment is left out and counted.
-    async fn discussion(&self, event: &Event) -> Result<Discussion> {
+    async fn discussion(&self, event: &Event, live: bool) -> Result<Discussion> {
         let (_, number) = parse_external_id(&event.external_id)?;
         let mut d = Discussion::default();
         for c in self.comments(number).await? {
@@ -246,15 +326,22 @@ impl SourceAdapter for GithubIssues {
             if body.contains(COMMENT_MARKER_PREFIX) {
                 continue; // Nucleus's own comment.
             }
-            let trusted = match self.is_collaborator(&author).await {
+            let trusted = match self.is_collaborator(&author, live).await {
                 Ok(t) => t,
+                Err(e) if live => return Err(e),
                 Err(e) => {
                     tracing::warn!(author, err = %format!("{e:#}"), "intake: collaborator check failed — comment left out");
                     false
                 }
             };
             if trusted {
+                let id = match &c["id"] {
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => format!("{}@{}", author, c["created_at"].as_str().unwrap_or_default()),
+                };
                 d.trusted.push(Comment {
+                    id,
                     author,
                     body,
                     created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
@@ -264,6 +351,55 @@ impl SourceAdapter for GithubIssues {
             }
         }
         Ok(d)
+    }
+
+    /// The issue, its timeline and its last edit time, read now; the label
+    /// actor (and who reopened, when a reopen opened the gate) checked
+    /// live against the collaborator list.
+    async fn live_state(&self, event: &Event) -> Result<SourceState> {
+        let (_, number) = parse_external_id(&event.external_id)?;
+        let issue = gh_json(&*self.gh, args(&["api", "-X", "GET", &format!("repos/{}/issues/{number}", self.repo)])).await?;
+        if issue["number"].as_u64() != Some(number) {
+            bail!("the issues API did not return issue {number}");
+        }
+        let labels: Vec<String> = issue["labels"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|l| l["name"].as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let timeline = timeline_events(&self.pages(&format!("repos/{}/issues/{number}/timeline", self.repo)).await?);
+        let last_edit = self.last_edited_at(number).await?.map(|t| crate::timestamp::to_sortable(&t));
+        let gate = match gate_events(&timeline, &self.gate_label) {
+            None => None,
+            Some((label, opener)) => {
+                let mut trusted = self.is_collaborator(&label.actor, true).await?;
+                if trusted && opener.actor != label.actor {
+                    trusted = self.is_collaborator(&opener.actor, true).await?;
+                }
+                Some(GateEvidence {
+                    event_id: format!("{}:{}", opener.event, opener.id),
+                    label_event_id: format!("labeled:{}", label.id),
+                    label_actor: label.actor.clone(),
+                    label_at: label.created_at.clone(),
+                    opener: opener.actor.clone(),
+                    trusted,
+                })
+            }
+        };
+        let edited_after_gate = match &gate {
+            Some(g) => {
+                last_edit.as_deref().map(|t| t > g.label_at.as_str()).unwrap_or(false)
+                    || timeline.iter().any(|e| e.event == "renamed" && e.created_at > g.label_at)
+            }
+            None => false,
+        };
+        Ok(SourceState {
+            open: issue["state"].as_str() == Some("open"),
+            accepted: labels.iter().any(|l| l.eq_ignore_ascii_case(&self.gate_label)),
+            title: issue["title"].as_str().unwrap_or_default().to_string(),
+            body: issue["body"].as_str().unwrap_or_default().to_string(),
+            gate,
+            edited_after_gate,
+        })
     }
 
     async fn reply(&self, event: &Event, body: &str, marker: &str) -> Result<Option<String>> {
@@ -406,6 +542,12 @@ pub(crate) mod tests {
                 GhOut { ok, stdout: stdout.to_string(), stderr: stderr.to_string() },
             ));
         }
+        /// Replace the rule for `needle` (or add it first).
+        pub(crate) fn set(&self, needle: &str, ok: bool, stdout: &str, stderr: &str) {
+            let mut rules = self.rules.lock().unwrap();
+            rules.retain(|(n, _)| n != needle);
+            rules.insert(0, (needle.to_string(), GhOut { ok, stdout: stdout.to_string(), stderr: stderr.to_string() }));
+        }
         pub(crate) fn calls_with(&self, needle: &str) -> usize {
             self.calls.lock().unwrap().iter().filter(|c| c.contains(needle)).count()
         }
@@ -423,7 +565,11 @@ pub(crate) mod tests {
             }
             self.calls.lock().unwrap().push(shown);
             for (needle, out) in self.rules.lock().unwrap().iter() {
-                if joined.contains(needle.as_str()) {
+                let hit = match needle.strip_suffix('$') {
+                    Some(end) => joined.ends_with(end),
+                    None => joined.contains(needle.as_str()),
+                };
+                if hit {
                     return Ok(out.clone());
                 }
             }
@@ -512,22 +658,26 @@ pub(crate) mod tests {
         gh.on("collaborators/stranger", false, "", "gh: Not Found (HTTP 404)");
         gh.on("collaborators/flaky", false, "", "HTTP 502 Bad Gateway");
         let (_d, a) = adapter(gh.clone()).await;
-        let (ev, _) = super::super::store::upsert_event(
+        let (ev, _, _) = super::super::store::upsert_event(
             &a.db,
             &issue_to_event("acme/widget", &issue_json(7, &["nucleus"], "open", "x"), "nucleus").unwrap(),
         )
         .await
         .unwrap();
-        let d = a.discussion(&ev).await.unwrap();
+        let d = a.discussion(&ev, false).await.unwrap();
         assert_eq!(d.trusted.len(), 1);
         assert_eq!(d.trusted[0].body, "Use the v2 API.");
         assert_eq!(d.ignored, 2, "the stranger and the failed check");
         // The answers are cached: a second read asks gh again only for the
         // author whose check failed.
         let before = gh.calls_with("collaborators/");
-        a.discussion(&ev).await.unwrap();
+        a.discussion(&ev, false).await.unwrap();
         assert_eq!(gh.calls_with("collaborators/") - before, 1);
-        assert!(!a.is_collaborator("bad/login").await.unwrap(), "odd logins are never looked up");
+        assert!(!a.is_collaborator("bad/login", false).await.unwrap(), "odd logins are never looked up");
+        // A live read ignores the cache and fails on an error.
+        let before = gh.calls_with("collaborators/maintainer");
+        assert!(a.discussion(&ev, true).await.is_err(), "the flaky check fails a live read");
+        assert!(gh.calls_with("collaborators/maintainer") > before, "live reads ask GitHub again");
     }
 
     #[tokio::test]
@@ -536,7 +686,7 @@ pub(crate) mod tests {
         gh.on("issues/9/comments", true, "[]", "");
         gh.on("issue comment 9", true, "https://example.invalid/acme/widget/issues/9#issuecomment-1\n", "");
         let (_d, a) = adapter(gh.clone()).await;
-        let (ev, _) = super::super::store::upsert_event(
+        let (ev, _, _) = super::super::store::upsert_event(
             &a.db,
             &issue_to_event("acme/widget", &issue_json(9, &["nucleus"], "open", "x"), "nucleus").unwrap(),
         )
@@ -560,6 +710,53 @@ pub(crate) mod tests {
         let url = a.reply(&ev, "Draft PR open.", "nucleus-intake:item-1:comment").await.unwrap();
         assert_eq!(url.as_deref(), Some("https://example.invalid/c/2"));
         assert_eq!(gh.calls_with("issue comment 9"), 1);
+    }
+
+    #[tokio::test]
+    async fn live_state_reads_the_gate_from_the_timeline() {
+        let gh = Arc::new(FakeGh::default());
+        let issue = serde_json::json!({ "number": 3, "title": "T", "body": "B", "state": "open", "labels": [{ "name": "Nucleus" }] });
+        gh.on("repos/acme/widget/issues/3$", true, &issue.to_string(), "");
+        let ev = |event: &str, id: u64, who: &str, at: &str| {
+            serde_json::json!({ "event": event, "id": id, "actor": { "login": who }, "label": { "name": "nucleus" }, "created_at": at })
+        };
+        let timeline = serde_json::json!([
+            ev("labeled", 1, "stranger", "2026-09-20T09:00:00Z"),
+            ev("unlabeled", 2, "maintainer", "2026-09-20T09:30:00Z"),
+            ev("labeled", 3, "maintainer", "2026-09-20T10:00:00Z"),
+            { "event": "commented", "id": 4, "created_at": "2026-09-20T10:10:00Z" },
+            ev("reopened", 5, "maintainer", "2026-09-20T11:00:00Z"),
+        ]);
+        gh.on("issues/3/timeline", true, &timeline.to_string(), "");
+        gh.on("-F number=3$", true, r#"{"data":{"repository":{"issue":{"lastEditedAt":"2026-09-20T09:59:00Z"}}}}"#, "");
+        gh.on("collaborators/maintainer", true, "", "");
+        let (_d, a) = adapter(gh.clone()).await;
+        let (ev3, _, _) = super::super::store::upsert_event(
+            &a.db,
+            &issue_to_event("acme/widget", &issue_json(3, &["nucleus"], "open", "x"), "nucleus").unwrap(),
+        )
+        .await
+        .unwrap();
+        let st = a.live_state(&ev3).await.unwrap();
+        assert!(st.open && st.accepted && !st.edited_after_gate);
+        assert_eq!((st.title.as_str(), st.body.as_str()), ("T", "B"));
+        let g = st.gate.unwrap();
+        assert_eq!((g.event_id.as_str(), g.label_event_id.as_str(), g.label_actor.as_str()), ("reopened:5", "labeled:3", "maintainer"));
+        assert!(g.trusted);
+        // Trust is read live: the cache is not consulted.
+        super::super::store::cache_collaborator(&a.db, "acme/widget", "maintainer", false).await.unwrap();
+        assert!(a.live_state(&ev3).await.unwrap().gate.unwrap().trusted);
+        // An edit after the label, and a failed GraphQL read.
+        gh.set("-F number=3$", true, r#"{"data":{"repository":{"issue":{"lastEditedAt":"2026-09-20T10:30:00Z"}}}}"#, "");
+        assert!(a.live_state(&ev3).await.unwrap().edited_after_gate);
+        gh.set("-F number=3$", false, "", "HTTP 502");
+        assert!(a.live_state(&ev3).await.is_err());
+        // The label removed last: no gate.
+        let mut t2 = timeline.as_array().unwrap().clone();
+        t2.push(ev("unlabeled", 6, "maintainer", "2026-09-20T12:00:00Z"));
+        gh.set("issues/3/timeline", true, &serde_json::Value::Array(t2).to_string(), "");
+        gh.set("-F number=3$", true, r#"{"data":{"repository":{"issue":{"lastEditedAt":null}}}}"#, "");
+        assert!(a.live_state(&ev3).await.unwrap().gate.is_none());
     }
 
     #[test]

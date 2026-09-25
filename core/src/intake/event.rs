@@ -68,11 +68,17 @@ pub struct Event {
     pub accepted: bool,
     pub first_seen_at: String,
     pub last_seen_at: String,
+    /// Why the last gate check created no item (GitHub: the label was added
+    /// by a non-collaborator, the text changed after the label, …).
+    pub gate_note: Option<String>,
 }
 
 /// One comment of the discussion on an event, from a trusted author.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Comment {
+    /// The comment's id at its source (the pipeline binds an item to the
+    /// content of every comment it used, by id).
+    pub id: String,
     pub author: String,
     pub body: String,
     pub created_at: String,
@@ -86,6 +92,63 @@ pub struct Discussion {
     pub trusted: Vec<Comment>,
     /// Comments left out because their authors are not trusted.
     pub ignored: usize,
+}
+
+/// Who opened an item's gate, as the source records it (GitHub: the
+/// timeline event that added the label, and a later reopen).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateEvidence {
+    /// The event that opened the gate: the label event, or a reopen after
+    /// it. A new gate event starts a new item.
+    pub event_id: String,
+    /// The event that added the gate label.
+    pub label_event_id: String,
+    /// The account that added the label.
+    pub label_actor: String,
+    /// When the label was added (RFC3339).
+    pub label_at: String,
+    /// The account behind `event_id` (the label actor, or who reopened).
+    pub opener: String,
+    /// True when `label_actor` and `opener` are trusted by the source
+    /// (GitHub: repository collaborators), checked live, never from a cache.
+    pub trusted: bool,
+}
+
+/// The source's current state of an event, read live (never from the
+/// store or a cache). The pipeline reads it when it admits an event and
+/// right before every irreversible step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceState {
+    pub open: bool,
+    /// The gate label is present.
+    pub accepted: bool,
+    pub title: String,
+    pub body: String,
+    /// `None` when the source has no record of who set the label.
+    pub gate: Option<GateEvidence>,
+    /// The title or body was edited after the label was added.
+    pub edited_after_gate: bool,
+}
+
+/// The content hash an item is bound to: title and body of the event at
+/// the moment its gate was satisfied (SHA-256, hex).
+pub fn revision_hash(title: &str, body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(title.as_bytes());
+    h.update([0u8]);
+    h.update(body.as_bytes());
+    hex(&h.finalize())
+}
+
+/// SHA-256 of one comment's body, hex.
+pub fn comment_hash(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex(&Sha256::digest(body.as_bytes()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// What one poll returned.
@@ -115,8 +178,13 @@ pub trait SourceAdapter: Send + Sync {
     fn poll_interval(&self) -> Duration;
     /// Events changed since `cursor` (`None`: the first poll).
     async fn poll(&self, cursor: Option<&str>) -> Result<PollBatch>;
-    /// The trusted part of the discussion on `event`.
-    async fn discussion(&self, event: &Event) -> Result<Discussion>;
+    /// The trusted part of the discussion on `event`. With `live`, every
+    /// author's trust is checked at the source now; otherwise a cached
+    /// answer may be used (display and polling only).
+    async fn discussion(&self, event: &Event, live: bool) -> Result<Discussion>;
+    /// The event's state at the source now, with the evidence of who opened
+    /// its gate. Any failure is an error; the caller fails closed.
+    async fn live_state(&self, event: &Event) -> Result<SourceState>;
     /// Post `body` on the event at its source (GitHub: an issue comment).
     /// `marker` is a unique string the adapter embeds invisibly and checks
     /// first, so a retry after a crash does not post twice. Returns the

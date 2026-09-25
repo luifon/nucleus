@@ -137,13 +137,14 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             } else {
                 for e in events {
                     println!(
-                        "{:<5} {:<10} {:<28} {:<6} {}{}",
+                        "{:<5} {:<10} {:<28} {:<6} {}{}{}",
                         e.id,
                         e.source,
                         e.external_id,
                         e.state,
                         e.title,
-                        if e.accepted { " [accepted]" } else { "" }
+                        if e.accepted { " [accepted]" } else { "" },
+                        e.gate_note.as_deref().map(|n| format!(" — no item: {n}")).unwrap_or_default()
                     );
                 }
             }

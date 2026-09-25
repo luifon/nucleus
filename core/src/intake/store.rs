@@ -116,6 +116,133 @@ CREATE TABLE IF NOT EXISTS meta (
 /// v2: the commit Nucleus collected from the item's clone and pushes.
 const SCHEMA_V2: &str = "ALTER TABLE items ADD COLUMN head_sha TEXT";
 
+/// v3 (finding: untrusted edits reach an acting session): an item is bound
+/// to the revision of its event at the moment the gate was satisfied, and
+/// to the gate event itself. `items` is rebuilt without `UNIQUE(event_id)`:
+/// an event gets a new item each time its gate opens again (the label is
+/// re-added, the issue reopened), and at most one open item at a time.
+/// `item_comments` binds an item to every trusted comment it used. Events
+/// record when their content last changed and when the gate was checked.
+const V3_ITEM_COLUMNS: &str = "id, event_id, repo, title, stage, failed_stage, error, classification, eval_json, \
+    plan_draft, plan_version, approved_plan, approved_version, approved_at, approved_via, branch, worktree, \
+    base_ref, impl_summary, tests_status, tests_output, pr_url, comment_draft, comment_state, comment_url, surface, \
+    group_requested_at, group_jid, group_closed_at, current_task_id, last_task_id, step_errors, created_at, \
+    updated_at, closed_at, head_sha";
+
+const SCHEMA_V3: &[&str] = &[
+    "CREATE TABLE items_v3 (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id           INTEGER NOT NULL REFERENCES events(id),
+        repo               TEXT NOT NULL,
+        title              TEXT NOT NULL,
+        stage              TEXT NOT NULL,
+        failed_stage       TEXT,
+        error              TEXT,
+        classification     TEXT,
+        eval_json          TEXT,
+        plan_draft         TEXT,
+        plan_version       INTEGER NOT NULL DEFAULT 0,
+        approved_plan      TEXT,
+        approved_version   INTEGER,
+        approved_at        TEXT,
+        approved_via       TEXT,
+        branch             TEXT,
+        worktree           TEXT,
+        base_ref           TEXT,
+        impl_summary       TEXT,
+        tests_status       TEXT,
+        tests_output       TEXT,
+        pr_url             TEXT,
+        comment_draft      TEXT,
+        comment_state      TEXT NOT NULL DEFAULT 'none',
+        comment_url        TEXT,
+        surface            TEXT NOT NULL DEFAULT 'none',
+        group_requested_at TEXT,
+        group_jid          TEXT,
+        group_closed_at    TEXT,
+        current_task_id    TEXT,
+        last_task_id       TEXT,
+        step_errors        INTEGER NOT NULL DEFAULT 0,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        closed_at          TEXT,
+        head_sha           TEXT,
+        rev_title          TEXT,
+        rev_body           TEXT,
+        revision_hash      TEXT,
+        gate_event_id      TEXT,
+        label_event_id     TEXT,
+        gate_actor         TEXT,
+        gate_at            TEXT,
+        stale_reason       TEXT
+    )",
+    "INSERT INTO items_v3 ({cols}) SELECT {cols} FROM items",
+    "DROP TABLE items",
+    "ALTER TABLE items_v3 RENAME TO items",
+    "CREATE INDEX idx_items_stage ON items(stage, id)",
+    "CREATE UNIQUE INDEX idx_items_open_event ON items(event_id) WHERE stage NOT IN ('closed', 'cancelled', 'stale')",
+    "CREATE UNIQUE INDEX idx_items_gate ON items(event_id, gate_event_id) WHERE gate_event_id IS NOT NULL",
+    "CREATE TABLE item_comments (
+        item_id     INTEGER NOT NULL REFERENCES items(id),
+        comment_id  TEXT NOT NULL,
+        author      TEXT NOT NULL,
+        body_hash   TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (item_id, comment_id)
+    )",
+    "ALTER TABLE events ADD COLUMN changed_at TEXT",
+    "ALTER TABLE events ADD COLUMN gate_checked_at TEXT",
+    "ALTER TABLE events ADD COLUMN gate_note TEXT",
+    "UPDATE events SET changed_at = last_seen_at",
+];
+
+/// Runs [`SCHEMA_V3`] with foreign keys off (the documented SQLite
+/// procedure for rebuilding a table other tables reference), in one
+/// transaction, then checks every foreign key before committing.
+fn migrate_v3(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
+    Box::pin(async move {
+        let mut conn = pool.acquire().await?;
+        sqlx::query("PRAGMA foreign_keys = OFF").execute(&mut *conn).await?;
+        let result = async {
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            let done: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'revision_hash'")
+                    .fetch_one(&mut *conn)
+                    .await?;
+            if done > 0 {
+                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                return Ok(());
+            }
+            let applied = async {
+                for stmt in SCHEMA_V3 {
+                    let stmt = stmt.replace("{cols}", V3_ITEM_COLUMNS);
+                    sqlx::query(&stmt).execute(&mut *conn).await.with_context(|| format!("intake.db v3: {stmt}"))?;
+                }
+                let broken: Vec<(String,)> =
+                    sqlx::query_as("SELECT \"table\" FROM pragma_foreign_key_check").fetch_all(&mut *conn).await?;
+                if !broken.is_empty() {
+                    bail!("intake.db v3 left broken foreign keys in {broken:?}");
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            match applied {
+                Ok(()) => {
+                    sqlx::query("COMMIT").execute(&mut *conn).await?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(e)
+                }
+            }
+        }
+        .await;
+        sqlx::query("PRAGMA foreign_keys = ON").execute(&mut *conn).await?;
+        result
+    })
+}
+
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(super::INTAKE_DB_PATH)).await?;
@@ -124,6 +251,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
         &[
             crate::migrate::Migration { version: 1, name: "intake baseline", step: crate::migrate::Step::Sql(SCHEMA_V1) },
             crate::migrate::Migration { version: 2, name: "collected commit", step: crate::migrate::Step::Sql(SCHEMA_V2) },
+            crate::migrate::Migration { version: 3, name: "revision binding", step: crate::migrate::Step::Rust(migrate_v3) },
         ],
     )
     .await
@@ -139,7 +267,7 @@ pub async fn open_read_only(workspace_root: &Path) -> Result<SqlitePool> {
 // ── events ───────────────────────────────────────────────────────────────
 
 const EVENT_COLUMNS: &str = "id, source, external_id, project, kind, title, body, author, labels_json, url, \
-    state, created_at, updated_at, accepted, first_seen_at, last_seen_at";
+    state, created_at, updated_at, accepted, first_seen_at, last_seen_at, gate_note";
 
 fn event_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<Event> {
     Ok(Event {
@@ -159,6 +287,7 @@ fn event_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<Event> {
         accepted: r.try_get::<i64, _>("accepted")? != 0,
         first_seen_at: r.try_get("first_seen_at")?,
         last_seen_at: r.try_get("last_seen_at")?,
+        gate_note: r.try_get("gate_note")?,
     })
 }
 
@@ -191,7 +320,8 @@ fn validate_event(e: &NewEvent) -> Result<()> {
 /// Record an event, deduplicated by `(source, external_id)`: the first
 /// report inserts it, a later report updates the fields the source may
 /// change (title, body, labels, state, gate decision, raw). One transaction.
-pub async fn upsert_event(pool: &SqlitePool, e: &NewEvent) -> Result<(Event, Upsert)> {
+/// Also returns the event as it was before, for an update.
+pub async fn upsert_event(pool: &SqlitePool, e: &NewEvent) -> Result<(Event, Upsert, Option<Event>)> {
     validate_event(e)?;
     let now = crate::timestamp::now();
     let labels = serde_json::to_string(&e.labels)?;
@@ -210,8 +340,8 @@ pub async fn upsert_event(pool: &SqlitePool, e: &NewEvent) -> Result<(Event, Ups
             sqlx::query(
                 "INSERT INTO events (source, external_id, project, kind, title, body, author, labels_json,
                                      url, state, created_at, updated_at, raw_json, accepted,
-                                     first_seen_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
+                                     first_seen_at, last_seen_at, changed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, ?15)",
             )
             .bind(&e.source)
             .bind(&e.external_id)
@@ -230,7 +360,7 @@ pub async fn upsert_event(pool: &SqlitePool, e: &NewEvent) -> Result<(Event, Ups
             .bind(&now)
             .execute(&mut *tx)
             .await?;
-            Upsert::Inserted
+            (Upsert::Inserted, None)
         }
         Some(row) => {
             let old = event_from_row(&row)?;
@@ -246,7 +376,8 @@ pub async fn upsert_event(pool: &SqlitePool, e: &NewEvent) -> Result<(Event, Ups
             sqlx::query(
                 "UPDATE events SET project = ?3, kind = ?4, title = ?5, body = ?6, author = ?7,
                         labels_json = ?8, url = ?9, state = ?10, updated_at = COALESCE(?11, updated_at),
-                        raw_json = ?12, accepted = ?13, last_seen_at = ?14
+                        raw_json = ?12, accepted = ?13, last_seen_at = ?14,
+                        changed_at = CASE WHEN ?15 THEN ?14 ELSE changed_at END
                   WHERE source = ?1 AND external_id = ?2",
             )
             .bind(&e.source)
@@ -263,18 +394,15 @@ pub async fn upsert_event(pool: &SqlitePool, e: &NewEvent) -> Result<(Event, Ups
             .bind(&raw)
             .bind(e.accepted as i64)
             .bind(&now)
+            .bind(changed)
             .execute(&mut *tx)
             .await?;
-            if changed {
-                Upsert::Updated
-            } else {
-                Upsert::Unchanged
-            }
+            (if changed { Upsert::Updated } else { Upsert::Unchanged }, Some(old))
         }
     };
     tx.commit().await?;
     let ev = event_by_key(pool, &e.source, &e.external_id).await?.context("event vanished")?;
-    Ok((ev, kind))
+    Ok((ev, kind.0, kind.1))
 }
 
 pub async fn event_by_key(pool: &SqlitePool, source: &str, external_id: &str) -> Result<Option<Event>> {
@@ -293,6 +421,55 @@ pub async fn event(pool: &SqlitePool, id: i64) -> Result<Event> {
         .await
         .with_context(|| format!("no event {id}"))?;
     event_from_row(&row)
+}
+
+/// Accepted, open events of `source` on one of `projects` that have no
+/// open item and changed since their gate was last checked: the candidates
+/// for a new item.
+pub async fn gate_candidates(pool: &SqlitePool, source: &str, projects: &[String]) -> Result<Vec<Event>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {EVENT_COLUMNS} FROM events e
+          WHERE source = ?1 AND accepted = 1 AND state = 'open'
+            AND (gate_checked_at IS NULL OR gate_checked_at < COALESCE(changed_at, last_seen_at))
+            AND NOT EXISTS (SELECT 1 FROM items i WHERE i.event_id = e.id AND i.stage NOT IN ('closed','cancelled','stale'))
+          ORDER BY id"
+    ))
+    .bind(source)
+    .fetch_all(pool)
+    .await?;
+    let lower: Vec<String> = projects.iter().map(|p| p.to_lowercase()).collect();
+    let mut out = Vec::new();
+    for r in &rows {
+        let e = event_from_row(r)?;
+        if e.project.as_deref().map(|p| lower.contains(&p.to_lowercase())).unwrap_or(false) {
+            out.push(e);
+        }
+    }
+    Ok(out)
+}
+
+/// Set the stored title and body of event `id` to what the source returned
+/// live (the gate check binds an item to that text; a later poll compares).
+pub async fn set_event_content(pool: &SqlitePool, id: i64, title: &str, body: &str) -> Result<()> {
+    sqlx::query("UPDATE events SET title = ?2, body = ?3 WHERE id = ?1")
+        .bind(id)
+        .bind(title)
+        .bind(body)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Record that the gate of event `id` was checked now, with the reason no
+/// item was created (`None` when one was).
+pub async fn set_gate_checked(pool: &SqlitePool, id: i64, note: Option<&str>) -> Result<()> {
+    sqlx::query("UPDATE events SET gate_checked_at = ?2, gate_note = ?3 WHERE id = ?1")
+        .bind(id)
+        .bind(crate::timestamp::now())
+        .bind(note)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Newest first.
@@ -371,6 +548,23 @@ pub struct Item {
     pub created_at: String,
     pub updated_at: String,
     pub closed_at: Option<String>,
+    /// The event's title and body when the gate was satisfied: the only
+    /// issue text any brief uses.
+    pub rev_title: Option<String>,
+    pub rev_body: Option<String>,
+    /// [`super::event::revision_hash`] of `rev_title` and `rev_body`. The
+    /// item goes `stale` when the source's text no longer matches it.
+    pub revision_hash: Option<String>,
+    /// The source event that opened the gate (GitHub: `labeled:<id>` or
+    /// `reopened:<id>`; `accept:<time>` for `nucleus events emit --accept`).
+    pub gate_event_id: Option<String>,
+    /// The label event the gate depends on (`labeled:<id>`).
+    pub label_event_id: Option<String>,
+    /// Who set the gate (GitHub: the collaborator who added the label).
+    pub gate_actor: Option<String>,
+    pub gate_at: Option<String>,
+    /// Why the item stopped as `stale`.
+    pub stale_reason: Option<String>,
 }
 
 impl Item {
@@ -435,21 +629,45 @@ const ITEM_COLUMNS: &str = "id, event_id, repo, title, stage, failed_stage, erro
     plan_draft, plan_version, approved_plan, approved_version, approved_at, approved_via, branch, worktree, \
     base_ref, impl_summary, head_sha, tests_status, tests_output, pr_url, comment_draft, comment_state, comment_url, \
     surface, group_requested_at, group_jid, group_closed_at, current_task_id, last_task_id, step_errors, \
-    created_at, updated_at, closed_at";
+    created_at, updated_at, closed_at, rev_title, rev_body, revision_hash, gate_event_id, label_event_id, \
+    gate_actor, gate_at, stale_reason";
 
-/// Create the item for an accepted event (at most one per event), in the
-/// `queued` stage. Returns `None` when the event already has an item.
-pub async fn create_item(pool: &SqlitePool, event: &Event, repo: &str) -> Result<Option<Item>> {
+/// What a new item is bound to: the event's revision and the gate event.
+#[derive(Debug, Clone)]
+pub struct NewItem<'a> {
+    pub event: &'a Event,
+    pub repo: &'a str,
+    pub rev_title: &'a str,
+    pub rev_body: &'a str,
+    pub gate_event_id: &'a str,
+    pub label_event_id: Option<&'a str>,
+    pub gate_actor: &'a str,
+    pub gate_at: &'a str,
+}
+
+/// Create an item for an accepted event, in the `queued` stage, bound to
+/// the given revision and gate event. Returns `None` when the event
+/// already has an open item or an item for this gate event.
+pub async fn create_item(pool: &SqlitePool, n: &NewItem<'_>) -> Result<Option<Item>> {
     let now = crate::timestamp::now();
+    let hash = super::event::revision_hash(n.rev_title, n.rev_body);
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let res = sqlx::query(
-        "INSERT OR IGNORE INTO items (event_id, repo, title, stage, created_at, updated_at)
-         VALUES (?1, ?2, ?3, 'queued', ?4, ?4)",
+        "INSERT OR IGNORE INTO items (event_id, repo, title, stage, created_at, updated_at, rev_title, rev_body,
+                                      revision_hash, gate_event_id, label_event_id, gate_actor, gate_at)
+         VALUES (?1, ?2, ?3, 'queued', ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )
-    .bind(event.id)
-    .bind(repo)
-    .bind(super::clip(&event.title, 200))
+    .bind(n.event.id)
+    .bind(n.repo)
+    .bind(super::clip(n.rev_title, 200))
     .bind(&now)
+    .bind(n.rev_title)
+    .bind(n.rev_body)
+    .bind(&hash)
+    .bind(n.gate_event_id)
+    .bind(n.label_event_id)
+    .bind(n.gate_actor)
+    .bind(n.gate_at)
     .execute(&mut *tx)
     .await?;
     if res.rows_affected() == 0 {
@@ -461,9 +679,17 @@ pub async fn create_item(pool: &SqlitePool, event: &Event, repo: &str) -> Result
     )
     .bind(id)
     .bind(&now)
-    .bind(format!("accepted {} event {}", event.source, event.external_id))
+    .bind(format!(
+        "accepted {} event {} (gate {} by {})",
+        n.event.source, n.event.external_id, n.gate_event_id, n.gate_actor
+    ))
     .execute(&mut *tx)
     .await?;
+    sqlx::query("UPDATE events SET gate_checked_at = ?2, gate_note = NULL WHERE id = ?1")
+        .bind(n.event.id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(Some(item(pool, id).await?))
 }
@@ -476,16 +702,41 @@ pub async fn item(pool: &SqlitePool, id: i64) -> Result<Item> {
         .with_context(|| format!("no item #{id}"))
 }
 
-pub async fn item_for_event(pool: &SqlitePool, event_id: i64) -> Result<Option<Item>> {
-    Ok(sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM items WHERE event_id = ?1"))
+/// The event's open item (not closed, cancelled or stale), if any.
+pub async fn open_item_for_event(pool: &SqlitePool, event_id: i64) -> Result<Option<Item>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {ITEM_COLUMNS} FROM items WHERE event_id = ?1 AND stage NOT IN ('closed','cancelled','stale')"
+    ))
+    .bind(event_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Every item of an event, oldest first.
+pub async fn items_for_event(pool: &SqlitePool, event_id: i64) -> Result<Vec<Item>> {
+    Ok(sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM items WHERE event_id = ?1 ORDER BY id"))
         .bind(event_id)
-        .fetch_optional(pool)
+        .fetch_all(pool)
         .await?)
 }
 
-/// Newest first. `open_only` leaves out closed and cancelled items.
+/// Ids of the items a tick advances (not closed, cancelled or stale).
+pub async fn active_item_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
+    Ok(sqlx::query_scalar("SELECT id FROM items WHERE stage NOT IN ('closed','cancelled','stale') ORDER BY id")
+        .fetch_all(pool)
+        .await?)
+}
+
+/// Newest first. `open_only` leaves out closed and cancelled items, and
+/// stale items that a newer item of the same event replaced (a stale item
+/// waits for the operator until then).
 pub async fn list_items(pool: &SqlitePool, open_only: bool, limit: i64) -> Result<Vec<Item>> {
-    let filter = if open_only { "WHERE stage NOT IN ('closed','cancelled')" } else { "" };
+    let filter = if open_only {
+        "WHERE stage NOT IN ('closed','cancelled') AND NOT (stage = 'stale' AND EXISTS \
+         (SELECT 1 FROM items b WHERE b.event_id = items.event_id AND b.id > items.id))"
+    } else {
+        ""
+    };
     Ok(sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM items {filter} ORDER BY id DESC LIMIT ?1"))
         .bind(limit)
         .fetch_all(pool)
@@ -553,6 +804,7 @@ const SETTABLE: &[&str] = &[
     "step_errors",
     "title",
     "closed_at",
+    "stale_reason",
 ];
 
 fn set_clause(set: &[(&str, Val)], first_param: usize) -> Result<String> {
@@ -750,6 +1002,51 @@ pub async fn set_wa_queued(pool: &SqlitePool, message_id: i64, outbound: i64) ->
     Ok(())
 }
 
+// ── comment binding ──────────────────────────────────────────────────────
+
+/// What [`bind_comment`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentBinding {
+    /// First use: recorded.
+    New,
+    /// Used before with the same content.
+    Same,
+    /// Used before with different content: the item must not continue.
+    Changed,
+}
+
+/// Bind item `id` to a trusted comment's content (by comment id). The
+/// first use records its hash; a later use compares.
+pub async fn bind_comment(pool: &SqlitePool, id: i64, comment_id: &str, author: &str, body_hash: &str) -> Result<CommentBinding> {
+    let res = sqlx::query(
+        "INSERT OR IGNORE INTO item_comments (item_id, comment_id, author, body_hash, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(id)
+    .bind(comment_id)
+    .bind(author)
+    .bind(body_hash)
+    .bind(crate::timestamp::now())
+    .execute(pool)
+    .await?;
+    if res.rows_affected() == 1 {
+        return Ok(CommentBinding::New);
+    }
+    let stored: String = sqlx::query_scalar("SELECT body_hash FROM item_comments WHERE item_id = ?1 AND comment_id = ?2")
+        .bind(id)
+        .bind(comment_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(if stored == body_hash { CommentBinding::Same } else { CommentBinding::Changed })
+}
+
+/// The ids of every comment item `id` used.
+pub async fn bound_comments(pool: &SqlitePool, id: i64) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar("SELECT comment_id FROM item_comments WHERE item_id = ?1 ORDER BY comment_id")
+        .bind(id)
+        .fetch_all(pool)
+        .await?)
+}
+
 // ── collaborators, meta ──────────────────────────────────────────────────
 
 /// A cached collaborator decision younger than `max_age_secs`.
@@ -824,6 +1121,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// An item for `ev` bound to its current text, as the gate would.
+    pub(crate) async fn new_item(pool: &SqlitePool, ev: &Event, gate: &str) -> Option<Item> {
+        create_item(
+            pool,
+            &NewItem {
+                event: ev,
+                repo: "acme/widget",
+                rev_title: &ev.title,
+                rev_body: &ev.body,
+                gate_event_id: gate,
+                label_event_id: Some(gate),
+                gate_actor: "maintainer",
+                gate_at: "2026-09-20T10:05:00.000Z",
+            },
+        )
+        .await
+        .unwrap()
+    }
+
     pub(crate) async fn temp_db() -> (tempfile::TempDir, SqlitePool) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
@@ -834,17 +1150,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn events_are_deduplicated_by_source_and_external_id() {
         let (_d, pool) = temp_db().await;
-        let (a, k) = upsert_event(&pool, &issue(1, &[], "open")).await.unwrap();
+        let (a, k, _) = upsert_event(&pool, &issue(1, &[], "open")).await.unwrap();
         assert_eq!(k, Upsert::Inserted);
-        let (b, k) = upsert_event(&pool, &issue(1, &[], "open")).await.unwrap();
+        let (b, k, _) = upsert_event(&pool, &issue(1, &[], "open")).await.unwrap();
         assert_eq!((k, b.id), (Upsert::Unchanged, a.id));
-        let (c, k) = upsert_event(&pool, &issue(1, &["nucleus"], "open")).await.unwrap();
+        let (c, k, _) = upsert_event(&pool, &issue(1, &["nucleus"], "open")).await.unwrap();
         assert_eq!((k, c.id), (Upsert::Updated, a.id));
         assert!(c.accepted && c.labels == vec!["nucleus".to_string()]);
         // Same external id from another source is another event.
         let mut other = issue(1, &[], "open");
         other.source = "cli".into();
-        let (d, k) = upsert_event(&pool, &other).await.unwrap();
+        let (d, k, _) = upsert_event(&pool, &other).await.unwrap();
         assert_eq!(k, Upsert::Inserted);
         assert_ne!(d.id, a.id);
         assert_eq!(list_events(&pool, 10).await.unwrap().len(), 2);
@@ -869,10 +1185,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn one_item_per_event_and_guarded_stage_changes() {
         let (_d, pool) = temp_db().await;
-        let (ev, _) = upsert_event(&pool, &issue(2, &["nucleus"], "open")).await.unwrap();
-        let it = create_item(&pool, &ev, "acme/widget").await.unwrap().unwrap();
+        let (ev, _, _) = upsert_event(&pool, &issue(2, &["nucleus"], "open")).await.unwrap();
+        let it = new_item(&pool, &ev, "labeled:1").await.unwrap();
         assert_eq!((it.stage(), it.id), (Stage::Queued, 1));
-        assert!(create_item(&pool, &ev, "acme/widget").await.unwrap().is_none());
+        assert_eq!(it.revision_hash.as_deref(), Some(super::super::event::revision_hash("Issue 2", "body").as_str()));
+        assert!(new_item(&pool, &ev, "labeled:1").await.is_none(), "one item per gate event");
+        assert!(new_item(&pool, &ev, "labeled:2").await.is_none(), "one open item per event");
         assert!(advance(&pool, it.id, Stage::Queued, StageEvent::EvalStarted, "eval", vec![]).await.unwrap());
         // A second process that read `queued` loses.
         assert!(!advance(&pool, it.id, Stage::Queued, StageEvent::EvalStarted, "eval", vec![]).await.unwrap());
@@ -892,6 +1210,13 @@ pub(crate) mod tests {
         assert!(advance(&pool, it.id, Stage::Queued, StageEvent::Cancel, "stop", vec![]).await.unwrap());
         let it = item(&pool, it.id).await.unwrap();
         assert!(it.closed_at.is_some() && it.stage() == Stage::Cancelled);
+        // A closed item lets a new gate event start a new item; the same
+        // gate event never does.
+        assert!(new_item(&pool, &ev, "labeled:1").await.is_none());
+        let second = new_item(&pool, &ev, "reopened:9").await.unwrap();
+        assert_eq!(second.id, 2);
+        assert_eq!(open_item_for_event(&pool, ev.id).await.unwrap().unwrap().id, 2);
+        assert_eq!(items_for_event(&pool, ev.id).await.unwrap().len(), 2);
         let log = transitions(&pool, it.id).await.unwrap();
         let path: Vec<&str> = log.iter().map(|t| t.to_stage.as_str()).collect();
         assert_eq!(path, ["queued", "eval", "failed", "queued", "cancelled"]);
@@ -900,8 +1225,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn thread_messages_dedup_and_read_marks() {
         let (_d, pool) = temp_db().await;
-        let (ev, _) = upsert_event(&pool, &issue(3, &["nucleus"], "open")).await.unwrap();
-        let it = create_item(&pool, &ev, "acme/widget").await.unwrap().unwrap();
+        let (ev, _, _) = upsert_event(&pool, &issue(3, &["nucleus"], "open")).await.unwrap();
+        let it = new_item(&pool, &ev, "labeled:1").await.unwrap();
         let m = |r: Option<&'static str>| NewMessage {
             author: "operator",
             via: "whatsapp",
@@ -921,6 +1246,50 @@ pub(crate) mod tests {
         unread(&pool, it.id, "t1").await.unwrap();
         assert!(messages(&pool, it.id).await.unwrap().iter().all(|m| m.pending_agent == 1));
         set_wa_queued(&pool, b, 7).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn comments_are_bound_by_content() {
+        let (_d, pool) = temp_db().await;
+        let (ev, _, _) = upsert_event(&pool, &issue(4, &["nucleus"], "open")).await.unwrap();
+        let it = new_item(&pool, &ev, "labeled:1").await.unwrap();
+        assert_eq!(bind_comment(&pool, it.id, "55", "dev", "h1").await.unwrap(), CommentBinding::New);
+        assert_eq!(bind_comment(&pool, it.id, "55", "dev", "h1").await.unwrap(), CommentBinding::Same);
+        assert_eq!(bind_comment(&pool, it.id, "55", "dev", "h2").await.unwrap(), CommentBinding::Changed);
+        assert_eq!(bound_comments(&pool, it.id).await.unwrap(), ["55"]);
+    }
+
+    #[tokio::test]
+    async fn v3_rebuilds_items_and_keeps_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(super::super::INTAKE_DB_PATH);
+        let pool = crate::db::open(&path).await.unwrap();
+        crate::migrate::migrate(
+            &pool,
+            &[
+                crate::migrate::Migration { version: 1, name: "intake baseline", step: crate::migrate::Step::Sql(SCHEMA_V1) },
+                crate::migrate::Migration { version: 2, name: "collected commit", step: crate::migrate::Step::Sql(SCHEMA_V2) },
+            ],
+        )
+        .await
+        .unwrap();
+        for sql in [
+            "INSERT INTO events (source, external_id, kind, title, body, labels_json, state, raw_json, accepted, first_seen_at, last_seen_at)
+             VALUES ('github', 'acme/widget#1', 'issue', 'T', 'B', '[]', 'open', '{}', 1, 't', 't')",
+            "INSERT INTO items (event_id, repo, title, stage, created_at, updated_at, head_sha) VALUES (1, 'acme/widget', 'T', 'eval', 't', 't', 'abc')",
+            "INSERT INTO item_messages (item_id, at, author, via, body) VALUES (1, 't', 'nucleus', 'pipeline', 'hi')",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+        let pool = open(dir.path()).await.unwrap();
+        let it = item(&pool, 1).await.unwrap();
+        assert_eq!((it.stage.as_str(), it.head_sha.as_deref(), it.revision_hash), ("eval", Some("abc"), None));
+        assert_eq!(messages(&pool, 1).await.unwrap().len(), 1);
+        let fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(&pool).await.unwrap();
+        assert_eq!(fk, 1, "foreign keys are on again");
+        // Running open again is a no-op.
+        drop(open(dir.path()).await.unwrap());
     }
 
     #[tokio::test]
