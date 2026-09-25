@@ -174,6 +174,31 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     Ok(pool)
 }
 
+/// The schema version this code writes.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// True when `pool` (a read-only intake.db) has the full schema: the
+/// migration ledger records [`SCHEMA_VERSION`] and the item tables exist.
+/// An empty file, or a database a writer is still creating, is not ready.
+pub async fn schema_ready(pool: &SqlitePool) -> bool {
+    let tables: i64 = match sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('schema_migrations', 'events', 'items', 'item_messages', 'item_transitions', 'item_tasks')",
+    )
+    .fetch_one(pool)
+    .await
+    {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    if tables != 6 {
+        return false;
+    }
+    matches!(
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM schema_migrations").fetch_one(pool).await,
+        Ok(Some(v)) if v >= SCHEMA_VERSION
+    )
+}
+
 /// Open an existing intake.db read-only (dashboard reads).
 pub async fn open_read_only(workspace_root: &Path) -> Result<SqlitePool> {
     crate::db::open_read_only(&workspace_root.join(super::INTAKE_DB_PATH)).await

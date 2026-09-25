@@ -120,7 +120,10 @@ async fn read_pool(s: &IntakeState) -> Option<sqlx::SqlitePool> {
     if !s.intake.enabled || !s.workspace_root.join(nucleus_core::intake::INTAKE_DB_PATH).exists() {
         return None;
     }
-    store::open_read_only(&s.workspace_root).await.ok()
+    let pool = store::open_read_only(&s.workspace_root).await.ok()?;
+    // An empty or half-created database (a writer is migrating it) reads as
+    // "nothing yet", not as an error.
+    store::schema_ready(&pool).await.then_some(pool)
 }
 
 async fn list(State(s): State<Arc<IntakeState>>, Query(q): Query<ListQ>) -> Result<Json<Vec<Item>>, IntakeError> {
@@ -315,6 +318,32 @@ mod tests {
         let Json(l) = list(State(state(dir.path())), Query(ListQ { all: Some(true) })).await.unwrap();
         assert!(l.is_empty());
         assert!(detail(State(state(dir.path())), Query(DetailQ { id: 1 })).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unmigrated_database_is_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(nucleus_core::intake::INTAKE_DB_PATH);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        // An empty file.
+        std::fs::write(&db, b"").unwrap();
+        let Json(l) = list(State(enabled_state(dir.path())), Query(ListQ { all: Some(true) })).await.unwrap();
+        assert!(l.is_empty());
+        assert!(matches!(detail(State(enabled_state(dir.path())), Query(DetailQ { id: 1 })).await, Err(IntakeError::NotFound(1))));
+        // A database without the items table.
+        std::fs::remove_file(&db).unwrap();
+        let pool = nucleus_core::db::open(&db).await.unwrap();
+        sqlx::query("CREATE TABLE events (id INTEGER PRIMARY KEY)").execute(&pool).await.unwrap();
+        pool.close().await;
+        let Json(l) = list(State(enabled_state(dir.path())), Query(ListQ { all: Some(true) })).await.unwrap();
+        assert!(l.is_empty());
+        // A migrated one lists normally.
+        std::fs::remove_file(&db).unwrap();
+        let _ = std::fs::remove_file(db.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db.with_extension("db-shm"));
+        drop(store::open(dir.path()).await.unwrap());
+        let Json(l) = list(State(enabled_state(dir.path())), Query(ListQ { all: Some(true) })).await.unwrap();
+        assert!(l.is_empty(), "migrated and empty");
     }
 
     #[tokio::test]
