@@ -78,6 +78,7 @@ fn base_spawn(ctx: &ProfileContext) -> SpawnOptions {
         ready_timeout: Duration::from_secs(60),
         resume_session_id: None,
         agent_label: Some(ctx.agent_label.to_string()),
+        env: vec![],
     }
 }
 
@@ -165,6 +166,13 @@ impl SessionProfile {
 
     pub fn ready_timeout(mut self, d: Duration) -> Self {
         self.spawn.ready_timeout = d;
+        self
+    }
+
+    /// Set an environment variable for the session's `claude` process and
+    /// every tool command it runs (ADR-033: the task worker's role).
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.spawn.env.push((key.into(), value.into()));
         self
     }
 

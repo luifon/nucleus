@@ -111,6 +111,42 @@ export function usePolling<T>(
   return state;
 }
 
+/** Calls `refetch` every `intervalMs` while `active` is true and the tab
+ *  is visible. Pairs with `useFetch` when polling should run only under a
+ *  condition derived from the fetched data (for example: some task is
+ *  still running), which `usePolling` cannot express because its
+ *  interval is always on. */
+export function usePollWhile(refetch: () => void, active: boolean, intervalMs: number): void {
+  const refetchRef = useRef(refetch);
+  refetchRef.current = refetch;
+
+  useEffect(() => {
+    if (!active) return;
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    const start = () => {
+      if (timer !== null) return;
+      timer = setInterval(() => refetchRef.current(), intervalMs);
+    };
+    const stop = () => {
+      if (timer === null) return;
+      clearInterval(timer);
+      timer = null;
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") start();
+      else stop();
+    };
+
+    if (document.visibilityState === "visible") start();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [active, intervalMs]);
+}
+
 /** Today's date in `YYYY-MM-DD` (local). Recomputed on each render but
  *  cheap; if a surface needs to react to date-rollovers, wire a 1-minute
  *  polling hook around it. */

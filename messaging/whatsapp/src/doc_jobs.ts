@@ -74,8 +74,11 @@ export async function fireEnrichJob(opts: {
   config: Config;
   record: DocRecord;
   chatId: string;
+  /** One enrichment job per key (the inbound message). */
+  sourceKey?: string | null;
 }): Promise<void> {
   const { jobStore, docStore, config, record, chatId } = opts;
+  if (opts.sourceKey && jobStore.bySourceKey(opts.sourceKey)) return;
   const docPath = docStore.pathFor(record);
   try {
     const { promise } = startJob({
@@ -85,6 +88,7 @@ export async function fireEnrichJob(opts: {
       chatId,
       docId: record.id,
       instruction: `enrich "${record.logicalName}"`,
+      sourceKey: opts.sourceKey,
       prompt: buildEnrichPrompt(docPath),
       // No tools, no add-dirs: Read-only session over one in-workspace file.
       appendSystemPrompt:
@@ -198,12 +202,14 @@ export async function runImportJob(opts: {
   config: Config;
   record: DocRecord;
   chatId: string;
+  /** One import job per key (the inbound message). */
+  sourceKey?: string | null;
 }): Promise<string> {
   const { jobStore, docStore, config, record, chatId } = opts;
   // Identity guard: importing an identity document into the (session-
   // mounted) vault defeats S18's by-reference reasoning. Override = retag.
   if (record.tags.some((t) => t.toLowerCase() === "identity")) {
-    return `⚠️ "${record.logicalName}" está marcado identity — não importo para o vault. Retag se quiser mesmo.`;
+    return `⚠️ "${record.logicalName}" is tagged identity — not importing it into the vault. Retag it if you really want this.`;
   }
   const { promise } = startJob({
     store: jobStore,
@@ -212,6 +218,7 @@ export async function runImportJob(opts: {
     chatId,
     docId: record.id,
     instruction: `vault-import "${record.logicalName}"`,
+    sourceKey: opts.sourceKey,
     prompt: buildImportPrompt(docStore.pathFor(record), record.logicalName),
     appendSystemPrompt:
       "You are a document importer. You read exactly one file and emit " +
@@ -224,5 +231,10 @@ export async function runImportJob(opts: {
   }
   const relPath = writeImportedNote(config, record, proposal);
   docStore.recordImport(record.id, relPath, chatId);
-  return `📥 "${record.logicalName}" importado para o vault: ${relPath}`;
+  return importResultLine(record.logicalName, relPath);
+}
+
+/** The reply line of a finished vault import. */
+export function importResultLine(name: string, relPath: string): string {
+  return `📥 "${name}" importado para o vault: ${relPath}`;
 }

@@ -24,6 +24,7 @@ pub struct Settings {
     pub usage: UsageConfig,
     pub vault_search: VaultSearchConfig,
     pub vault_check: VaultCheckConfig,
+    pub tasks: TasksConfig,
     pub ports: PortsConfig,
 }
 
@@ -542,6 +543,82 @@ fn default_frontmatter_exempt() -> Vec<String> {
     ["README.md", "Home.md"].iter().map(|s| s.to_string()).collect()
 }
 
+/// Background task workers (ADR-033). Internal safety limits only — the
+/// operator never sees them unless one is hit, and every hit is logged as a
+/// task event.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TasksConfig {
+    /// Workers allowed to run at once. A task started past this limit stays
+    /// `queued` until a slot frees.
+    #[serde(default = "default_tasks_max_concurrent")]
+    pub max_concurrent: u32,
+    /// A worker running longer than this is stopped and marked failed.
+    #[serde(default = "default_tasks_max_runtime_hours")]
+    pub max_runtime_hours: u32,
+    /// tmux session that hosts the worker windows. Change it only to keep a
+    /// second workspace (a test run) apart from the operator's workers.
+    #[serde(default = "default_tasks_tmux_session")]
+    pub tmux_session: String,
+    /// Operator-facing status lines for finished tasks (`[tasks.texts]`).
+    #[serde(default)]
+    pub texts: TaskTexts,
+}
+
+/// The status line a finished task's result message starts with, per final
+/// status. `{id}` is the short task id, `{title}` the task title. These go to
+/// the task's origin (WhatsApp or Discord), so they live with the task
+/// ledger, not with one venue.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TaskTexts {
+    pub done: String,
+    pub failed: String,
+    pub cancelled: String,
+    pub interrupted: String,
+    /// The one note sent when a result's delivery is given up: its outcome
+    /// is unknown (the send failed after the message may have left) or it
+    /// failed too many times. `{reason}` is the recorded reason.
+    pub delivery_failed: String,
+}
+
+impl Default for TaskTexts {
+    fn default() -> Self {
+        Self {
+            done: "✅ Task {id} done — {title}".into(),
+            failed: "⚠️ Task {id} failed — {title}".into(),
+            cancelled: "⏹ Task {id} cancelled — {title}".into(),
+            interrupted: "⚠️ Task {id} interrupted — {title}".into(),
+            delivery_failed: "⚠️ Task {id} — {title}: the result message was not confirmed as delivered \
+                              ({reason}). It is not sent again, so that it cannot arrive twice. The full \
+                              result is in the task ledger (dashboard, Tasks page; `nucleus tasks status {id}`)."
+                .into(),
+        }
+    }
+}
+
+fn default_tasks_tmux_session() -> String {
+    crate::tasks::TASKS_TMUX_SESSION.to_string()
+}
+
+fn default_tasks_max_concurrent() -> u32 {
+    6
+}
+
+fn default_tasks_max_runtime_hours() -> u32 {
+    12
+}
+
+impl Default for TasksConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: default_tasks_max_concurrent(),
+            max_runtime_hours: default_tasks_max_runtime_hours(),
+            tmux_session: default_tasks_tmux_session(),
+            texts: TaskTexts::default(),
+        }
+    }
+}
+
 fn default_reminder_channels() -> Vec<String> {
     vec!["discord-home".to_string()]
 }
@@ -582,6 +659,8 @@ struct TomlConfig {
     vault_search: VaultSearchConfig,
     #[serde(default)]
     vault_check: VaultCheckConfig,
+    #[serde(default)]
+    tasks: TasksConfig,
     ports: PortsConfig,
 }
 
@@ -644,6 +723,7 @@ impl Settings {
             usage: toml.usage,
             vault_search: toml.vault_search,
             vault_check: toml.vault_check,
+            tasks: toml.tasks,
             ports: toml.ports,
         })
     }

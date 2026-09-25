@@ -256,3 +256,22 @@ The setup wizard (ADR-010) can automate steps 2-4 once it lands.
   operator-DM pre-authorized case
 - CLAUDE.md Rule 10 — reminders CLI / channel values; updated to
   include `whatsapp-dm`
+
+## Amendment (2026-09-24, ADR-033) — the conversational path
+
+The DM and group conversational handlers no longer call
+`SessionPool.ask` and wait for one reply. A turn engine
+(`messaging/whatsapp/src/chat_engine.ts`) owns each chat's session:
+
+- every message is typed into the session when it arrives, also while a turn
+  runs (the running turn reads it at its next step);
+- the reply is the turn's final text at the real end of the turn, sent
+  through `outbound_queue` and quoting the operator's message;
+- one code-sent acknowledgement after 30 s, rate-limited progress messages,
+  a safety ceiling in hours instead of the 180 s timeout;
+- every message and turn is recorded (`chat_inbound`, `chat_turns`); a restart
+  sends one "interrupted" note per item.
+
+Rule 6 is unchanged: replies still go only to the chat the message came from,
+and the outbound drain still re-checks every target against the allowlists.
+Details in [[ADR-033]].

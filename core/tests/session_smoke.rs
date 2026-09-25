@@ -43,6 +43,7 @@ async fn spawn_ask_close_round_trip() {
         ready_timeout: Duration::from_secs(20),
         resume_session_id: None,
         agent_label: None,
+        env: vec![],
     })
     .await
     .expect("spawn");

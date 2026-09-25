@@ -1266,73 +1266,8 @@ async fn seed_reminders(pool: &SqlitePool, seeds: &[SeedRow]) -> Result<()> {
     Ok(())
 }
 
-// ============ WhatsApp outbound bridge ============
-//
-// To deliver a reminder to a WhatsApp chat without conflicting with
-// the whatsapp bot's Baileys auth (single-client constraint), the reminders
-// binary enqueues into a table that lives in memory/whatsapp.db. The bot
-// drains it every 1s and sends via its existing socket. See messaging/whatsapp/
-// src/db.ts OutboundQueueStore + index.ts startOutboundDrain.
-
-pub async fn open_whatsapp_db(path: &Path) -> Result<SqlitePool> {
-    let pool = nucleus_core::db::open(path).await?;
-    // Full ADR-018 shape (kind/media_path/mimetype/filename) for FRESH-
-    // INSTALL PARITY with the TS owner (messaging/whatsapp/src/db.ts)
-    // only — CREATE IF NOT EXISTS no-ops on existing DBs, and per ADR-020
-    // Rust runs NO migrations on whatsapp.db; the TS side heals pre-media
-    // DBs. The enqueue path below stays text-only (kind defaults 'text').
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS outbound_queue (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            target       TEXT    NOT NULL,
-            body         TEXT    NOT NULL,
-            source       TEXT    NOT NULL,
-            enqueued_at  TEXT    NOT NULL,
-            status       TEXT    NOT NULL DEFAULT 'pending',
-            attempts     INTEGER NOT NULL DEFAULT 0,
-            last_error   TEXT,
-            sent_at      TEXT,
-            msg_id       TEXT,
-            kind         TEXT    NOT NULL DEFAULT 'text',
-            media_path   TEXT,
-            mimetype     TEXT,
-            filename     TEXT
-        );
-        "#,
-    )
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_outbound_status_enqueued
-         ON outbound_queue(status, enqueued_at)",
-    )
-    .execute(&pool)
-    .await?;
-    Ok(pool)
-}
-
-pub async fn enqueue_whatsapp(
-    pool: &SqlitePool,
-    target: &str,
-    body: &str,
-    source: &str,
-) -> Result<i64> {
-    let now = Utc::now().to_rfc3339();
-    let row: (i64,) = sqlx::query_as(
-        "INSERT INTO outbound_queue (target, body, source, enqueued_at, status, attempts)
-         VALUES (?1, ?2, ?3, ?4, 'pending', 0)
-         RETURNING id",
-    )
-    .bind(target)
-    .bind(body)
-    .bind(source)
-    .bind(&now)
-    .fetch_one(pool)
-    .await
-    .context("enqueue outbound whatsapp")?;
-    Ok(row.0)
-}
+// WhatsApp delivery goes through `nucleus_core::whatsapp_queue` (the queue
+// table in memory/whatsapp.db that the bot drains; ADR-020 §5).
 
 /// Enqueue at most once per `source`: the row is inserted only when no row
 /// with the same `source` exists, in one statement, so two processes (or a

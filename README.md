@@ -59,7 +59,10 @@ Every binary that needs Claude goes through `core::claude_session::Session`
 (one-shot) or `SessionPool` (per-chat persistent) — the single seam for
 permission mode, denylist, persona injection, the tmux window lifecycle, and
 transcript-tail parsing. The TS port lives at `messaging/whatsapp/src/claude_session.ts`
-and mirrors the same API.
+and mirrors `Session`. WhatsApp chats run on a turn engine
+(`messaging/whatsapp/src/chat_engine.ts`, ADR-033) that follows each session's
+transcript and replies when the turn really ends; long work can run as a
+background task (`nucleus tasks`, ADR-033).
 
 Why tmux? `claude -p` (headless) is moving to API-only billing; the Max
 subscription only covers interactive mode. Long-lived sessions also win on
@@ -340,6 +343,22 @@ stale_after_days = 30
 archive_after_days = 90
 enabled = true
 
+[whatsapp.turns]
+# ADR-033: code-sent acknowledgement, progress rate, safety ceiling.
+ack_after_secs = 30
+progress_interval_secs = 180
+turn_ceiling_hours = 6
+
+[whatsapp.texts]
+# ADR-033: every fixed text the bot sends (English defaults in
+# messaging/whatsapp/src/texts.ts); override any key here.
+# ack = "⏳ Working on it…"
+
+[tasks]
+# ADR-033: internal safety limits for background workers.
+max_concurrent = 6
+max_runtime_hours = 12
+
 [ports]
 nucleus_dashboard = 8092
 ```
@@ -491,6 +510,7 @@ nucleus/
 - `docs/ADR-035-vault-search-and-vault-check.md` — FTS5 vault search (`vault-search` CLI, dashboard search, credential exclusions) and the weekly deterministic `vault-check` report
 - `docs/ADR-032-repo-private-skills-tree.md` — operator-private skills in the gitignored `.nucleus/.claude/skills/`, loaded via `--add-dir`; rejected alternatives
 - `docs/ADR-034-usage-accounting.md` — token and estimated-cost accounting for every Claude Code and Codex session: parsing and dedupe rules, cost-state reconciliation, price table, project and Nucleus attribution, `/usage` surface
+- `docs/ADR-033-turn-engine-and-task-ledger.md` — WhatsApp turn engine (real end of turn, mid-turn messages, ack/progress, quoted replies via the queue, typed input everywhere, outbound idempotency and secret filter) + the background task ledger (`nucleus tasks`, per-chat scopes)
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
@@ -550,6 +570,20 @@ tmux kill-window -t nucleus-discord:<window-prefix>
   --channels discord-home
 
 ./target/release/nucleus reminders list   # see pending
+
+# Background tasks (ADR-033). The WhatsApp DM session starts and inspects
+# them for you when you ask in plain language; the CLI is the same.
+./target/release/nucleus tasks start --title "Weekly report" --brief - <<'EOF'
+<full instructions for the worker>
+EOF
+./target/release/nucleus tasks list                 # running + recently finished
+./target/release/nucleus tasks status <id>          # state, timings, progress log
+./target/release/nucleus tasks output <id>          # result (or latest progress)
+./target/release/nucleus tasks cancel <id>
+tmux attach -t nucleus-tasks                        # watch the workers
+
+# Give the WhatsApp DM session context without a message from you (ADR-021/033)
+./target/release/nucleus session-send --to whatsapp-dm --from main --message "<brief>"
 
 # Search past session transcripts (ADR-023; index refreshes on every run)
 ./target/release/nucleus session-search "what did we decide about X" --days 30

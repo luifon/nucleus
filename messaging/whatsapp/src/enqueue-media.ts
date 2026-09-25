@@ -12,7 +12,9 @@
 //     the third). Bumps retrieve_count + audit.
 //
 //   --path /abs/file --kind image|document --target <digits|jid|group-name>
-//     Generic producer path (gallery etc.). Target validated by the drain.
+//     Generic producer path (gallery etc.). The target must be the
+//     operator's DM or a configured group (target_policy.ts); refused here
+//     otherwise, and validated again by the drain.
 //
 // Both modes COPY the file into memory/outbound-staging/ — the queue row's
 // media_path is drain-owned and unlinked at terminal state; pointing it at
@@ -22,9 +24,11 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { loadConfig } from "./config.js";
+import { refuseUnlessAllowed } from "./caller_guard.js";
 import { ChatSessionStore, OutboundQueueStore, type OutboundKind } from "./db.js";
 import { DocStore } from "./docstore.js";
 import { makeVaultManifestHook } from "./docstore_vault.js";
+import { enqueueRefusal } from "./target_policy.js";
 
 function fail(msg: string): never {
   console.error(JSON.stringify({ error: msg }));
@@ -57,6 +61,17 @@ function main(): void {
     path.resolve(import.meta.dirname, "..", "..", "..");
   const config = loadConfig(workspaceRoot, false);
   const flags = parseArgs(process.argv.slice(2));
+  // The target first, whoever the caller is: only the operator's DM or a
+  // configured group (target_policy.ts); the drain checks it again.
+  const rawTarget = flags.get("target");
+  if (rawTarget !== undefined) {
+    const refused = enqueueRefusal(rawTarget, config);
+    if (refused) fail(`target ${JSON.stringify(rawTarget)} refused: ${refused}`);
+  }
+  // --doc delivers to the operator's own DM: the operator, or the DM chat
+  // session with a valid task scope. --path sends anywhere: the operator
+  // only (ADR-033).
+  refuseUnlessAllowed("enqueue-media", flags.has("doc") ? "document" : "send", config.dbPath);
 
   // Schema owner first (ack.ts convention), then the queue writer.
   new ChatSessionStore(config.dbPath);
@@ -103,7 +118,6 @@ function main(): void {
     // ── Generic producer mode ──
     srcPath = flags.get("path")!;
     const rawKind = flags.get("kind");
-    const rawTarget = flags.get("target");
     if (!rawKind || (rawKind !== "image" && rawKind !== "document")) {
       fail("--path mode needs --kind image|document");
     }

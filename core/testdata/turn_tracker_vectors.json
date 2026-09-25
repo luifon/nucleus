@@ -1,0 +1,133 @@
+{
+  "_comment": "Shared vectors for the transcript turn tracker (ADR-033). Consumed by core/src/turn_tracker.rs and messaging/whatsapp/src/turn_tracker.test.ts. Records are reduced copies of real Claude Code 2.1.281 transcript records (fields the tracker does not read are dropped). Add cases here; never fork per-language copies.",
+  "cases": [
+    {
+      "name": "single turn with a direct answer",
+      "records": [
+        {"type": "user", "origin": {"kind": "human"}, "promptSource": "typed", "message": {"role": "user", "content": "[test] reply OK"}},
+        {"type": "attachment", "attachment": {"type": "date", "date": "2026-09-24"}},
+        {"type": "assistant", "message": {"id": "m1", "stop_reason": "end_turn", "content": [{"type": "thinking", "thinking": ""}]}},
+        {"type": "assistant", "message": {"id": "m1", "stop_reason": "end_turn", "content": [{"type": "text", "text": "OK"}]}},
+        {"type": "system", "subtype": "stop_hook_summary"},
+        {"type": "system", "subtype": "turn_duration", "durationMs": 1916}
+      ],
+      "events": [
+        {"type": "prompt", "origin": "human", "text": "[test] reply OK", "starts_turn": true},
+        {"type": "turn_end", "final_text": "OK", "pending_bg": 0}
+      ]
+    },
+    {
+      "name": "narration before a slow tool is progress, not the answer",
+      "records": [
+        {"type": "user", "origin": {"kind": "human"}, "message": {"role": "user", "content": "refaz o relatorio"}},
+        {"type": "assistant", "message": {"id": "m1", "stop_reason": "tool_use", "content": [{"type": "text", "text": "Refazendo o relatorio agora."}]}},
+        {"type": "assistant", "message": {"id": "m1", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "python3 build.py"}}]}},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]}},
+        {"type": "assistant", "message": {"id": "m2", "stop_reason": "end_turn", "content": [{"type": "text", "text": "Relatorio pronto:"}]}},
+        {"type": "assistant", "message": {"id": "m2", "stop_reason": "end_turn", "content": [{"type": "text", "text": "tudo certo."}]}},
+        {"type": "system", "subtype": "turn_duration", "durationMs": 240000}
+      ],
+      "events": [
+        {"type": "prompt", "origin": "human", "text": "refaz o relatorio", "starts_turn": true},
+        {"type": "progress", "text": "Refazendo o relatorio agora."},
+        {"type": "turn_end", "final_text": "Relatorio pronto:\ntudo certo.", "pending_bg": 0}
+      ]
+    },
+    {
+      "name": "messages typed mid-turn are enqueued, then absorbed, and do not end the turn",
+      "records": [
+        {"type": "user", "origin": {"kind": "human"}, "message": {"role": "user", "content": "B1 run a slow command"}},
+        {"type": "assistant", "message": {"id": "m1", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "slow"}}]}},
+        {"type": "queue-operation", "operation": "enqueue", "content": "B2 add BANANA"},
+        {"type": "queue-operation", "operation": "enqueue", "content": "B3 add CHERRY"},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}]}},
+        {"type": "queue-operation", "operation": "remove", "content": "B2 add BANANA", "reason": "absorbed_mid_turn"},
+        {"type": "queue-operation", "operation": "remove", "content": "B3 add CHERRY", "reason": "absorbed_mid_turn"},
+        {"type": "attachment", "attachment": {"type": "queued_command", "prompt": "B2 add BANANA", "commandMode": "prompt", "origin": {"kind": "human"}}},
+        {"type": "attachment", "attachment": {"type": "queued_command", "prompt": "B3 add CHERRY", "commandMode": "prompt", "origin": {"kind": "human"}}},
+        {"type": "assistant", "message": {"id": "m2", "stop_reason": "end_turn", "content": [{"type": "text", "text": "DONE BANANA CHERRY"}]}},
+        {"type": "system", "subtype": "turn_duration"}
+      ],
+      "events": [
+        {"type": "prompt", "origin": "human", "text": "B1 run a slow command", "starts_turn": true},
+        {"type": "enqueued", "text": "B2 add BANANA"},
+        {"type": "enqueued", "text": "B3 add CHERRY"},
+        {"type": "absorbed", "text": "B2 add BANANA"},
+        {"type": "absorbed", "text": "B3 add CHERRY"},
+        {"type": "turn_end", "final_text": "DONE BANANA CHERRY", "pending_bg": 0}
+      ]
+    },
+    {
+      "name": "a background command splits the work across two turns",
+      "records": [
+        {"type": "user", "origin": {"kind": "human"}, "message": {"role": "user", "content": "run the long job"}},
+        {"type": "assistant", "message": {"id": "m1", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_bg", "name": "Bash", "input": {"command": "long-job", "run_in_background": true}}]}},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_bg", "content": "Command running in background with ID: b1"}]}},
+        {"type": "assistant", "message": {"id": "m2", "stop_reason": "end_turn", "content": [{"type": "text", "text": "The job runs in the background. I will report when it finishes."}]}},
+        {"type": "system", "subtype": "turn_duration"},
+        {"type": "queue-operation", "operation": "enqueue", "content": "<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n</task-notification>"},
+        {"type": "queue-operation", "operation": "dequeue"},
+        {"type": "user", "origin": {"kind": "task-notification"}, "promptSource": "system", "message": {"role": "user", "content": "<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n</task-notification>"}},
+        {"type": "assistant", "message": {"id": "m3", "stop_reason": "end_turn", "content": [{"type": "text", "text": "The job finished: 42 rows."}]}},
+        {"type": "system", "subtype": "turn_duration"}
+      ],
+      "events": [
+        {"type": "prompt", "origin": "human", "text": "run the long job", "starts_turn": true},
+        {"type": "bg_started", "id": "toolu_bg"},
+        {"type": "turn_end", "final_text": "The job runs in the background. I will report when it finishes.", "pending_bg": 1},
+        {"type": "enqueued", "text": "<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n</task-notification>"},
+        {"type": "bg_finished", "id": "toolu_bg"},
+        {"type": "prompt", "origin": "task-notification", "text": "<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n</task-notification>", "starts_turn": true},
+        {"type": "turn_end", "final_text": "The job finished: 42 rows.", "pending_bg": 0}
+      ]
+    },
+    {
+      "name": "a completion notice absorbed mid-turn clears the background command",
+      "records": [
+        {"type": "user", "origin": {"kind": "human"}, "message": {"role": "user", "content": "run it in the background and wait"}},
+        {"type": "assistant", "message": {"id": "m1", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_bg", "name": "Bash", "input": {"command": "job", "run_in_background": true}}]}},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_bg", "content": "Command running in background with ID: b1"}]}},
+        {"type": "assistant", "message": {"id": "m2", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_w", "name": "Bash", "input": {"command": "poll output"}}]}},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_w", "content": "BG-DONE"}]}},
+        {"type": "attachment", "attachment": {"type": "queued_command", "prompt": "<task-notification>\n<tool-use-id>toolu_bg</tool-use-id>\n</task-notification>", "origin": {"kind": "task-notification"}}},
+        {"type": "assistant", "message": {"id": "m3", "stop_reason": "end_turn", "content": [{"type": "text", "text": "RESULT-OK BG-DONE"}]}},
+        {"type": "system", "subtype": "turn_duration"}
+      ],
+      "events": [
+        {"type": "prompt", "origin": "human", "text": "run it in the background and wait", "starts_turn": true},
+        {"type": "bg_started", "id": "toolu_bg"},
+        {"type": "bg_finished", "id": "toolu_bg"},
+        {"type": "absorbed", "text": "<task-notification>\n<tool-use-id>toolu_bg</tool-use-id>\n</task-notification>"},
+        {"type": "turn_end", "final_text": "RESULT-OK BG-DONE", "pending_bg": 0}
+      ]
+    },
+    {
+      "name": "an interrupted turn ends without a final text",
+      "records": [
+        {"type": "user", "origin": {"kind": "human"}, "message": {"role": "user", "content": "do something long"}},
+        {"type": "assistant", "message": {"id": "m1", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "x"}}]}},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}},
+        {"type": "system", "subtype": "turn_duration"}
+      ],
+      "events": [
+        {"type": "prompt", "origin": "human", "text": "do something long", "starts_turn": true},
+        {"type": "turn_end", "final_text": null, "pending_bg": 0}
+      ]
+    },
+    {
+      "name": "meta records, unknown origins and a stray turn_duration",
+      "records": [
+        {"type": "system", "subtype": "turn_duration"},
+        {"type": "user", "isMeta": true, "message": {"role": "user", "content": "<command-name>/x</command-name>"}},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Continue from where you left off."}]}},
+        {"type": "assistant", "message": {"id": "m1", "stop_reason": "end_turn", "content": [{"type": "text", "text": "No response requested."}]}},
+        {"type": "system", "subtype": "turn_duration"},
+        {"type": "not json at all"}
+      ],
+      "events": [
+        {"type": "prompt", "origin": "unknown", "text": "Continue from where you left off.", "starts_turn": true},
+        {"type": "turn_end", "final_text": "No response requested.", "pending_bg": 0}
+      ]
+    }
+  ]
+}

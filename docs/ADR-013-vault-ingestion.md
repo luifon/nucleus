@@ -168,3 +168,27 @@ a document out entirely; identity docs are import-refused on top.
 - Auto vault import (vault stays curated; import is explicit).
 - Operator-persona job sessions (code-owned prompts keep replies
   predictable; the persona signature comes from formatReply at send time).
+
+## Amendment (2026-09-24, ADR-033) — general background work
+
+The jobs primitive stays for the three document kinds (act, enrich,
+vault-import). General background work ("do this in the background", long
+reports, the planned issue pipeline) uses the task ledger instead:
+`memory/tasks.db`, owned by `nucleus_core::tasks`, started with
+`nucleus tasks start`, run by a detached worker in the `nucleus-tasks` tmux
+session. The "future extension" sketched above (cross-process producers
+inserting queued rows) is what the task ledger provides, venue-agnostic and
+outside the bot process. The two ledgers are not merged: jobs are coupled to
+the document library and the bot's quick-window promotion; tasks are not.
+
+The `ensureTmuxSession` race that failed concurrent job spawns with
+"duplicate session: nucleus-whatsapp-jobs" is fixed (the error now means the
+session exists).
+
+Every reply of the document path — the archive acknowledgement, the
+in-window answer of an act or vault-import job, the "working on it" line of
+a promoted job and its later result, and every failure line — goes through
+the outbound queue (operator decision, ADR-033), like the conversation path:
+retried, allowlist-checked, secret-filtered, sent on the live socket. The
+quick window still decides between one reply and two. The fixed lines are
+English and configurable under `[whatsapp.texts]`.

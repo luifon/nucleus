@@ -203,6 +203,10 @@ mod tests {
         p
     }
 
+    /// Tests that point NUCLEUS_TIER2_DIR at their own directory hold this:
+    /// the environment is shared by every test thread.
+    static TIER2_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn index(dir: &Path) -> String {
         std::fs::read_to_string(dir.join(INDEX_FILE)).unwrap_or_default()
     }
@@ -259,6 +263,7 @@ mod tests {
 
     #[test]
     fn promote_writes_one_frontmatter_block_even_if_the_body_has_one() {
+        let _env = TIER2_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmpdir();
         unsafe { std::env::set_var("NUCLEUS_TIER2_DIR", &dir) };
         let mem = Memory {
@@ -276,6 +281,7 @@ mod tests {
 
     #[test]
     fn merge_appends_a_dated_section_and_keeps_the_body() {
+        let _env = TIER2_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmpdir();
         unsafe { std::env::set_var("NUCLEUS_TIER2_DIR", &dir) };
         let mem = Memory { name: "m".into(), description: "orig desc".into(), kind: Kind::Feedback, body: "Original body.".into() };

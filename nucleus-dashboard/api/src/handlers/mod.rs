@@ -8,4 +8,5 @@ pub mod news;
 pub mod reminders;
 pub mod skills;
 pub mod usage;
+pub mod tasks;
 pub mod vault;

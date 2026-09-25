@@ -495,6 +495,51 @@ New `i64`/`u64` DTO fields need `#[ts(type = "number")]` (or
 `"number | null"`) — ts-rs defaults them to `bigint`, which breaks
 JSON-parsed numbers.
 
+## Rule 13 — WhatsApp turns and background tasks (ADR-033)
+
+- The WhatsApp conversational path is the turn engine
+  (`messaging/whatsapp/src/chat_engine.ts`). It types each message into the
+  chat session when it arrives, replies with the turn's final text when the
+  turn ends (`turn_duration`), quotes the operator's message, and sends
+  everything through `outbound_queue`. The document-job replies use the queue
+  too. Do not add direct `sock.sendMessage` calls or request/response asks to
+  those paths.
+- Every prompt Nucleus puts into a session is TYPED (plain prompt), in Rust
+  and TypeScript alike; there is no paste path. Agent messages are typed
+  inside the code-owned envelope (`agent_msg::envelope` / `agentEnvelope`),
+  never with a hand-written header.
+- Every outbound WhatsApp text passes the runtime secret filter
+  (`secret_filter.ts`); code-owned texts are English and live in
+  `messaging/whatsapp/src/texts.ts` (`[whatsapp.texts]`) or `[tasks.texts]`.
+- Work that takes more than a few minutes, or that the operator asks to run in
+  the background, is a task: `./target/release/nucleus tasks start --title …
+  --requested-by <operator|model> --brief - <<'EOF' … EOF` (add `--origin
+  <venue>` outside a chat session; inside the WhatsApp DM session the origin
+  comes from the session's task scope). Inspect or stop tasks with
+  `tasks list|status|output|cancel`. The result is delivered to the origin
+  automatically; do not message the operator about it yourself.
+- The tasks CLI, `session-send` and the WhatsApp send scripts decide what a
+  caller may do from the process tree: the start environment of the
+  outermost ancestor that carries `NUCLEUS_SESSION` (`core/src/caller.rs`,
+  `core/src/proc_tree.rs`, `messaging/whatsapp/src/caller_guard.ts`), never
+  from the command's own environment. A chat session sees only its own
+  chat's tasks, a worker may not start, cancel or send, other Nucleus
+  sessions may not use tasks and send only as their own agent, and a turn
+  that read an agent message may not start or cancel tasks or send onward.
+  Do not work around these checks (detaching, editing the CLIs, writing the
+  databases directly); ADR-033 records that they are not isolation.
+- Every path that puts a message on WhatsApp (the outbound queue drain,
+  `send.ts`, `ack.ts`, `enqueue-media.ts`) accepts only the operator's DM and
+  the configured groups, whoever the caller is
+  (`messaging/whatsapp/src/target_policy.ts`). A new sending path uses the
+  same policy.
+- Every write to `memory/tasks.db` goes through `nucleus_core::tasks` (the
+  `nucleus` binary), one `BEGIN IMMEDIATE` transaction per transition. Never
+  write it with sqlite3 or from TypeScript.
+- To give the WhatsApp DM session context, use
+  `nucleus session-send --to whatsapp-dm`; `session-send` refuses raw tmux
+  injection into the `nucleus-whatsapp` and `nucleus-whatsapp-dm` sessions.
+
 ## When in doubt
 
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit

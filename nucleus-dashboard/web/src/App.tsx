@@ -13,6 +13,7 @@ import {
   FolderLock,
   Activity,
   Gauge,
+  ListChecks,
   Menu,
   X,
   type LucideIcon,
@@ -28,6 +29,7 @@ import ChatPage from "./pages/ChatPage";
 import GalleryPage from "./pages/GalleryPage";
 import DocumentsPage from "./pages/DocumentsPage";
 import UsagePage from "./pages/UsagePage";
+import TasksPage from "./pages/TasksPage";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 
 type RouteEntry = {
@@ -49,6 +51,7 @@ const ROUTES: RouteEntry[] = [
   { path: "/agents",    label: "agents",    icon: Boxes,           group: "observability", impl: "scaffolded" },
   { path: "/skills",    label: "skills",    icon: Sparkles,        group: "observability", impl: "scaffolded" },
   { path: "/reminders", label: "reminders", icon: Bell,            group: "observability", impl: "scaffolded" },
+  { path: "/tasks",     label: "tasks",     icon: ListChecks,      group: "observability", impl: "scaffolded" },
   { path: "/diary",     label: "diary",     icon: BookOpen,        group: "observability", impl: "scaffolded" },
   { path: "/vault",     label: "vault",     icon: Database,        group: "observability", impl: "scaffolded" },
   { path: "/usage",     label: "usage",     icon: Gauge,           group: "observability", impl: "scaffolded" },
@@ -102,6 +105,7 @@ export default function App() {
               <Route path="/skills" element={<SkillsPage />} />
               <Route path="/diary" element={<DiaryPage />} />
               <Route path="/reminders" element={<RemindersPage />} />
+              <Route path="/tasks" element={<TasksPage />} />
               <Route path="/agents" element={<AgentsPage />} />
               <Route path="/vault" element={<VaultPage />} />
               <Route path="/vault/:tab" element={<VaultPage />} />

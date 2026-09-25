@@ -1,8 +1,9 @@
 // Long-lived interactive `claude` sessions driven via tmux.
 //
 // TS counterpart of `nucleus_core::claude_session` — same architecture:
-// spawn `claude` in a tmux window, send messages via paste-buffer,
-// tail the session transcript JSONL for assistant turns. No TUI scraping.
+// spawn `claude` in a tmux window, type every message into the pane as
+// keyboard input (ADR-033), tail the session transcript JSONL for assistant
+// turns. No TUI scraping.
 
 import { spawn, exec } from "node:child_process";
 import { promisify } from "node:util";
@@ -12,7 +13,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { appendEntry as diaryAppendEntry, record as diaryRecord } from "./diary.js";
 import * as runlog from "./runlog.js";
 
 const execAsync = promisify(exec);
@@ -34,8 +34,35 @@ export interface SpawnOptions {
   /** If set, resume that existing claude session via `--resume`. */
   resumeSessionId?: string;
   /** Registry agent name (ADR-016). When set, each spawn appends a row to
-   *  `memory/logs/<agent>/runs.jsonl` pointing at the transcript. */
+   *  `memory/logs/<agent>/runs.jsonl` pointing at the transcript, and the
+   *  session runs with NUCLEUS_AGENT=<label> (the operator CLIs attribute
+   *  its agent messages by it). */
   agentLabel?: string;
+  /** Extra environment variables for the `claude` process and every tool
+   *  command it runs (ADR-033: a DM chat session's NUCLEUS_TASK_SCOPE).
+   *  Names must match [A-Z_][A-Z0-9_]*. */
+  env?: Record<string, string>;
+  /** Kind of session, set as NUCLEUS_SESSION in the `claude` start
+   *  environment (ADR-033, proc_tree.ts): `chat`, `braindump`, `job`, or
+   *  the default `agent`. The operator CLIs and the send scripts decide
+   *  what a caller may do from it. */
+  sessionKind?: string;
+}
+
+/** `env K='v' … ` for the launch command, or "" when there is nothing to
+ *  set. Names are not quoted, so they are restricted; values are quoted.
+ *  Mirror of core's env_prefix. Pure. */
+export function envPrefix(env: Record<string, string>): string {
+  const entries = Object.entries(env);
+  if (entries.length === 0) return "";
+  let out = "env ";
+  for (const [k, v] of entries) {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(k)) {
+      throw new Error(`invalid environment variable name for a session: ${JSON.stringify(k)}`);
+    }
+    out += `${k}=${shellQuote(v)} `;
+  }
+  return out;
 }
 
 export interface AskOptions {
@@ -79,7 +106,7 @@ const DEFAULT_ASK: Required<AskOptions> = {
  *  the model has no built-in clock, and a single `date` call at session
  *  start gets carried as the anchor for every turn after. Recomputing
  *  per ask() keeps "tomorrow"/"in N hours" reasoning honest. */
-function withDatePreamble(message: string): string {
+export function withDatePreamble(message: string): string {
   const now = new Date();
   const tz = process.env.TZ || process.env.NUCLEUS_TZ || "America/Sao_Paulo";
   const fmt = new Intl.DateTimeFormat("en-CA", {
@@ -193,6 +220,7 @@ export class Session {
   }
 
   async ask(message: string, opts: AskOptions = {}): Promise<string> {
+    checkPromptSize(message);
     const reply = await this.askOnce(message, opts);
     const kind = classifyInfraReply(reply);
     if (kind === null) return reply;
@@ -241,7 +269,7 @@ export class Session {
   /** Kill this session's window and relaunch it on `model`, resuming the same
    *  session id so the chat keeps its history. Only `ask`'s model-failure
    *  path calls this. Mirrors core's respawn_on_fallback. */
-  private async respawnOnFallback(model: string): Promise<void> {
+  async respawnOnFallback(model: string): Promise<void> {
     if (!this.spawnOpts) {
       throw new Error("respawn: session has no spawn options (constructed directly?)");
     }
@@ -280,7 +308,9 @@ export class Session {
     if (settled !== null && settled > this.cursor) this.cursor = settled;
     const fromOffset = this.cursor;
     try {
-      await pasteAndSend(this.tmuxTarget, withDatePreamble(message));
+      await submitInput(this.tmuxTarget, withDatePreamble(message), {
+        transcriptPath: this.transcriptPath,
+      });
     } catch (e) {
       if (e instanceof WedgedInputError) {
         // The TUI stopped accepting submits (2026-07-18: operator DMs piled
@@ -308,6 +338,41 @@ export class Session {
     return reply;
   }
 
+  /** Type `payload` into the session and submit it, verified against the
+   *  transcript, without waiting for a reply. The chat engine (ADR-033)
+   *  follows the transcript itself. `marker` is a string unique to this
+   *  payload; the submit counts as landed only when a transcript record
+   *  carries it. Kills the window on a wedged input, like `ask`. Refuses a
+   *  payload over MAX_TYPED_INPUT_BYTES before typing. Returns how the
+   *  harness recorded the input (a pasted prompt is logged by submitInput;
+   *  the caller records it). */
+  async submit(payload: string, opts: { marker: string }): Promise<SubmitResult> {
+    try {
+      return await submitInput(this.tmuxTarget, payload, {
+        transcriptPath: this.transcriptPath,
+        marker: opts.marker,
+      });
+    } catch (e) {
+      if (e instanceof WedgedInputError) await this.close().catch(() => {});
+      throw e;
+    }
+  }
+
+  /** Send one key to the window (the engine interrupts a turn that passed
+   *  its safety ceiling with Escape). */
+  async sendKey(key: string): Promise<void> {
+    await tmux(["send-keys", "-t", this.tmuxTarget, key]);
+  }
+
+  /** Current pane text (the engine checks it for a permission prompt). */
+  async capturePane(): Promise<string> {
+    const { stdout } = await tmux(["capture-pane", "-t", this.tmuxTarget, "-p"]).catch(() => ({
+      stdout: "",
+      stderr: "",
+    }));
+    return stdout;
+  }
+
   /** True while the underlying tmux window still exists. A window can die
    *  without the pool noticing (claude crash, manual kill, `claude update`
    *  swapping the binary, operator cleanup) — callers must check before
@@ -333,264 +398,21 @@ export class Session {
   }
 }
 
-/** Manages a Map<chatKey, Session>. One claude per chat, lazily spawned. */
-export class SessionPool {
-  private entries = new Map<
-    string,
-    { session: Session; lastActive: number; lock: Promise<void>; turnsSinceReview: number }
-  >();
-  constructor(private readonly config: PoolConfig) {}
-
-  async ask(
-    chatKey: string,
-    message: string,
-    resumeSessionId: string | undefined,
-    opts: AskOptions = {},
-  ): Promise<AskResult> {
-    const t0 = Date.now();
-
-    let entry = this.entries.get(chatKey);
-    let wasColdSpawn = false;
-    // A pooled session whose tmux window has died (claude crash, binary
-    // upgrade, manual kill) must be dropped and respawned — asking into a
-    // dead window just burns the full ask timeout. Resume the same claude
-    // session id so the conversation continues where it left off.
-    if (entry && !(await entry.session.isAlive())) {
-      this.entries.delete(chatKey);
-      const deadSessionId = entry.session.sessionId;
-      await entry.session.close().catch(() => {});
-      entry = undefined;
-      resumeSessionId = deadSessionId;
-    }
-    if (!entry) {
-      wasColdSpawn = true;
-      const session = await Session.spawn({
-        workspaceRoot: this.config.workspaceRoot,
-        appendSystemPrompt: this.config.appendSystemPrompt,
-        permissionMode: this.config.permissionMode,
-        disallowedTools: this.config.disallowedTools,
-        allowedTools: this.config.allowedTools,
-        addDirs: this.config.addDirs,
-        tmuxSession: this.config.tmuxSession,
-        windowName: sanitizeWindowName(chatKey),
-        // 20s (the SpawnOptions default) is too tight for a cold `claude`
-        // boot under load; the rotation path already learned this and uses
-        // 60s. Keep the two in lockstep.
-        readyTimeoutMs: 60_000,
-        resumeSessionId,
-        agentLabel: this.config.agentLabel,
-      });
-      entry = { session, lastActive: Date.now(), lock: Promise.resolve(), turnsSinceReview: 0 };
-      this.entries.set(chatKey, entry);
-    }
-
-    // Serialize per-chat asks — claude can't handle two prompts in flight.
-    const prev = entry.lock;
-    let release!: () => void;
-    entry.lock = new Promise<void>((r) => (release = r));
-    await prev;
-    try {
-      const reply = await entry.session.ask(message, opts);
-      entry.lastActive = Date.now();
-      // On-the-fly skill-review nudge (ADR-017).
-      let reviewDue = false;
-      const interval = this.config.reviewNudgeInterval ?? 0;
-      if (interval > 0) {
-        entry.turnsSinceReview += 1;
-        if (entry.turnsSinceReview >= interval) {
-          reviewDue = true;
-          entry.turnsSinceReview = 0;
-        }
-      }
-      return {
-        reply,
-        sessionId: entry.session.sessionId,
-        elapsedMs: Date.now() - t0,
-        wasColdSpawn,
-        transcriptPath: entry.session.transcriptPath,
-        reviewDue,
-      };
-    } finally {
-      release();
-    }
-  }
-
-  async reapIdle(): Promise<number> {
-    const cutoff = Date.now() - this.config.idleTimeoutMs;
-    const stale: string[] = [];
-    for (const [key, entry] of this.entries) {
-      if (entry.lastActive < cutoff) stale.push(key);
-    }
-    for (const key of stale) {
-      const entry = this.entries.get(key);
-      if (entry) {
-        this.entries.delete(key);
-        await entry.session.close().catch(() => {});
-      }
-    }
-    return stale.length;
-  }
-
-  // Roll every active per-chat session forward by one day. TS mirror of
-  // `nucleus_core::claude_session::SessionPool::daily_rotate`. Skips
-  // chats inactive >24h or with <10 text turns; for the rest, asks the
-  // old session to summarize itself, appends the summary to the agent's
-  // daily diary, spawns a fresh session primed with summary + last 10
-  // turns, and calls `dbUpdate(chatKey, newSessionId)` so the caller
-  // can persist the new mapping. Failures are recorded to the diary as
-  // OBSERVATION; the old session is left alone in that case.
-  async dailyRotate(
-    diaryRoot: string,
-    dbUpdate: (chatKey: string, newSessionId: string) => Promise<void>,
-  ): Promise<RotationStats> {
-    const stats: RotationStats = { considered: 0, rotated: 0, skipped: 0, failed: 0 };
-    const keys = Array.from(this.entries.keys());
-    for (const chatKey of keys) {
-      stats.considered++;
-      const outcome = await this.rotateOne(chatKey, diaryRoot, dbUpdate).catch((e) => {
-        diaryRecord(
-          diaryRoot,
-          `daily_rotate ${chatKey}`,
-          `rotation failed: ${e instanceof Error ? e.message : String(e)}`,
-          "OBSERVATION",
-        );
-        return "failed" as const;
-      });
-      if (outcome === "rotated") stats.rotated++;
-      else if (outcome === "skipped") stats.skipped++;
-      else stats.failed++;
-    }
-    return stats;
-  }
-
-  private async rotateOne(
-    chatKey: string,
-    diaryRoot: string,
-    dbUpdate: (chatKey: string, newSessionId: string) => Promise<void>,
-  ): Promise<"rotated" | "skipped"> {
-    const entry = this.entries.get(chatKey);
-    if (!entry) return "skipped";
-
-    // Acquire the per-entry lock the same way ask() does: chain a new
-    // promise behind the previous one so a concurrent user ask waits
-    // for the rotation to finish.
-    const prev = entry.lock;
-    let release!: () => void;
-    entry.lock = new Promise<void>((r) => (release = r));
-    await prev;
-    try {
-      // Skip cold chats — idle reaper handles them.
-      if (entry.lastActive < Date.now() - 24 * 60 * 60 * 1000) return "skipped";
-
-      const turns = lastNTurns(entry.session.transcriptPath, 100);
-      if (turns.length < 10) return "skipped";
-      const replay = turns.slice(-10);
-
-      // Step 1: ask for the summary. Generous timeout — no user is
-      // waiting and the model may have to consume a large transcript.
-      const reply = await entry.session.ask(SUMMARY_PROMPT, {
-        maxWaitMs: 300_000,
-        quiescentMs: 5_000,
-      });
-      // ADR-025 memory flush: the same ask carries a DURABLE section; a
-      // format-ignoring reply degrades to summary-only.
-      const { summary, durable } = splitRotationReply(reply);
-
-      // Step 2: append to today's diary — plus a distinct flush entry when
-      // the session surfaced durable observations (distiller input).
-      diaryAppendEntry(
-        diaryRoot,
-        `daily_rotate ${chatKey}`,
-        `Session rotated. Yesterday's summary:\n\n${summary.trim()}`,
-      );
-      if (durable !== null) {
-        diaryAppendEntry(
-          diaryRoot,
-          `memory_flush ${chatKey}`,
-          `Durable observations flushed at rotation:\n\n${durable}`,
-        );
-      }
-
-      // Step 3: spawn a fresh session (no resume, new UUID, new window).
-      const newSession = await Session.spawn({
-        workspaceRoot: this.config.workspaceRoot,
-        appendSystemPrompt: this.config.appendSystemPrompt,
-        permissionMode: this.config.permissionMode,
-        disallowedTools: this.config.disallowedTools,
-        allowedTools: this.config.allowedTools,
-        addDirs: this.config.addDirs,
-        tmuxSession: this.config.tmuxSession,
-        // windowName left undefined → derives from the new session UUID.
-        // (Cosmetic only — windows are addressed by unique id, so a name
-        // collision with the still-alive old window wouldn't matter.)
-        readyTimeoutMs: 60_000,
-        agentLabel: this.config.agentLabel,
-      });
-
-      // Step 4: prime the new session. If priming fails, tear it down so
-      // we don't orphan it.
-      const priming = buildPrimingPreamble(summary, replay);
-      try {
-        await newSession.ask(priming, { maxWaitMs: 300_000, quiescentMs: 5_000 });
-      } catch (e) {
-        await newSession.close().catch(() => {});
-        throw e;
-      }
-
-      // Step 5: hand the new session-id to the caller for DB persistence.
-      try {
-        await dbUpdate(chatKey, newSession.sessionId);
-      } catch (e) {
-        await newSession.close().catch(() => {});
-        throw e;
-      }
-
-      // Step 6: swap in the new session, then close the old one.
-      const oldSession = entry.session;
-      entry.session = newSession;
-      entry.lastActive = Date.now();
-      await oldSession.close().catch(() => {});
-
-      return "rotated";
-    } finally {
-      release();
-    }
-  }
-
-  async shutdown(): Promise<void> {
-    for (const [, entry] of this.entries) {
-      await entry.session.close().catch(() => {});
-    }
-    this.entries.clear();
-    await tmux(["kill-session", "-t", this.config.tmuxSession]).catch(() => {});
-  }
-}
-
-export interface PoolConfig {
-  workspaceRoot: string;
-  appendSystemPrompt?: string;
-  permissionMode?: string;
-  disallowedTools?: string[];
-  /** Tool patterns pre-approved past the auto-mode classifier (ADR-018:
-   *  the DM pool pre-approves the docs/enqueue-media CLIs). */
-  allowedTools?: string[];
-  addDirs?: string[];
-  tmuxSession: string;
-  idleTimeoutMs: number;
-  /** Registry agent name for the run-log (ADR-016), threaded into every
-   *  session this pool spawns. */
-  agentLabel?: string;
-  /** On-the-fly skill review (ADR-017): after this many asks on a chat, the
-   *  next AskResult.reviewDue is true. 0/undefined = disabled. */
-  reviewNudgeInterval?: number;
-}
-
 // ---- internals ----
 
 function transcriptPathFor(workspaceRoot: string, sessionId: string): string {
   const encoded = workspaceRoot.replace(/\//g, "-");
   return path.join(os.homedir(), ".claude", "projects", encoded, `${sessionId}.jsonl`);
 }
+
+/** The variables that identify a Nucleus session (core proc_tree::SESSION_VARS). */
+export const SESSION_VARS = [
+  "NUCLEUS_SESSION",
+  "NUCLEUS_AGENT",
+  "NUCLEUS_TASK_SCOPE",
+  "NUCLEUS_TASK_WORKER",
+  "CLAUDE_CODE_SESSION_ID",
+];
 
 async function ensureTmuxSession(name: string): Promise<void> {
   try {
@@ -599,13 +421,25 @@ async function ensureTmuxSession(name: string): Promise<void> {
   } catch {
     // not there
   }
-  await execAsync(`tmux new-session -d -s ${shellQuote(name)}`);
+  try {
+    // The server a new session may start inherits this environment and
+    // passes it to every window it opens; it must not carry a session's
+    // identity (proc_tree.ts).
+    const env = { ...process.env };
+    for (const k of SESSION_VARS) delete env[k];
+    await execAsync(`tmux new-session -d -s ${shellQuote(name)}`, { env });
+  } catch (e) {
+    // Two spawns that start together both see "no session" and both run
+    // new-session; the second fails with "duplicate session" (seen with two
+    // jobs at once, nucleus-whatsapp-jobs). The session exists either way.
+    if (!String((e as Error).message).includes("duplicate session")) throw e;
+  }
 }
 
 /** Fallback model for spawned sessions when the configured/default model is
  *  unavailable (fable-5 incident 2026-06-13). Mirrors core's fallback_model;
  *  default is the stable Opus the error banner itself recommends. */
-function fallbackModel(): string {
+export function fallbackModel(): string {
   const v = process.env.NUCLEUS_CLAUDE_FALLBACK_MODEL?.trim();
   return v ? v : "claude-opus-4-8";
 }
@@ -751,7 +585,12 @@ async function launchWindow(
     args.push("--allowed-tools", opts.allowedTools.join(" "));
   }
 
-  const inner = `cd ${shellQuote(opts.workspaceRoot)} && claude ${args.map(shellQuote).join(" ")}`;
+  const env: Record<string, string> = { ...(opts.env ?? {}) };
+  if (opts.agentLabel && env.NUCLEUS_AGENT === undefined) env.NUCLEUS_AGENT = opts.agentLabel;
+  // Every Nucleus session is marked in its `claude` start environment,
+  // which its tool commands cannot change (proc_tree.ts).
+  if (env.NUCLEUS_SESSION === undefined) env.NUCLEUS_SESSION = opts.sessionKind ?? "agent";
+  const inner = `cd ${shellQuote(opts.workspaceRoot)} && ${envPrefix(env)}claude ${args.map(shellQuote).join(" ")}`;
 
   // Target the window by its server-unique id (`@N`), never by
   // `session:name` — stale windows share chat-key names and tmux refuses
@@ -825,85 +664,440 @@ export class WedgedInputError extends Error {
   }
 }
 
-/** Load `content` into a fresh NAMED tmux buffer and paste it into `target`. */
-async function pasteInto(target: string, content: string): Promise<void> {
-  // NAMED buffer per paste, never the server-global default. Concurrent
-  // sessions (S13 fires enrich + act/import jobs at once on one inbound)
-  // each load-buffer then paste-buffer — on the shared default buffer the
-  // second load clobbers the first, so both windows paste whichever load
-  // won (the S13 vault-import got the enrich prompt and silently failed,
-  // 2026-06-13). A unique buffer name isolates them; `paste-buffer -d`
-  // deletes it after so we don't leak buffers.
-  const buf = `nucleus-${target.replace(/@/, "")}-${randomUUID().slice(0, 8)}`;
-  // Load buffer from stdin so any content (quotes, emoji, newlines) is safe.
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn("tmux", ["load-buffer", "-b", buf, "-"], {
-      stdio: ["pipe", "ignore", "pipe"],
-    });
-    let stderr = "";
-    child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("error", reject);
-    child.on("close", (code) =>
-      code === 0 ? resolve() : reject(new Error(`load-buffer failed: ${stderr.trim()}`)),
-    );
-    child.stdin!.write(content);
-    child.stdin!.end();
-  });
-  // `-p`: bracketed-paste framing. Raw keystroke replay lets the TUI's
-  // timing-based paste heuristic split one payload into a collapsed chip
-  // plus typed text, dropping the head of the message (core hit this on
-  // every distiller run from 2026-08-31). Mirrors core's `paste_into`.
-  await tmux(["paste-buffer", "-p", "-d", "-b", buf, "-t", target]);
+/** Typed input (ADR-033), mirror of core's TYPE_CHUNK_BYTES: one
+ *  `send-keys -H` call per chunk of up to 128 bytes, 10 ms apart. The TUI
+ *  treats one read of more than about 800 bytes as a paste and drops the
+ *  head of the text; chunks that arrive while the TUI is busy are read
+ *  together, so larger chunks (512 bytes was measured) turn into a paste
+ *  under load; typeWithFlowControl waits for each chunk's echo. A 64 KiB
+ *  prompt takes about 16 s. */
+export const TYPE_CHUNK_BYTES = 128;
+const TYPE_CHUNK_PAUSE_MS = 10;
+/** Largest prompt typed into a session (core MAX_TYPED_PROMPT_BYTES). */
+export const MAX_TYPED_PROMPT_BYTES = 64 * 1024;
+
+/** Largest input typed by any path: a prompt of up to
+ *  MAX_TYPED_PROMPT_BYTES plus the date preamble and headers the code adds
+ *  (core MAX_TYPED_INPUT_BYTES). submitInput refuses more. */
+export const MAX_TYPED_INPUT_BYTES = MAX_TYPED_PROMPT_BYTES + 1024;
+
+/** Refuse a prompt over MAX_TYPED_PROMPT_BYTES with a clear error. */
+export function checkPromptSize(prompt: string): void {
+  checkSize(prompt, MAX_TYPED_PROMPT_BYTES);
 }
 
-/** Close-bracketed-paste escape, sent literally. If a paste ever leaves the
- *  TUI mid-paste-mode, every later keystroke (including Enter) is swallowed
- *  as literal pasted text — this terminator snaps it out. */
-const BRACKETED_PASTE_END = "\x1b[201~";
+/** Refuse typed input over MAX_TYPED_INPUT_BYTES. */
+export function checkInputSize(input: string): void {
+  checkSize(input, MAX_TYPED_INPUT_BYTES);
+}
 
-async function pasteAndSend(target: string, content: string): Promise<void> {
-  await pasteInto(target, content);
-  // Wait for the bracketed-paste sequence to fully drain into claude's TUI
-  // before pressing Enter. Without this, large pastes leave the TUI in
-  // mid-paste-mode when Enter arrives, so the Enter gets eaten as a literal
-  // newline and the prompt sits queued unsent. Same fix as the Rust side
-  // (core/src/claude_session.rs::wait_for_input_settled).
-  await waitForInputSettled(target, 250, 10_000);
-
-  // Submit is VERIFIED, not fire-and-forget: on 2026-07-18 the settle
-  // heuristic passed, Enter was eaten anyway, and the operator's DMs piled
-  // up typed-but-unsent with zero signal. Ladder of increasingly forceful
-  // recoveries; every rung ends with Enter + "did the input row clear?".
-  const recoveries: (() => Promise<void>)[] = [
-    async () => {}, // rung 0: plain Enter
-    async () => {
-      // rung 1: close a possibly-stuck bracketed paste, then Enter
-      await tmux(["send-keys", "-t", target, "-l", BRACKETED_PASTE_END]);
-    },
-    async () => {
-      // rung 2: clear the draft entirely and re-paste from scratch.
-      //
-      // Only safe while OUR draft is still in the input. An empty input means
-      // the submit may already have landed and the pane check merely lagged,
-      // and re-pasting would send the operator's message twice — under his
-      // own WhatsApp identity, which is the worst surface we have.
-      const { head: h, tail: t } = draftFragments(content);
-      if (!(await draftPresent(target, h, t))) {
-        throw new WedgedInputError(target, 2);
-      }
-      await tmux(["send-keys", "-t", target, "-l", BRACKETED_PASTE_END]).catch(() => {});
-      await tmux(["send-keys", "-t", target, "C-u"]);
-      await pasteInto(target, content);
-      await waitForInputSettled(target, 250, 10_000);
-    },
-  ];
-  const { head, tail } = draftFragments(content);
-  for (const recover of recoveries) {
-    await recover();
-    await tmux(["send-keys", "-t", target, "Enter"]);
-    if (await waitForDraftGone(target, head, tail, 2_500)) return;
+function checkSize(text: string, limit: number): void {
+  const n = Buffer.byteLength(text, "utf8");
+  if (n > limit) {
+    throw new Error(
+      `prompt is ${n} bytes; the limit for a typed prompt is ${limit} bytes. ` +
+        "Split the input, or write it to a file and name the file in the prompt",
+    );
   }
-  throw new WedgedInputError(target, recoveries.length);
+}
+
+/** Make text safe to type: CRLF/CR → LF, tab → two spaces (Tab is a TUI
+ *  key), every other control character dropped (ESC would start an escape
+ *  sequence; ESC during a turn interrupts it). Mirror of core's
+ *  sanitize_for_typing. */
+export function sanitizeForTyping(content: string): string {
+  let out = "";
+  for (const c of content.replace(/\r\n/g, "\n").replace(/\r/g, "\n")) {
+    const code = c.codePointAt(0)!;
+    if (c === "\n") out += c;
+    else if (c === "\t") out += "  ";
+    else if (code < 0x20 || code === 0x7f) continue;
+    else out += c;
+  }
+  return out;
+}
+
+/** Split into chunks of at most `maxBytes` UTF-8 bytes, never inside a
+ *  character. Mirror of core's type_chunks. */
+export function typeChunks(content: string, maxBytes: number): string[] {
+  const max = Math.max(4, maxBytes);
+  const out: string[] = [];
+  let cur = "";
+  let curBytes = 0;
+  for (const c of content) {
+    const n = Buffer.byteLength(c, "utf8");
+    if (curBytes + n > max) {
+      out.push(cur);
+      cur = "";
+      curBytes = 0;
+    }
+    cur += c;
+    curBytes += n;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/** The tmux argument lists that type `content` into `target`, one
+ *  `send-keys -H` call per chunk; each chunk goes as raw UTF-8 bytes
+ *  because `send-keys -l` drops a trailing `;`. Mirror of core's
+ *  type_invocations. Pure. */
+export function typeInvocations(target: string, content: string): string[][] {
+  return typeChunks(content, TYPE_CHUNK_BYTES).map((chunk) => [
+    "send-keys",
+    "-t",
+    target,
+    "-H",
+    ...[...Buffer.from(chunk, "utf8")].map((b) => b.toString(16).padStart(2, "0")),
+  ]);
+}
+
+/** Flow control between typed chunks: after a chunk, wait until the pane
+ *  shows the tail of the text typed so far, so the next chunk is sent only
+ *  after the TUI has read the previous one. Chunks sent into a TUI that is
+ *  not reading them accumulate, and one read of more than about 800 bytes
+ *  becomes a paste. Mirror of core's TYPE_ECHO_*. */
+export const TYPE_ECHO_POLL_MS = 20;
+/** Longest wait for one chunk's echo. On this bound the next chunk is sent
+ *  anyway and the stall is counted. */
+export const TYPE_ECHO_WAIT_MS = 2_000;
+/** After this many stalls in one prompt, the rest is typed without waiting
+ *  (the pane does not show the typed text, for example because it turned
+ *  into a paste), so a 64 KiB prompt cannot take minutes. */
+export const TYPE_ECHO_MAX_STALLS = 3;
+/** Code points of the typed text the pane must show. */
+const TYPE_ECHO_TAIL_CHARS = 16;
+
+/** What `typeWithFlowControl` needs from tmux (a test double implements it). */
+export interface TypingIo {
+  send(args: string[]): Promise<void>;
+  capture(): Promise<string>;
+  sleep(ms: number): Promise<void>;
+  now(): number;
+}
+
+/** How a prompt was typed. */
+export interface TypingStats {
+  chunks: number;
+  /** Chunks whose echo did not appear within TYPE_ECHO_WAIT_MS. */
+  stalls: number;
+}
+
+/** The last TYPE_ECHO_TAIL_CHARS non-whitespace code points of `typed`,
+ *  whitespace removed (the TUI wraps long lines). Empty when `typed` has
+ *  none. Pure. */
+export function echoTail(typed: string): string {
+  const chars = Array.from(squashWs(typed));
+  return chars.slice(Math.max(0, chars.length - TYPE_ECHO_TAIL_CHARS)).join("");
+}
+
+/** Type `content` into `target` chunk by chunk with flow control. */
+export async function typeWithFlowControl(target: string, content: string, io: TypingIo): Promise<TypingStats> {
+  const chunks = typeChunks(content, TYPE_CHUNK_BYTES);
+  const stats: TypingStats = { chunks: chunks.length, stalls: 0 };
+  let typed = "";
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    await io.send([
+      "send-keys",
+      "-t",
+      target,
+      "-H",
+      ...[...Buffer.from(chunk, "utf8")].map((b) => b.toString(16).padStart(2, "0")),
+    ]);
+    typed += chunk;
+    await io.sleep(TYPE_CHUNK_PAUSE_MS);
+    // The last chunk needs no echo wait: the submit path waits for the
+    // draft to be visible and settled.
+    if (i === chunks.length - 1 || stats.stalls >= TYPE_ECHO_MAX_STALLS) continue;
+    const want = echoTail(typed);
+    if (!want) continue;
+    const start = io.now();
+    for (;;) {
+      if (squashWs(await io.capture()).includes(want)) break;
+      if (io.now() - start >= TYPE_ECHO_WAIT_MS) {
+        stats.stalls += 1;
+        break;
+      }
+      await io.sleep(TYPE_ECHO_POLL_MS);
+    }
+  }
+  return stats;
+}
+
+function tmuxTypingIo(target: string): TypingIo {
+  return {
+    send: async (args) => {
+      await tmux(args);
+    },
+    capture: async () =>
+      (await tmux(["capture-pane", "-t", target, "-p"]).catch(() => ({ stdout: "", stderr: "" }))).stdout,
+    sleep,
+    now: () => Date.now(),
+  };
+}
+
+/** Type `content` as keyboard input, without pressing Enter. A line feed
+ *  inserts a newline in the input box; it does not submit. */
+async function typeInto(target: string, content: string): Promise<TypingStats> {
+  const stats = await typeWithFlowControl(target, content, tmuxTypingIo(target));
+  if (stats.stalls > 0) {
+    console.error(
+      `whatsapp: typing into ${target}: ${stats.stalls} of ${stats.chunks} chunks were not echoed within ${TYPE_ECHO_WAIT_MS}ms`,
+    );
+  }
+  return stats;
+}
+
+/** Remove a multi-line draft without ESC: C-u clears one line, BSpace joins
+ *  it to the line above. */
+async function clearDraft(target: string, lines: number): Promise<void> {
+  for (let i = 0; i <= lines; i++) {
+    await tmux(["send-keys", "-t", target, "C-u"]);
+    await tmux(["send-keys", "-t", target, "BSpace"]);
+  }
+}
+
+/** The pane is waiting for a keypress answer (a permission dialog, the
+ *  trust prompt, the resume picker) instead of holding a draft. Typing into
+ *  it could answer it; Enter picks the highlighted option. Keys on the live
+ *  row (the last ❯ row): a numbered option there is a picker. Text that
+ *  merely appears in the scrollback (the model asking "Do you want to…?")
+ *  does not count. Pure. */
+export function paneAwaitingChoice(pane: string): string | null {
+  const lines = pane.split("\n");
+  let idx = -1;
+  for (let i = 0; i < lines.length; i++) if (lines[i].trimStart().startsWith("❯")) idx = i;
+  if (idx < 0) return null;
+  const live = lines[idx].trimStart().slice(1).trim();
+  if (/^\d+\.\s/.test(live)) return `option picker (${live.slice(0, 40)})`;
+  const near = lines.slice(Math.max(0, idx - 4), idx + 3).join("\n");
+  for (const m of ["trust this folder", "Resume from summary"]) {
+    if (near.includes(m)) return m;
+  }
+  return null;
+}
+
+/** Did the harness accept `marker` in the transcript text `appended` — as a
+ *  prompt that started a turn, as input queued while the session was busy
+ *  (`queue-operation` enqueue), or as input absorbed into the running turn
+ *  (`queued_command` attachment)? Pure; whitespace-insensitive because the
+ *  harness may rewrap text. Mirror of core's transcript_accepted_marker. */
+export function transcriptAccepted(appended: string, marker: string): boolean {
+  return transcriptAcceptance(appended, marker).accepted;
+}
+
+/** How the harness recorded an accepted prompt. `promptSource` is the
+ *  `promptSource` of the user record that carries the marker ("typed" for
+ *  typed input); "pasted" when that record has no such field and its text
+ *  is wrapped in `<pasted_content`; null when the input was accepted as
+ *  queued or absorbed input (those records carry no source) or not at all.
+ *  Mirror of core's transcript_acceptance. Pure. */
+export interface Acceptance {
+  accepted: boolean;
+  via: "prompt" | "queued" | "absorbed" | null;
+  promptSource: string | null;
+}
+
+export function transcriptAcceptance(appended: string, marker: string): Acceptance {
+  const none: Acceptance = { accepted: false, via: null, promptSource: null };
+  const want = squashWs(marker);
+  if (!want) return none;
+  for (const raw of appended.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    let v: any;
+    try {
+      v = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    let text: string | null = null;
+    let via: Acceptance["via"] = null;
+    if (v?.type === "user") {
+      const c = v.message?.content;
+      if (typeof c === "string") text = c;
+      else if (Array.isArray(c)) {
+        text = c
+          .filter((b: any) => typeof b?.text === "string")
+          .map((b: any) => b.text)
+          .join("\n");
+      }
+      via = "prompt";
+    } else if (v?.type === "queue-operation" && typeof v.content === "string") {
+      text = v.content;
+      via = "queued";
+    } else if (v?.type === "attachment" && typeof v.attachment?.prompt === "string") {
+      text = v.attachment.prompt;
+      via = "absorbed";
+    }
+    if (text === null || !squashWs(text).includes(want)) continue;
+    let promptSource: string | null = null;
+    if (via === "prompt") {
+      if (typeof v.promptSource === "string") promptSource = v.promptSource;
+      else if (text.includes("<pasted_content")) promptSource = "pasted";
+    }
+    return { accepted: true, via, promptSource };
+  }
+  return none;
+}
+
+/** A prompt the harness recorded as something other than typed input. */
+export function arrivedPasted(a: { promptSource: string | null }): boolean {
+  return a.promptSource !== null && a.promptSource !== "typed";
+}
+
+async function fileSize(p: string): Promise<number> {
+  try {
+    return (await fs.stat(p)).size;
+  } catch {
+    return 0;
+  }
+}
+
+async function readFrom(p: string, offset: number): Promise<string> {
+  try {
+    const fh = await fs.open(p, "r");
+    try {
+      const size = (await fh.stat()).size;
+      if (size <= offset) return "";
+      const buf = Buffer.alloc(size - offset);
+      await fh.read(buf, 0, buf.length, offset);
+      return buf.toString("utf8");
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    return "";
+  }
+}
+
+/** How long to wait for proof that a submit landed. */
+const SUBMIT_CONFIRM_MS = 6_000;
+/** How long a pane showing a picker may hold up a submit before it fails. */
+const CHOICE_WAIT_MS = 30_000;
+
+/** Type `content` into the input box and submit it, verifying it landed.
+ *
+ *  Every message this process sends is typed in chunks, so it reaches the
+ *  model as a typed prompt (ADR-033). A bracketed paste would reach it
+ *  wrapped in `<pasted_content>`, which Claude Code treats as possibly not
+ *  written by the user; attributed agent messages carry their own
+ *  code-written envelope instead.
+ *
+ *  Verification: with a transcript, the submit counts as landed only when a
+ *  record past the pre-submit size carries `marker` (default: the head of
+ *  the content) as a prompt, a queued input or an absorbed input — so input
+ *  typed while the session is busy counts once the harness queues it.
+ *  Ladder: Enter; a bare second Enter; then, only while OUR draft is still
+ *  visible, clear it and put it in again. Never Enter into a picker.
+ *
+ *  Throws WedgedInputError when every rung failed. */
+export async function submitInput(
+  target: string,
+  raw: string,
+  opts: { transcriptPath?: string; marker?: string } = {},
+): Promise<SubmitResult> {
+  const content = sanitizeForTyping(raw);
+  // Every typed input is bounded, whichever path submits it (ask, the chat
+  // engine's submit, a context message).
+  checkInputSize(content);
+  const { head, tail } = draftFragments(content);
+  const marker = opts.marker ?? head;
+  const lines = content.split("\n").length;
+
+  // Never type into a picker: wait (bounded) for it to go away.
+  const waitStart = Date.now();
+  for (;;) {
+    const { stdout } = await tmux(["capture-pane", "-t", target, "-p"]).catch(() => ({
+      stdout: "",
+      stderr: "",
+    }));
+    const choice = paneAwaitingChoice(stdout);
+    if (!choice) break;
+    if (Date.now() - waitStart > CHOICE_WAIT_MS) {
+      throw new Error(`input blocked: the session is showing a prompt (${choice}) — not typing into it`);
+    }
+    await sleep(500);
+  }
+
+  let stalls = 0;
+  const put = async () => {
+    stalls += (await typeInto(target, content)).stalls;
+    await waitForDraftVisible(target, head, tail, 30_000);
+    await waitForInputSettled(target, 250, 10_000);
+  };
+  await put();
+
+  for (let rung = 0; rung < 3; rung++) {
+    if (rung === 2) {
+      if (!(await draftPresent(target, head, tail))) throw new WedgedInputError(target, 2);
+      await clearDraft(target, lines);
+      await put();
+    }
+    const { stdout: pane } = await tmux(["capture-pane", "-t", target, "-p"]).catch(() => ({
+      stdout: "",
+      stderr: "",
+    }));
+    if (!draftStuck(pane, head, tail)) {
+      const choice = paneAwaitingChoice(pane);
+      if (choice) {
+        throw new Error(`input blocked: a prompt appeared (${choice}) — refusing to press Enter into it`);
+      }
+    }
+    const from = opts.transcriptPath ? await fileSize(opts.transcriptPath) : 0;
+    await tmux(["send-keys", "-t", target, "Enter"]);
+    let acceptance: Acceptance | null = null;
+    if (opts.transcriptPath) {
+      const start = Date.now();
+      while (Date.now() - start < SUBMIT_CONFIRM_MS) {
+        const a = transcriptAcceptance(await readFrom(opts.transcriptPath, from), marker);
+        if (a.accepted) {
+          acceptance = a;
+          break;
+        }
+        await sleep(150);
+      }
+    } else if (await waitForDraftGone(target, head, tail, SUBMIT_CONFIRM_MS)) {
+      acceptance = { accepted: true, via: null, promptSource: null };
+    }
+    if (acceptance) {
+      const result: SubmitResult = { via: acceptance.via, promptSource: acceptance.promptSource, typingStalls: stalls };
+      if (arrivedPasted(acceptance)) {
+        console.error(
+          `whatsapp: the prompt submitted to ${target} arrived as ${acceptance.promptSource} content, not typed input`,
+        );
+      }
+      return result;
+    }
+  }
+  throw new WedgedInputError(target, 3);
+}
+
+/** What a verified submit observed. */
+export interface SubmitResult {
+  /** How the harness accepted the input (null: no transcript to check). */
+  via: Acceptance["via"];
+  /** `promptSource` of the accepted prompt record; null when the input was
+   *  queued or absorbed (the record of a queued input carries none). */
+  promptSource: string | null;
+  /** Typed chunks whose echo did not appear in time (typeWithFlowControl). */
+  typingStalls: number;
+}
+
+/** Poll until OUR draft is visible in the live input region (the text
+ *  arrived and Enter will mean something). Best-effort. */
+async function waitForDraftVisible(
+  target: string,
+  head: string,
+  tail: string,
+  deadlineMs: number,
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < deadlineMs) {
+    if (await draftPresent(target, head, tail)) return;
+    await sleep(100);
+  }
 }
 
 /** Short recognizable prefix of the draft's first line, used to tell "our
@@ -939,12 +1133,15 @@ export async function draftPresent(
 
 export function draftFragments(content: string): { head: string; tail: string } {
   const lines = content.split("\n").filter((l) => l.trim().length > 0);
-  const head = lines.length ? lines[0].trim().slice(0, 24) : "";
+  // Counted in code points (Array.from), like core's `chars()`: a UTF-16
+  // slice can cut an emoji's surrogate pair in half, and a lone surrogate
+  // never matches the captured pane.
+  const head = lines.length ? Array.from(lines[0].trim()).slice(0, 24).join("") : "";
   // LAST 24 chars of the whole content, matching core's draft_fragments. The
   // first 24 chars of the last line is wrong: a long final line wraps and its
   // start scrolls out of the input box, which is the very bug this fixes.
-  const trimmed = content.trimEnd();
-  const tail = trimmed.slice(Math.max(0, trimmed.length - 24));
+  const chars = Array.from(content.trimEnd());
+  const tail = chars.slice(Math.max(0, chars.length - 24)).join("");
   return { head, tail };
 }
 
@@ -1054,8 +1251,21 @@ async function dismissTrustPrompt(target: string, timeoutMs: number): Promise<vo
       stderr: "",
     }));
     if (stdout.includes("trust this folder")) {
-      await tmux(["send-keys", "-t", target, "Enter"]).catch(() => {});
-      return;
+      // Claude Code 2.1.26x+ opens the picker with "❯ No, exit" highlighted;
+      // a blind Enter exits claude. Move to "Yes" and press Enter only once
+      // the screen SHOWS the highlight on "Yes": a Down sent while the
+      // picker is still starting is dropped, and the Enter after it then
+      // exits (seen 2026-09-24 with 2.1.282). Mirror of core.
+      const row = stdout.split("\n").find((l) => l.trimStart().startsWith("❯"));
+      if (row && row.includes("No, exit")) {
+        await tmux(["send-keys", "-t", target, "Down"]).catch(() => {});
+        await sleep(300);
+        continue;
+      }
+      if (row && row.includes("Yes")) {
+        await tmux(["send-keys", "-t", target, "Enter"]).catch(() => {});
+        return;
+      }
     }
     if (stdout.includes("❯") && !stdout.includes("trust")) return;
     await sleep(200);
@@ -1082,6 +1292,19 @@ export async function waitForTuiReady(target: string, timeoutMs: number): Promis
     }));
     if (stdout.includes("❯") && (stdout.includes("auto mode") || stdout.includes("Try "))) {
       return;
+    }
+    // A cold claude can take longer than dismissTrustPrompt's window to show
+    // the trust picker; answer it here too (Down onto "Yes", then Enter once
+    // the highlight is visibly there).
+    if (stdout.includes("trust this folder")) {
+      const row = stdout.split("\n").find((l) => l.trimStart().startsWith("❯")) ?? "";
+      if (row.includes("No, exit")) {
+        await tmux(["send-keys", "-t", target, "Down"]).catch(() => {});
+      } else if (row.includes("Yes")) {
+        await tmux(["send-keys", "-t", target, "Enter"]).catch(() => {});
+      }
+      await sleep(300);
+      continue;
     }
     if (stdout.includes("Resume from summary")) {
       if (resumeDismissAttempts >= MAX_RESUME_DISMISSALS) {
@@ -1237,13 +1460,6 @@ export function extractLastAssistantText(buffer: string, requireEndTurn = false)
   return last;
 }
 
-function sanitizeWindowName(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, "-")
-    .slice(0, 16);
-}
-
 function shellQuote(s: string): string {
   // Single-quote escape: it's → 'it'\''s'
   return `'${s.replace(/'/g, "'\\''")}'`;
@@ -1274,7 +1490,7 @@ export interface RotationStats {
  *  tomorrow that never made it into the diary. Split by splitRotationReply;
  *  a reply that ignores the format degrades to summary-only (pre-ADR-025
  *  behavior). Mirror of core/src/claude_session.rs::SUMMARY_PROMPT. */
-const SUMMARY_PROMPT =
+export const SUMMARY_PROMPT =
   "This session rotates now. Reply with exactly two sections and no other text:\n" +
   "SUMMARY:\n" +
   "5-10 bullets for tomorrow's session — ongoing tasks, decisions made, " +

@@ -34,6 +34,7 @@ Operator tools:
   vault-search          FTS5 search over the Obsidian vault
   session-send          send a message into another agent session
   usage <sub>           token and cost accounting (refresh|report)
+  tasks <sub>           background tasks (start|list|status|output|cancel|sweep)
 
 Every command accepts --help.
 ";
@@ -67,7 +68,12 @@ async fn main() -> Result<()> {
     let mut sub: Vec<OsString> = vec![OsString::from(format!("nucleus {name}"))];
     sub.extend(argv.into_iter().skip(1));
 
-    nucleus_core::init_tracing();
+    // Operator tools print their result on stdout; their logs go to stderr.
+    if matches!(name.as_str(), "tasks" | "session-send" | "session-search") {
+        nucleus_core::init_tracing_stderr();
+    } else {
+        nucleus_core::init_tracing();
+    }
 
     match name.as_str() {
         // Services that take no arguments. Without this guard a typo or a
@@ -94,6 +100,7 @@ async fn main() -> Result<()> {
         "vault-check" => vault_check::run(sub).await,
         "session-send" => nucleus_core::cmd::session_send::run(sub).await,
         "usage" => nucleus_core::cmd::usage::run(sub).await,
+        "tasks" => nucleus_core::cmd::tasks::run(sub).await,
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
             Ok(())

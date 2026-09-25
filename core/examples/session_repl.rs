@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
         ready_timeout: Duration::from_secs(20),
         resume_session_id: None,
         agent_label: None,
+        env: vec![],
     })
     .await?;
     println!(

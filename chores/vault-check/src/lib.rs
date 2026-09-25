@@ -40,7 +40,6 @@ use nucleus_core::vault::exclude::Exclusions;
 use std::path::{Path, PathBuf};
 
 const WATERMARK_KEY: &str = "vault-check.scheduled";
-const WHATSAPP_DB_PATH: &str = "memory/whatsapp.db";
 /// Dashboard route that shows the latest report.
 const DASHBOARD_ROUTE: &str = "/vault/check";
 /// A claim older than this with no completion belongs to a process that
@@ -98,7 +97,6 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
         opts.quarantine_dir = Some(workspace_root.join(check::QUARANTINE_DIR));
         let ctx = Scheduled {
             workspace_root: workspace_root.clone(),
-            whatsapp_db: workspace_root.join(WHATSAPP_DB_PATH),
             cron: cfg.cron.clone(),
             notify_target: if cfg.notify { reminders::operator_whatsapp_dm() } else { None },
             notify: cfg.notify,
@@ -143,8 +141,8 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
         let line = check::summary_line(&report.counts, link.as_deref());
         match reminders::operator_whatsapp_dm() {
             Some(target) => {
-                let pool = reminders::store::open_whatsapp_db(&workspace_root.join(WHATSAPP_DB_PATH)).await?;
-                reminders::store::enqueue_whatsapp(&pool, &target, &line, "vault-check").await?;
+                let pool = nucleus_core::whatsapp_queue::open(&workspace_root).await?;
+                nucleus_core::whatsapp_queue::enqueue_text(&pool, &target, &line, "vault-check").await?;
             }
             None => tracing::warn!("vault-check: WHATSAPP_ALLOWED_DM_JIDS is empty; summary not sent"),
         }
@@ -155,7 +153,6 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
 /// Inputs of one scheduled wake.
 struct Scheduled {
     workspace_root: PathBuf,
-    whatsapp_db: PathBuf,
     cron: String,
     notify: bool,
     notify_target: Option<String>,
@@ -206,7 +203,7 @@ async fn run_scheduled(
         match &ctx.notify_target {
             Some(target) => {
                 let line = check::summary_line(&report.counts, ctx.link.as_deref());
-                let wa = reminders::store::open_whatsapp_db(&ctx.whatsapp_db).await?;
+                let wa = nucleus_core::whatsapp_queue::open(&ctx.workspace_root).await?;
                 let source = format!("vault-check:{key}");
                 let queued = reminders::store::enqueue_whatsapp_once(&wa, target, &line, &source).await?;
                 tracing::info!(queued = queued.is_some(), "vault-check: summary for this occurrence queued");
@@ -340,7 +337,6 @@ mod tests {
     fn ctx(ws: &Path) -> Scheduled {
         Scheduled {
             workspace_root: ws.to_path_buf(),
-            whatsapp_db: ws.join("memory/whatsapp.db"),
             cron: "0 20 * * 0".into(),
             notify: true,
             notify_target: Some("5511999999999@s.whatsapp.net".into()),
@@ -356,7 +352,7 @@ mod tests {
     }
 
     async fn queued(ws: &Path) -> Vec<String> {
-        let pool = reminders::store::open_whatsapp_db(&ws.join("memory/whatsapp.db")).await.unwrap();
+        let pool = nucleus_core::whatsapp_queue::open(ws).await.unwrap();
         sqlx::query_scalar("SELECT source FROM outbound_queue").fetch_all(&pool).await.unwrap()
     }
 
@@ -403,7 +399,7 @@ mod tests {
         // The crashed process: claim taken, summary queued, never completed.
         let pool = check::open(ws).await.unwrap();
         assert_eq!(check::claim_occurrence(&pool, key, now, chrono::Duration::minutes(30)).await.unwrap(), Claim::Acquired);
-        let wa = reminders::store::open_whatsapp_db(&ws.join("memory/whatsapp.db")).await.unwrap();
+        let wa = nucleus_core::whatsapp_queue::open(ws).await.unwrap();
         reminders::store::enqueue_whatsapp_once(&wa, "x", "line", &format!("vault-check:{key}")).await.unwrap();
 
         let c = ctx(ws);

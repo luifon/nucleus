@@ -13,3 +13,4 @@ export * from "./agents";
 export * from "./vault";
 export * from "./chat";
 export * from "./dashboard";
+export * from "./tasks";

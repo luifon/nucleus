@@ -16,8 +16,10 @@
 
 import path from "node:path";
 import { loadConfig } from "./config.js";
+import { refuseUnlessAllowed } from "./caller_guard.js";
 import { ChatSessionStore, OutboundQueueStore } from "./db.js";
 import { formatReply } from "./format.js";
+import { enqueueRefusal } from "./target_policy.js";
 
 function main(): void {
   const body = process.argv.slice(2).join(" ").trim();
@@ -34,6 +36,8 @@ function main(): void {
   // otherwise the fallback fires whenever this script is invoked from a
   // context (tmux, npx) where .env hasn't already been sourced.
   const config = loadConfig(workspaceRoot, false);
+  // The operator, or the brain-dump planning session (ADR-005a, ADR-033).
+  refuseUnlessAllowed("ack", "ack", config.dbPath);
   const personaName = config.personaDisplayName;
 
   const target = config.brainDumpGroupNames[0];
@@ -42,6 +46,13 @@ function main(): void {
       "ack: WHATSAPP_BRAINDUMP_GROUP_NAMES is empty; nowhere to send",
     );
     process.exit(2);
+  }
+
+  // The same target policy as every sending path (target_policy.ts).
+  const refused = enqueueRefusal(target, config);
+  if (refused) {
+    console.error(`ack: target ${JSON.stringify(target)} refused: ${refused}`);
+    process.exit(3);
   }
 
   // ChatSessionStore creates the schema (outbound_queue + pending_plans);

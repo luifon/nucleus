@@ -70,12 +70,30 @@ day after the watermark, or `default_days_back` days ago when there is none,
 never later than today.
 
 - **Distiller metabolism** — one watermark per agent
-  (`distiller.metabolism.<agent>`): the last local date whose diary is fully
-  processed. Each run walks from the day after it through today in 2-day
-  windows (the yesterday+today shape the pass always pasted), one ask per
-  window, and advances the mark after each window, stopping at yesterday
-  because today's diary is still being written. A normal day is one window;
-  a week of failed nights is a few more asks, each the usual size.
+  (`distiller.metabolism.<agent>`), stored as `<date>@<offset>`: every day
+  before `date` is processed, and the first `offset` bytes of that day's
+  diary file. Each run walks from the mark through today in 2-day windows
+  (the yesterday+today shape the pass always pasted), one ask per window,
+  and after each window sets the mark to exactly what the window read.
+  Today's diary is still being written, so a run reads it up to its last
+  complete line and records that offset; the next run (later the same day,
+  or the next day) reads only what was appended since. Diary files only
+  grow, so every diary byte is sent to the model once. A normal day is one
+  window; a week of failed nights is a few more asks, each the usual size.
+  A bare `<date>` (the earlier format) means that day was fully processed.
+- **Distiller contemplation** — one progress mark per agent
+  (`distiller.contemplation.<agent>`), stored as `<offset>:<sha256>`: the
+  first `offset` bytes of the agent's `_pending.md` have been judged and
+  applied, and `sha256` is the hash of those bytes. Large pending lists are
+  judged in consecutive parts; the mark moves past a part once all its
+  decisions applied. The first part that fails (a reply that does not parse,
+  or a decision that fails to apply) stops the agent, and the next run
+  resumes at that part, so earlier parts are not applied twice. A part with
+  a failed decision is judged again whole; its successful decisions can
+  therefore be applied a second time, by a new judgment of the same
+  candidates. After a complete pass the file is emptied and the mark reset;
+  a crash between the two leaves a mark whose hash does not match the file,
+  which counts as nothing applied.
 - **Skill-gap-learner `learn`** — `skill-gap-learner.learn`: the date of the
   last completed run. The gap pass reads at least 7 days of diary, stretched
   back to the day after the watermark when runs were missed. Set after the

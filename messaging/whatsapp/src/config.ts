@@ -2,11 +2,12 @@ import { DEFAULT_BREAKER } from "./breaker.js";
 import fs from "node:fs";
 import path from "node:path";
 import { resolvePersona } from "./persona.js";
+import { textsFrom } from "./texts.js";
 
 /** Minimal TOML reader — supports flat tables, scalars, single-line AND
  * multi-line string arrays. Doesn't handle nested tables, inline tables,
  * dotted keys, etc. Fine for our config surface. */
-function parseToml(src: string): Record<string, any> {
+export function parseToml(src: string): Record<string, any> {
   const out: Record<string, any> = {};
   let table: Record<string, any> = out;
 
@@ -49,8 +50,13 @@ function parseToml(src: string): Record<string, any> {
     if (!line) continue;
     const tableMatch = line.match(/^\[([^\]]+)\]$/);
     if (tableMatch) {
-      const name = tableMatch[1];
-      table = out[name] = (out[name] as Record<string, any>) ?? {};
+      // Dotted names nest: [whatsapp.turns] → out.whatsapp.turns. (Before
+      // this, [whatsapp.breaker] landed under the literal key
+      // "whatsapp.breaker" and the breaker overrides were never applied.)
+      table = out;
+      for (const part of tableMatch[1].split(".").map((p) => p.trim())) {
+        table = table[part] = (table[part] as Record<string, any>) ?? {};
+      }
       continue;
     }
     const eq = line.indexOf("=");
@@ -190,6 +196,10 @@ export interface Config {
   jobsDbPath: string;
   /** ADR-027 connection breaker knobs ([whatsapp.breaker] in nucleus.toml). */
   breaker: import("./breaker.js").BreakerConfig;
+  /** ADR-033 turn engine knobs ([whatsapp.turns] in nucleus.toml). */
+  turns: import("./chat_engine.js").TurnsConfig;
+  /** ADR-033: the `nucleus` binary (tasks CLI, skill review). */
+  nucleusBin: string | null;
 }
 
 export type { Config as default };
@@ -258,6 +268,36 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
     outboundStagingDir: path.join(workspaceRoot, "memory/outbound-staging"),
     jobsDbPath: path.join(workspaceRoot, "memory/jobs.db"),
     breaker: breakerConfig(parsed.whatsapp?.breaker ?? {}),
+    turns: turnsConfig(parsed.whatsapp?.turns ?? {}, parsed.whatsapp?.texts ?? {}),
+    nucleusBin: findNucleusBin(workspaceRoot),
+  };
+}
+
+/** The built `nucleus` binary: release first, then debug; null when neither
+ *  exists (a checkout that was never built). */
+export function findNucleusBin(workspaceRoot: string): string | null {
+  for (const p of ["target/release/nucleus", "target/debug/nucleus"]) {
+    const full = path.join(workspaceRoot, p);
+    if (fs.existsSync(full)) return full;
+  }
+  return null;
+}
+
+/** ADR-033: [whatsapp.turns] overrides layered over the defaults, plus the
+ *  fixed texts from [whatsapp.texts] (texts.ts). */
+export function turnsConfig(
+  t: Record<string, unknown>,
+  texts: Record<string, unknown> = {},
+): import("./chat_engine.js").TurnsConfig {
+  const pos = (v: unknown): number | null =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+  return {
+    ackAfterMs: (pos(t.ack_after_secs) ?? 30) * 1000,
+    progressIntervalMs: (pos(t.progress_interval_secs) ?? 180) * 1000,
+    progressMaxChars: pos(t.progress_max_chars) ?? 160,
+    ceilingMs: (pos(t.turn_ceiling_hours) ?? 6) * 3_600_000,
+    permissionStallMs: (pos(t.permission_stall_secs) ?? 120) * 1000,
+    texts: textsFrom(texts),
   };
 }
 

@@ -173,3 +173,14 @@ runtime       = "rust"
 tmux_session  = "nucleus-gmail"
 diary_key     = "reminders"
 persona_venue = "gmail"
+
+[[agent]]
+name          = "tasks"
+class         = "ephemeral"
+launch        = "on-demand"
+runtime       = "rust"
+# Background task workers (ADR-033): one window per task, started by
+# `nucleus tasks start` (chat sessions, the operator, the issue pipeline).
+# The ledger is memory/tasks.db; worker logs in memory/logs/tasks/; raw
+# session output via the runs.jsonl index.
+tmux_session  = "nucleus-tasks"

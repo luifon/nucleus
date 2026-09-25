@@ -29,39 +29,57 @@ notify_on_failure: []
 ```
 
 - `--to` must belong to a registered agent (`agents.toml`), exact or as
-  `<registered>-suffix` (per-chat pools: `nucleus-whatsapp-dm:1`).
-- The `[agent-msg from:… at:… hop:…]` header is machine-prepended — never
-  write one yourself.
+  `<registered>-suffix`.
+- **WhatsApp DM: always `--to whatsapp-dm`** (ADR-033). The message is queued
+  for the bot's turn engine, which types it into the operator's DM session and
+  spawns or resumes that session when none is live. Raw tmux targets in
+  `nucleus-whatsapp` / `nucleus-whatsapp-dm` are refused, because the engine
+  owns typing into those panes. `--await-reply` is not available on this route.
+- The message is typed inside a code-owned envelope: the
+  `[agent-msg from:… at:… hop:…]` header, a line saying it is not from the
+  operator, and every line of your message prefixed with `│ `. Never write a
+  header yourself.
+- The sender and the hop are derived (ADR-021 amendment): a Nucleus session
+  sends as its own agent (`NUCLEUS_AGENT`); a different `--from` is refused.
+  From the operator's own session use `--from main`. A session whose current
+  turn read an agent message cannot send onward, whatever `--hop` says.
 - Every send is logged in `memory/agent_messages.db` (audit: who told whom
   what, delivered or not).
 
 ## Procedure
 
-1. **Find a live target.** `tmux ls`, then `tmux list-windows -t <session>`
-   — a live claude window is any window not named `zsh`. Venue pools
-   (`nucleus-whatsapp-dm`) only spawn per-chat windows on INBOUND messages;
-   they may not exist yet.
-2. **Live target → send.** Compose a self-contained brief (the target has
-   none of your context): decisions made, constraints, what to do next.
-   Include guardrails the target can't infer ("browser is held by the main
-   session — WebSearch only").
-3. **No live target → arm the spawn watcher** (background), then have the
-   operator (or the flow) trigger an inbound message:
+1. **Compose a self-contained brief** (the target has none of your
+   context): decisions made, constraints, what to do next. Include guardrails
+   the target can't infer ("browser is held by the main session — WebSearch
+   only").
+2. **WhatsApp DM:**
 
    ```bash
-   while true; do
-     W=$(tmux list-windows -t nucleus-whatsapp-dm -F '#{window_index} #{window_name}' \
-         2>/dev/null | awk '$2 != "zsh" {print $1}' | tail -1)
-     [ -n "$W" ] && break; sleep 2
-   done
-   for i in $(seq 1 12); do
-     ./target/release/nucleus session-send --to "nucleus-whatsapp-dm:$W" --from main \
-       --message '<brief>' && break
-     sleep 15
-   done
+   ./target/release/nucleus session-send --to whatsapp-dm --from main --message '<brief>'
    ```
 
-4. **Proactive message TO the operator** (no session required): insert into
+   The bot types it within a few seconds, spawning or resuming the DM session
+   if needed. The session's reply to it is not sent to WhatsApp.
+3. **Other venues (Discord, chat):** find a live window with `tmux ls` and
+   `tmux list-windows -t <session>` (a live claude window is any window not
+   named `zsh`), then `session-send --to <session>:<window>`.
+
+4. **Work that should run on its own** ("research X and report back"): start
+   a background task with `--origin whatsapp-dm` instead of briefing the chat
+   session. The result goes to the operator's DM and into the DM session as
+   context:
+
+   ```bash
+   ./target/release/nucleus tasks start --origin whatsapp-dm --requested-by operator \
+     --title "<short title>" --brief - <<'EOF'
+   <full brief>
+   EOF
+   ```
+
+   (Inside the WhatsApp DM session the origin is set by the session's task
+   scope; the session omits `--origin`.)
+
+5. **Proactive message TO the operator** (no session required): insert into
    the venue's outbound queue — the bot drains it in ~1s:
 
    ```bash
@@ -70,7 +88,7 @@ notify_on_failure: []
      VALUES ('$JID', '<message>', 'agent-msg:<label>', strftime('%Y-%m-%dT%H:%M:%fZ','now'));"
    ```
 
-5. Follow-up conversation rides the normal venue loop — the injected context
+6. Follow-up conversation rides the normal venue loop — the injected context
    lives in the session, so the operator just keeps chatting.
 
 ## Rules that are NOT optional (ADR-021)
@@ -84,16 +102,27 @@ notify_on_failure: []
 
 # Failure modes
 
-- **Cold-first-reply race:** the operator's first message spawns the session
-  AND gets answered before the watcher can inject — that reply is un-briefed.
-  Warn the operator, or pre-warm with a throwaway inbound before the real
-  conversation.
-- **Injected replies are never auto-posted to the venue** — the wrapper only
-  forwards replies to real inbound messages. For operator-visible output use
+- **Brief lands after the operator's message:** if the operator writes before
+  the queued brief is typed, the first reply is un-briefed. Send the brief
+  first, then tell the operator to write.
+- **Injected replies are never auto-posted to the venue** — the WhatsApp turn
+  engine treats a turn that read only `[agent-msg]` input as context. For operator-visible output use
   the outbound queue (step 4) or let the operator's next message pull it.
-- **Idle-gate refusal** ("did not become idle within 30s"): target is
-  mid-turn or showing a picker. Wait and retry; do NOT bypass with raw
-  send-keys.
+- **Idle-gate refusal** ("did not become idle within 30s", tmux route only):
+  target is mid-turn or showing a picker. Wait and retry; do NOT bypass with
+  raw send-keys.
+- **"does not match this session's agent" / "not a registered agent"
+  refusal:** `--from` names someone else. Drop `--from` inside a Nucleus
+  session, use `--from main` from the operator's own session.
+- **"hop limit" refusal:** this turn is reacting to an agent message. Ask the
+  operator instead of forwarding.
+- **"background task workers do not send" refusal:** you are a task worker;
+  the result is delivered automatically.
+- **"driven by the WhatsApp turn engine" refusal:** you targeted a
+  `nucleus-whatsapp*` chat pane directly. Use `--to whatsapp-dm`.
+- **Inbox row stays pending / failed:** check `session_inbox` in
+  `memory/whatsapp.db` (`last_error`) and `memory/whatsapp.log`; the bot must
+  be running to drain it.
 - **"input wedged" error:** the target's TUI stopped accepting submits —
   switch to the bot-triage skill; do not retry blindly.
 - **Unregistered target refusal:** the session isn't in `agents.toml` —

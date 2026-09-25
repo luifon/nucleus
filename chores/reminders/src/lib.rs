@@ -31,7 +31,6 @@ use std::time::Duration;
 
 const AGENT_NAME: &str = "reminders";
 const DB_PATH: &str = "memory/reminders.db";
-const WHATSAPP_DB_PATH: &str = "memory/whatsapp.db";
 
 #[derive(Parser)]
 #[command(name = "reminders", about = "Nucleus scheduled reminders")]
@@ -897,8 +896,8 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                         if send {
                             let body = match &fallback {
                                 Some(content) => format!(
-                                    "⚠️ Reminder #{} — a sessão falhou, conteúdo bruto abaixo \
-                                     (sem formatação/análise):\n\n{content}",
+                                    "⚠️ Reminder #{} — the session failed; raw content below \
+                                     (no formatting or analysis):\n\n{content}",
                                     reminder.id
                                 ),
                                 None => format!(
@@ -1293,8 +1292,9 @@ async fn deliver(
                 )
             })?;
             let body = format!("🔔 *Reminder:* {}", r.body);
-            let pool = store::open_whatsapp_db(&workspace_root.join(WHATSAPP_DB_PATH)).await?;
-            let queue_id = store::enqueue_whatsapp(&pool, &target, &body, "reminders").await?;
+            let pool = nucleus_core::whatsapp_queue::open(workspace_root).await?;
+            let queue_id =
+                nucleus_core::whatsapp_queue::enqueue_text(&pool, &target, &body, "reminders").await?;
             Ok(format!("whatsapp-queue#{}", queue_id))
         }
         store::CHANNEL_CALENDAR => deliver_calendar(settings, workspace_root, r).await,

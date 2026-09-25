@@ -1,0 +1,163 @@
+[
+  {
+    "name": "operator terminal: shell ancestors only, a terminal, no claude on it",
+    "snapshot": {
+      "tty": "16777219",
+      "ancestors": [
+        {"pid": 300, "claude": false, "env": {}},
+        {"pid": 200, "claude": false, "env": null}
+      ],
+      "tty_peers": []
+    },
+    "expect": {"origin": "terminal"}
+  },
+  {
+    "name": "operator's interactive Claude Code session: outermost claude has no Nucleus marker",
+    "snapshot": {
+      "tty": "16777219",
+      "ancestors": [
+        {"pid": 301, "claude": false, "env": {}},
+        {"pid": 300, "claude": true, "env": {}, "session_id": null}
+      ]
+    },
+    "expect": {"origin": "operator-session", "session_id": null}
+  },
+  {
+    "name": "WhatsApp DM chat session: marker, agent and scope from the claude start environment",
+    "snapshot": {
+      "tty": "16777300",
+      "ancestors": [
+        {"pid": 501, "claude": false, "env": {}},
+        {"pid": 500, "claude": true, "session_id": "sess-chat", "env": {"NUCLEUS_SESSION": "chat", "NUCLEUS_AGENT": "whatsapp", "NUCLEUS_TASK_SCOPE": "tok"}},
+        {"pid": 499, "claude": false, "env": {}}
+      ]
+    },
+    "expect": {"origin": "nucleus", "kind": "chat", "agent": "whatsapp", "scope": "tok", "session_id": "sess-chat"}
+  },
+  {
+    "name": "a session cannot hide behind a claude it started: the outermost claude decides",
+    "snapshot": {
+      "tty": "16777300",
+      "ancestors": [
+        {"pid": 602, "claude": true, "env": {}},
+        {"pid": 601, "claude": false, "env": {"NUCLEUS_SESSION": "agent", "NUCLEUS_AGENT": "main"}},
+        {"pid": 600, "claude": true, "session_id": "sess-worker", "env": {"NUCLEUS_SESSION": "worker", "NUCLEUS_AGENT": "tasks", "NUCLEUS_TASK_WORKER": "abcd1234"}}
+      ]
+    },
+    "expect": {"origin": "nucleus", "kind": "worker", "agent": "tasks", "worker": "abcd1234", "session_id": "sess-worker"}
+  },
+  {
+    "name": "the outermost claude's environment cannot be read: refuse to decide",
+    "snapshot": {
+      "tty": "16777300",
+      "ancestors": [
+        {"pid": 701, "claude": true, "env": {"NUCLEUS_SESSION": "chat"}},
+        {"pid": 700, "claude": true, "env": null}
+      ]
+    },
+    "expect": {"origin": "unknown"}
+  },
+  {
+    "name": "a detached command keeps the pane's terminal: the Nucleus claude on it identifies the session",
+    "snapshot": {
+      "tty": "16777300",
+      "ancestors": [],
+      "tty_peers": [
+        {"pid": 500, "claude": true, "session_id": "sess-chat", "env": {"NUCLEUS_SESSION": "chat", "NUCLEUS_AGENT": "whatsapp", "NUCLEUS_TASK_SCOPE": "tok"}}
+      ]
+    },
+    "expect": {"origin": "nucleus", "kind": "chat", "agent": "whatsapp", "scope": "tok", "session_id": "sess-chat"}
+  },
+  {
+    "name": "an operator claude on the same terminal does not make a Nucleus session",
+    "snapshot": {
+      "tty": "16777219",
+      "ancestors": [
+        {"pid": 10, "claude": false, "env": {}}
+      ],
+      "tty_peers": [
+        {"pid": 300, "claude": true, "env": {}}
+      ]
+    },
+    "expect": {"origin": "terminal"}
+  },
+  {
+    "name": "no claude ancestor and no terminal: detached",
+    "snapshot": {
+      "tty": null,
+      "ancestors": [
+        {"pid": 900, "claude": false, "env": {"NUCLEUS_AGENT": "whatsapp"}}
+      ]
+    },
+    "expect": {"origin": "detached"}
+  },
+  {
+    "name": "an ancestry cut short cannot be trusted",
+    "snapshot": {
+      "tty": "16777219",
+      "ancestors": [
+        {"pid": 10, "claude": false, "env": {}}
+      ],
+      "complete": false
+    },
+    "expect": {"origin": "unknown"}
+  },
+  {
+    "name": "two different Nucleus sessions on one terminal: refuse to decide",
+    "snapshot": {
+      "tty": "16777300",
+      "ancestors": [],
+      "tty_peers": [
+        {"pid": 500, "claude": true, "env": {"NUCLEUS_SESSION": "chat", "NUCLEUS_AGENT": "whatsapp"}},
+        {"pid": 501, "claude": true, "env": {"NUCLEUS_SESSION": "worker", "NUCLEUS_TASK_WORKER": "ab12"}}
+      ]
+    },
+    "expect": {"origin": "unknown"}
+  },
+  {
+    "name": "a Nucleus marker in any ancestor's start environment makes a Nucleus session, claude or not",
+    "snapshot": {
+      "tty": "16777219",
+      "ancestors": [
+        {"pid": 10, "claude": false, "env": {"NUCLEUS_SESSION": "chat", "NUCLEUS_TASK_SCOPE": "forged"}}
+      ]
+    },
+    "expect": {"origin": "nucleus", "kind": "chat", "scope": "forged"}
+  },
+  {
+    "name": "a process taken for claude above a worker (a forged claude name) cannot hide the marked worker below it",
+    "snapshot": {
+      "tty": "16777300",
+      "ancestors": [
+        {"pid": 1103, "claude": false, "env": {}},
+        {"pid": 1102, "claude": true, "session_id": "sess-worker", "env": {"NUCLEUS_SESSION": "worker", "NUCLEUS_TASK_WORKER": "feed1234"}},
+        {"pid": 1101, "claude": false, "env": null},
+        {"pid": 1100, "claude": true, "env": {}}
+      ]
+    },
+    "expect": {"origin": "nucleus", "kind": "worker", "worker": "feed1234", "session_id": "sess-worker"}
+  },
+  {
+    "name": "a new tmux server started from a worker session keeps its marker: a command in its pane is the worker",
+    "snapshot": {
+      "tty": "16777400",
+      "ancestors": [
+        {"pid": 1201, "claude": false, "env": {}},
+        {"pid": 1200, "claude": false, "env": {"NUCLEUS_SESSION": "worker", "NUCLEUS_TASK_WORKER": "cafe5678"}}
+      ],
+      "tty_peers": []
+    },
+    "expect": {"origin": "nucleus", "kind": "worker", "worker": "cafe5678"}
+  },
+  {
+    "name": "a claude with an unreadable environment further out than the marked ancestor: refuse to decide",
+    "snapshot": {
+      "tty": "16777300",
+      "ancestors": [
+        {"pid": 1301, "claude": false, "env": {"NUCLEUS_SESSION": "chat"}},
+        {"pid": 1300, "claude": true, "env": null}
+      ]
+    },
+    "expect": {"origin": "unknown"}
+  }
+]

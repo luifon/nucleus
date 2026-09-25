@@ -26,6 +26,8 @@ function row(over: Partial<OutboundRow>): OutboundRow {
     mediaPath: null,
     mimetype: null,
     filename: null,
+    quotedJson: null,
+    msgId: null,
     ...over,
   };
 }

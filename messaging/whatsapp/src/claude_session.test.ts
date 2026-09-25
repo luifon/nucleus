@@ -16,10 +16,28 @@ import {
   lastPromptRow,
   draftFragment,
   draftFragments,
+  envPrefix,
   draftStuck,
   waitForDraftGone,
   splitRotationReply,
   addDirsWithPrivateSkills,
+  sanitizeForTyping,
+  typeChunks,
+  typeInvocations,
+  TYPE_CHUNK_BYTES,
+  MAX_TYPED_PROMPT_BYTES,
+  MAX_TYPED_INPUT_BYTES,
+  checkPromptSize,
+  transcriptAccepted,
+  transcriptAcceptance,
+  arrivedPasted,
+  submitInput,
+  typeWithFlowControl,
+  TYPE_ECHO_MAX_STALLS,
+  TYPE_ECHO_POLL_MS,
+  TYPE_ECHO_WAIT_MS,
+  type TypingIo,
+  paneAwaitingChoice,
   Turn,
 } from "./claude_session.js";
 
@@ -425,4 +443,169 @@ test("addDirsWithPrivateSkills: appends <root>/.nucleus only when it exists and 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ── typed input (ADR-033) ──
+
+test("sanitizeForTyping keeps newlines and text, drops control keys", () => {
+  assert.equal(sanitizeForTyping("a\r\nb\rc\td\x1b[201~e\x07"), "a\nb\nc  d[201~e");
+  assert.equal(sanitizeForTyping("ação 🧪 ; end;"), "ação 🧪 ; end;");
+});
+
+test("typeChunks never splits a character and bounds the bytes", () => {
+  const s = "🧪".repeat(5) + "abc";
+  const chunks = typeChunks(s, 8);
+  assert.equal(chunks.join(""), s);
+  assert.ok(chunks.every((c) => Buffer.byteLength(c) <= 8));
+  assert.deepEqual(typeChunks("", 64), []);
+});
+
+test("typing is one send-keys call per chunk below the paste threshold", () => {
+  const content = "a".repeat(1000) + "😀é;" + "b".repeat(300);
+  const calls = typeInvocations("@1", content);
+  const bytes: number[] = [];
+  for (const args of calls) {
+    assert.deepEqual(args.slice(0, 4), ["send-keys", "-t", "@1", "-H"]);
+    assert.ok(args.length - 4 <= TYPE_CHUNK_BYTES);
+    bytes.push(...args.slice(4).map((h) => parseInt(h, 16)));
+  }
+  assert.equal(Buffer.from(bytes).toString("utf8"), content);
+  assert.ok(TYPE_CHUNK_BYTES <= 128, "larger chunks turn into a paste under load");
+});
+
+test("prompts over the cap are refused before typing", () => {
+  assert.doesNotThrow(() => checkPromptSize("x".repeat(MAX_TYPED_PROMPT_BYTES)));
+  assert.throws(() => checkPromptSize("x".repeat(MAX_TYPED_PROMPT_BYTES + 1)), /the limit for a typed prompt/);
+});
+
+test("transcriptAccepted finds the marker in a prompt, a queued input or an absorbed input", () => {
+  const m = "ref:wa-0123abcd";
+  const prompt = JSON.stringify({ type: "user", message: { content: `[WhatsApp — ref:wa-0123abcd]\n\nhi` } });
+  const queued = JSON.stringify({ type: "queue-operation", operation: "enqueue", content: `x ref:wa-0123abcd` });
+  const absorbed = JSON.stringify({ type: "attachment", attachment: { type: "queued_command", prompt: `ref:wa-0123abcd` } });
+  const other = JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: m }] } });
+  assert.equal(transcriptAccepted(prompt + "\n", m), true);
+  assert.equal(transcriptAccepted(queued + "\n", m), true);
+  assert.equal(transcriptAccepted(absorbed + "\n", m), true);
+  assert.equal(transcriptAccepted(other + "\n", m), false, "assistant text never confirms a submit");
+  assert.equal(transcriptAccepted("", m), false);
+});
+
+test("paneAwaitingChoice sees pickers in the live input region only", () => {
+  assert.equal(paneAwaitingChoice("❯ hello"), null);
+  assert.match(paneAwaitingChoice("Do you want to proceed?\n❯ 1. Yes\n  2. No") ?? "", /option picker/);
+  assert.equal(paneAwaitingChoice("Do you want to see the list?\n❯ "), null, "model text is not a picker");
+  assert.equal(
+    paneAwaitingChoice(" Do you trust this folder?\n ❯ No, exit\n   Yes, I trust this folder"),
+    "trust this folder",
+  );
+  assert.equal(paneAwaitingChoice("❯ 1. old picker answered\nreply\n❯ "), null);
+});
+
+test("draftFragments never splits a surrogate pair (#21)", () => {
+  // 23 ASCII characters then an emoji: the 24th code point is the emoji,
+  // which is two UTF-16 units.
+  const head = "a".repeat(23) + "😀" + "tail";
+  const { head: h } = draftFragments(head);
+  assert.equal(Array.from(h).length, 24);
+  assert.ok(h.endsWith("😀"), "the emoji is whole");
+  assert.ok(!/[\uD800-\uDBFF]$/.test(h), "no lone high surrogate");
+  const tailCase = "start " + "😀" + "b".repeat(23);
+  const { tail } = draftFragments(tailCase);
+  assert.equal(Array.from(tail).length, 24);
+  assert.ok(tail.startsWith("😀"));
+});
+
+test("envPrefix quotes values and refuses unsafe names", () => {
+  assert.equal(envPrefix({}), "");
+  assert.equal(envPrefix({ NUCLEUS_TASK_SCOPE: "a'b c" }), "env NUCLEUS_TASK_SCOPE='a'\\''b c' ");
+  assert.throws(() => envPrefix({ "A;rm": "x" }));
+  assert.throws(() => envPrefix({ lower: "x" }));
+});
+
+// --- typed-input limits and flow control (ADR-033) ---
+
+test("submitInput refuses a payload over the cap before typing anything", async () => {
+  await assert.rejects(
+    submitInput("nucleus-test-no-such-session:0", "x".repeat(MAX_TYPED_INPUT_BYTES + 1)),
+    /limit for a typed prompt/,
+  );
+  // Multibyte: under the limit in characters, over it in bytes.
+  await assert.rejects(
+    submitInput("nucleus-test-no-such-session:0", "é".repeat(MAX_TYPED_INPUT_BYTES / 2 + 1)),
+    /limit for a typed prompt/,
+  );
+});
+
+/** A pane that shows typed bytes `lag` polls after they were sent. */
+function laggingPane(lag: number) {
+  let clock = 0;
+  let shown = "";
+  const pending: Array<{ text: string; polls: number }> = [];
+  const events: string[] = [];
+  const io: TypingIo = {
+    send: async (args) => {
+      const text = Buffer.from(args.slice(4).join(""), "hex").toString("utf8");
+      events.push(`send:${text}`);
+      pending.push({ text, polls: lag });
+    },
+    capture: async () => {
+      for (const p of pending) p.polls -= 1;
+      while (pending.length && pending[0].polls <= 0) shown += pending.shift()!.text;
+      events.push(`capture:${shown.length}`);
+      return `❯ ${shown}`;
+    },
+    sleep: async (ms) => {
+      clock += ms;
+    },
+    now: () => clock,
+  };
+  return { io, events, shown: () => shown };
+}
+
+test("typing sends the next chunk only after the pane shows the previous one", async () => {
+  const content = Array.from({ length: 4 }, (_, i) => String.fromCharCode(97 + i).repeat(TYPE_CHUNK_BYTES)).join("");
+  const pane = laggingPane(3);
+  const stats = await typeWithFlowControl("t", content, pane.io);
+  assert.equal(stats.chunks, 4);
+  assert.equal(stats.stalls, 0);
+  // Before each send after the first, the last capture showed everything
+  // sent so far.
+  let sentBytes = 0;
+  let lastCapture = -1;
+  for (const e of pane.events) {
+    if (e.startsWith("send:")) {
+      if (sentBytes > 0) assert.equal(lastCapture, sentBytes, `send after ${sentBytes} bytes before their echo`);
+      sentBytes += Buffer.byteLength(e.slice(5));
+    } else {
+      lastCapture = Number(e.slice(8));
+    }
+  }
+});
+
+test("a pane that never shows the typed text costs a bounded wait, then typing goes on", async () => {
+  const content = "z".repeat(TYPE_CHUNK_BYTES * 10);
+  const pane = laggingPane(Number.MAX_SAFE_INTEGER);
+  const stats = await typeWithFlowControl("t", content, pane.io);
+  assert.equal(stats.chunks, 10);
+  assert.equal(stats.stalls, TYPE_ECHO_MAX_STALLS, "waits stop after the stall limit");
+  const captures = pane.events.filter((e) => e.startsWith("capture:")).length;
+  assert.ok(captures <= TYPE_ECHO_MAX_STALLS * (TYPE_ECHO_WAIT_MS / TYPE_ECHO_POLL_MS + 1), `${captures} captures`);
+  assert.equal(pane.events.filter((e) => e.startsWith("send:")).length, 10, "every chunk was sent");
+});
+
+test("transcriptAcceptance reports the promptSource of the accepted prompt", () => {
+  const typed = JSON.stringify({ type: "user", promptSource: "typed", message: { content: "[ref:wa-1] hello" } });
+  const pasted = JSON.stringify({ type: "user", message: { content: '<pasted_content id="1">[ref:wa-2] hello</pasted_content>' } });
+  const other = JSON.stringify({ type: "user", promptSource: "paste", message: { content: "[ref:wa-4] x" } });
+  const queued = JSON.stringify({ type: "queue-operation", operation: "enqueue", content: "[ref:wa-3] later" });
+  assert.deepEqual(transcriptAcceptance(typed, "ref:wa-1"), { accepted: true, via: "prompt", promptSource: "typed" });
+  const p = transcriptAcceptance(pasted, "ref:wa-2");
+  assert.equal(p.promptSource, "pasted");
+  assert.ok(arrivedPasted(p));
+  assert.ok(arrivedPasted(transcriptAcceptance(other, "ref:wa-4")));
+  const q = transcriptAcceptance(queued, "ref:wa-3");
+  assert.deepEqual(q, { accepted: true, via: "queued", promptSource: null });
+  assert.ok(!arrivedPasted(q));
+  assert.equal(transcriptAcceptance(typed, "ref:wa-9").accepted, false);
 });

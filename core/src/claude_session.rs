@@ -3,8 +3,9 @@
 //! Architecture:
 //! - We spawn `claude` (NOT `claude -p`) inside a tmux window. The Max
 //!   subscription covers interactive usage; `-p` is moving to API-only.
-//! - User messages go in via tmux's paste buffer (handles any content
-//!   without shell-escape hell).
+//! - Every message is typed into the pane as keyboard input in small UTF-8
+//!   chunks (`send-keys -H`), so it reaches the model as a typed prompt and
+//!   not as `<pasted_content>` (ADR-033).
 //! - Responses come out by tailing the session transcript file that
 //!   claude writes at `$HOME/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
 //!   No TUI scraping — the transcript is structured JSON, one event per line.
@@ -20,9 +21,8 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::process::Command;
 
 use crate::claude::PermissionMode;
@@ -133,6 +133,15 @@ fn is_no_turn_phantom(reply: &str) -> bool {
         .eq_ignore_ascii_case("no response requested")
 }
 
+/// Short description when `reply` is infrastructure failing (a model banner,
+/// an API error, the usage-limit banner, the "No response requested."
+/// phantom) rather than an answer; `None` for real content. For callers that
+/// read a turn's final text from the transcript themselves instead of through
+/// [`Session::ask`] (the ADR-033 task worker).
+pub fn infra_failure_description(reply: &str) -> Option<&'static str> {
+    classify_infra_reply(reply).map(InfraError::describe)
+}
+
 /// Classify an `ask` reply that is infrastructure failing rather than an
 /// answer, or `None` when it's real content.
 ///
@@ -228,6 +237,9 @@ pub struct Session {
     /// reply means a session that never produced one is not what the next
     /// spawn resumes.
     daily: Option<DailySessionRecord>,
+    /// What the most recent typed submit of this session observed (how the
+    /// harness recorded the prompt, typing stalls). `None` before the first.
+    last_submit: Option<SubmitOutcome>,
 }
 
 /// What `Session::ask` persists on its first success when the spawn opted
@@ -275,6 +287,10 @@ pub struct SpawnOptions {
     /// raw output survives the window being killed. `None` = no run-log
     /// (examples, tests, ad-hoc sessions).
     pub agent_label: Option<String>,
+    /// Extra environment variables for the `claude` process, and so for every
+    /// tool command it runs. The task ledger uses them to tell its CLI who is
+    /// calling (ADR-033: a chat session's task scope, a worker's role).
+    pub env: Vec<(String, String)>,
 }
 
 // NOTE (ADR-020): `Default` is deliberately NOT implemented for
@@ -408,6 +424,7 @@ impl Session {
             workspace_root: opts.workspace_root.clone(),
             spawn_opts: opts,
             daily: None,
+            last_submit: None,
         })
     }
 
@@ -427,9 +444,24 @@ impl Session {
         model_override: Option<&str>,
     ) -> Result<Option<String>> {
         let claude_args = build_claude_args(session_id, resuming, opts, model_override);
+        // Every session knows which registry agent it runs as; the operator
+        // CLIs attribute its sends and scope its task access by it
+        // (crate::agent_msg::ENV_AGENT, crate::caller).
+        let mut env = opts.env.clone();
+        if let Some(agent) = &opts.agent_label {
+            if !env.iter().any(|(k, _)| k == crate::agent_msg::ENV_AGENT) {
+                env.push((crate::agent_msg::ENV_AGENT.to_string(), agent.clone()));
+            }
+        }
+        // Every Nucleus session is marked in its `claude` start environment,
+        // which its tool commands cannot change (crate::proc_tree).
+        if !env.iter().any(|(k, _)| k == crate::proc_tree::ENV_SESSION) {
+            env.push((crate::proc_tree::ENV_SESSION.to_string(), crate::proc_tree::SESSION_AGENT.to_string()));
+        }
         let inner = format!(
-            "cd {} && {} {}",
+            "cd {} && {}{} {}",
             shell_quote(&opts.workspace_root.to_string_lossy()),
+            env_prefix(&env)?,
             shell_quote(&claude_bin()),
             claude_args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
         );
@@ -505,7 +537,9 @@ impl Session {
 
     /// Send a user message and wait for claude's next assistant reply. Blocks
     /// for at most `opts.max_wait`.
+    /// Refuses a message over [`MAX_TYPED_PROMPT_BYTES`] before typing.
     pub async fn ask(&mut self, message: &str, opts: AskOptions) -> Result<String> {
+        check_prompt_size(message)?;
         let reply = self.ask_once(message, &opts).await?;
         let Some(kind) = classify_infra_reply(&reply) else {
             self.record_daily_session().await;
@@ -646,13 +680,19 @@ impl Session {
             .await
             .map(|m| m.len())
             .unwrap_or(0);
-        if let Err(e) = paste_and_send(
+        // Typed, not pasted (ADR-033): a paste reaches the model wrapped in
+        // `<pasted_content>`, which Claude Code treats as text the user may
+        // not have written.
+        let submitted = type_and_submit_verified(
             &self.tmux_target,
             &payload,
             Some((self.transcript_path.as_path(), pre_send_len)),
         )
-        .await
-        {
+        .await;
+        if let Ok(outcome) = &submitted {
+            self.last_submit = Some(outcome.clone());
+        }
+        if let Err(e) = submitted {
             // A wedged TUI (submit verified to have NOT landed after the full
             // recovery ladder) is unrecoverable from outside: kill the window
             // so is_alive() fails and pool callers respawn with --resume,
@@ -679,6 +719,52 @@ impl Session {
             .map(|m| m.len())
             .unwrap_or(self.cursor);
         Ok(reply)
+    }
+
+    /// Type `message` (with the date preamble) as keyboard input and submit
+    /// it, verified against the transcript. Does not wait for a reply: the
+    /// caller follows the transcript from the returned byte offset with a
+    /// [`crate::turn_tracker::TurnTracker`]. Used by callers that need the
+    /// whole turn (progress, background tasks, cancel) instead of one reply —
+    /// the ADR-033 task worker.
+    /// Refuses a message over [`MAX_TYPED_PROMPT_BYTES`] before typing.
+    pub async fn submit_typed(&mut self, message: &str) -> Result<u64> {
+        check_prompt_size(message)?;
+        let from = wait_for_transcript_quiet(&self.transcript_path, Duration::from_secs(3))
+            .await
+            .unwrap_or(self.cursor);
+        let payload = with_date_preamble(message);
+        let pre_send_len = tokio::fs::metadata(&self.transcript_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let submitted = type_and_submit_verified(
+            &self.tmux_target,
+            &payload,
+            Some((self.transcript_path.as_path(), pre_send_len)),
+        )
+        .await;
+        if let Ok(outcome) = &submitted {
+            self.last_submit = Some(outcome.clone());
+        }
+        if let Err(e) = submitted {
+            if format!("{e:#}").contains("input wedged") {
+                let _ = Command::new("tmux")
+                    .args(["kill-window", "-t", &self.tmux_target])
+                    .output()
+                    .await;
+            }
+            return Err(e);
+        }
+        self.cursor = from;
+        Ok(from)
+    }
+
+    /// What the most recent typed submit observed: how the harness recorded
+    /// the prompt (`promptSource`) and the typing stalls. A prompt recorded as
+    /// pasted content is also logged when it happens.
+    pub fn last_submit(&self) -> Option<&SubmitOutcome> {
+        self.last_submit.as_ref()
     }
 
     /// True while the underlying tmux window still exists. A window can die
@@ -886,6 +972,7 @@ impl SessionPool {
                 ready_timeout: Duration::from_secs(60),
                 resume_session_id: resume_session_id.clone(),
                 agent_label: self.config.agent_label.clone(),
+                env: vec![],
             })
             .await;
             match spawned {
@@ -1121,6 +1208,7 @@ impl SessionPool {
             ready_timeout: Duration::from_secs(60),
             resume_session_id: None,
             agent_label: self.config.agent_label.clone(),
+            env: vec![],
         })
         .await
         .context("daily_rotate: spawn new session")?;
@@ -1432,7 +1520,7 @@ fn private_add_dir(opts: &SpawnOptions) -> Option<PathBuf> {
     (!already_listed).then_some(private)
 }
 
-fn transcript_path_for(workspace_root: &Path, session_id: &str) -> PathBuf {
+pub(crate) fn transcript_path_for(workspace_root: &Path, session_id: &str) -> PathBuf {
     let encoded = workspace_root.to_string_lossy().replace('/', "-");
     let home = std::env::var("HOME").unwrap_or_default();
     PathBuf::from(home)
@@ -1450,70 +1538,24 @@ async fn ensure_tmux_session(name: &str) -> Result<()> {
     if has.status.success() {
         return Ok(());
     }
-    let out = Command::new("tmux")
-        .args(["new-session", "-d", "-s", name])
-        .output()
-        .await?;
-    if !out.status.success() {
+    // The server a new session may start inherits this process's
+    // environment and passes it to every window it opens; it must not carry
+    // a session's identity (crate::proc_tree::SESSION_VARS).
+    let mut cmd = Command::new("tmux");
+    cmd.args(["new-session", "-d", "-s", name]);
+    for var in crate::proc_tree::SESSION_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd.output().await?;
+    // Two spawns that start at the same moment both see "no session" and
+    // both run new-session; the second fails with "duplicate session". The
+    // session exists either way, which is all this function promises.
+    if !out.status.success()
+        && !String::from_utf8_lossy(&out.stderr).contains("duplicate session")
+    {
         anyhow::bail!(
             "tmux new-session failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// Load `content` into a fresh NAMED tmux buffer and paste it into `target`.
-///
-/// NAMED buffer per paste, never the server-global default. Concurrent
-/// sessions (ADR-020 parallel pool spawns; S13 concurrent jobs) each
-/// `load-buffer` then `paste-buffer` — on the shared default buffer the
-/// second load clobbers the first, so both windows paste whichever load
-/// won (cross-contaminated prompts; S13 vault-import got the enrich
-/// prompt, 2026-06-13). A unique buffer name isolates them; `paste-buffer
-/// -d` deletes it after so we don't leak buffers.
-async fn paste_into(target: &str, content: &str) -> Result<()> {
-    let buf = format!(
-        "nucleus-{}-{}",
-        target.trim_start_matches('@'),
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
-    let mut child = Command::new("tmux")
-        .args(["load-buffer", "-b", &buf, "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning tmux load-buffer")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(content.as_bytes()).await?;
-        stdin.shutdown().await?;
-    }
-    let out = child.wait_with_output().await?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "tmux load-buffer failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-
-    // `-p`: wrap the buffer in bracketed-paste escapes. Without them tmux
-    // replays the payload as raw keystrokes and the TUI's paste heuristic
-    // decides where one "paste" ends by timing: the first burst became a
-    // collapsed chip (or was dropped outright) and the rest arrived as typed
-    // text, so the model received the message minus its head — the date
-    // preamble and the whole instruction, in the distiller's case (every
-    // night from 2026-08-31 on; the transcript verifier caught it as
-    // "draft is gone but the submit was never confirmed"). Bracketed, the
-    // whole payload lands as one paste regardless of chunking.
-    let p = Command::new("tmux")
-        .args(["paste-buffer", "-p", "-d", "-b", &buf, "-t", target])
-        .output()
-        .await?;
-    if !p.status.success() {
-        anyhow::bail!(
-            "tmux paste-buffer failed: {}",
-            String::from_utf8_lossy(&p.stderr).trim()
         );
     }
     Ok(())
@@ -1532,25 +1574,6 @@ async fn send_keys(target: &str, key: &str) -> Result<()> {
     }
     Ok(())
 }
-
-async fn send_keys_literal(target: &str, text: &str) -> Result<()> {
-    let e = Command::new("tmux")
-        .args(["send-keys", "-t", target, "-l", text])
-        .output()
-        .await?;
-    if !e.status.success() {
-        anyhow::bail!(
-            "tmux send-keys -l failed: {}",
-            String::from_utf8_lossy(&e.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// Close-bracketed-paste escape sequence, sent as literal bytes. If a paste
-/// ever leaves the TUI mid-paste-mode, every later keystroke (including
-/// Enter) is swallowed as literal pasted text — this terminator snaps it out.
-pub(crate) const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 
 /// Short recognizable prefix of the draft's first non-empty line, used to
 /// tell "our text is still sitting in the input" apart from every other
@@ -1649,7 +1672,7 @@ pub(crate) fn draft_stuck(pane: &str, head: &str, tail: &str) -> bool {
     (!head.is_empty() && region.contains(&head)) || (!tail.is_empty() && region.contains(&tail))
 }
 
-/// Poll until OUR draft is VISIBLE in the live input row — the paste landed
+/// Poll until OUR draft is VISIBLE in the live input row — the input landed
 /// and Enter will mean something. False on deadline; the caller presses on so
 /// the recovery ladder still gets its turn.
 async fn wait_for_draft_present(target: &str, head: &str, tail: &str, deadline: Duration) -> bool {
@@ -1667,7 +1690,7 @@ async fn wait_for_draft_present(target: &str, head: &str, tail: &str, deadline: 
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    tracing::warn!(target, "paste never appeared in the input row within the deadline");
+    tracing::warn!(target, "typed input never appeared in the input row within the deadline");
     false
 }
 
@@ -1692,116 +1715,6 @@ async fn wait_for_draft_gone(target: &str, head: &str, tail: &str, deadline: Dur
     false
 }
 
-/// Paste `content` into `target` and submit it, VERIFYING the submit landed.
-///
-/// 2026-07-18: the settle-then-Enter heuristic passed, Enter was eaten
-/// anyway (TUI stuck in what looked like an open bracketed paste), and the
-/// operator's WhatsApp DMs piled up typed-but-unsent with zero signal.
-/// Ladder of increasingly forceful recoveries; every rung ends with Enter
-/// plus "did OUR draft leave the input row?". Exhausted ladder → an
-/// "input wedged" error the caller must treat as fatal for the window.
-pub(crate) async fn paste_and_submit_verified(
-    target: &str,
-    content: &str,
-    transcript: Option<(&Path, u64)>,
-) -> Result<()> {
-    let (head, tail) = draft_fragments(content);
-    // What we demand back from the transcript. The head is the date preamble,
-    // which carries the wall-clock minute, so it distinguishes this payload
-    // from an earlier turn's.
-    let marker = head.clone();
-    paste_and_wait(target, content, &head, &tail).await?;
-
-    // Rung 1 is a bare second Enter, and it is the one that matters: the TUI
-    // consumes the first Enter while it is still processing the paste, so the
-    // draft stays put and a plain retry sends it. Re-pasting before trying
-    // that throws away the very draft the second Enter would have submitted
-    // (2026-08-28), so the destructive rungs come last.
-    for rung in 0..4u8 {
-        match rung {
-            0 | 1 => {} // Enter, then a bare second Enter
-            2 => {
-                // close a possibly-open bracketed paste, then Enter
-                let _ = send_keys_literal(target, BRACKETED_PASTE_END).await;
-            }
-            _ => {
-                // Last resort: clear the draft and paste it again. Only safe
-                // while OUR draft is still sitting in the input. If the input
-                // is empty the submit may already have gone and the
-                // confirmation merely lagged, and re-pasting would send the
-                // same message twice.
-                if !draft_present(target, &head, &tail).await {
-                    anyhow::bail!(
-                        "input wedged: draft is gone but the submit was never confirmed — \
-                         refusing to re-paste and risk a duplicate (target {target})"
-                    );
-                }
-                let _ = send_keys_literal(target, BRACKETED_PASTE_END).await;
-                send_keys(target, "C-u").await?;
-                paste_and_wait(target, content, &head, &tail).await?;
-            }
-        }
-        // Never press Enter blind. A pooled session parked on a permission
-        // picker would take Enter as "accept the default option", silently
-        // approving a gated tool and losing this message. The old pane-only
-        // verifier avoided that by construction; the transcript check does
-        // not, so the guard has to be explicit.
-        if let Some(dialog) = pane_awaiting_choice(target, &head, &tail).await {
-            anyhow::bail!(
-                "input wedged: the pane is showing a prompt that is not our draft, so Enter \
-                 would answer it — refusing (target {target}): {dialog}"
-            );
-        }
-        // Re-snapshot immediately before Enter. The caller's mark was taken
-        // before `paste_and_wait`, which can burn 40s; anything appended in
-        // that window is unrelated to this submit.
-        let mark = match transcript {
-            Some((path, from)) => Some((
-                path,
-                tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(from),
-            )),
-            None => None,
-        };
-        send_keys(target, "Enter").await?;
-        if submit_landed(target, mark, &marker, &head, &tail).await {
-            return Ok(());
-        }
-        tracing::warn!(target, rung, "submit did not land — recovering");
-    }
-    anyhow::bail!("input wedged: submit did not clear after 4 recovery attempts (target {target})")
-}
-
-/// Did the message actually get submitted?
-///
-/// The transcript is ground truth: claude appends the user message the moment
-/// it accepts one, and the file cannot lie. The pane cannot be trusted for
-/// this — the TUI repaints lazily, so `capture-pane` can return a frame from
-/// before the submit and make a successful send look failed. Acting on that
-/// stale frame is worse than useless: the last recovery rung clears the draft
-/// and re-pastes, destroying a message that had already gone (2026-08-28).
-///
-/// Falls back to the pane check only when the caller has no transcript to
-/// watch (tests, ad-hoc tmux use).
-async fn submit_landed(
-    target: &str,
-    transcript: Option<(&Path, u64)>,
-    marker: &str,
-    head: &str,
-    tail: &str,
-) -> bool {
-    let Some((path, from)) = transcript else {
-        return wait_for_draft_gone(target, head, tail, SUBMIT_CONFIRM_TIMEOUT).await;
-    };
-    let start = Instant::now();
-    while start.elapsed() < SUBMIT_CONFIRM_TIMEOUT {
-        if transcript_has_user_marker(path, from, marker).await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-    false
-}
-
 /// Did claude append a USER entry carrying `marker` past byte `from`?
 ///
 /// Byte growth alone proves nothing: a transcript collects `attachment`,
@@ -1811,6 +1724,7 @@ async fn submit_landed(
 /// "confirmed" a prompt that was never sent — the exact silent loss this
 /// check exists to catch. So parse the appended lines and demand our own
 /// text back.
+#[cfg(test)]
 async fn transcript_has_user_marker(path: &Path, from: u64, marker: &str) -> bool {
     let Ok(bytes) = tokio::fs::read(path).await else {
         return false;
@@ -1892,31 +1806,463 @@ async fn pane_awaiting_choice(target: &str, head: &str, tail: &str) -> Option<St
 /// How long to wait for proof that a submit landed.
 const SUBMIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// How long to wait for pasted text to appear in the input row. Generous
+/// How long to wait for typed text to appear in the input row. Generous
 /// because a TUI busy with startup work (MCP servers, a remote-control
 /// handshake) can take tens of seconds to paint.
-const PASTE_VISIBLE_TIMEOUT: Duration = Duration::from_secs(30);
+const INPUT_VISIBLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Paste `content` and wait until it is actually visible in the input row.
-///
-/// `wait_for_input_settled` only asks "has the pane stopped changing?", and a
-/// pane that has not begun rendering the paste is perfectly still. Enter then
-/// landed on an empty input, did nothing, and the text rendered a moment
-/// later and sat there unsent — the verifier saw a clear input row, called it
-/// a success, and `ask` waited out its full timeout with no signal.
-async fn paste_and_wait(target: &str, content: &str, head: &str, tail: &str) -> Result<()> {
-    paste_into(target, content).await?;
-    wait_for_draft_present(target, head, tail, PASTE_VISIBLE_TIMEOUT).await;
-    // Then let the paste finish draining, so Enter is not eaten inside it.
-    wait_for_input_settled(target, Duration::from_millis(250), Duration::from_secs(10)).await
+// ---- typed input (ADR-033) ----
+//
+// A bracketed paste reaches the model wrapped in `<pasted_content id=…>`
+// tags, and Claude Code treats pasted content as text the user may not have
+// written. Typed input reaches it as a plain user prompt
+// (`origin.kind = human`, `promptSource = typed`). Verified 2026-09-24 on
+// Claude Code 2.1.281:
+//
+// - Typing the whole payload in one `send-keys` burst trips the TUI's
+//   paste-detection heuristic: the first part of the text becomes a
+//   collapsed paste and is dropped from the submitted prompt.
+// - Typing it in chunks of up to 768 bytes with a short pause between
+//   chunks submits the full text as typed input (see TYPE_CHUNK_BYTES). A
+//   line feed (0x0A) inserts a newline in the input box and does not submit.
+// - `send-keys -l` drops a trailing `;` from an argument (tmux parses it as a
+//   command separator), so each chunk is sent as raw UTF-8 bytes with
+//   `send-keys -H`.
+// - `C-u` clears only the current line of a multi-line draft, so clearing a
+//   draft takes `C-u` + `BSpace` once per line.
+
+/// Bytes per typed chunk: one `send-keys -H` call, 10 ms apart. The TUI
+/// treats one read of more than about 800 bytes as a paste and drops the
+/// head of the text. Measured 2026-09-24 on Claude Code 2.1.281 with a
+/// 64 KiB prompt on an idle machine: 64- to 768-byte chunks arrive as typed
+/// input and 880-byte chunks do not; with a second session typing at the
+/// same time, 512-byte chunks also turned into a paste, because chunks that
+/// arrive while the TUI is busy are read together. The margin is the time
+/// the TUI may stall before 800 bytes accumulate: about 140 ms at 128
+/// bytes per 22 ms call. A 64 KiB prompt takes about 16 s at 128 bytes with
+/// the echo check between chunks ([`type_with_flow_control`]). A chunk never
+/// splits a UTF-8 character.
+pub(crate) const TYPE_CHUNK_BYTES: usize = 128;
+/// Pause between typed chunks.
+pub(crate) const TYPE_CHUNK_PAUSE: Duration = Duration::from_millis(10);
+/// Largest prompt Nucleus types into a session. Typing takes about 0.2 s
+/// per KiB, and a prompt is instructions: data larger than this belongs in a
+/// file the prompt names. [`Session::ask`] and [`Session::submit_typed`]
+/// refuse a larger prompt.
+pub const MAX_TYPED_PROMPT_BYTES: usize = 64 * 1024;
+/// Largest input typed into a session by any path: a prompt of up to
+/// [`MAX_TYPED_PROMPT_BYTES`] plus the date preamble and envelope headers
+/// the code adds to it. [`type_and_submit_verified`] refuses more, so the
+/// paths without a prompt check of their own (session-send) are bounded too.
+pub const MAX_TYPED_INPUT_BYTES: usize = MAX_TYPED_PROMPT_BYTES + 1024;
+
+/// Make `content` safe to type into the TUI: CRLF/CR become LF, a tab becomes
+/// two spaces (Tab is a TUI key), and every other control character is
+/// dropped (an ESC byte would start an escape sequence; ESC twice clears the
+/// input, and ESC during a turn interrupts it).
+pub(crate) fn sanitize_for_typing(content: &str) -> String {
+    let unified = content.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(unified.len());
+    for c in unified.chars() {
+        match c {
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("  "),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
-async fn paste_and_send(
+/// Split `content` into chunks of at most `max_bytes` bytes, never inside a
+/// UTF-8 character.
+pub(crate) fn type_chunks(content: &str, max_bytes: usize) -> Vec<String> {
+    let max_bytes = max_bytes.max(4);
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in content.chars() {
+        if cur.len() + c.len_utf8() > max_bytes {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The tmux argument lists that type `content` into `target`, one
+/// `send-keys -H` call per chunk; each chunk goes as raw UTF-8 bytes
+/// because `send-keys -l` drops a trailing `;`. Pure.
+pub(crate) fn type_invocations(target: &str, content: &str) -> Vec<Vec<String>> {
+    type_chunks(content, TYPE_CHUNK_BYTES)
+        .iter()
+        .map(|chunk| {
+            let mut args: Vec<String> = ["send-keys", "-t", target, "-H"].map(String::from).to_vec();
+            args.extend(chunk.as_bytes().iter().map(|b| format!("{b:02x}")));
+            args
+        })
+        .collect()
+}
+
+/// Flow control between typed chunks: after a chunk, wait until the pane
+/// shows the tail of the text typed so far, so the next chunk is sent only
+/// after the TUI has read the previous one. Chunks sent into a TUI that is
+/// not reading them accumulate, and one read of more than about 800 bytes
+/// becomes a paste. Poll interval of the echo check.
+pub(crate) const TYPE_ECHO_POLL: Duration = Duration::from_millis(20);
+/// Longest wait for one chunk's echo. On this bound the next chunk is sent
+/// anyway and the stall is counted.
+pub(crate) const TYPE_ECHO_WAIT: Duration = Duration::from_secs(2);
+/// After this many stalls in one prompt, the rest is typed without waiting
+/// (the pane does not show the typed text, for example because it turned
+/// into a paste), so a 64 KiB prompt cannot take minutes.
+pub(crate) const TYPE_ECHO_MAX_STALLS: usize = 3;
+/// Characters of the typed text the pane must show.
+const TYPE_ECHO_TAIL_CHARS: usize = 16;
+
+/// What [`type_with_flow_control`] needs from tmux (a test double
+/// implements it).
+pub(crate) trait TypingIo {
+    async fn send(&mut self, args: &[String]) -> Result<()>;
+    async fn capture(&mut self) -> String;
+    async fn sleep(&mut self, d: Duration);
+    fn elapsed_since(&self, start: Duration) -> Duration;
+    fn now(&self) -> Duration;
+}
+
+/// How a prompt was typed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TypingStats {
+    pub chunks: usize,
+    /// Chunks whose echo did not appear within [`TYPE_ECHO_WAIT`].
+    pub stalls: usize,
+}
+
+/// The last [`TYPE_ECHO_TAIL_CHARS`] non-whitespace characters of `typed`.
+/// Empty when `typed` has none. Pure.
+pub(crate) fn echo_tail(typed: &str) -> String {
+    let squashed: Vec<char> = squash_ws(typed).chars().collect();
+    squashed[squashed.len().saturating_sub(TYPE_ECHO_TAIL_CHARS)..].iter().collect()
+}
+
+/// Type `content` into `target` chunk by chunk with flow control.
+pub(crate) async fn type_with_flow_control(
+    target: &str,
+    content: &str,
+    io: &mut impl TypingIo,
+) -> Result<TypingStats> {
+    let invocations = type_invocations(target, content);
+    let chunks = type_chunks(content, TYPE_CHUNK_BYTES);
+    let mut stats = TypingStats { chunks: chunks.len(), stalls: 0 };
+    let mut typed = String::new();
+    for (i, (args, chunk)) in invocations.iter().zip(chunks.iter()).enumerate() {
+        io.send(args).await?;
+        typed.push_str(chunk);
+        io.sleep(TYPE_CHUNK_PAUSE).await;
+        // The last chunk needs no echo wait: the submit path waits for the
+        // draft to be visible and settled.
+        if i + 1 == chunks.len() || stats.stalls >= TYPE_ECHO_MAX_STALLS {
+            continue;
+        }
+        let want = echo_tail(&typed);
+        if want.is_empty() {
+            continue;
+        }
+        let start = io.now();
+        loop {
+            if squash_ws(&io.capture().await).contains(&want) {
+                break;
+            }
+            if io.elapsed_since(start) >= TYPE_ECHO_WAIT {
+                stats.stalls += 1;
+                break;
+            }
+            io.sleep(TYPE_ECHO_POLL).await;
+        }
+    }
+    Ok(stats)
+}
+
+struct TmuxTyping<'a> {
+    target: &'a str,
+    origin: Instant,
+}
+
+impl TypingIo for TmuxTyping<'_> {
+    async fn send(&mut self, args: &[String]) -> Result<()> {
+        let out = Command::new("tmux").args(args).output().await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "tmux send-keys -H failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+    async fn capture(&mut self) -> String {
+        Command::new("tmux")
+            .args(["capture-pane", "-t", self.target, "-p"])
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    }
+    async fn sleep(&mut self, d: Duration) {
+        tokio::time::sleep(d).await;
+    }
+    fn elapsed_since(&self, start: Duration) -> Duration {
+        self.now().saturating_sub(start)
+    }
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+}
+
+/// Type `content` into `target` as keyboard input. Does not press Enter.
+async fn type_into(target: &str, content: &str) -> Result<TypingStats> {
+    let stats =
+        type_with_flow_control(target, content, &mut TmuxTyping { target, origin: Instant::now() }).await?;
+    if stats.stalls > 0 {
+        tracing::warn!(
+            target,
+            stalls = stats.stalls,
+            chunks = stats.chunks,
+            "typed chunks were not echoed in time"
+        );
+    }
+    Ok(stats)
+}
+
+/// Refuse a prompt over [`MAX_TYPED_PROMPT_BYTES`] with a clear error.
+pub(crate) fn check_prompt_size(prompt: &str) -> Result<()> {
+    check_size(prompt, MAX_TYPED_PROMPT_BYTES)
+}
+
+/// Refuse typed input over [`MAX_TYPED_INPUT_BYTES`] (a prompt with its
+/// preamble and headers).
+pub(crate) fn check_input_size(input: &str) -> Result<()> {
+    check_size(input, MAX_TYPED_INPUT_BYTES)
+}
+
+fn check_size(text: &str, limit: usize) -> Result<()> {
+    let n = text.len();
+    if n > limit {
+        anyhow::bail!(
+            "prompt is {n} bytes; the limit for a typed prompt is {limit} bytes \
+             (about {} s of typing). Split the input, or write it to a file and name the file \
+             in the prompt",
+            limit / 16_384
+        );
+    }
+    Ok(())
+}
+
+/// Remove a draft of `lines` lines from the input box without ESC.
+async fn clear_draft(target: &str, lines: usize) -> Result<()> {
+    for _ in 0..=lines {
+        send_keys(target, "C-u").await?;
+        send_keys(target, "BSpace").await?;
+    }
+    Ok(())
+}
+
+/// How the harness accepted a submitted input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptedVia {
+    /// A user prompt record.
+    Prompt,
+    /// Queued while the session was busy (`queue-operation` enqueue).
+    Queued,
+    /// Absorbed into the running turn (`queued_command` attachment).
+    Absorbed,
+}
+
+/// What [`transcript_acceptance`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Acceptance {
+    pub via: AcceptedVia,
+    /// `promptSource` of the user record carrying the marker (`typed` for
+    /// typed input); `pasted` when that record has no such field and its
+    /// text is wrapped in `<pasted_content`; `None` for queued or absorbed
+    /// input (those records carry no source).
+    pub prompt_source: Option<String>,
+}
+
+impl Acceptance {
+    /// The harness recorded the prompt as something other than typed input.
+    pub fn arrived_pasted(&self) -> bool {
+        self.prompt_source.as_deref().is_some_and(|s| s != "typed")
+    }
+}
+
+/// The first record of `appended` that carries `marker` as a prompt, a
+/// queued input or an absorbed input. Pure; mirror of the WhatsApp bot's
+/// `transcriptAcceptance`.
+pub(crate) fn transcript_acceptance(appended: &str, marker: &str) -> Option<Acceptance> {
+    let want = squash_ws(marker);
+    if want.is_empty() {
+        return None;
+    }
+    for line in appended.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let (text, via) = match v.get("type").and_then(|t| t.as_str()) {
+            Some("user") => {
+                let text = match v.pointer("/message/content") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Array(items)) => items
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => continue,
+                };
+                (text, AcceptedVia::Prompt)
+            }
+            Some("queue-operation") => match v.get("content").and_then(|c| c.as_str()) {
+                Some(t) => (t.to_string(), AcceptedVia::Queued),
+                None => continue,
+            },
+            Some("attachment") => match v.pointer("/attachment/prompt").and_then(|c| c.as_str()) {
+                Some(t) => (t.to_string(), AcceptedVia::Absorbed),
+                None => continue,
+            },
+            _ => continue,
+        };
+        if !squash_ws(&text).contains(&want) {
+            continue;
+        }
+        let prompt_source = match via {
+            AcceptedVia::Prompt => v
+                .get("promptSource")
+                .and_then(|p| p.as_str())
+                .map(str::to_string)
+                .or_else(|| text.contains("<pasted_content").then(|| "pasted".to_string())),
+            _ => None,
+        };
+        return Some(Acceptance { via, prompt_source });
+    }
+    None
+}
+
+/// Did the harness accept `marker` past byte `from`? See
+/// [`transcript_acceptance`].
+async fn transcript_accepted_marker(path: &Path, from: u64, marker: &str) -> Option<Acceptance> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    if bytes.len() as u64 <= from {
+        return None;
+    }
+    transcript_acceptance(&String::from_utf8_lossy(&bytes[from as usize..]), marker)
+}
+
+/// What a verified typed submit observed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubmitOutcome {
+    /// How the input was accepted; `None` without a transcript to check.
+    pub acceptance: Option<Acceptance>,
+    /// Typed chunks whose echo did not appear in time.
+    pub typing_stalls: usize,
+}
+
+impl SubmitOutcome {
+    pub fn arrived_pasted(&self) -> bool {
+        self.acceptance.as_ref().is_some_and(Acceptance::arrived_pasted)
+    }
+}
+
+/// Type `content` into `target` and submit it, verifying the submit landed.
+///
+/// Recovery ladder: Enter, a bare second Enter, then (only while our draft is
+/// still visible) clear and retype. Never Enter into a picker. The
+/// transcript is the proof when the caller has one: a user prompt, a
+/// `queue-operation` enqueue or a `queued_command` attachment carrying the
+/// draft's head. Input typed while the session is busy is queued by the
+/// harness, which is the intended behavior for mid-turn messages.
+///
+/// Refuses content over [`MAX_TYPED_INPUT_BYTES`] before typing, whichever
+/// caller submits it. A prompt the transcript records as other than typed
+/// input is logged and reported in the returned [`SubmitOutcome`].
+pub(crate) async fn type_and_submit_verified(
     target: &str,
     content: &str,
     transcript: Option<(&Path, u64)>,
-) -> Result<()> {
-    paste_and_submit_verified(target, content, transcript).await
+) -> Result<SubmitOutcome> {
+    let content = sanitize_for_typing(content);
+    check_input_size(&content)?;
+    let (head, tail) = draft_fragments(&content);
+    let lines = content.lines().count();
+    if let Some(dialog) = pane_awaiting_choice(target, &head, &tail).await {
+        anyhow::bail!(
+            "input blocked: the pane is showing a prompt ({dialog}) — refusing to type into it \
+             (target {target})"
+        );
+    }
+    let mut stalls = type_into(target, &content).await?.stalls;
+    wait_for_draft_present(target, &head, &tail, INPUT_VISIBLE_TIMEOUT).await;
+    wait_for_input_settled(target, Duration::from_millis(250), Duration::from_secs(10)).await?;
+
+    for rung in 0..3u8 {
+        if rung == 2 {
+            if !draft_present(target, &head, &tail).await {
+                anyhow::bail!(
+                    "input wedged: draft is gone but the submit was never confirmed — \
+                     refusing to retype and risk a duplicate (target {target})"
+                );
+            }
+            clear_draft(target, lines).await?;
+            stalls += type_into(target, &content).await?.stalls;
+            wait_for_draft_present(target, &head, &tail, INPUT_VISIBLE_TIMEOUT).await;
+            wait_for_input_settled(target, Duration::from_millis(250), Duration::from_secs(10))
+                .await?;
+        }
+        if let Some(dialog) = pane_awaiting_choice(target, &head, &tail).await {
+            anyhow::bail!(
+                "input wedged: the pane is showing a prompt that is not our draft, so Enter \
+                 would answer it — refusing (target {target}): {dialog}"
+            );
+        }
+        let mark = match transcript {
+            Some((path, from)) => Some((
+                path,
+                tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(from),
+            )),
+            None => None,
+        };
+        send_keys(target, "Enter").await?;
+        let landed = match mark {
+            Some((path, from)) => {
+                let start = Instant::now();
+                let mut found = None;
+                while start.elapsed() < SUBMIT_CONFIRM_TIMEOUT {
+                    if let Some(a) = transcript_accepted_marker(path, from, &head).await {
+                        found = Some(a);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                found.map(|a| SubmitOutcome { acceptance: Some(a), typing_stalls: stalls })
+            }
+            None => wait_for_draft_gone(target, &head, &tail, SUBMIT_CONFIRM_TIMEOUT)
+                .await
+                .then_some(SubmitOutcome { acceptance: None, typing_stalls: stalls }),
+        };
+        if let Some(outcome) = landed {
+            if outcome.arrived_pasted() {
+                tracing::warn!(
+                    target,
+                    prompt_source = ?outcome.acceptance.as_ref().and_then(|a| a.prompt_source.clone()),
+                    stalls,
+                    "the submitted prompt arrived as pasted content, not typed input"
+                );
+            }
+            return Ok(outcome);
+        }
+        tracing::warn!(target, rung, "typed submit did not land — recovering");
+    }
+    anyhow::bail!("input wedged: typed submit did not land after 3 attempts (target {target})")
 }
 
 /// Poll the pane content; if claude's "trust this folder" prompt is showing,
@@ -1935,20 +2281,26 @@ async fn dismiss_trust_prompt_if_present(target: &str, timeout: Duration) -> Res
             // default changed between CLI versions: 2.1.263 opens with
             // "❯ No, exit" highlighted, and a blind Enter there exits claude
             // and the spawn fails as "TUI did not become ready".
-            if let Some(row) = pane.lines().find(|l| l.trim_start().starts_with('❯')) {
-                if row.contains("No, exit") {
-                    let _ = Command::new("tmux")
-                        .args(["send-keys", "-t", target, "Down"])
-                        .output()
-                        .await;
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                }
+            //
+            // Press Enter only once the screen SHOWS the highlight on "Yes":
+            // a Down sent while the picker is still starting is dropped, and
+            // the Enter after it then exits (seen 2026-09-24 with 2.1.282).
+            let row = pane.lines().find(|l| l.trim_start().starts_with('❯')).unwrap_or("");
+            if row.contains("No, exit") {
+                let _ = Command::new("tmux")
+                    .args(["send-keys", "-t", target, "Down"])
+                    .output()
+                    .await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                continue;
             }
-            let _ = Command::new("tmux")
-                .args(["send-keys", "-t", target, "Enter"])
-                .output()
-                .await;
-            return Ok(());
+            if row.contains("Yes") {
+                let _ = Command::new("tmux")
+                    .args(["send-keys", "-t", target, "Enter"])
+                    .output()
+                    .await;
+                return Ok(());
+            }
         }
         // If the transcript-creation phase has started, the prompt didn't fire.
         if pane.contains("│") && pane.contains(">") && !pane.contains("trust") {
@@ -1960,9 +2312,9 @@ async fn dismiss_trust_prompt_if_present(target: &str, timeout: Duration) -> Res
 }
 
 /// Poll the pane until consecutive captures stay identical for `settle_window`.
-/// Used after `paste-buffer` to wait for the bracketed-paste sequence to fully
-/// drain into the TUI before pressing Enter; otherwise Enter gets eaten inside
-/// the paste and the prompt sits queued.
+/// Used after typing to wait for the input to finish rendering before pressing
+/// Enter; otherwise Enter can be consumed while the TUI still processes the
+/// input and the prompt stays in the input box.
 async fn wait_for_input_settled(
     target: &str,
     settle_window: Duration,
@@ -2018,6 +2370,25 @@ async fn wait_for_tui_ready(target: &str, timeout: Duration) -> Result<()> {
         // text varies across versions ("auto mode on", "Try ..." hints).
         if pane.contains("❯") && (pane.contains("auto mode") || pane.contains("Try ")) {
             return Ok(());
+        }
+
+        // A cold claude can take longer than the trust-prompt dismisser's
+        // window to show the trust picker; answer it here too (Down onto
+        // "Yes", then Enter once the highlight is visibly there).
+        if pane.contains("trust this folder") {
+            let row = pane.lines().find(|l| l.trim_start().starts_with('❯')).unwrap_or("");
+            let key = if row.contains("No, exit") {
+                Some("Down")
+            } else if row.contains("Yes") {
+                Some("Enter")
+            } else {
+                None
+            };
+            if let Some(key) = key {
+                let _ = Command::new("tmux").args(["send-keys", "-t", target, key]).output().await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            continue;
         }
 
         // Resume-from-summary picker. Default option (1) is "Resume from
@@ -2451,6 +2822,26 @@ fn strip_date_preamble(s: &str) -> &str {
 }
 
 /// Single-quote shell escape: `it's` → `'it'\''s'`.
+/// `env K='v' … ` for the launch command, or "" when there is nothing to
+/// set. Names are restricted to `[A-Z_][A-Z0-9_]*` because they are not
+/// quoted; values are shell-quoted.
+pub(crate) fn env_prefix(env: &[(String, String)]) -> Result<String> {
+    if env.is_empty() {
+        return Ok(String::new());
+    }
+    let mut out = String::from("env ");
+    for (k, v) in env {
+        let valid = !k.is_empty()
+            && k.chars().next().map(|c| c.is_ascii_uppercase() || c == '_').unwrap_or(false)
+            && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        if !valid {
+            anyhow::bail!("invalid environment variable name for a session: {k:?}");
+        }
+        out.push_str(&format!("{k}={} ", shell_quote(v)));
+    }
+    Ok(out)
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -2486,7 +2877,46 @@ mod tests {
             ready_timeout: Duration::from_secs(1),
             resume_session_id: None,
             agent_label: None,
+            env: vec![],
         }
+    }
+
+    #[test]
+    fn typing_chunks_stay_below_the_paste_threshold() {
+        // Multi-byte characters never split; every call types at most one
+        // chunk (well below the ~800-byte paste threshold); the bytes
+        // reassemble to the content.
+        let content = format!("{}😀é;{}", "a".repeat(1000), "b".repeat(300));
+        let chunks = type_chunks(&content, TYPE_CHUNK_BYTES);
+        assert!(chunks.iter().all(|c| c.len() <= TYPE_CHUNK_BYTES));
+        assert_eq!(chunks.concat(), content);
+        let calls = type_invocations("@1", &content);
+        assert_eq!(calls.len(), chunks.len());
+        let mut bytes = Vec::new();
+        for args in &calls {
+            assert_eq!(&args[..4], &["send-keys", "-t", "@1", "-H"]);
+            assert!(args.len() - 4 <= TYPE_CHUNK_BYTES);
+            bytes.extend(args[4..].iter().map(|a| u8::from_str_radix(a, 16).unwrap()));
+        }
+        assert_eq!(String::from_utf8(bytes).unwrap(), content);
+        assert!(TYPE_CHUNK_BYTES <= 128, "see TYPE_CHUNK_BYTES: larger chunks turn into a paste under load");
+    }
+
+    #[test]
+    fn prompts_over_the_cap_are_refused() {
+        assert!(check_prompt_size(&"x".repeat(MAX_TYPED_PROMPT_BYTES)).is_ok());
+        let err = check_prompt_size(&"x".repeat(MAX_TYPED_PROMPT_BYTES + 1)).unwrap_err();
+        assert!(format!("{err:#}").contains("the limit for a typed prompt"), "{err:#}");
+    }
+
+    #[test]
+    fn env_prefix_quotes_values_and_refuses_bad_names() {
+        assert_eq!(env_prefix(&[]).unwrap(), "");
+        let p = env_prefix(&[("NUCLEUS_TASK_SCOPE".into(), "a'b c".into())]).unwrap();
+        assert_eq!(p, "env NUCLEUS_TASK_SCOPE='a'\\''b c' ");
+        assert!(env_prefix(&[("A;rm".into(), "x".into())]).is_err());
+        assert!(env_prefix(&[("lower".into(), "x".into())]).is_err());
+        assert!(env_prefix(&[("".into(), "x".into())]).is_err());
     }
 
     fn add_dir_values(args: &[String]) -> Vec<String> {
@@ -3269,5 +3699,116 @@ mod tests {
         assert!(gone_result, "cleared live row must report gone");
 
         tmux_kill(session).await;
+    }
+
+    // ---- typed-input limits and flow control (ADR-033) ----
+
+    #[tokio::test]
+    async fn every_typed_submit_refuses_content_over_the_cap() {
+        // The session-send path (agent_msg) calls this directly, without
+        // Session::ask's check.
+        let err = type_and_submit_verified("nucleus-test-no-such-session:0", &"x".repeat(MAX_TYPED_INPUT_BYTES + 1), None)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("limit for a typed prompt"), "{err:#}");
+        // Multibyte: under the limit in characters, over it in bytes.
+        let err = type_and_submit_verified("nucleus-test-no-such-session:0", &"é".repeat(MAX_TYPED_INPUT_BYTES / 2 + 1), None)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("limit for a typed prompt"), "{err:#}");
+    }
+
+    /// A pane that shows typed bytes `lag` captures after they were sent,
+    /// on a simulated clock.
+    struct LaggingPane {
+        lag: usize,
+        clock: Duration,
+        shown: String,
+        pending: Vec<(String, usize)>,
+        events: Vec<String>,
+    }
+
+    impl LaggingPane {
+        fn new(lag: usize) -> Self {
+            Self { lag, clock: Duration::ZERO, shown: String::new(), pending: vec![], events: vec![] }
+        }
+    }
+
+    impl TypingIo for LaggingPane {
+        async fn send(&mut self, args: &[String]) -> Result<()> {
+            let bytes: Vec<u8> = args[4..].iter().map(|h| u8::from_str_radix(h, 16).unwrap()).collect();
+            let text = String::from_utf8(bytes).unwrap();
+            self.events.push(format!("send:{}", text.len()));
+            self.pending.push((text, self.lag));
+            Ok(())
+        }
+        async fn capture(&mut self) -> String {
+            for p in &mut self.pending {
+                p.1 = p.1.saturating_sub(1);
+            }
+            while self.pending.first().is_some_and(|p| p.1 == 0) {
+                let (t, _) = self.pending.remove(0);
+                self.shown.push_str(&t);
+            }
+            self.events.push(format!("capture:{}", self.shown.len()));
+            format!("❯ {}", self.shown)
+        }
+        async fn sleep(&mut self, d: Duration) {
+            self.clock += d;
+        }
+        fn elapsed_since(&self, start: Duration) -> Duration {
+            self.clock.saturating_sub(start)
+        }
+        fn now(&self) -> Duration {
+            self.clock
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_sends_the_next_chunk_only_after_the_pane_shows_the_previous_one() {
+        let content: String = ('a'..='d').map(|c| c.to_string().repeat(TYPE_CHUNK_BYTES)).collect();
+        let mut pane = LaggingPane::new(3);
+        let stats = type_with_flow_control("t", &content, &mut pane).await.unwrap();
+        assert_eq!(stats, TypingStats { chunks: 4, stalls: 0 });
+        let mut sent = 0usize;
+        let mut last_capture: Option<usize> = None;
+        for e in &pane.events {
+            if let Some(n) = e.strip_prefix("send:") {
+                if sent > 0 {
+                    assert_eq!(last_capture, Some(sent), "a chunk was sent before the previous one was echoed");
+                }
+                sent += n.parse::<usize>().unwrap();
+            } else {
+                last_capture = Some(e.strip_prefix("capture:").unwrap().parse().unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pane_that_never_echoes_costs_a_bounded_wait_then_typing_goes_on() {
+        let content = "z".repeat(TYPE_CHUNK_BYTES * 10);
+        let mut pane = LaggingPane::new(usize::MAX);
+        let stats = type_with_flow_control("t", &content, &mut pane).await.unwrap();
+        assert_eq!(stats, TypingStats { chunks: 10, stalls: TYPE_ECHO_MAX_STALLS });
+        assert_eq!(pane.events.iter().filter(|e| e.starts_with("send:")).count(), 10);
+        let max_captures =
+            TYPE_ECHO_MAX_STALLS * (TYPE_ECHO_WAIT.as_millis() / TYPE_ECHO_POLL.as_millis() + 1) as usize;
+        assert!(pane.events.iter().filter(|e| e.starts_with("capture:")).count() <= max_captures);
+    }
+
+    #[test]
+    fn transcript_acceptance_reports_the_prompt_source() {
+        let typed = r#"{"type":"user","promptSource":"typed","message":{"content":"[ref:wa-1] hello"}}"#;
+        let pasted = r#"{"type":"user","message":{"content":"<pasted_content id=\"1\">[ref:wa-2] hi</pasted_content>"}}"#;
+        let queued = r#"{"type":"queue-operation","operation":"enqueue","content":"[ref:wa-3] later"}"#;
+        let a = transcript_acceptance(typed, "ref:wa-1").unwrap();
+        assert_eq!(a, Acceptance { via: AcceptedVia::Prompt, prompt_source: Some("typed".into()) });
+        assert!(!a.arrived_pasted());
+        let p = transcript_acceptance(pasted, "ref:wa-2").unwrap();
+        assert_eq!(p.prompt_source.as_deref(), Some("pasted"));
+        assert!(p.arrived_pasted());
+        let q = transcript_acceptance(queued, "ref:wa-3").unwrap();
+        assert_eq!(q, Acceptance { via: AcceptedVia::Queued, prompt_source: None });
+        assert!(transcript_acceptance(typed, "ref:wa-9").is_none());
     }
 }

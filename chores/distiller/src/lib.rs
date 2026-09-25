@@ -2,9 +2,10 @@
 //!
 //! No subcommand. Each invocation:
 //!   1. metabolism    — extract candidates from each agent's diary since its
-//!                      watermark (normally yesterday + today; a failed night
-//!                      or a machine that was off is caught up in 2-day
-//!                      windows, ADR-029) → _pending.md
+//!                      watermark, a date and byte offset, so no diary byte
+//!                      is read twice (normally the rest of yesterday +
+//!                      today; a failed night or a machine that was off is
+//!                      caught up in 2-day windows, ADR-029) → _pending.md
 //!   2. contemplation — judge them (PROMOTE | MERGE | ARCHIVE | DROP) + prune
 //!
 //! Both passes run in one claude session per local day (ADR-029 daily
@@ -37,11 +38,106 @@ const VAULT_SEARCH_CMD: &str = "./target/release/nucleus vault-search";
 /// outage.
 const METABOLISM_WINDOW_DAYS: i64 = 2;
 
-/// Per-agent watermark key: the last local date whose diary metabolism has
-/// fully processed (today's file is still being written, so the mark stops at
-/// yesterday).
+/// Per-agent metabolism watermark key. The value is a [`DiaryMark`].
 fn metabolism_watermark_key(agent: &str) -> String {
     format!("distiller.metabolism.{agent}")
+}
+
+/// Per-agent contemplation progress key. The value is a [`PendingMark`].
+fn contemplation_progress_key(agent: &str) -> String {
+    format!("distiller.contemplation.{agent}")
+}
+
+/// How far metabolism has read an agent's diary: every day before `date`,
+/// and the first `offset` bytes of `date`'s file.
+///
+/// Today's diary is still being written. A run reads it up to its last
+/// complete line and records that byte offset; the next run (later the same
+/// day, or the next day) starts at the offset, so each diary byte is sent to
+/// the model once. Diary files only grow (entries are appended whole), so
+/// the offset stays valid. Stored as `<date>@<offset>`. A bare `<date>` (the
+/// earlier format) means that day was fully processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiaryMark {
+    date: NaiveDate,
+    offset: usize,
+}
+
+impl DiaryMark {
+    fn parse(v: &str) -> Option<DiaryMark> {
+        match v.split_once('@') {
+            Some((d, o)) => Some(DiaryMark { date: d.parse().ok()?, offset: o.parse().ok()? }),
+            None => Some(DiaryMark { date: v.parse::<NaiveDate>().ok()?.succ_opt()?, offset: 0 }),
+        }
+    }
+
+    fn encode(&self) -> String {
+        format!("{}@{}", self.date, self.offset)
+    }
+}
+
+/// Where metabolism resumes for `key`: the stored mark, or yesterday when
+/// there is none (the pre-watermark window). Never after today.
+async fn metabolism_start(workspace_root: &Path, key: &str, today: NaiveDate) -> Result<DiaryMark> {
+    let yesterday = DiaryMark { date: today.pred_opt().unwrap_or(today), offset: 0 };
+    let mark = match chore_state::watermark(workspace_root, key).await? {
+        Some(v) => DiaryMark::parse(&v).unwrap_or_else(|| {
+            tracing::warn!(key, value = %v, "metabolism watermark is unreadable — starting at yesterday");
+            yesterday
+        }),
+        None => yesterday,
+    };
+    Ok(if mark.date > today { DiaryMark { date: today, offset: 0 } } else { mark })
+}
+
+/// The diary from `start` through the end of `to` (routine entries removed,
+/// see `diary::without_routine`), and the mark just after what was read.
+/// Days before `today` are read whole; `today` is read up to its last
+/// complete line, because the file is still being written.
+fn read_window(agent_dir: &Path, start: DiaryMark, to: NaiveDate, today: NaiveDate) -> Result<(String, DiaryMark)> {
+    let mut out = String::new();
+    let mut date = start.date;
+    let mut end = DiaryMark { date: to.succ_opt().unwrap_or(to), offset: 0 };
+    while date <= to {
+        let path = agent_dir.join(format!("{}.md", date));
+        let text = if path.exists() {
+            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
+        } else {
+            String::new()
+        };
+        let upto = if date == today { text.rfind('\n').map(|i| i + 1).unwrap_or(0) } else { text.len() };
+        let skip = if date == start.date { start.offset } else { 0 };
+        // A file shorter than the mark was replaced; read it from the start.
+        let skip = if skip > upto { 0 } else { skip };
+        let slice = text.get(skip..upto).unwrap_or("");
+        let kept = diary::without_routine(slice);
+        if !kept.trim().is_empty() {
+            out.push_str(&format!("### {date}\n\n{kept}"));
+        }
+        if date == today {
+            end = DiaryMark { date, offset: upto };
+        }
+        let Some(next) = date.succ_opt() else { break; };
+        date = next;
+    }
+    Ok((out, end))
+}
+
+/// The model calls a distiller pass makes, separated so the passes can be
+/// tested without a claude session.
+trait Model {
+    async fn ask(&mut self, prompt: &str) -> Result<String>;
+}
+
+struct SessionModel<'a> {
+    session: &'a mut nucleus_core::claude_session::Session,
+    opts: &'a nucleus_core::claude_session::AskOptions,
+}
+
+impl Model for SessionModel<'_> {
+    async fn ask(&mut self, prompt: &str) -> Result<String> {
+        self.session.ask(prompt, self.opts.clone()).await
+    }
 }
 
 /// Entry point for this subcommand of the `nucleus` binary. `args` is the
@@ -227,67 +323,32 @@ async fn metabolism(workspace_root: &Path, diary_root: &Path, settings: &Setting
     let today = Local::now().date_naive();
     let mut total_staged = 0usize;
     let mut agents_processed = 0usize;
+    let mut model = SessionModel { session: &mut session, opts: &ask_opts };
 
     for (agent, agent_dir) in agents {
         if agent == AGENT_NAME { continue; }  // distiller doesn't extract from itself
-        // Start the day after this agent's watermark (ADR-029): a night the
-        // pass failed, or a machine that was off, is caught up here instead
-        // of skipped. No watermark = yesterday, the pre-watermark window.
-        let key = metabolism_watermark_key(&agent);
-        let from = chore_state::resume_date_after(workspace_root, &key, 1).await?;
-        let mut window_start = from;
-        let mut agent_staged = 0usize;
-        let mut agent_windows = 0usize;
-        let mut agent_parse_failures = 0usize;
-        while window_start <= today {
-            let window_end = (window_start + Duration::days(METABOLISM_WINDOW_DAYS - 1)).min(today);
-            let body = read_entries_between(&agent_dir, window_start, window_end)?;
-            if !body.trim().is_empty() {
-                agent_windows += 1;
-                // Ok(None): the reply did not parse. Stop this agent here so
-                // its watermark stays on the last window whose candidates
-                // were actually staged; the next run retries from there. An
-                // ask error propagates — that is the session, not the agent.
-                let Some(staged) =
-                    metabolize_window(&mut session, &ask_opts, &agent, &agent_dir, &body).await?
-                else {
-                    agent_parse_failures += 1;
-                    break;
-                };
-                agent_staged += staged;
-            }
-            // Today's diary is still being written; the mark stops at
-            // yesterday so tomorrow's pass re-reads today in full.
-            if let Some(yesterday) = today.pred_opt() {
-                let processed_through = window_end.min(yesterday);
-                if processed_through >= window_start {
-                    chore_state::set_watermark(workspace_root, &key, &processed_through.to_string())
-                        .await?;
-                }
-            }
-            window_start = window_end + Duration::days(1);
-        }
-        if agent_parse_failures > 0 {
+        let run = metabolize_agent(&mut model, workspace_root, &agent, &agent_dir, today).await?;
+        if run.parse_failed {
             tracing::warn!(
                 "metabolism: agent {} — stopped at an unparsable reply; watermark held, will retry next run",
                 agent
             );
         }
-        if agent_windows == 0 {
+        if run.windows == 0 {
             continue;
         }
         agents_processed += 1;
-        total_staged += agent_staged;
-        if agent_windows > 1 {
+        total_staged += run.staged;
+        if run.windows > 1 {
             tracing::info!(
                 "metabolism: agent {} — caught up {} windows from {}",
-                agent, agent_windows, from
+                agent, run.windows, run.from
             );
         }
-        if agent_staged == 0 {
+        if run.staged == 0 {
             tracing::info!("metabolism: agent {} — no candidates", agent);
         } else {
-            tracing::info!("metabolism: agent {} — {} candidates staged", agent, agent_staged);
+            tracing::info!("metabolism: agent {} — {} candidates staged", agent, run.staged);
         }
     }
 
@@ -303,18 +364,89 @@ async fn metabolism(workspace_root: &Path, diary_root: &Path, settings: &Setting
     Ok(())
 }
 
+/// What one agent's metabolism did.
+struct AgentRun {
+    from: NaiveDate,
+    windows: usize,
+    staged: usize,
+    parse_failed: bool,
+}
+
+/// Metabolism for one agent: from its watermark (ADR-029) through today in
+/// windows of [`METABOLISM_WINDOW_DAYS`], one ask per window, advancing the
+/// watermark after each window to exactly what that window read. A night the
+/// pass failed, or a machine that was off, is caught up here instead of
+/// skipped; content an earlier run already read is not read again.
+async fn metabolize_agent(
+    model: &mut impl Model,
+    workspace_root: &Path,
+    agent: &str,
+    agent_dir: &Path,
+    today: NaiveDate,
+) -> Result<AgentRun> {
+    let key = metabolism_watermark_key(agent);
+    let mut start = metabolism_start(workspace_root, &key, today).await?;
+    let mut run = AgentRun { from: start.date, windows: 0, staged: 0, parse_failed: false };
+    while start.date <= today {
+        let window_end = (start.date + Duration::days(METABOLISM_WINDOW_DAYS - 1)).min(today);
+        let (body, next) = read_window(agent_dir, start, window_end, today)?;
+        if !body.trim().is_empty() {
+            run.windows += 1;
+            // Ok(None): the reply did not parse. Stop this agent here so
+            // its watermark stays on the last window whose candidates were
+            // actually staged; the next run retries from there. An ask
+            // error propagates — that is the session, not the agent.
+            let Some(staged) = metabolize_window(model, agent, agent_dir, &body).await? else {
+                run.parse_failed = true;
+                break;
+            };
+            run.staged += staged;
+        }
+        if next != start {
+            chore_state::set_watermark(workspace_root, &key, &next.encode()).await?;
+        }
+        if window_end >= today {
+            break;
+        }
+        start = next;
+    }
+    Ok(run)
+}
+
 /// One metabolism ask: extract candidates from `body` (one window of an
 /// agent's diary) and stage them in `_pending.md`. `Ok(Some(n))` = n
 /// candidates staged; `Ok(None)` = the reply did not parse, nothing staged
 /// and the caller must not advance past this window; `Err` = the ask failed.
 async fn metabolize_window(
-    session: &mut nucleus_core::claude_session::Session,
-    ask_opts: &nucleus_core::claude_session::AskOptions,
+    model: &mut impl Model,
     agent: &str,
     agent_dir: &Path,
     body: &str,
 ) -> Result<Option<usize>> {
-    let prompt = format!(r#"Read these recent diary entries from agent "{agent}". Identify candidates worth
+    // One ask per part, so no prompt exceeds the typed-prompt limit; the
+    // candidates are staged only when every part parsed, so a retry of the
+    // window does not stage the earlier parts twice.
+    let mut all: Vec<Candidate> = Vec::new();
+    for prompt in metabolism_prompts(agent, body) {
+        let raw = model.ask(&prompt).await?;
+        let cleaned = strip_code_fence(&raw);
+        match serde_json::from_str::<Vec<Candidate>>(&cleaned) {
+            Ok(v) => all.extend(v),
+            Err(e) => {
+                tracing::warn!("metabolism: parse failed for {}: {} — raw: {}", agent, e, cleaned);
+                return Ok(None);
+            }
+        }
+    }
+    if all.is_empty() {
+        return Ok(Some(0));
+    }
+    append_pending(agent_dir, &all)?;
+    Ok(Some(all.len()))
+}
+
+fn metabolism_prompt(agent: &str, body: &str) -> String {
+    format!(r#"Read these recent diary entries from agent "{agent}". Identify candidates worth
 promoting to long-term shared memory. A candidate is a stable user fact, a preference,
 a piece of feedback, or a recurring observation — not a one-off task summary.
 
@@ -326,97 +458,83 @@ Empty array if nothing worth promoting.
 Diary content:
 ---
 {body}
----"#);
+---"#)
+}
 
-    let raw = session.ask(&prompt, ask_opts.clone()).await?;
-    let cleaned = strip_code_fence(&raw);
-    let candidates: Vec<Candidate> = match serde_json::from_str(&cleaned) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("metabolism: parse failed for {}: {} — raw: {}", agent, e, cleaned);
-            return Ok(None);
+/// The metabolism prompts for one window of `body`: one prompt, or several
+/// when the window is larger than one prompt may be.
+fn metabolism_prompts(agent: &str, body: &str) -> Vec<String> {
+    let budget = PROMPT_LIMIT.saturating_sub(metabolism_prompt(agent, "").len());
+    split_to_budget(body, budget).iter().map(|part| metabolism_prompt(agent, part)).collect()
+}
+
+/// Largest prompt the distiller builds: the typed-prompt limit minus room
+/// for the date preamble the session adds.
+const PROMPT_LIMIT: usize = nucleus_core::claude_session::MAX_TYPED_PROMPT_BYTES - 1024;
+
+/// Split `text` into parts of at most `max` bytes, at diary headings
+/// (`## `/`### ` lines) where possible, else at line ends, else inside a
+/// line (never inside a UTF-8 character). Pure.
+fn split_to_budget(text: &str, max: usize) -> Vec<String> {
+    let max = max.max(64);
+    if text.len() <= max {
+        return vec![text.to_string()];
+    }
+    // Sections: a heading line and the lines up to the next heading.
+    let mut sections: Vec<String> = Vec::new();
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("## ") || line.starts_with("### ") || sections.is_empty() {
+            sections.push(String::new());
         }
-    };
-    if candidates.is_empty() {
-        return Ok(Some(0));
+        sections.last_mut().unwrap().push_str(line);
     }
-    append_pending(agent_dir, &candidates)?;
-    Ok(Some(candidates.len()))
-}
-
-fn append_pending(agent_dir: &Path, candidates: &[Candidate]) -> Result<()> {
-    let pending = agent_dir.join("_pending.md");
-    let mut buf = String::new();
-    let now = Local::now();
-    buf.push_str(&format!("\n## {} — {} candidates\n", now.format("%Y-%m-%d %H:%M"), candidates.len()));
-    for c in candidates {
-        buf.push_str(&format!("- [{}] (conf {:.2}) {}\n", c.tag, c.confidence, c.body.trim()));
-    }
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true).append(true).open(&pending)?;
-    f.write_all(buf.as_bytes())?;
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct Decision {
-    op: String,                  // PROMOTE | MERGE | ARCHIVE | DROP
-    name: Option<String>,        // memory file slug for PROMOTE/MERGE
-    description: Option<String>, // for PROMOTE
-    kind: Option<String>,        // user|feedback|project|reference for PROMOTE
-    body: Option<String>,        // markdown body for PROMOTE/MERGE/ARCHIVE
-    /// PARA destination for ARCHIVE: e.g. "4-Areas/Nucleus", "0-Inbox",
-    /// "5-Resources/Rust-async", "6-Slipbox". Validated against the
-    /// vault's allowed top-level buckets in [`resolve_bucket`]; new
-    /// sub-folders under 3-Projects / 4-Areas / 5-Resources are NOT
-    /// auto-created (those represent durable user commitments, see
-    /// CLAUDE.md Rule 9).
-    bucket: Option<String>,
-    /// ARCHIVE filename within `bucket`. If None we generate
-    /// `YYYY-Www-<agent>.md`. Should be a leaf filename (no path
-    /// separators).
-    filename: Option<String>,
-    reason: Option<String>,      // for log
-}
-
-async fn contemplation(workspace_root: &Path, diary_root: &Path, settings: &Settings) -> Result<()> {
-    let agents = list_agent_dirs(diary_root)?;
-    if agents.is_empty() {
-        tracing::info!("contemplation: no agent diaries found");
-        return Ok(());
-    }
-    let vault_path = expand_home(&settings.obsidian.vault_path);
-    // Resumes the metabolism session (ADR-029 daily session) — the vault
-    // --add-dir is passed on every launch, so the resumed session has it.
-    let (mut session, ask_opts) = SessionProfile::one_shot_utility(&ProfileContext {
-        workspace_root,
-        claude: &settings.claude,
-        tmux_session: "nucleus-distiller",
-        agent_label: "distiller",
-    })
-    .add_dirs(vec![vault_path.clone()])
-    .window_name("contemplation")
-    // Each ask may now run vault searches (ADR-035) before answering; the
-    // utility profile's 180 s ceiling was sized for a single JSON reply.
-    .max_wait(std::time::Duration::from_secs(360))
-    .daily_session(AGENT_NAME)
-    .spawn()
-    .await
-    .context("spawning claude session for contemplation")?;
-    let week_ago = Local::now() - Duration::days(settings.diary.retain_days as i64);
-    let vault_summary = summarize_vault(&vault_path);
-    let mut applied_all = true;
-
-    for (agent, agent_dir) in &agents {
-        if agent == AGENT_NAME { continue; }
-        let body = read_recent_entries(agent_dir, week_ago)?;
-        let pending = std::fs::read_to_string(agent_dir.join("_pending.md")).unwrap_or_default();
-        if body.trim().is_empty() && pending.trim().is_empty() {
+    let mut pieces: Vec<String> = Vec::new();
+    for sec in sections {
+        if sec.len() <= max {
+            pieces.push(sec);
             continue;
         }
+        for line in sec.split_inclusive('\n') {
+            if line.len() <= max {
+                pieces.push(line.to_string());
+                continue;
+            }
+            let mut cur = String::new();
+            for c in line.chars() {
+                if cur.len() + c.len_utf8() > max {
+                    pieces.push(std::mem::take(&mut cur));
+                }
+                cur.push(c);
+            }
+            if !cur.is_empty() {
+                pieces.push(cur);
+            }
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for p in pieces {
+        if !cur.is_empty() && cur.len() + p.len() > max {
+            parts.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(&p);
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    parts
+}
 
-        let prompt = format!(r#"You are the weekly distiller for agent "{agent}". Read the candidate
+fn contemplation_prompt(
+    agent: &str,
+    vault_path: &Path,
+    vault_summary: &str,
+    retain_days: u32,
+    body: &str,
+    pending: &str,
+) -> String {
+    format!(
+        r#"You are the weekly distiller for agent "{agent}". Read the candidate
 observations below and decide an op for each. The vault at {vault:?} is mounted
 via --add-dir — read files freely when classifying.
 
@@ -504,48 +622,145 @@ PENDING CANDIDATES:
 ---
 {pending}
 ---"#,
-            vault = vault_path,
-            vault_summary = vault_summary,
-            vault_search = VAULT_SEARCH_CMD,
-            retain_days = settings.diary.retain_days,
-            body = body,
-            pending = pending,
-        );
+        vault = vault_path,
+        vault_search = VAULT_SEARCH_CMD,
+    )
+}
 
-        let raw = session.ask(&prompt, ask_opts.clone()).await?;
-        let cleaned = strip_code_fence(&raw);
-        let decisions: Vec<Decision> = match serde_json::from_str(&cleaned) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("contemplation: parse failed for {}: {} — raw: {}", agent, e, cleaned);
-                continue;
-            }
-        };
+/// The contemplation prompts for one agent, each with the number of bytes
+/// of `pending` it covers (the parts are consecutive and together cover all
+/// of `pending`). One prompt when everything fits; otherwise the pending
+/// candidates are split into parts (each judged once), and each prompt
+/// carries the most recent diary that fits beside its part.
+fn contemplation_prompts(
+    agent: &str,
+    vault_path: &Path,
+    vault_summary: &str,
+    retain_days: u32,
+    body: &str,
+    pending: &str,
+) -> Vec<(String, usize)> {
+    let whole = contemplation_prompt(agent, vault_path, vault_summary, retain_days, body, pending);
+    if whole.len() <= PROMPT_LIMIT {
+        return vec![(whole, pending.len())];
+    }
+    let overhead = contemplation_prompt(agent, vault_path, vault_summary, retain_days, "", "").len();
+    let budget = PROMPT_LIMIT.saturating_sub(overhead);
+    split_to_budget(pending, budget / 2)
+        .iter()
+        .map(|part| {
+            let diary = recent_within(body, budget.saturating_sub(part.len()));
+            (contemplation_prompt(agent, vault_path, vault_summary, retain_days, &diary, part), part.len())
+        })
+        .collect()
+}
 
-        let mut counts = std::collections::HashMap::new();
-        let mut failed = 0usize;
-        for d in &decisions {
-            *counts.entry(d.op.clone()).or_insert(0) += 1;
-            if let Err(e) = apply_decision(agent, d, &vault_path).await {
-                failed += 1;
-                tracing::warn!("contemplation: apply failed for {} {:?}: {}", agent, d.op, e);
+/// The most recent part of `text` that fits in `max` bytes, cut at a
+/// heading or line end, with a note when older content was left out. Pure.
+fn recent_within(text: &str, max: usize) -> String {
+    const NOTE: &str = "(older diary entries omitted to fit the prompt limit)\n";
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let parts = split_to_budget(text, max.saturating_sub(NOTE.len()).max(64));
+    let mut kept: Vec<&String> = Vec::new();
+    let mut size = NOTE.len();
+    for p in parts.iter().rev() {
+        if size + p.len() > max {
+            break;
+        }
+        size += p.len();
+        kept.push(p);
+    }
+    kept.reverse();
+    format!("{NOTE}{}", kept.into_iter().map(String::as_str).collect::<String>())
+}
+
+fn append_pending(agent_dir: &Path, candidates: &[Candidate]) -> Result<()> {
+    let pending = agent_dir.join("_pending.md");
+    let mut buf = String::new();
+    let now = Local::now();
+    buf.push_str(&format!("\n## {} — {} candidates\n", now.format("%Y-%m-%d %H:%M"), candidates.len()));
+    for c in candidates {
+        buf.push_str(&format!("- [{}] (conf {:.2}) {}\n", c.tag, c.confidence, c.body.trim()));
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true).append(true).open(&pending)?;
+    f.write_all(buf.as_bytes())?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct Decision {
+    op: String,                  // PROMOTE | MERGE | ARCHIVE | DROP
+    name: Option<String>,        // memory file slug for PROMOTE/MERGE
+    description: Option<String>, // for PROMOTE
+    kind: Option<String>,        // user|feedback|project|reference for PROMOTE
+    body: Option<String>,        // markdown body for PROMOTE/MERGE/ARCHIVE
+    /// PARA destination for ARCHIVE: e.g. "4-Areas/Nucleus", "0-Inbox",
+    /// "5-Resources/Rust-async", "6-Slipbox". Validated against the
+    /// vault's allowed top-level buckets in [`resolve_bucket`]; new
+    /// sub-folders under 3-Projects / 4-Areas / 5-Resources are NOT
+    /// auto-created (those represent durable user commitments, see
+    /// CLAUDE.md Rule 9).
+    bucket: Option<String>,
+    /// ARCHIVE filename within `bucket`. If None we generate
+    /// `YYYY-Www-<agent>.md`. Should be a leaf filename (no path
+    /// separators).
+    filename: Option<String>,
+    reason: Option<String>,      // for log
+}
+
+async fn contemplation(workspace_root: &Path, diary_root: &Path, settings: &Settings) -> Result<()> {
+    let agents = list_agent_dirs(diary_root)?;
+    if agents.is_empty() {
+        tracing::info!("contemplation: no agent diaries found");
+        return Ok(());
+    }
+    let vault_path = expand_home(&settings.obsidian.vault_path);
+    // Resumes the metabolism session (ADR-029 daily session) — the vault
+    // --add-dir is passed on every launch, so the resumed session has it.
+    let (mut session, ask_opts) = SessionProfile::one_shot_utility(&ProfileContext {
+        workspace_root,
+        claude: &settings.claude,
+        tmux_session: "nucleus-distiller",
+        agent_label: "distiller",
+    })
+    .add_dirs(vec![vault_path.clone()])
+    .window_name("contemplation")
+    // Each ask may now run vault searches (ADR-035) before answering; the
+    // utility profile's 180 s ceiling was sized for a single JSON reply.
+    .max_wait(std::time::Duration::from_secs(360))
+    .daily_session(AGENT_NAME)
+    .spawn()
+    .await
+    .context("spawning claude session for contemplation")?;
+    let week_ago = Local::now() - Duration::days(settings.diary.retain_days as i64);
+    let vault_summary = summarize_vault(&vault_path);
+    let mut applied_all = true;
+    let mut judge = SessionJudge {
+        model: SessionModel { session: &mut session, opts: &ask_opts },
+        vault_path: vault_path.clone(),
+    };
+    let ctx = ContemplationContext {
+        workspace_root,
+        vault_path: &vault_path,
+        vault_summary: &vault_summary,
+        retain_days: settings.diary.retain_days,
+    };
+
+    for (agent, agent_dir) in &agents {
+        if agent == AGENT_NAME { continue; }
+        let body = read_recent_entries(agent_dir, week_ago)?;
+        match contemplate_agent(&mut judge, &ctx, agent, agent_dir, &body).await? {
+            Contemplated::Nothing => {}
+            Contemplated::Incomplete => applied_all = false,
+            Contemplated::Complete => {
+                prune_old_diaries(agent_dir, week_ago.date_naive())?;
+                clear_pending(workspace_root, agent, agent_dir).await?;
             }
         }
-        tracing::info!("contemplation: agent {} → {:?}", agent, counts);
-
-        // A failed op keeps its inputs: the pending candidates stay staged and
-        // the source diaries are not pruned, so the next pass sees the same
-        // evidence again instead of losing it with the failure.
-        if failed > 0 {
-            tracing::warn!(
-                "contemplation: agent {} — {} op(s) failed; keeping _pending.md and skipping the prune",
-                agent, failed
-            );
-            applied_all = false;
-            continue;
-        }
-        prune_old_diaries(agent_dir, week_ago.date_naive())?;
-        let _ = std::fs::write(agent_dir.join("_pending.md"), "");
     }
 
     let _ = session.close().await;
@@ -574,6 +789,165 @@ PENDING CANDIDATES:
         if applied_all && dropped == 0 { diary::Tag::Routine } else { diary::Tag::Observation },
     );
     Ok(())
+}
+
+/// A contemplation pass: asks the model and applies its decisions.
+trait Judge: Model {
+    async fn apply(&mut self, agent: &str, d: &Decision) -> Result<()>;
+}
+
+struct SessionJudge<'a> {
+    model: SessionModel<'a>,
+    vault_path: PathBuf,
+}
+
+impl Model for SessionJudge<'_> {
+    async fn ask(&mut self, prompt: &str) -> Result<String> {
+        self.model.ask(prompt).await
+    }
+}
+
+impl Judge for SessionJudge<'_> {
+    async fn apply(&mut self, agent: &str, d: &Decision) -> Result<()> {
+        apply_decision(agent, d, &self.vault_path).await
+    }
+}
+
+struct ContemplationContext<'a> {
+    workspace_root: &'a Path,
+    vault_path: &'a Path,
+    vault_summary: &'a str,
+    retain_days: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Contemplated {
+    /// No diary and no pending candidates.
+    Nothing,
+    /// Every part was judged and every decision applied.
+    Complete,
+    /// A part did not parse or one of its decisions failed; the parts before
+    /// it are recorded as done, it and the rest stay for the next run.
+    Incomplete,
+}
+
+/// How much of an agent's `_pending.md` contemplation has applied: its first
+/// `offset` bytes, whose SHA-256 is `prefix_sha256`. The hash detects a file
+/// that was cleared (and possibly refilled) after the mark was written; such
+/// a mark no longer applies and the file is read from the start. Stored as
+/// `<offset>:<hex>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingMark {
+    offset: usize,
+    prefix_sha256: String,
+}
+
+impl PendingMark {
+    fn of(pending: &str, offset: usize) -> PendingMark {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(pending.as_bytes().get(..offset).unwrap_or_default());
+        PendingMark { offset, prefix_sha256: digest.iter().map(|b| format!("{b:02x}")).collect() }
+    }
+
+    fn parse(v: &str) -> Option<PendingMark> {
+        let (o, h) = v.split_once(':')?;
+        Some(PendingMark { offset: o.parse().ok()?, prefix_sha256: h.to_string() })
+    }
+
+    fn encode(&self) -> String {
+        format!("{}:{}", self.offset, self.prefix_sha256)
+    }
+
+    /// Bytes of `pending` already applied: the offset when the file still
+    /// starts with the content the mark was taken over, else 0.
+    fn applied_in(&self, pending: &str) -> usize {
+        if self.offset <= pending.len()
+            && pending.is_char_boundary(self.offset)
+            && PendingMark::of(pending, self.offset) == *self
+        {
+            self.offset
+        } else {
+            0
+        }
+    }
+}
+
+/// Contemplation for one agent. The pending candidates are judged in parts
+/// (see [`contemplation_prompts`]); after each part whose decisions all
+/// applied, the progress mark moves past that part's bytes of
+/// `_pending.md`, so a failure in a later part does not make the next run
+/// judge and apply the earlier parts again. The first part that fails stops
+/// the agent: the progress mark is a prefix, so a later part applied past a
+/// failed one would be applied again when the failed one is retried. A part
+/// with a failed decision is judged again whole on the next run (its other
+/// decisions included); the model's decisions for a retried part are new
+/// decisions, not a replay.
+async fn contemplate_agent(
+    judge: &mut impl Judge,
+    ctx: &ContemplationContext<'_>,
+    agent: &str,
+    agent_dir: &Path,
+    body: &str,
+) -> Result<Contemplated> {
+    let key = contemplation_progress_key(agent);
+    let pending = std::fs::read_to_string(agent_dir.join("_pending.md")).unwrap_or_default();
+    let mut done = match chore_state::watermark(ctx.workspace_root, &key).await? {
+        Some(v) => PendingMark::parse(&v).map(|m| m.applied_in(&pending)).unwrap_or(0),
+        None => 0,
+    };
+    let rest = &pending[done..];
+    if body.trim().is_empty() && rest.trim().is_empty() {
+        return Ok(Contemplated::Nothing);
+    }
+
+    let parts = contemplation_prompts(agent, ctx.vault_path, ctx.vault_summary, ctx.retain_days, body, rest);
+    let mut counts = std::collections::HashMap::new();
+    let mut outcome = Contemplated::Complete;
+    for (prompt, consumed) in parts {
+        let raw = judge.ask(&prompt).await?;
+        let cleaned = strip_code_fence(&raw);
+        let decisions: Vec<Decision> = match serde_json::from_str(&cleaned) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("contemplation: parse failed for {}: {} — raw: {}", agent, e, cleaned);
+                outcome = Contemplated::Incomplete;
+                break;
+            }
+        };
+        let mut failed = 0usize;
+        for d in &decisions {
+            *counts.entry(d.op.clone()).or_insert(0) += 1;
+            if let Err(e) = judge.apply(agent, d).await {
+                failed += 1;
+                tracing::warn!("contemplation: apply failed for {} {:?}: {}", agent, d.op, e);
+            }
+        }
+        if failed > 0 {
+            // A failed op keeps its inputs: this part's candidates stay
+            // staged and the source diaries are not pruned, so the next pass
+            // sees the same evidence again instead of losing it.
+            tracing::warn!(
+                "contemplation: agent {} — {} op(s) failed; keeping the rest of _pending.md and skipping the prune",
+                agent, failed
+            );
+            outcome = Contemplated::Incomplete;
+            break;
+        }
+        done += consumed;
+        chore_state::set_watermark(ctx.workspace_root, &key, &PendingMark::of(&pending, done).encode()).await?;
+    }
+    tracing::info!("contemplation: agent {} → {:?}", agent, counts);
+    Ok(outcome)
+}
+
+/// Empty `_pending.md` after a complete contemplation. The progress mark is
+/// reset after the file: a crash in between leaves a mark whose hash no
+/// longer matches the (empty or refilled) file, which [`PendingMark`]
+/// treats as nothing applied.
+async fn clear_pending(workspace_root: &Path, agent: &str, agent_dir: &Path) -> Result<()> {
+    std::fs::write(agent_dir.join("_pending.md"), "")?;
+    chore_state::set_watermark(workspace_root, &contemplation_progress_key(agent), &PendingMark::of("", 0).encode())
+        .await
 }
 
 fn prune_old_diaries(agent_dir: &Path, before: NaiveDate) -> Result<()> {
@@ -815,6 +1189,212 @@ fn strip_leading_frontmatter(body: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diary(days: usize, entry_bytes: usize) -> String {
+        let mut out = String::new();
+        for d in 0..days {
+            out.push_str(&format!("### 2026-09-{:02}\n\n", d + 1));
+            for i in 0..10 {
+                out.push_str(&format!("## 10:{i:02} — OBSERVATION\n{}\n", "é".repeat(entry_bytes / 2)));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn split_keeps_everything_within_the_budget() {
+        let text = diary(3, 4_000);
+        let parts = split_to_budget(&text, 10_000);
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|p| p.len() <= 10_000));
+        assert_eq!(parts.concat(), text, "nothing lost or reordered");
+        // A single line longer than the budget is cut, never inside a char.
+        let line = "ü".repeat(10_000);
+        let parts = split_to_budget(&line, 1_001);
+        assert!(parts.iter().all(|p| p.len() <= 1_001));
+        assert_eq!(parts.concat(), line);
+    }
+
+    #[test]
+    fn no_distiller_prompt_exceeds_the_typed_prompt_limit() {
+        let cap = nucleus_core::claude_session::MAX_TYPED_PROMPT_BYTES;
+        // A window of diary three times the limit is several metabolism asks.
+        let body = diary(6, 4_000);
+        assert!(body.len() > 3 * cap);
+        let prompts = metabolism_prompts("discord", &body);
+        assert!(prompts.len() >= 3);
+        assert!(prompts.iter().all(|p| p.len() <= cap), "{:?}", prompts.iter().map(String::len).collect::<Vec<_>>());
+        // Contemplation: large diary and large pending list.
+        let pending: String = (0..4_000).map(|i| format!("- [FACT] (conf 0.80) candidate number {i} about something\n")).collect();
+        let parts = contemplation_prompts("discord", Path::new("/vault"), "vault/\n", 7, &body, &pending);
+        assert_eq!(parts.iter().map(|(_, n)| n).sum::<usize>(), pending.len(), "the parts cover the pending list");
+        let prompts: Vec<String> = parts.into_iter().map(|(p, _)| p).collect();
+        assert!(prompts.len() > 1);
+        assert!(prompts.iter().all(|p| p.len() <= cap));
+        for i in [0, 1_999, 3_999] {
+            let line = format!("candidate number {i} about something");
+            assert_eq!(prompts.iter().filter(|p| p.contains(&line)).count(), 1, "each candidate is judged once");
+        }
+        assert!(prompts.iter().all(|p| p.contains("older diary entries omitted")));
+        // Small inputs stay one prompt with the whole diary.
+        let small = contemplation_prompts("discord", Path::new("/vault"), "vault/\n", 7, "### d\nx\n", "- [FACT] y\n");
+        assert_eq!(small.len(), 1);
+        assert!(!small[0].0.contains("omitted"));
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "distiller-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Records every prompt; replies with a fixed script (default `[]`).
+    #[derive(Default)]
+    struct Fake {
+        prompts: Vec<String>,
+        replies: std::collections::VecDeque<String>,
+        applied: Vec<String>,
+        fail_apply: Vec<String>,
+    }
+
+    impl Model for Fake {
+        async fn ask(&mut self, prompt: &str) -> Result<String> {
+            self.prompts.push(prompt.to_string());
+            Ok(self.replies.pop_front().unwrap_or_else(|| "[]".into()))
+        }
+    }
+
+    impl Judge for Fake {
+        async fn apply(&mut self, _agent: &str, d: &Decision) -> Result<()> {
+            let name = d.name.clone().unwrap_or_default();
+            if self.fail_apply.contains(&name) {
+                anyhow::bail!("apply failed");
+            }
+            self.applied.push(name);
+            Ok(())
+        }
+    }
+
+    fn entry(agent_dir: &Path, date: NaiveDate, text: &str) {
+        use std::io::Write;
+        let path = agent_dir.join(format!("{date}.md"));
+        let fresh = !path.exists();
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        if fresh {
+            write!(f, "---\nagent: x\ndate: {date}\n---\n").unwrap();
+        }
+        write!(f, "\n## 10:00 — dm\n{text}\n- OBSERVATION: {text}\n").unwrap();
+    }
+
+    /// Two runs on the same day with the diary growing in between, then a
+    /// run the next day: every diary entry reaches the model exactly once.
+    #[tokio::test]
+    async fn metabolism_sends_each_diary_entry_once_across_runs() {
+        let root = tmp_dir("metab");
+        let agent_dir = root.join("memory/diaries/discord");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        entry(&agent_dir, d.pred_opt().unwrap(), "entry-yesterday");
+        entry(&agent_dir, d, "entry-alpha");
+
+        let mut fake = Fake::default();
+        metabolize_agent(&mut fake, &root, "discord", &agent_dir, d).await.unwrap();
+        entry(&agent_dir, d, "entry-beta");
+        metabolize_agent(&mut fake, &root, "discord", &agent_dir, d).await.unwrap();
+        // Nothing new: no ask at all.
+        let asks = fake.prompts.len();
+        metabolize_agent(&mut fake, &root, "discord", &agent_dir, d).await.unwrap();
+        assert_eq!(fake.prompts.len(), asks, "a run with no new diary asks nothing");
+        let next = d.succ_opt().unwrap();
+        entry(&agent_dir, next, "entry-gamma");
+        metabolize_agent(&mut fake, &root, "discord", &agent_dir, next).await.unwrap();
+
+        let all = fake.prompts.concat();
+        for e in ["entry-yesterday", "entry-alpha", "entry-beta", "entry-gamma"] {
+            // Each entry appears twice in its prompt (heading body + bullet).
+            assert_eq!(all.matches(&format!("\n{e}\n")).count(), 1, "{e} sent once: {:#?}", fake.prompts);
+        }
+        assert_eq!(fake.prompts.len(), 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diary_mark_reads_the_earlier_date_format() {
+        let d = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        assert_eq!(DiaryMark::parse("2026-09-10"), Some(DiaryMark { date: d.succ_opt().unwrap(), offset: 0 }));
+        let m = DiaryMark { date: d, offset: 123 };
+        assert_eq!(DiaryMark::parse(&m.encode()), Some(m));
+        assert_eq!(DiaryMark::parse("junk"), None);
+    }
+
+    fn decision(name: &str) -> String {
+        format!(r#"{{"op": "DROP", "name": "{name}", "reason": "r"}}"#)
+    }
+
+    /// A contemplation whose second part fails: the next run judges the
+    /// second part and after, never the first part again.
+    #[tokio::test]
+    async fn contemplation_resumes_after_the_last_applied_part() {
+        let root = tmp_dir("contemp");
+        let agent_dir = root.join("memory/diaries/discord");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // Enough candidates for several parts.
+        let pending: String = (0..4_000).map(|i| format!("- [FACT] (conf 0.80) candidate number {i:04} about something\n")).collect();
+        std::fs::write(agent_dir.join("_pending.md"), &pending).unwrap();
+        let ctx = ContemplationContext {
+            workspace_root: &root,
+            vault_path: Path::new("/vault"),
+            vault_summary: "vault/\n",
+            retain_days: 7,
+        };
+        let parts = contemplation_prompts("discord", ctx.vault_path, ctx.vault_summary, 7, "", &pending);
+        assert!(parts.len() >= 3, "{}", parts.len());
+
+        // Run 1: part 1 applies; part 2 has a decision that fails.
+        let mut fake = Fake::default();
+        fake.replies.push_back(format!("[{}]", decision("part1")));
+        fake.replies.push_back(format!("[{}, {}]", decision("part2-ok"), decision("part2-bad")));
+        fake.fail_apply.push("part2-bad".into());
+        let out = contemplate_agent(&mut fake, &ctx, "discord", &agent_dir, "").await.unwrap();
+        assert_eq!(out, Contemplated::Incomplete);
+        assert_eq!(fake.prompts.len(), 2, "stops at the failed part");
+        assert!(fake.prompts[0].contains("candidate number 0000"));
+
+        // Run 2: resumes at part 2; part 1 is not judged or applied again.
+        let mut fake2 = Fake::default();
+        let out = contemplate_agent(&mut fake2, &ctx, "discord", &agent_dir, "").await.unwrap();
+        assert_eq!(out, Contemplated::Complete);
+        assert_eq!(fake2.prompts.len(), parts.len() - 1);
+        assert!(fake2.prompts.iter().all(|p| !p.contains("candidate number 0000")), "part 1 not judged again");
+        assert!(fake2.prompts[0].contains(&parts[1].0[parts[1].0.find("PENDING CANDIDATES").unwrap()..]));
+        let last = "candidate number 3999";
+        assert_eq!(fake2.prompts.iter().filter(|p| p.contains(last)).count(), 1);
+
+        // After a complete run the file and the mark reset together; new
+        // candidates staged later are judged from the start.
+        clear_pending(&root, "discord", &agent_dir).await.unwrap();
+        std::fs::write(agent_dir.join("_pending.md"), "- [FACT] (conf 0.9) fresh candidate\n").unwrap();
+        let mut fake3 = Fake::default();
+        contemplate_agent(&mut fake3, &ctx, "discord", &agent_dir, "").await.unwrap();
+        assert!(fake3.prompts[0].contains("fresh candidate"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A mark left by a crash between clearing `_pending.md` and resetting
+    /// the mark does not skip candidates staged afterwards.
+    #[test]
+    fn a_stale_pending_mark_applies_to_nothing() {
+        let old = "- [FACT] a\n- [FACT] b\n";
+        let mark = PendingMark::of(old, old.len());
+        assert_eq!(mark.applied_in(old), old.len());
+        assert_eq!(mark.applied_in(&format!("{old}- [FACT] c\n")), old.len(), "appends keep the mark");
+        assert_eq!(mark.applied_in("- [FACT] new one, longer than before\n"), 0);
+        assert_eq!(mark.applied_in(""), 0);
+    }
 
     #[test]
     fn archive_appends_without_a_second_frontmatter() {

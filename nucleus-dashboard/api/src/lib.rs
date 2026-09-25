@@ -209,6 +209,14 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     ));
     app = app.nest("/skills/api", handlers::skills::router(skills_state));
 
+    // Tasks (ADR-033) — background-task ledger + conversational turns.
+    // Both DBs are opened per request and tolerated missing.
+    let tasks_state = Arc::new(handlers::tasks::TasksState {
+        workspace_root: workspace_root.clone(),
+        tasks: settings.tasks.clone(),
+    });
+    app = app.nest("/tasks/api", handlers::tasks::router(tasks_state));
+
     // Diary router — per ADR-004, every bot writes to
     // memory/diaries/<agent>/<YYYY-MM-DD>.md.
     let diary_root = workspace_root.join(&settings.diary.root);

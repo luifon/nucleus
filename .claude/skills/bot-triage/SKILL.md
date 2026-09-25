@@ -52,6 +52,24 @@ sqlite3 memory/agent_messages.db "SELECT at, sender, target, delivered,
   COALESCE(error,'-') FROM agent_messages ORDER BY id DESC LIMIT 5;"
 ```
 
+WhatsApp conversational turns (ADR-033) — where did the operator's message go?
+
+```bash
+sqlite3 memory/whatsapp.db "SELECT ref, status, received_at, typed_at, turn_id,
+  COALESCE(error,'-') FROM chat_inbound ORDER BY received_at DESC LIMIT 5;"
+sqlite3 memory/whatsapp.db "SELECT substr(id,1,8), kind, status, started_at, ended_at,
+  ack_sent, progress_count, COALESCE(error,'-') FROM chat_turns
+  ORDER BY started_at DESC LIMIT 5;"
+./target/release/nucleus tasks list        # background tasks (ADR-033)
+```
+
+A message stuck at `received` was never typed (session spawn failing — see
+the log); `typed` but no turn means the session has not read it yet (a long
+turn is running, or the pane is on a prompt); a `running` turn hours old is
+stuck on something on screen (layer 1). The engine sends one ack after 30s
+and replies only when the turn ends — silence with a `running` turn is
+normal while the work runs.
+
 `status='pending'` piling up → the bot process is down or disconnected.
 `error` columns name the failure. A fire with `success=1` that the operator
 never saw → look at the message body (preamble/marker issues), not delivery.

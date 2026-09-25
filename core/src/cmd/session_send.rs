@@ -21,11 +21,16 @@ use std::time::Duration;
 )]
 struct Cli {
     /// Target tmux session[:window]; the session must belong to a registered
-    /// agent (agents.toml), exact or as `<registered>-suffix`.
+    /// agent (agents.toml), exact or as `<registered>-suffix`. `whatsapp-dm`
+    /// queues the message for the WhatsApp turn engine, which types it into
+    /// the operator's DM chat session (ADR-033); the engine-managed tmux
+    /// sessions themselves are refused.
     #[arg(long)]
     to: String,
     /// Sender agent label — written into the attribution header and the log.
-    #[arg(long)]
+    /// Inside a Nucleus session it may be omitted: the session sends as its
+    /// own agent, and any other value is refused.
+    #[arg(long, default_value = "")]
     from: String,
     /// Message body. The `[agent-msg …]` header is machine-prepended; do not
     /// include one yourself.

@@ -1,9 +1,11 @@
 // One-shot send. Reuses the paired auth state, opens a connection, sends a
 // single message, and exits cleanly.
 //
-// Usage: npm run send -- <phone-or-jid> <message...>
-//   phone: international format, digits only (country code + number, no '+')
-//   jid:   already-formed like <id>@s.whatsapp.net or <id>@g.us
+// Usage: npm run send -- <target> <message...>
+//   target: the operator's DM (digits of a WHATSAPP_ALLOWED_DM_JIDS entry, or
+//           its JID) or a configured group (its JID or its name). Any other
+//           target is refused before a connection opens, whoever the caller
+//           is (target_policy.ts, ADR-033).
 //
 // The bot identity is whatever account is currently paired. The message
 // appears as that account sent it.
@@ -18,23 +20,39 @@ import {
 import pino from "pino";
 import path from "node:path";
 import { loadConfig } from "./config.js";
+import { refuseUnlessAllowed } from "./caller_guard.js";
+import { enqueueRefusal, GroupAllowlist, isOperatorDm, resolveTarget } from "./target_policy.js";
 
 const log = pino({ level: process.env.NUCLEUS_LOG ?? "info" });
 const baileysLogger = pino({ level: "silent" });
 
-async function main() {
-  const args = process.argv.slice(2);
-  if (args.length < 2) {
-    console.error("usage: npm run send -- <phone-or-jid> <message...>");
-    process.exit(2);
-  }
-  const target = args[0];
-  const message = args.slice(1).join(" ");
+/** Exit with status 3: the target is not the operator's DM or a
+ *  configured group. */
+function refuseTarget(target: string, reason: string): never {
+  console.error(`send: refused — ${JSON.stringify(target)} is not the operator's DM or a configured group: ${reason} (ADR-033).`);
+  process.exit(3);
+}
 
+async function main() {
   const workspaceRoot =
     process.env.NUCLEUS_WORKSPACE_ROOT ??
     path.resolve(import.meta.dirname, "..", "..", "..");
   const config = loadConfig(workspaceRoot, false);
+  const args = process.argv.slice(2);
+  if (args.length < 2) {
+    console.error("usage: npm run send -- <target> <message...>");
+    process.exit(2);
+  }
+  // `dm` is the operator's DM (the first WHATSAPP_ALLOWED_DM_JIDS entry).
+  const target = args[0] === "dm" ? ([...config.allowedDmSenders][0] ?? "") : args[0];
+  const message = args.slice(1).join(" ");
+  // Only the operator's DM or a configured group, whoever the caller is. A
+  // group JID that is not configured by JID may still be a configured group
+  // by name: that is decided from the group list once connected.
+  const early = target.endsWith("@g.us") ? null : enqueueRefusal(target, config);
+  if (early) refuseTarget(target, early);
+  // Direct sends are for the operator's own terminal only (ADR-033).
+  refuseUnlessAllowed("send", "send", config.dbPath);
 
   const authDir = path.join(workspaceRoot, "messaging/whatsapp/auth");
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
@@ -58,17 +76,19 @@ async function main() {
       const { connection } = update;
       if (connection === "open") {
         try {
-          // Resolve target → JID. If it already looks like a JID, pass through.
-          let jid: string;
-          if (target.includes("@")) {
-            jid = target;
-          } else {
-            const digits = target.replace(/\D/g, "");
-            const res = await sock.onWhatsApp(digits);
-            if (!res || !res[0]?.exists) {
-              throw new Error(`${digits} is not on WhatsApp (or check returned empty)`);
-            }
-            jid = res[0].jid;
+          const groups = isOperatorDm(target, config)
+            ? new GroupAllowlist(config)
+            : new GroupAllowlist(
+                config,
+                Object.entries(await sock.groupFetchAllParticipating()).map(([jid, meta]) => ({
+                  jid,
+                  subject: meta?.subject ?? "",
+                })),
+              );
+          const jid = resolveTarget(target, config, groups);
+          if (!jid) {
+            sock.end(undefined);
+            refuseTarget(target, "no configured group has this JID or name");
           }
 
           log.info({ jid, len: message.length }, "send: dispatching message");

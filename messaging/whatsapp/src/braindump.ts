@@ -186,6 +186,7 @@ export async function planCapture(
   config: Config,
   chatId: string,
   plansStore: PendingPlansStore,
+  sourceMsgId: string | null = null,
 ): Promise<PlanForReview> {
   const t0 = Date.now();
   const vaultSummary = summarizeVault(config.vaultPath);
@@ -219,6 +220,8 @@ export async function planCapture(
     addDirs: [config.vaultPath],
     tmuxSession: TMUX_SESSION,
     windowName: `plan-${windowSuffix}`,
+    // ADR-033: the planning session may send its ack (ack.ts checks this).
+    sessionKind: "braindump",
   };
 
   const session = await Session.spawn(spawnOpts);
@@ -272,6 +275,7 @@ export async function planCapture(
     opsJson: JSON.stringify(plan.ops),
     summary: plan.summary,
     confidence: plan.confidence,
+    sourceMsgId,
   });
 
   return {
@@ -281,6 +285,20 @@ export async function planCapture(
     confidence: plan.confidence,
     ops: plan.ops.map((op, i) => ({ id: i + 1, op })),
     elapsedMs: Date.now() - t0,
+  };
+}
+
+/** The review form of a stored plan (a message handled again finds the
+ *  plan it already produced; ADR-033). */
+export function planForReviewFromRow(row: PendingPlanRow): PlanForReview {
+  const ops: CaptureOp[] = JSON.parse(row.opsJson);
+  return {
+    planId: row.id,
+    shortId: shortPlanId(row.id),
+    summary: row.summary,
+    confidence: row.confidence,
+    ops: ops.map((op, i) => ({ id: i + 1, op })),
+    elapsedMs: 0,
   };
 }
 
@@ -313,6 +331,7 @@ export async function interpretResponse(
     disallowedTools: config.disallowedTools,
     tmuxSession: TMUX_SESSION,
     windowName: `resp-${windowSuffix}`,
+    sessionKind: "braindump",
   };
 
   const session = await Session.spawn(spawnOpts);
@@ -344,66 +363,95 @@ export function applyPlan(
   plansStore: PendingPlansStore,
   config: Config,
   patches: OpPatch[] = [],
+  byMsgId: string | null = null,
 ): CaptureOutcome {
   const t0 = Date.now();
   const row = plansStore.get(planId);
   if (!row) throw new Error(`braindump: plan ${planId} not found`);
 
   let ops: CaptureOp[] = JSON.parse(row.opsJson);
+  let idsToApply: number[];
 
-  // Operator course-corrections (a `modify` interpretation): apply the
-  // field-level patches to the persisted ops BEFORE filing, then re-persist
-  // so the corrected plan is what the audit trail reflects. The operator
-  // approved the *corrected* placement, so we file it the same turn — no
-  // second review round-trip.
-  if (patches.length > 0) {
-    ops = ops.map((op, i) => applyOpPatch(op, patches.find((p) => p.id === i + 1)));
-    plansStore.updateOps(planId, JSON.stringify(ops));
+  // ADR-033: an apply that already started (the bot stopped part-way, and
+  // the accepting message is handled again) resumes with the recorded ids
+  // and the already-patched ops; ops with a recorded result are not filed
+  // again. At most the op being filed when the bot stopped is repeated.
+  if (row.status === "applying" && row.applyIds) {
+    idsToApply = row.applyIds;
+  } else {
+    // Operator course-corrections (a `modify` interpretation): apply the
+    // field-level patches to the persisted ops BEFORE filing, then
+    // re-persist so the corrected plan is what the audit trail reflects.
+    // The operator approved the *corrected* placement, so we file it the
+    // same turn — no second review round-trip.
+    if (patches.length > 0) {
+      ops = ops.map((op, i) => applyOpPatch(op, patches.find((p) => p.id === i + 1)));
+      plansStore.updateOps(planId, JSON.stringify(ops));
+    }
+    idsToApply =
+      acceptedIds === "all"
+        ? ops.map((_, i) => i + 1)
+        : Array.from(new Set(acceptedIds)).filter((id) => id >= 1 && id <= ops.length);
+    plansStore.beginApply(planId, idsToApply, byMsgId);
   }
-
-  const idsToApply =
-    acceptedIds === "all"
-      ? ops.map((_, i) => i + 1)
-      : Array.from(new Set(acceptedIds)).filter((id) => id >= 1 && id <= ops.length);
+  const progress = { ...(plansStore.get(planId)?.applyProgress ?? {}) } as Record<string, AppliedOp>;
+  const fileOnce = (opId: number, op: () => AppliedOp): AppliedOp => {
+    const done = progress[String(opId)];
+    if (done) return done;
+    const result = op();
+    plansStore.recordApplied(planId, opId, result);
+    progress[String(opId)] = result;
+    return result;
+  };
 
   const applied: AppliedOp[] = [];
   for (const id of idsToApply) {
     const op = ops[id - 1];
-    applied.push(applyOp(config.vaultPath, op));
+    applied.push(fileOnce(id, () => applyOp(config.vaultPath, op)));
   }
 
   // Safety net only when operator approved everything AND nothing landed.
   const approvedAll = idsToApply.length === ops.length;
   const anyOk = applied.some((a) => a.status === "ok");
   if (approvedAll && !anyOk && ops.length > 0) {
-    const today = localToday();
-    const fallbackOp: CaptureOp = {
-      op: "create",
-      bucket: FALLBACK_BUCKET,
-      filename: `${today}-fallback-${Date.now().toString(36)}.md`,
-      body: synthesizeFallbackBody(
-        today,
-        row.captureText,
-        { ops, summary: row.summary, confidence: row.confidence },
-        applied,
-      ),
-      createsSubfolder: false,
-      reason: "all approved ops rejected by validator; preserving capture",
-    };
-    applied.push(applyOp(config.vaultPath, fallbackOp));
+    applied.push(
+      fileOnce(0, () => {
+        const today = localToday();
+        const fallbackOp: CaptureOp = {
+          op: "create",
+          bucket: FALLBACK_BUCKET,
+          filename: `${today}-fallback-${Date.now().toString(36)}.md`,
+          body: synthesizeFallbackBody(
+            today,
+            row.captureText,
+            { ops, summary: row.summary, confidence: row.confidence },
+            applied,
+          ),
+          createsSubfolder: false,
+          reason: "all approved ops rejected by validator; preserving capture",
+        };
+        return applyOp(config.vaultPath, fallbackOp);
+      }),
+    );
   }
 
   const okCount = applied.filter((a) => a.status === "ok").length;
   const finalStatus: "applied" | "partial" =
     okCount === idsToApply.length && approvedAll ? "applied" : "partial";
-  plansStore.resolve(planId, finalStatus, `apply ids=${JSON.stringify(idsToApply)}`);
-
-  return {
+  const outcome: CaptureOutcome = {
     ops: applied,
     summary: row.summary,
     confidence: row.confidence,
     elapsedMs: Date.now() - t0,
   };
+  plansStore.resolve(
+    planId,
+    finalStatus,
+    `apply ids=${JSON.stringify(idsToApply)}`,
+    null,
+    JSON.stringify(outcome),
+  );
+  return outcome;
 }
 
 // ==================== RUNDOWN ====================
@@ -414,7 +462,7 @@ export function applyPlan(
 export function formatRundown(plan: PlanForReview): string {
   const conf = (plan.confidence * 100).toFixed(0);
   const lines: string[] = [
-    `✓ plano #${plan.shortId} (${conf}%)`,
+    `✓ plan #${plan.shortId} (${conf}%)`,
   ];
   if (plan.summary) {
     lines.push(`"${plan.summary}"`);
@@ -424,7 +472,7 @@ export function formatRundown(plan: PlanForReview): string {
     lines.push(`${id}. ${rundownOpLine(op)}`);
   }
   if (plan.ops.length === 0) {
-    lines.push("(claude returned no ops — nada para revisar)");
+    lines.push("(claude returned no ops — nothing to review)");
   }
   return lines.join("\n");
 }
@@ -760,13 +808,13 @@ source: whatsapp-braindump
 tags: [fallback, needs-manual-sort]
 ---
 
-# Capture preservada (${today})
+# Preserved capture (${today})
 
-O planejador do brain-dump não conseguiu produzir um plano de operações válido
-(retornou prosa em vez de JSON, duas vezes). A captura ${inputKind} original
-está preservada abaixo para classificação manual.
+The brain-dump planner could not produce a valid operation plan (it returned
+prose instead of JSON, twice). The original ${inputKind} capture is preserved
+below for manual filing.
 
-## Captura original
+## Original capture
 
 ${text.trim()}
 `;
@@ -781,7 +829,7 @@ ${text.trim()}
         reason: "planning returned unparseable output twice; preserving verbatim capture",
       },
     ],
-    summary: "⚠️ planejamento falhou — captura preservada em 0-Inbox para classificação manual",
+    summary: "⚠️ planning failed — capture preserved in 0-Inbox for manual filing",
     confidence: 0.2,
   };
 }
@@ -882,7 +930,7 @@ export function parseInterpretResponse(raw: string, opCount: number): InterpretR
     // treat it as ambiguous and let the operator try again.
     return {
       action: "ambiguous",
-      note: `não entendi sua resposta (parser: ${(e as Error).message}). pode reformular?`,
+      note: `I did not understand the reply (parser: ${(e as Error).message}). Can you rephrase?`,
     };
   }
   const action = obj?.action;
@@ -895,7 +943,7 @@ export function parseInterpretResponse(raw: string, opCount: number): InterpretR
   if (action === "ambiguous") {
     return {
       action: "ambiguous",
-      note: typeof obj.note === "string" ? obj.note : "não entendi, pode reformular?",
+      note: typeof obj.note === "string" ? obj.note : "I did not understand; can you rephrase?",
     };
   }
   if (action === "apply" || action === "modify") {
@@ -906,7 +954,7 @@ export function parseInterpretResponse(raw: string, opCount: number): InterpretR
     if (ids.length === 0) {
       return {
         action: "ambiguous",
-        note: "não entendi quais ops aplicar. pode reformular?",
+        note: "I did not understand which ops to apply. Can you rephrase?",
       };
     }
     const note = typeof obj.note === "string" ? obj.note : undefined;
@@ -920,7 +968,7 @@ export function parseInterpretResponse(raw: string, opCount: number): InterpretR
   }
   return {
     action: "ambiguous",
-    note: `resposta com ação desconhecida (${String(action)}). pode reformular?`,
+    note: `the reply has an unknown action (${String(action)}). Can you rephrase?`,
   };
 }
 

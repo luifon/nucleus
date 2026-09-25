@@ -26,6 +26,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Config } from "./config.js";
 import { Session } from "./claude_session.js";
+import { addColumnsIfMissing } from "./db.js";
 
 export const JOBS_TMUX_SESSION = "nucleus-whatsapp-jobs";
 
@@ -53,6 +54,8 @@ export interface JobRow {
   sessionId: string | null;
   resultSummary: string | null;
   error: string | null;
+  /** `<whatsapp msgid>:<kind>` for a job an inbound message started. */
+  sourceKey: string | null;
 }
 
 interface RawJobRow {
@@ -68,6 +71,7 @@ interface RawJobRow {
   session_id: string | null;
   result_summary: string | null;
   error: string | null;
+  source_key?: string | null;
 }
 
 function toRow(r: RawJobRow): JobRow {
@@ -84,6 +88,7 @@ function toRow(r: RawJobRow): JobRow {
     sessionId: r.session_id,
     resultSummary: r.result_summary,
     error: r.error,
+    sourceKey: r.source_key ?? null,
   };
 }
 
@@ -114,17 +119,31 @@ export class JobStore {
       CREATE INDEX IF NOT EXISTS idx_jobs_status_created
         ON jobs(status, created_at DESC);
     `);
+    // ADR-033 inbound idempotency: the inbound message (and job kind) that
+    // started the job. One job per key, so a message handled again after a
+    // crash finds its job instead of starting a second one.
+    addColumnsIfMissing(this.db, "jobs", [["source_key", "source_key TEXT"]]);
+    this.db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_source_key ON jobs(source_key) WHERE source_key IS NOT NULL`,
+    );
   }
 
-  insert(i: { kind: JobKind; chatId: string; docId?: string; instruction: string }): string {
+  /** Insert a running job. Throws when a job with `sourceKey` exists. */
+  insert(i: { kind: JobKind; chatId: string; docId?: string; instruction: string; sourceKey?: string | null }): string {
     const id = randomUUID();
     this.db
       .prepare(
-        `INSERT INTO jobs (id, kind, doc_id, chat_id, instruction, status, created_at)
-         VALUES (?, ?, ?, ?, ?, 'running', ?)`,
+        `INSERT INTO jobs (id, kind, doc_id, chat_id, instruction, status, created_at, source_key)
+         VALUES (?, ?, ?, ?, ?, 'running', ?, ?)`,
       )
-      .run(id, i.kind, i.docId ?? null, i.chatId, i.instruction, new Date().toISOString());
+      .run(id, i.kind, i.docId ?? null, i.chatId, i.instruction, new Date().toISOString(), i.sourceKey ?? null);
     return id;
+  }
+
+  /** The job an inbound message started, by its source key. */
+  bySourceKey(key: string): JobRow | null {
+    const r = this.db.prepare(`SELECT * FROM jobs WHERE source_key = ?`).get(key) as RawJobRow | undefined;
+    return r ? toRow(r) : null;
   }
 
   setSession(id: string, sessionId: string, tmuxWindow: string): void {
@@ -199,6 +218,8 @@ export interface StartJobOpts {
   allowedTools?: string[];
   addDirs?: string[];
   maxWaitMs?: number;
+  /** One job per key (JobStore.bySourceKey). */
+  sourceKey?: string | null;
 }
 
 export interface JobOutcome {
@@ -217,6 +238,7 @@ export function startJob(o: StartJobOpts): { jobId: string; promise: Promise<Job
     chatId: o.chatId,
     docId: o.docId,
     instruction: o.instruction,
+    sourceKey: o.sourceKey,
   });
   const t0 = Date.now();
   const promise = (async (): Promise<JobOutcome> => {
@@ -232,6 +254,7 @@ export function startJob(o: StartJobOpts): { jobId: string; promise: Promise<Job
         windowName: `job-${jobId.slice(0, 8)}`,
         readyTimeoutMs: 60_000,
         agentLabel: "whatsapp", // run-log rows for free (ADR-016)
+        sessionKind: "job",
       });
       o.store.setSession(jobId, session.sessionId, session.tmuxTarget);
       try {

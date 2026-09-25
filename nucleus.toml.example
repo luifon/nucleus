@@ -157,6 +157,57 @@ scheduled_apply = false
 # Scheduled runs: enqueue the one-line summary to the operator's WhatsApp DM.
 notify = true
 
+# ADR-033 WhatsApp turn engine. Every value is optional.
+# ack_after_secs: an operator message without an answer this long gets one
+#   code-sent acknowledgement ([whatsapp.texts] ack).
+# progress_interval_secs: at most one progress message per turn per interval,
+#   only when the model wrote new intermediate text; cut to progress_max_chars.
+#   The outbound secret filter withholds a progress message that names a
+#   secret or an identifier.
+# turn_ceiling_hours: a turn running longer is interrupted and reported.
+# permission_stall_secs: a turn stuck on an on-screen confirmation this long
+#   is reported once.
+[whatsapp.turns]
+ack_after_secs = 30
+progress_interval_secs = 180
+progress_max_chars = 160
+turn_ceiling_hours = 6
+permission_stall_secs = 120
+
+# ADR-033 fixed texts the WhatsApp bot sends (English by default). Every key
+# is optional; the full list and the defaults are in
+# messaging/whatsapp/src/texts.ts (keys in snake_case here). Placeholders in
+# braces are filled by the bot.
+[whatsapp.texts]
+# ack = "⏳ Working on it…"
+# progress_prefix = "↻ Progress: "
+# interrupted = "⚠️ Interrupted: the bot restarted before the reply. Not resumed — send it again if you still want it."
+# ceiling = "⚠️ This reply passed the {hours} h safety limit; I interrupted the session."
+
+# [whatsapp.texts.infra_reasons]
+# usage_limit = "the account reached its usage limit"
+
+# ADR-033 background task workers (`nucleus tasks`). Internal safety limits:
+# a task past max_concurrent waits queued for a slot; a worker past
+# max_runtime_hours (counted from the moment it takes a slot) is stopped and
+# marked failed. Both are logged when hit.
+[tasks]
+max_concurrent = 6
+max_runtime_hours = 12
+# tmux session hosting the worker windows (change only to isolate a test run)
+# tmux_session = "nucleus-tasks"
+
+# Status line of a finished task's result message, per final status. Goes to
+# the task's origin (WhatsApp or Discord). {id} = short task id, {title}.
+[tasks.texts]
+# done = "✅ Task {id} done — {title}"
+# failed = "⚠️ Task {id} failed — {title}"
+# cancelled = "⏹ Task {id} cancelled — {title}"
+# interrupted = "⚠️ Task {id} interrupted — {title}"
+# Sent once when a result's delivery is given up (outcome unknown, or too many
+# failures); the result is not sent again. {reason} = the recorded reason.
+# delivery_failed = "⚠️ Task {id} — {title}: the result message was not confirmed as delivered ({reason}). …"
+
 # ADR-027 WhatsApp connection circuit breaker. Defaults are sane; every
 # value is optional. ladder_ms = reconnect backoff per consecutive quick
 # failure; open_threshold failures within window_ms open the circuit

@@ -7,3 +7,4 @@ pub mod session_search;
 pub mod session_send;
 pub mod usage;
 pub mod vault_search;
+pub mod tasks;
