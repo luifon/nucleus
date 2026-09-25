@@ -618,22 +618,46 @@ struct Unit {
     entity: bool,
 }
 
-/// The characters of `text`: literal (`decode = false`, the title), or
-/// with every character reference outside the `code` ranges decoded
-/// ([`charref::decode_at`]). Inside `attribute` ranges (the tags of HTML
-/// nodes) the attribute-value rule applies. A backslash-escaped `&` is
-/// literal only outside `html` (a Markdown escape; HTML has none).
+/// The characters of `text` as GitHub renders them, each with its source
+/// bytes. With `decode = false` (the title) every character is literal.
+/// Otherwise each range is decoded exactly as its renderer decodes it:
+///
+/// - code (`code` ranges): literal;
+/// - raw HTML (`html` ranges, the placed HTML nodes): the browser's WHATWG
+///   rules ([`charref::decode_at`]), with the attribute-value rule inside
+///   `attribute` ranges (the tags);
+/// - Markdown text (everything else): CommonMark's rules
+///   ([`charref::decode_commonmark_at`]: only references that end in `;`),
+///   a backslash-escaped `&` stays literal, and an unescaped `*` is not a
+///   character GitHub is sure to show (it may be an emphasis delimiter), so
+///   it stands in the stream as U+FFFC, which no exemption accepts as a
+///   neighbour.
 fn units(text: &str, code: &[(usize, usize)], decode: bool, attribute: &[(usize, usize)], html: &[(usize, usize)]) -> Vec<Unit> {
     let b = text.as_bytes();
     let mut out = Vec::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
-        if decode && b[i] == b'&' && !inside(code, i) && !(escaped(b, i) && !inside(html, i)) {
-            if let Some((cs, len)) = charref::decode_at(text, i, inside(attribute, i)) {
-                for c in cs {
-                    out.push(Unit { c, at: i, end: i + len, entity: true });
+        if decode && !inside(code, i) {
+            let in_html = inside(html, i);
+            if b[i] == b'&' {
+                let decoded = if in_html {
+                    charref::decode_at(text, i, inside(attribute, i))
+                } else if !escaped(b, i) {
+                    charref::decode_commonmark_at(text, i)
+                } else {
+                    None
+                };
+                if let Some((cs, len)) = decoded {
+                    for c in cs {
+                        out.push(Unit { c, at: i, end: i + len, entity: true });
+                    }
+                    i += len;
+                    continue;
                 }
-                i += len;
+            }
+            if b[i] == b'*' && !in_html && !escaped(b, i) {
+                out.push(Unit { c: '\u{FFFC}', at: i, end: i + 1, entity: false });
+                i += 1;
                 continue;
             }
         }
@@ -1100,8 +1124,23 @@ fn inline_block<'a>(n: &'a AstNode<'a>, range: &dyn Fn(&AstNode<'_>) -> (usize, 
 /// definitions); only a one-to-one match places them. An unplaced code span
 /// stays unmasked; an unplaced HTML node is reported with its position
 /// unknown.
-fn place_inline(text: &str, starts: &[usize], defs: &[(usize, usize)], pending: Vec<Pending>, t: &mut Tree) {
+fn place_inline(text: &str, starts: &[usize], defs: &[(usize, usize)], mut pending: Vec<Pending>, t: &mut Tree) {
     let b = text.as_bytes();
+    // A reported position counts only outside reference definitions and,
+    // for HTML, outside code that itself checked out. A block with any node
+    // that fails is shifted: all its nodes go through the matcher.
+    let code_ok: Vec<(usize, usize)> =
+        pending.iter().filter(|p| p.code.is_some() && p.ok && !inside(defs, p.at)).map(|p| (p.at, p.end)).collect();
+    let shifted: std::collections::HashSet<usize> = pending
+        .iter()
+        .filter(|p| !p.ok || inside(defs, p.at) || (p.code.is_none() && inside(&code_ok, p.at)))
+        .map(|p| p.block)
+        .collect();
+    for p in &mut pending {
+        if shifted.contains(&p.block) {
+            p.ok = false;
+        }
+    }
     let mut placed: Vec<Option<(usize, usize)>> = pending.iter().map(|p| p.ok.then_some((p.at, p.end))).collect();
     // Code first: placed code is excluded when HTML is placed.
     for pass_code in [true, false] {
@@ -1127,7 +1166,9 @@ fn place_inline(text: &str, starts: &[usize], defs: &[(usize, usize)], pending: 
             let mut p = bs;
             while p < be.min(text.len()) {
                 let hit = match pending[i].code {
-                    Some(n) => (b[p] == b'`' && !escaped(b, p)).then(|| code_span_at(text, p, n, &pending[i].literal)).flatten(),
+                    Some(n) => (b[p] == b'`' && !escaped(b, p) && !inside(defs, p))
+                        .then(|| code_span_at(text, p, n, &pending[i].literal))
+                        .flatten(),
                     None => (b[p] == b'<'
                         && !escaped(b, p)
                         && !inside(&code_now, p)
@@ -1713,6 +1754,24 @@ fn scan_markdown_raw(text: &str) -> Vec<Raw> {
     let tags = tree_html(&tree.html, &m, text, &mut out);
     let html_ranges: Vec<(usize, usize)> = tree.html.iter().filter(|h| h.known).map(|h| h.range).collect();
     invisible_findings(text, &units(text, &tree.literal, true, &tags, &html_ranges), &mut out);
+    // An HTML node that could not be placed: its source is read as Markdown
+    // above; its literal is also read as HTML here, since the context is
+    // unknown. A finding from either counts, over the whole location.
+    for node in tree.html.iter().filter(|h| !h.known) {
+        let lit = node.literal.as_str();
+        let tag_spans: Vec<(usize, usize)> = (0..lit.len())
+            .filter(|&i| lit.as_bytes()[i] == b'<')
+            .filter_map(|i| parse_tag(lit, i).map(|t| (i, t.end)))
+            .collect();
+        let mut found = Vec::new();
+        invisible_findings(lit, &units(lit, &[], true, &tag_spans, &[(0, lit.len())]), &mut found);
+        for mut f in found.into_iter().filter(|f| f.kind == Kind::InvisibleEntity) {
+            f.at = 0;
+            f.end = text.len();
+            f.text = format!("position unknown (read as HTML): {}", f.text);
+            out.push(f);
+        }
+    }
     text_comments(&m, text, &html_ranges, &mut out);
     definitions(&m, text, &mut out);
     hiding_macros(&m, text, &tree.math, &mut out);

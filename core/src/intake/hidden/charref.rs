@@ -4,11 +4,17 @@
 //! named reference of [`super::entities::ENTITIES`], including the legacy
 //! names that are valid without `;`.
 //!
-//! GitHub decodes references in two places: CommonMark decodes the ones
-//! that end in `;` in Markdown text, and the browser decodes the rest of
-//! the HTML the sanitizer keeps, where `;` is optional for numeric and
-//! legacy references. The hold decodes with the browser's rules
-//! everywhere outside code, which decodes at least what either does.
+//! GitHub decodes references in two places, with different rules, and the
+//! hold decodes each range with its own renderer's rules (decoding more
+//! than the renderer is not stricter: it changes the characters the
+//! exemptions look at):
+//!
+//! - Markdown text: CommonMark ([`decode_commonmark_at`]) decodes only
+//!   references that end in `;`: `&#` 1–7 digits `;`, `&#x` 1–6 hex digits
+//!   `;`, or a name from the table followed by `;`. Code point 0 and
+//!   invalid ones become U+FFFD; there is no Windows-1252 remapping.
+//! - Raw HTML: the browser ([`decode_at`]), where `;` is optional for
+//!   numeric references and the legacy names.
 
 use super::entities::{ENTITIES, MAX_NAME_LEN};
 
@@ -58,7 +64,34 @@ pub fn numeric_char(v: u32) -> char {
     char::from_u32(v).unwrap_or('\u{FFFD}')
 }
 
-/// Decode the character reference that starts at `i` (`text[i] == '&'`):
+/// Decode a CommonMark character reference at `i` (`text[i] == '&'`): the
+/// characters it produces and its length, or `None` when CommonMark leaves
+/// the `&` as text.
+pub fn decode_commonmark_at(text: &str, i: usize) -> Option<(Vec<char>, usize)> {
+    let b = text.as_bytes();
+    let semi = b[i + 1..b.len().min(i + 2 + MAX_NAME_LEN)].iter().position(|c| *c == b';')? + i + 1;
+    let body = &text[i + 1..semi];
+    let len = semi + 1 - i;
+    if let Some(num) = body.strip_prefix('#') {
+        let v = if let Some(hex) = num.strip_prefix(['x', 'X']) {
+            (!hex.is_empty() && hex.len() <= 6 && hex.bytes().all(|c| c.is_ascii_hexdigit()))
+                .then(|| u32::from_str_radix(hex, 16).ok())
+                .flatten()?
+        } else {
+            (!num.is_empty() && num.len() <= 7 && num.bytes().all(|c| c.is_ascii_digit()))
+                .then(|| num.parse::<u32>().ok())
+                .flatten()?
+        };
+        let c = if v == 0 { '\u{FFFD}' } else { char::from_u32(v).unwrap_or('\u{FFFD}') };
+        return Some((vec![c], len));
+    }
+    let name = &text[i + 1..semi + 1];
+    let k = ENTITIES.binary_search_by(|(n, _)| n.as_bytes().cmp(name.as_bytes())).ok()?;
+    Some((ENTITIES[k].1.iter().filter_map(|c| char::from_u32(*c)).collect(), len))
+}
+
+/// Decode the character reference that starts at `i` (`text[i] == '&'`) by
+/// the WHATWG rules (raw HTML):
 /// the characters it produces (one named reference can produce two) and
 /// its length in bytes, or `None` when the standard leaves the `&` as text.
 /// `in_attribute`: the attribute-value rule, where a named reference

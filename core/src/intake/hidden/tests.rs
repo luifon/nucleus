@@ -381,35 +381,70 @@ fn entity_joiners_follow_the_same_rules() {
 }
 
 #[test]
-fn character_references_follow_the_whatwg_rules() {
-    // Numeric without `;`, inside raw HTML and in text.
+fn character_references_are_decoded_as_their_renderer_does() {
+    // Raw HTML (an HTML block): the browser's rules, `;` optional.
     let f = only("<div>ig&#8203nore</div>", Kind::InvisibleEntity);
     assert_eq!(f.len(), 1, "{f:?}");
     assert_eq!(f[0].text, "&#8203 → U+200B ZERO WIDTH SPACE");
-    assert!(has("a &#x200B b", Kind::InvisibleEntity));
-    // `zwj` is not a legacy name: without `;` it stays text.
+    assert!(has("<div>&#8203</div>", Kind::InvisibleEntity));
+    // Markdown text: CommonMark's rules, only with `;`. `&#8203` renders as
+    // the literal text "&#8203": no invisible character.
+    assert!(kinds("a &#8203 b").is_empty());
+    assert!(kinds("a &#x200B b").is_empty());
+    assert!(has("a &#8203; b", Kind::InvisibleEntity));
+    // `zwj` is not a legacy name: without `;` it is text in both contexts.
     assert!(kinds("a&zwj b").is_empty());
+    assert!(kinds("<div>a&zwj b</div>").is_empty());
     assert!(has("a&zwj;b", Kind::InvisibleEntity));
-    // A legacy name without `;`: decoded in text, not in an attribute
-    // value when `=` follows (the attribute-value rule).
-    assert!(has("x&shy=2", Kind::InvisibleEntity));
-    assert!(!has("<a href=\"https://example.invalid/?a=1&shy=2\">https://example.invalid/?a=1&amp;shy=2</a>", Kind::InvisibleEntity));
+    // The legacy `&shy`: text in Markdown; decoded in raw HTML text, but not
+    // in an attribute value before `=`.
+    assert!(!has("x&shy=2", Kind::InvisibleEntity));
+    assert!(has("<div>x&shy y</div>", Kind::InvisibleEntity));
+    assert!(!has("<div><a href=\"https://example.invalid/?a=1&shy=2\">x</a></div>", Kind::InvisibleEntity));
     // Named references that produce two characters: base + VS1.
     for src in ["&caps;", "&varsubsetneq;"] {
         let f = only(src, Kind::InvisibleEntity);
         assert_eq!(f.len(), 1, "{src}: {f:?}");
         assert!(f[0].text.contains("VARIATION SELECTOR-1"), "{}", f[0].text);
     }
-    // Visible results: no finding.
     assert!(kinds("&amp &amp; &lt;b&gt; &copy &nbsp;").is_empty());
-    // Numeric replacement rules: 0 and surrogates become U+FFFD, 0x80 is
-    // the euro sign, 0x81 stays a C1 control (invisible).
-    assert!(kinds("&#0; &#xD800; &#x80; &#128;").is_empty());
-    assert!(has("&#x81;", Kind::InvisibleEntity));
+    // Numeric values: CommonMark maps 0 and invalid ones to U+FFFD and keeps
+    // 0x80 as a C1 control (invisible); the browser maps 0x80 to the euro sign.
+    assert!(kinds("&#0; &#xD800;").is_empty());
+    assert!(has("&#128;", Kind::InvisibleEntity));
+    assert!(kinds("<div>&#128; &#0</div>").is_empty());
+    assert!(has("<div>&#x81</div>", Kind::InvisibleEntity));
     assert_eq!(charref::numeric_char(0x9F), '\u{178}');
     assert_eq!(charref::numeric_char(0x110000), '\u{FFFD}');
-    // Inside code the reference is shown literally.
-    assert!(kinds("`&#8203`").is_empty());
+    assert!(kinds("`&#8203;`").is_empty(), "code shows it literally");
+    assert!(kinds("\\&#8203;").is_empty(), "a Markdown escape");
+}
+
+#[test]
+fn exemptions_see_the_characters_the_renderer_shows() {
+    // `&copy` without `;` stays literal in Markdown: VS16 follows `y`.
+    assert!(has("&copy&#xFE0F;", Kind::InvisibleEntity));
+    // In raw HTML the browser decodes `&copy`: © + VS16 is a sequence. (An
+    // HTML block; `<span>` at a line start would be inline HTML inside
+    // Markdown text, where `&copy` stays literal.)
+    assert!(!has("<div>&copy&#xFE0F;</div>", Kind::InvisibleEntity));
+    assert!(has("<span>&copy&#xFE0F;</span>", Kind::InvisibleEntity));
+    assert!(kinds("&copy;&#xFE0F;").is_empty());
+    // A `*` may be an emphasis delimiter the page does not show: no
+    // exemption leans on it.
+    assert!(has("*\u{FE0F}hidden*", Kind::InvisibleCharacters));
+    assert!(kinds("\\*\u{FE0F}").is_empty(), "an escaped * is shown");
+    // RGI ZWJ: the sequence must be in the rendered text, not across
+    // emphasis delimiters or a reference Markdown leaves as text.
+    assert!(kinds("\u{1F469}&zwj;\u{1F4BB}").is_empty());
+    assert!(has("\u{1F469}*\u{200D}*\u{1F4BB}", Kind::InvisibleCharacters));
+    assert!(has("\u{1F469}&#x200D\u{1F4BB} x \u{1F469}\u{200D}&#x1F4BB", Kind::InvisibleCharacters));
+    assert!(kinds("<div>\u{1F469}&#x200D&#x1F4BB</div>").is_empty());
+    // Joining scripts: the same.
+    assert!(kinds("\u{645}\u{6CC}&zwnj;\u{62E}\u{648}\u{627}\u{647}\u{645}").is_empty());
+    assert!(has("\u{645}\u{6CC}*&zwnj;*\u{62E}", Kind::InvisibleEntity));
+    assert!(has("\u{645}\u{6CC}\u{200C}&#x62E\u{648}", Kind::InvisibleCharacters));
+    assert!(kinds("<div>\u{645}\u{6CC}\u{200C}&#x62E\u{648}</div>").is_empty());
 }
 
 #[test]
@@ -426,4 +461,14 @@ fn shifted_html_is_placed_in_document_order_or_reported_unknown() {
     assert!(!f.is_empty(), "{f:?}");
     assert!(f[0].text.starts_with("position unknown"), "{f:?}");
     assert_eq!((f[0].start, f[0].end), (0, src.chars().count() as u32));
+}
+
+#[test]
+fn a_reported_position_inside_a_definition_is_never_used() {
+    let src = "[a]: <iframe>\nxxxxx<iframe>\n";
+    let f = only(src, Kind::HtmlTag);
+    assert!(!f.is_empty(), "{f:?}");
+    for x in &f {
+        assert!(x.line == 2 || x.text.starts_with("position unknown"), "never on the definition: {f:?}");
+    }
 }
