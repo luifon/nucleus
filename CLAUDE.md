@@ -581,7 +581,9 @@ JSON-parsed numbers.
   identity and a code-owned message. The import reads a private snapshot
   built by Nucleus's own no-follow, descriptor-relative walk (no git command
   reads the clone; ignore rules come from bounded private copies of each
-  `.gitignore`, decided by `git check-ignore --no-index`) under enforced
+  `.gitignore`, decided by `git check-ignore --no-index` with the letter-case rule of
+  the clone's file system; every directory entry counts against
+  `[intake] import_max_entries` as it is read) under enforced
   byte and file-count limits (`[intake] import_max_*`), refuses hard links and
   special files, keeps base submodules and `.gitmodules` unchanged, and
   installs new objects as one pack. Before pushing, Nucleus reads the remote
