@@ -60,6 +60,7 @@ async fn ask_and_session_send_arrive_as_typed_prompts() {
         resume_session_id: None,
         agent_label: None,
         env: vec![],
+        state_root: None,
     })
     .await
     .expect("spawn");
@@ -149,6 +150,7 @@ async fn typing_time_64k() {
         resume_session_id: None,
         agent_label: None,
         env: vec![],
+        state_root: None,
     })
     .await
     .expect("spawn");

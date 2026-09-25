@@ -79,6 +79,7 @@ fn base_spawn(ctx: &ProfileContext) -> SpawnOptions {
         resume_session_id: None,
         agent_label: Some(ctx.agent_label.to_string()),
         env: vec![],
+        state_root: None,
     }
 }
 
@@ -176,6 +177,14 @@ impl SessionProfile {
         self
     }
 
+    /// Keep Nucleus's own files for this session (run-log, daily-session
+    /// record) under `root` instead of the working directory. For sessions
+    /// that run in another repository (ADR-036 worktrees).
+    pub fn state_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.spawn.state_root = Some(root.into());
+        self
+    }
+
     /// Add tool patterns on top of the Settings denylist (never replaces it).
     pub fn extend_disallowed_tools(mut self, extra: Vec<String>) -> Self {
         self.spawn.disallowed_tools.extend(extra);
@@ -202,7 +211,7 @@ impl SessionProfile {
                 .with_context(|| format!("spawning session ({label})"))?;
             return Ok((session, self.ask));
         };
-        let root = self.spawn.workspace_root.clone();
+        let root = self.spawn.state_root.clone().unwrap_or_else(|| self.spawn.workspace_root.clone());
         let date = crate::chore_state::today_local();
         let recorded = crate::chore_state::daily_session(&root, &key, &date)
             .await

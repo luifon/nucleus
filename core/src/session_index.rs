@@ -67,7 +67,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
 /// The Claude Code transcript dir for this workspace
 /// (`$HOME/.claude/projects/<encoded-cwd>/`).
 pub fn transcripts_dir(workspace_root: &Path) -> PathBuf {
-    let encoded = workspace_root.to_string_lossy().replace('/', "-");
+    let encoded = crate::claude_session::project_dir_name(workspace_root);
     let home = std::env::var("HOME").unwrap_or_default();
     PathBuf::from(home).join(".claude").join("projects").join(encoded)
 }
