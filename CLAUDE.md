@@ -557,10 +557,24 @@ JSON-parsed numbers.
   issue only after the operator approved the text.
 - Issue text and comments go into briefs only between the nonce data
   markers of `briefs::Fence`; only collaborator comments are included.
-- Plan and comment approvals are decided by code from the operator's own
+- Before the clone and before every agent task (eval, each refinement turn,
+  implementation), `core/src/intake/hidden.rs` scans the bound issue title,
+  body and used collaborator comments for content GitHub's page does not
+  show (HTML comments, invisible or format characters and their entities,
+  `<details>`, raw HTML outside the bare allowlist, link and footnote
+  definitions, alt text, link titles, dropped table cells, hiding math,
+  diagram fences; code is exempt except for invisible characters). A finding
+  moves the item to `held` (`[intake] hidden_content_hold`, default true);
+  no agent runs until the operator releases it (`nucleus intake release <n>`
+  from the terminal, the dashboard, or `#<n> release` typed by the operator)
+  or cancels it. A release is bound to the fingerprint of what was shown: a
+  changed issue or used comment refuses it and makes the item stale. The
+  hidden content is never stripped; released briefs carry
+  `briefs::RELEASED_NOTE` outside the fence.
+- Plan and comment approvals and releases of held items are decided by code from the operator's own
   message (`#n approve`, `#n approve comment`), the operator's terminal, or
   the dashboard. A chat session may list, show and cancel items; it never
-  approves.
+  approves or releases.
 - Thread messages reach WhatsApp only through `outbound_queue` (target
   policy, secret filter). Intake groups are created and left only by the
   bot (`messaging/whatsapp/src/intake.ts`), within `[intake.whatsapp]
