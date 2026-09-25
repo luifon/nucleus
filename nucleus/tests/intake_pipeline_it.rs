@@ -256,7 +256,7 @@ async fn issue_to_draft_pr_with_real_agents() {
 
     let log = std::fs::read_to_string(&env.gh_log).unwrap();
     let create = log.lines().find(|l| l.starts_with("pr create")).expect("a PR was created");
-    assert!(create.contains("--draft") && create.contains("--head nucleus/item-1-"), "{create}");
+    assert!(create.contains("--draft") && create.contains("--head nucleus/item-1 "), "{create}");
     assert!(!log.contains("pr merge") && !log.contains("pr ready"), "never merged, never marked ready");
     assert!(!log.contains("issue comment"), "no comment before the operator approves it");
 
