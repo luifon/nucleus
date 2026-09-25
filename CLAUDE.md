@@ -560,17 +560,19 @@ JSON-parsed numbers.
 - Before the clone and before every agent task (eval, each refinement turn,
   implementation), `core/src/intake/hidden.rs` scans the bound issue title,
   body and used collaborator comments for content GitHub's page does not
-  show (HTML comments, invisible or format characters and their entities,
-  `<details>`, raw HTML outside the bare allowlist, link and footnote
-  definitions, alt text, link titles, dropped table cells, hiding math,
-  diagram fences; code is exempt except for invisible characters). A finding
-  moves the item to `held` (`[intake] hidden_content_hold`, default true);
-  no agent runs until the operator releases it (`nucleus intake release <n>`
-  from the terminal, the dashboard, or `#<n> release` typed by the operator)
-  or cancels it. A release is bound to the fingerprint of what was shown: a
-  changed issue or used comment refuses it and makes the item stale. The
-  hidden content is never stripped; released briefs carry
-  `briefs::RELEASED_NOTE` outside the fence.
+  show. Markdown structure comes from comrak's GFM syntax tree (code,
+  fences, tables, links, images, math, in any container), never from
+  hand-written rules; invisible characters are scanned on the raw text,
+  code included. A finding moves the item to `held` (`[intake]
+  hidden_content_hold`, default true) with the complete findings and raw
+  sources stored; no agent runs until the operator releases it or cancels
+  it. Every release names the hold the operator reviewed (`nucleus intake
+  release <n> --hold <code>` from the terminal, the dashboard's rendered
+  fingerprint, or `#<n> release <code>` typed by the operator); a release
+  of an earlier hold is refused, checked again in the transaction that
+  changes the stage, and a changed issue or used comment refuses it and
+  makes the item stale. The hidden content is never stripped; released
+  briefs carry `briefs::RELEASED_NOTE` outside the fence.
 - Plan and comment approvals and releases of held items are decided by code from the operator's own
   message (`#n approve`, `#n approve comment`), the operator's terminal, or
   the dashboard. A chat session may list, show and cancel items; it never
