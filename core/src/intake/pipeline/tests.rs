@@ -27,9 +27,8 @@ struct Fixture {
     remote: PathBuf,
 }
 
-/// A workspace with intake enabled for `acme/widget`, whose base clone
-/// already exists (the fake gh cannot clone) and fetches from a local bare
-/// remote.
+/// A workspace with intake enabled for `acme/widget`, whose remote URL is a
+/// local bare repository.
 async fn fixture() -> Fixture {
     let ws_dir = tempfile::tempdir().unwrap();
     let work_dir = tempfile::tempdir().unwrap();
@@ -42,11 +41,8 @@ async fn fixture() -> Fixture {
         "git config user.email t@example.invalid && git config user.name T && echo 'helo' > README.md \
          && git add . && git commit -qm init && git push -q origin HEAD:main",
     );
-    let base = git::repo_dir(&work, "acme/widget").join("base");
-    std::fs::create_dir_all(base.parent().unwrap()).unwrap();
-    sh(&work, &format!("git clone -q remote.git {}", base.display()));
-    sh(&base, "git config user.email t@example.invalid && git config user.name T");
     let mut cfg = IntakeConfig { enabled: true, work_dir: work.to_string_lossy().into_owned(), ..Default::default() };
+    cfg.github.remote_url = work.join("remote.git").to_string_lossy().into_owned();
     cfg.repos.push(IntakeRepo {
         repo: "acme/widget".into(),
         default_branch: None,
@@ -350,8 +346,10 @@ async fn failures_are_retried_three_times_then_the_item_fails_and_can_be_resumed
     let f = fixture().await;
     record_event(&f.ctx, &issue(1, &["nucleus"], "open")).await.unwrap();
     // Break the remote: every fetch fails.
-    let base = git::repo_dir(&f.ctx.cfg.work_dir_path(), "acme/widget").join("base");
-    sh(&base, "git remote set-url origin /nonexistent/remote.git");
+    let good = f.ctx.cfg.clone();
+    let mut bad = good.clone();
+    bad.github.remote_url = "/nonexistent/remote.git".into();
+    let f = Fixture { ctx: Ctx { cfg: bad, ..f.ctx }, ..f };
     for attempt in 1..=2 {
         let r = super::tick(&f.ctx, false).await.unwrap();
         assert_eq!(r.errors.len(), 1);
@@ -361,7 +359,7 @@ async fn failures_are_retried_three_times_then_the_item_fails_and_can_be_resumed
     super::tick(&f.ctx, false).await.unwrap();
     let it = item1(&f).await;
     assert_eq!((it.stage(), it.failed_stage.as_deref()), (Stage::Failed, Some("queued")));
-    sh(&base, &format!("git remote set-url origin {}", f.remote.display()));
+    let f = Fixture { ctx: Ctx { cfg: good, ..f.ctx }, ..f };
     retry(&f.ctx, 1, "cli").await.unwrap();
     tick(&f).await;
     assert_eq!(item1(&f).await.stage(), Stage::Eval);

@@ -1,6 +1,6 @@
 //! GitHub through the `gh` CLI (ADR-036): the issue source adapter, the
-//! collaborator check, and the repository operations Nucleus code performs
-//! (clone, draft pull request, issue comment).
+//! collaborator check, and the GitHub operations Nucleus code performs
+//! (draft pull request, issue comment). Git fetch and push are in `git.rs`.
 //!
 //! Polling, not webhooks: Nucleus has no public ingress, and `gh` carries
 //! the operator's authentication. Every call goes through [`GhRunner`], so
@@ -309,16 +309,6 @@ fn tempfile_with(text: &str) -> Result<tempfile_lite::NamedFile> {
 /// The last `https://` token of `gh` output (the created object's URL).
 pub fn last_url(stdout: &str) -> Option<String> {
     stdout.split_whitespace().rev().find(|t| t.starts_with("https://")).map(str::to_string)
-}
-
-/// Clone `repo` into `dest` with `gh repo clone` (the operator's
-/// authentication, private repos included).
-pub async fn clone_repo(gh: &dyn GhRunner, repo: &str, dest: &Path) -> Result<()> {
-    let out = gh.run(&args(&["repo", "clone", repo, &dest.to_string_lossy()]), None).await?;
-    if !out.ok {
-        bail!("gh repo clone {repo} failed: {}", out.stderr.trim());
-    }
-    Ok(())
 }
 
 /// The open or closed pull request whose head is `branch`, if any.

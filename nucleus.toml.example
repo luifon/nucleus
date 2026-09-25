@@ -214,8 +214,8 @@ max_runtime_hours = 12
 # access can set labels). `nucleus intake tick` runs every minute from launchd
 # (tools/launchd/intake-tick.plist.example) and polls each repo every
 # poll_interval_secs with `gh` (the operator's gh login; no public ingress).
-# work_dir holds one clone per repo and one git worktree per item; it must be
-# outside this checkout. The repos name your projects: list them here, in the
+# work_dir holds one Nucleus-only mirror per repo and one clone per item; it
+# must be outside this checkout. The repos name your projects: list them here, in the
 # untracked nucleus.toml, never in a committed file.
 # [intake]
 # enabled = true
@@ -234,6 +234,9 @@ max_runtime_hours = 12
 # gh_bin = "/opt/homebrew/bin/gh"   # launchd has no shell PATH (Rule 5)
 # poll_interval_secs = 300
 # collaborator_cache_secs = 3600
+# # Nucleus fetches from and pushes to this URL only ({repo} = owner/name),
+# # with gh as the credential helper; it never reads a URL from a clone.
+# remote_url = "https://github.com/{repo}.git"
 #
 # Items that need a plan get a WhatsApp group with the bot and the operator.
 # Creating groups automatically from a personal account can trigger WhatsApp's

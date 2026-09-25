@@ -762,21 +762,28 @@ fn worktree(item: &Item) -> Result<PathBuf> {
     item.worktree.as_deref().map(PathBuf::from).context("the item has no worktree")
 }
 
-/// Clone or fetch the repo and check the item's worktree out at the newest
+/// The configured remote of the item's repo (never read from a clone).
+fn remote_for(ctx: &Ctx, repo: &str) -> Result<git::Remote> {
+    git::Remote::for_repo(&ctx.cfg.github.remote_url, repo, &ctx.cfg.github.gh_bin)
+        .map_err(|e| anyhow::Error::new(Fatal(format!("{e:#}"))))
+}
+
+/// Fetch the repo into the mirror and create the item's clone at the newest
 /// default branch; move to `eval`.
 async fn step_queued(ctx: &Ctx, item: &Item) -> Result<()> {
     let repo = repo_cfg(ctx, item)?;
     let wd = work_dir(ctx)?;
-    let base = git::ensure_base(&*ctx.gh, &wd, &item.repo).await?;
-    let base_ref = git::default_branch(&base, repo.default_branch.as_deref()).await?;
+    let remote = remote_for(ctx, &item.repo)?;
+    let mirror = git::sync_mirror(&wd, &item.repo, &remote).await?;
+    let base_ref = git::default_branch(&mirror, &remote, repo.default_branch.as_deref()).await?;
     let wt = git::worktree_path(&wd, &item.repo, item.id);
-    git::prepare_worktree(&base, &wt, &base_ref).await?;
+    git::prepare_clone(&mirror, &wt, &base_ref, item.id, None).await?;
     store::advance(
         &ctx.db,
         item.id,
         Stage::Queued,
         StageEvent::EvalStarted,
-        "worktree ready; eval starts",
+        "clone ready; eval starts",
         vec![
             ("worktree", wt.to_string_lossy().into_owned().into()),
             ("base_ref", base_ref.into()),
@@ -941,16 +948,17 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
         TaskState::None => {
             let base_ref = item.base_ref.clone().context("the item has no base branch")?;
             let branch = match &item.branch {
-                Some(b) if wt.join(".git").exists() => b.clone(),
+                Some(b) if wt.join(".git").is_dir() => b.clone(),
                 existing => {
-                    // First entry (or a lost worktree): start from the newest
+                    // First entry (or a lost clone): start from the newest
                     // default branch, so a plan discussed for days is built on
-                    // current code.
+                    // current code. A lost clone of a retried item comes back
+                    // with the work the mirror collected before.
                     let wd = work_dir(ctx)?;
-                    let base = git::ensure_base(&*ctx.gh, &wd, &item.repo).await?;
-                    git::prepare_worktree(&base, &wt, &base_ref).await?;
+                    let remote = remote_for(ctx, &item.repo)?;
+                    let mirror = git::sync_mirror(&wd, &item.repo, &remote).await?;
                     let b = existing.clone().unwrap_or_else(|| stage::branch_name(item.id, &item.title));
-                    git::switch_branch(&wt, &b).await?;
+                    git::prepare_clone(&mirror, &wt, &base_ref, item.id, Some(&b)).await?;
                     store::update(&ctx.db, item.id, Stage::Implementation, vec![("branch", b.clone().into())]).await?;
                     b
                 }
@@ -966,12 +974,18 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
         TaskState::Ended { why, .. } => fail(ctx, item, &why).await,
         TaskState::Done { id, result } => {
             let base_ref = item.base_ref.clone().context("the item has no base branch")?;
-            git::commit_leftovers(
+            let remote = remote_for(ctx, &item.repo)?;
+            let mirror = git::open_mirror(&work_dir(ctx)?, &item.repo, &remote).await?;
+            let sha = git::collect(
+                &mirror,
+                &remote,
                 &wt,
+                &base_ref,
+                item.id,
                 &format!("Commit changes the implementation agent left uncommitted (Nucleus item #{})", item.id),
             )
             .await?;
-            if git::commits_ahead(&wt, &base_ref).await? == 0 {
+            if git::commits_ahead(&mirror, &base_ref, &sha).await? == 0 {
                 return fail(ctx, item, "the implementation agent made no commits").await;
             }
             let tests = git::run_tests(
@@ -988,6 +1002,7 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
                 &format!("implementation done; tests {}", tests.status),
                 vec![
                     ("impl_summary", result.into()),
+                    ("head_sha", sha.into()),
                     ("tests_status", tests.status.into()),
                     ("tests_output", tests.output.into()),
                     ("current_task_id", Val::Text(None)),
@@ -1035,11 +1050,13 @@ fn pr_body(ctx: &Ctx, item: &Item, ev: &Event, repo: &IntakeRepo) -> String {
 
 async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     let repo = repo_cfg(ctx, item)?;
-    let wt = worktree(item)?;
     let branch = item.branch.clone().context("the item has no branch")?;
     let base_ref = item.base_ref.clone().context("the item has no base branch")?;
     let ev = store::event(&ctx.db, item.event_id).await?;
-    git::push(&wt, &branch).await?;
+    let sha = item.head_sha.clone().context("the item has no collected commit")?;
+    let remote = remote_for(ctx, &item.repo)?;
+    let mirror = git::open_mirror(&work_dir(ctx)?, &item.repo, &remote).await?;
+    git::push(&mirror, &remote, &sha, &branch, item.id).await?;
     let url = match github::find_pr(&*ctx.gh, &item.repo, &branch).await? {
         Some(u) => u,
         None => {
@@ -1229,8 +1246,7 @@ async fn cleanup(ctx: &Ctx, item: &Item) -> Result<()> {
         store::update(&ctx.db, item.id, item.stage(), vec![("group_closed_at", crate::timestamp::now().into())]).await?;
     }
     if let Some(wt) = item.worktree.as_deref().map(PathBuf::from) {
-        let base = git::repo_dir(&ctx.cfg.work_dir_path(), &item.repo).join("base");
-        git::remove_worktree(&base, &wt).await?;
+        git::remove_clone(&wt)?;
         store::update(&ctx.db, item.id, item.stage(), vec![("worktree", Val::Text(None))]).await?;
     }
     Ok(())

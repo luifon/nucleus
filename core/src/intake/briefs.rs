@@ -362,6 +362,7 @@ mod tests {
             worktree: None,
             base_ref: None,
             impl_summary: None,
+            head_sha: None,
             tests_status: None,
             tests_output: None,
             pr_url: None,

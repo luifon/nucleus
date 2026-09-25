@@ -690,6 +690,10 @@ pub struct IntakeGithubConfig {
     /// Upper bound on pages (100 issues each) read in one poll.
     #[serde(default = "default_intake_max_pages")]
     pub max_pages: u32,
+    /// The URL Nucleus fetches from and pushes to; `{repo}` is replaced by
+    /// `owner/name`. Nucleus never reads a remote URL from a clone.
+    #[serde(default = "default_intake_remote_url")]
+    pub remote_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -805,6 +809,9 @@ fn default_intake_collaborator_cache_secs() -> u64 {
 fn default_intake_max_pages() -> u32 {
     10
 }
+fn default_intake_remote_url() -> String {
+    "https://github.com/{repo}.git".into()
+}
 fn default_intake_max_groups_per_day() -> u32 {
     3
 }
@@ -835,6 +842,7 @@ impl Default for IntakeGithubConfig {
             poll_interval_secs: default_intake_poll_interval_secs(),
             collaborator_cache_secs: default_intake_collaborator_cache_secs(),
             max_pages: default_intake_max_pages(),
+            remote_url: default_intake_remote_url(),
         }
     }
 }

@@ -113,16 +113,18 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 )";
 
+/// v2: the commit Nucleus collected from the item's clone and pushes.
+const SCHEMA_V2: &str = "ALTER TABLE items ADD COLUMN head_sha TEXT";
+
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(super::INTAKE_DB_PATH)).await?;
     crate::migrate::migrate(
         &pool,
-        &[crate::migrate::Migration {
-            version: 1,
-            name: "intake baseline",
-            step: crate::migrate::Step::Sql(SCHEMA_V1),
-        }],
+        &[
+            crate::migrate::Migration { version: 1, name: "intake baseline", step: crate::migrate::Step::Sql(SCHEMA_V1) },
+            crate::migrate::Migration { version: 2, name: "collected commit", step: crate::migrate::Step::Sql(SCHEMA_V2) },
+        ],
     )
     .await
     .context("migrating intake.db")?;
@@ -341,6 +343,9 @@ pub struct Item {
     pub base_ref: Option<String>,
     /// The implementation agent's final message.
     pub impl_summary: Option<String>,
+    /// The commit Nucleus collected from the item's clone (the agent's
+    /// commits plus its uncommitted changes); exactly this commit is pushed.
+    pub head_sha: Option<String>,
     /// `passed`, `failed`, `timeout` or `not_run` (Nucleus's own run).
     pub tests_status: Option<String>,
     pub tests_output: Option<String>,
@@ -428,7 +433,7 @@ pub struct ItemTask {
 
 const ITEM_COLUMNS: &str = "id, event_id, repo, title, stage, failed_stage, error, classification, eval_json, \
     plan_draft, plan_version, approved_plan, approved_version, approved_at, approved_via, branch, worktree, \
-    base_ref, impl_summary, tests_status, tests_output, pr_url, comment_draft, comment_state, comment_url, \
+    base_ref, impl_summary, head_sha, tests_status, tests_output, pr_url, comment_draft, comment_state, comment_url, \
     surface, group_requested_at, group_jid, group_closed_at, current_task_id, last_task_id, step_errors, \
     created_at, updated_at, closed_at";
 
@@ -532,6 +537,7 @@ const SETTABLE: &[&str] = &[
     "worktree",
     "base_ref",
     "impl_summary",
+    "head_sha",
     "tests_status",
     "tests_output",
     "pr_url",
