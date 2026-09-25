@@ -590,6 +590,16 @@ async function main() {
         if (!sock) throw new Error("no live connection");
         await withTimeout(sock.groupLeave(jid), 30_000);
       },
+      listParticipating: async () => {
+        const sock = liveSock;
+        if (!sock) throw new Error("no live connection");
+        const all = await withTimeout(sock.groupFetchAllParticipating(), 60_000);
+        return Object.values(all).map((g: any) => ({
+          jid: g.id as string,
+          subject: String(g.subject ?? ""),
+          members: (g.participants ?? []).map((p: { id: string }) => p.id),
+        }));
+      },
       isMember: async (jid) => {
         const sock = liveSock;
         if (!sock) return null;

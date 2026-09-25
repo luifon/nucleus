@@ -10,7 +10,9 @@ import path from "node:path";
 import { ChatSessionStore, OutboundQueueStore } from "./db.js";
 import { parseToml } from "./config.js";
 import {
+  classifyCreateError,
   closeBackoffMs,
+  requestToken,
   GroupExecutor,
   groupBudgetAllows,
   intakeConfig,
@@ -77,18 +79,24 @@ function deps(store: IntakeStore, api: GroupApi, over: Partial<GroupExecutorDeps
 
 function fakeApi() {
   const calls: string[] = [];
+  const groups: Array<{ jid: string; subject: string; members: string[] }> = [];
   let n = 0;
   const api: GroupApi = {
     create: async (subject, participants) => {
       calls.push(`create ${subject} ${participants.join(",")}`);
       n += 1;
-      return { jid: `12036300000000000${n}@g.us`, members: [...participants, `${BOT}@s.whatsapp.net`] };
+      const g = { jid: `12036300000000000${n}@g.us`, subject, members: [...participants, `${BOT}@s.whatsapp.net`] };
+      groups.push(g);
+      return { jid: g.jid, members: g.members };
     },
     leave: async (jid) => {
       calls.push(`leave ${jid}`);
+      const i = groups.findIndex((g) => g.jid === jid);
+      if (i >= 0) groups.splice(i, 1);
     },
+    listParticipating: async () => [...groups],
   };
-  return { api, calls };
+  return { api, calls, groups };
 }
 
 test("the group budget counts creations in the last 24 hours", () => {
@@ -141,7 +149,7 @@ test("the executor creates a group with the operator only, within the budget", a
   request(db, "1", "create", "#1 Fix the typo");
   request(db, "2", "create", "#2 Another");
   await ex.tick();
-  assert.deepEqual(calls, [`create #1 Fix the typo ${OP}@s.whatsapp.net`]);
+  assert.deepEqual(calls, [`create #1 Fix the typo ~r1 ${OP}@s.whatsapp.net`], "the subject ends with the request token");
   assert.equal(store.group("1")?.status, "active");
   assert.equal(active.length, 1);
   assert.equal(store.itemForGroup(active[0]), "1");
@@ -161,9 +169,11 @@ test("a failed creation falls back to the DM and is not retried", async () => {
   const store = new IntakeStore(db);
   const api: GroupApi = {
     create: async () => {
-      throw new Error("rate-overlimit");
+      // A refusal from WhatsApp (a 4xx answer): nothing was created.
+      throw Object.assign(new Error("rate-overlimit"), { output: { statusCode: 429 } });
     },
     leave: async () => {},
+    listParticipating: async () => [],
   };
   const ex = new GroupExecutor(deps(store, api).d);
   request(db, "4", "create", "#4 x");
@@ -215,15 +225,81 @@ test("a request is claimed once, and a creation whose outcome is unknown is neve
   assert.equal(store.claim(req.id, "creating"), true);
   assert.equal(store.claim(req.id, "creating"), false, "a second pass does not claim it");
   // The bot stopped mid-creation: after the stuck-claim limit the request is
-  // recorded as unknown and the operator told; create is not called again.
+  // recorded as unknown with its token; create is not called again.
   const { api, calls } = fakeApi();
-  const t0 = Date.now();
-  const { d, alerts } = deps(store, api, { nowMs: () => t0 + 11 * 60 * 1000 });
-  await new GroupExecutor(d).tick();
+  let now = Date.now() + 11 * 60 * 1000;
+  const { d } = deps(store, api, { nowMs: () => now });
+  const ex = new GroupExecutor(d);
+  await ex.tick();
   assert.equal(calls.length, 0);
   assert.equal(store.group("1")?.status, "unknown");
-  assert.match(alerts[0], /may exist/);
+  assert.equal(store.group("1")?.token, requestToken(req.id));
   assert.equal(store.createdTimes().length, 1, "an unknown outcome counts against the daily limit");
+  // The participating groups do not contain it: confirmed absent.
+  now += 3 * 60 * 1000;
+  await ex.tick();
+  assert.equal(store.group("1")?.status, "absent");
+  assert.equal(calls.length, 0);
+});
+
+test("a creation that timed out but happened is found by its token and left", async () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  const base = fakeApi();
+  const api: GroupApi = {
+    ...base.api,
+    create: async (subject, participants) => {
+      await base.api.create(subject, participants);
+      throw new Error("timed out after 30000 ms");
+    },
+  };
+  let now = Date.parse("2026-09-24T12:00:00Z");
+  const closed: string[] = [];
+  const ex = new GroupExecutor(deps(store, api, { nowMs: () => now, onClosed: (j) => closed.push(j) }).d);
+  request(db, "7", "create", "#7 g", new Date(now).toISOString());
+  await ex.tick();
+  assert.equal(store.group("7")?.status, "unknown", "a timeout is not a rejection");
+  assert.equal(store.group("7")?.jid, null);
+  // The item was closed meanwhile.
+  request(db, "7", "close", null, new Date(now).toISOString());
+  await ex.tick();
+  assert.equal(store.group("7")?.status, "unknown", "an unknown group is never treated as closed");
+  now += 3 * 60 * 1000;
+  new DatabaseSync(db).prepare(`UPDATE intake_group_requests SET status = 'pending' WHERE action = 'close'`).run();
+  await ex.tick();
+  assert.equal(store.group("7")?.status, "closed", "found by its token, then left");
+  assert.equal(closed.length, 1);
+  assert.equal(base.groups.length, 0);
+});
+
+test("an unknown creation that cannot be resolved stays unknown and is reported", async () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  const base = fakeApi();
+  const api: GroupApi = {
+    ...base.api,
+    create: async () => {
+      throw Object.assign(new Error("connection closed"), { output: { statusCode: 428 } });
+    },
+    listParticipating: async () => {
+      throw new Error("timed out");
+    },
+  };
+  let now = Date.parse("2026-09-24T12:00:00Z");
+  const { d, alerts } = deps(store, api, { nowMs: () => now });
+  const ex = new GroupExecutor(d);
+  request(db, "8", "create", "#8 h", new Date(now).toISOString());
+  await ex.tick();
+  for (let i = 0; i < 40; i++) {
+    now += 3 * 60 * 1000;
+    await ex.tick();
+  }
+  assert.equal(store.group("8")?.status, "unknown");
+  assert.ok(alerts.some((a) => /still not known/.test(a)), "reported after the limit");
+  assert.equal(classifyCreateError(new Error("no live connection")), "rejected");
+  assert.equal(classifyCreateError(Object.assign(new Error("x"), { output: { statusCode: 403 } })), "rejected");
+  assert.equal(classifyCreateError(Object.assign(new Error("x"), { output: { statusCode: 408 } })), "unknown");
+  assert.equal(classifyCreateError(new Error("anything else")), "unknown");
 });
 
 test("an item closed before or during group creation ends without a group", async () => {
@@ -244,6 +320,7 @@ test("an item closed before or during group creation ends without a group", asyn
       return api.create(subject, participants);
     },
     leave: api.leave,
+    listParticipating: api.listParticipating,
   };
   request(db, "3", "create", "#3 c");
   const closed: string[] = [];
@@ -259,6 +336,7 @@ test("a new group with an unexpected member starts disabled and alerts the opera
   const api: GroupApi = {
     create: async () => ({ jid: GROUP, members: [`${OP}@s.whatsapp.net`, `${BOT}@s.whatsapp.net`, `${STRANGER}@s.whatsapp.net`] }),
     leave: async () => {},
+    listParticipating: async () => [],
   };
   const { d, alerts, seeded } = deps(store, api);
   request(db, "4", "create", "#4 d");
@@ -279,6 +357,7 @@ test("leaving is retried with backoff and closed_at is set only when the bot lef
       if (fail) throw new Error("timed out");
     },
     isMember: async () => member,
+    listParticipating: async () => [],
   };
   let now = Date.parse("2026-09-24T12:00:00Z");
   const { d, alerts } = deps(store, api, { nowMs: () => now });

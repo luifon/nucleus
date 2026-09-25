@@ -1606,11 +1606,14 @@ async fn sync_surface(ctx: &Ctx, item: &Item) -> Result<()> {
 /// bot's own table shows the group closed, or shows that none was created.
 async fn settle_group(ctx: &Ctx, item: &Item) -> Result<()> {
     let key = item.id.to_string();
-    let confirmed = match crate::whatsapp_queue::intake_group(&ctx.wa, &key).await? {
-        Some(g) if g.status == "active" => false,
-        Some(_) => true, // closed, fallback (never created), unknown (the operator was told)
-        None => false,   // the create request is still pending: wait for it
-    };
+    // Confirmed gone: the bot left it (`closed`), WhatsApp refused to create
+    // it (`fallback`), or the participating-groups list showed it never
+    // existed (`absent`). `active`, `unknown` (the creation may have
+    // happened) and no row (the create request is still pending) are not.
+    let confirmed = matches!(
+        crate::whatsapp_queue::intake_group(&ctx.wa, &key).await?,
+        Some(g) if matches!(g.status.as_str(), "closed" | "fallback" | "absent")
+    );
     if confirmed {
         store::update(&ctx.db, item.id, item.stage(), vec![("group_closed_at", crate::timestamp::now().into())]).await?;
     } else {

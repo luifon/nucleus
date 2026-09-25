@@ -22,11 +22,17 @@
 //
 // Request handling: a request is claimed with a conditional update
 // (`pending` → `creating` / `closing`) before any WhatsApp call, so two
-// passes never act on one request. A creation whose outcome is unknown (the
-// bot stopped mid-call) is never retried: it is recorded as `unknown` and the
-// operator is told. Leaving is retried with backoff until the bot confirms it
-// left; `closed_at` is set only then. A group created for an item that was
-// closed meanwhile is left at once.
+// passes never act on one request. Every creation puts a code-owned token
+// (` ~r<request id>`) at the end of the group subject. A creation that
+// WhatsApp refused is `fallback`; one whose outcome is not known (a timeout,
+// a lost connection, the bot stopped mid-call) is `unknown`: it is never
+// repeated and never treated as closed. The bot looks for it in the groups
+// it participates in: found by its token, it is recorded with its JID (and
+// left once its item no longer uses it); missing from the list, it is
+// `absent`. One still unknown after an hour is reported to the operator.
+// Leaving is retried with backoff until the bot confirms it left;
+// `closed_at` is set only then. A group created for an item that was closed
+// meanwhile is left at once.
 //
 // Group creation is rate-limited twice: the pipeline requests at most
 // `[intake.whatsapp] max_groups_per_day` groups in 24 hours, and the bot
@@ -51,10 +57,47 @@ export interface GroupRequest {
 export interface IntakeGroupRow {
   itemKey: string;
   jid: string | null;
-  /** `unknown`: a creation whose outcome is not known (the group may exist). */
-  status: "active" | "fallback" | "closed" | "unknown";
+  /** `unknown`: a creation whose outcome is not known (the group may exist);
+   *  `absent`: an unknown creation the participating-groups list showed
+   *  never happened. */
+  status: "active" | "fallback" | "closed" | "unknown" | "absent";
   reason: string | null;
   createdAt: string;
+  /** The request token in the group's subject (finds an unknown creation). */
+  token: string | null;
+  /** When an unknown creation was last looked for. */
+  checkedAt: string | null;
+}
+
+/** The code-owned token a creation puts at the end of the group subject,
+ *  derived from the request id, so a creation with an unknown outcome can
+ *  be found in the list of groups the bot participates in. */
+export function requestToken(requestId: number): string {
+  return ` ~r${requestId}`;
+}
+
+/** A group subject that ends with the request token, at most 100
+ *  characters. */
+export function subjectWithToken(subject: string, requestId: number): string {
+  const token = requestToken(requestId);
+  return `${subject.slice(0, 100 - token.length)}${token}`;
+}
+
+/** Whether a failed group creation definitely created nothing (`rejected`)
+ *  or may have created a group (`unknown`): a timeout, a closed or lost
+ *  connection, a server error, or anything not recognized. A refusal from
+ *  WhatsApp (a 4xx answer other than 408) and a call that was never sent
+ *  (no live connection) are definite. */
+export function classifyCreateError(e: unknown): "rejected" | "unknown" {
+  const err = e as { name?: string; message?: string; output?: { statusCode?: number } } | null;
+  const status = err?.output?.statusCode;
+  if (typeof status === "number") {
+    if (status >= 400 && status < 500 && status !== 408 && status !== 428 && status !== 440) return "rejected";
+    return "unknown";
+  }
+  const msg = String(err?.message ?? "");
+  if (/no live connection/i.test(msg)) return "rejected";
+  return "unknown";
 }
 
 /** How an operator message was written. Only `text` can be a command. */
@@ -111,6 +154,13 @@ export const MAX_CLOSE_ATTEMPTS = 8;
 /** A claim (`creating` / `closing`) older than this was left by a stopped
  *  bot. */
 const STUCK_CLAIM_MS = 10 * 60 * 1000;
+/** An unknown creation is first looked for this long after it became
+ *  unknown (a creation still in flight shows up late), then at most this
+ *  often. */
+const UNKNOWN_CHECK_MS = 2 * 60 * 1000;
+/** An unknown creation not resolved after this long is reported to the
+ *  operator (it is never treated as closed). */
+export const UNKNOWN_ALERT_MS = 60 * 60 * 1000;
 
 export interface IntakeWhatsAppConfig {
   refinementGroups: boolean;
@@ -194,7 +244,9 @@ export class IntakeStore {
         reason     TEXT,
         created_at TEXT NOT NULL,
         closed_at  TEXT,
-        members_json TEXT
+        members_json TEXT,
+        token      TEXT,
+        checked_at TEXT
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_groups_jid
         ON intake_groups(jid) WHERE jid IS NOT NULL;
@@ -219,6 +271,8 @@ export class IntakeStore {
     this.addColumn("intake_group_requests", "next_attempt_at", "TEXT");
     this.addColumn("intake_group_requests", "claimed_at", "TEXT");
     this.addColumn("intake_groups", "members_json", "TEXT");
+    this.addColumn("intake_groups", "token", "TEXT");
+    this.addColumn("intake_groups", "checked_at", "TEXT");
     this.addColumn("intake_inbound", "input_kind", "TEXT NOT NULL DEFAULT 'unknown'");
   }
 
@@ -306,9 +360,22 @@ export class IntakeStore {
 
   group(itemKey: string): IntakeGroupRow | null {
     const r = this.db
-      .prepare(`SELECT item_key, jid, status, reason, created_at FROM intake_groups WHERE item_key = ?`)
+      .prepare(`SELECT item_key, jid, status, reason, created_at, token, checked_at FROM intake_groups WHERE item_key = ?`)
       .get(itemKey) as any;
-    return r ? { itemKey: r.item_key, jid: r.jid, status: r.status, reason: r.reason, createdAt: r.created_at } : null;
+    return r ? rowOf(r) : null;
+  }
+
+  /** Creations whose outcome is not known yet. */
+  unknownGroups(): IntakeGroupRow[] {
+    return (
+      this.db
+        .prepare(`SELECT item_key, jid, status, reason, created_at, token, checked_at FROM intake_groups WHERE status = 'unknown'`)
+        .all() as any[]
+    ).map(rowOf);
+  }
+
+  markChecked(itemKey: string, nowMs: number): void {
+    this.db.prepare(`UPDATE intake_groups SET checked_at = ? WHERE item_key = ?`).run(new Date(nowMs).toISOString(), itemKey);
   }
 
   /** The item whose active group has this JID. */
@@ -337,14 +404,23 @@ export class IntakeStore {
 
   recordGroup(
     itemKey: string,
-    row: { jid: string | null; subject: string | null; status: string; reason: string | null; members?: string[] },
+    row: {
+      jid: string | null;
+      subject: string | null;
+      status: string;
+      reason: string | null;
+      members?: string[];
+      token?: string | null;
+      createdAtMs?: number;
+    },
   ): void {
     this.db
       .prepare(
-        `INSERT INTO intake_groups (item_key, jid, subject, status, reason, created_at, members_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO intake_groups (item_key, jid, subject, status, reason, created_at, members_json, token)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(item_key) DO UPDATE SET jid = COALESCE(excluded.jid, jid), subject = COALESCE(excluded.subject, subject),
-           status = excluded.status, reason = excluded.reason, members_json = COALESCE(excluded.members_json, members_json)`,
+           status = excluded.status, reason = excluded.reason, members_json = COALESCE(excluded.members_json, members_json),
+           token = COALESCE(excluded.token, token)`,
       )
       .run(
         itemKey,
@@ -352,8 +428,9 @@ export class IntakeStore {
         row.subject,
         row.status,
         row.reason,
-        new Date().toISOString(),
+        new Date(row.createdAtMs ?? Date.now()).toISOString(),
         row.members ? JSON.stringify([...row.members].sort()) : null,
+        row.token ?? null,
       );
   }
 
@@ -403,6 +480,18 @@ export class IntakeStore {
   }
 }
 
+function rowOf(r: any): IntakeGroupRow {
+  return {
+    itemKey: r.item_key,
+    jid: r.jid,
+    status: r.status,
+    reason: r.reason,
+    createdAt: r.created_at,
+    token: r.token ?? null,
+    checkedAt: r.checked_at ?? null,
+  };
+}
+
 /** What the executor needs from the connection. */
 export interface GroupApi {
   /** Create a group with `participants`; returns its JID and members. */
@@ -411,6 +500,10 @@ export interface GroupApi {
   /** False when the bot is not a member of `jid` (it left, or was
    *  removed); null when that cannot be told. Used after a failed leave. */
   isMember?(jid: string): Promise<boolean | null>;
+  /** Every group the bot participates in (Baileys
+   *  `groupFetchAllParticipating`). Finds a creation with an unknown
+   *  outcome by its subject token. */
+  listParticipating(): Promise<Array<{ jid: string; subject: string; members: string[] }>>;
 }
 
 export interface GroupExecutorDeps {
@@ -451,6 +544,7 @@ export class GroupExecutor {
     this.busy = true;
     try {
       this.reconcileClaims();
+      await this.resolveUnknown();
       for (const req of this.d.store.pendingRequests(10, this.now())) {
         if (req.action === "create") await this.create(req);
         else await this.close(req);
@@ -468,16 +562,95 @@ export class GroupExecutor {
     for (const c of store.stuckClaims(this.now())) {
       if (c.action === "create") {
         const why = "the bot stopped while creating the group; the group may exist";
-        store.recordGroup(c.itemKey, { jid: null, subject: c.subject, status: "unknown", reason: why });
-        store.finishRequest(c.id, "failed", why);
-        this.d.alertOperator(
-          `Item #${c.itemKey}: ${why}. If a group "${c.subject ?? `#${c.itemKey}`}" exists, leave it by hand; the item's thread runs in the DM.`,
-          `intake:group-unknown:${c.id}`,
-        );
+        this.markUnknown(c.itemKey, c.id, c.subject, why);
         log.warn({ item: c.itemKey }, "whatsapp: intake group creation outcome unknown");
       } else {
         store.release(c.id);
       }
+    }
+  }
+
+  /** A creation whose outcome is not known: never repeated, never treated
+   *  as closed; looked for by its token until it is found or confirmed
+   *  absent. */
+  private markUnknown(itemKey: string, requestId: number, subject: string | null, why: string): void {
+    this.d.store.recordGroup(itemKey, {
+      jid: null,
+      subject,
+      status: "unknown",
+      reason: why,
+      token: requestToken(requestId),
+      createdAtMs: this.now(),
+    });
+    this.d.store.finishRequest(requestId, "failed", `outcome unknown: ${why}`);
+  }
+
+  /** Look for unknown creations in the groups the bot participates in: a
+   *  group whose subject ends with the token is adopted (recorded with its
+   *  JID; the pipeline then asks the bot to leave it when its item no
+   *  longer uses it); a list without it confirms the creation never
+   *  happened. A failed listing changes nothing. An unknown creation older
+   *  than UNKNOWN_ALERT_MS is reported to the operator once. */
+  private async resolveUnknown(): Promise<void> {
+    const { store, log } = this.d;
+    const now = this.now();
+    const due = store.unknownGroups().filter((g) => {
+      const since = Date.parse(g.createdAt);
+      const checked = g.checkedAt ? Date.parse(g.checkedAt) : since;
+      return now - checked >= UNKNOWN_CHECK_MS;
+    });
+    if (due.length === 0) return;
+    let groups: Array<{ jid: string; subject: string; members: string[] }>;
+    try {
+      groups = await this.d.api.listParticipating();
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "whatsapp: listing groups failed — unknown creations stay unknown");
+      groups = [];
+      for (const g of due) {
+        store.markChecked(g.itemKey, now);
+        this.alertIfOld(g, now);
+      }
+      return;
+    }
+    for (const g of due) {
+      store.markChecked(g.itemKey, now);
+      const found = g.token ? groups.find((x) => x.subject.endsWith(g.token!)) : undefined;
+      if (found) {
+        await this.adopt(g.itemKey, found.jid, found.subject, found.members, null);
+        log.info({ item: g.itemKey, jid: found.jid }, "whatsapp: unknown intake group found by its token");
+      } else if (g.token) {
+        store.recordGroup(g.itemKey, { jid: null, subject: null, status: "absent", reason: "not among the groups the bot participates in" });
+        log.info({ item: g.itemKey }, "whatsapp: unknown intake group confirmed absent");
+      } else {
+        this.alertIfOld(g, now);
+      }
+    }
+  }
+
+  private alertIfOld(g: IntakeGroupRow, now: number): void {
+    if (now - Date.parse(g.createdAt) < UNKNOWN_ALERT_MS) return;
+    this.d.alertOperator(
+      `Item #${g.itemKey}: whether its WhatsApp group was created is still not known. If a group ending in "${g.token ?? ""}" exists, leave it by hand; the item's thread runs in the DM.`,
+      `intake:group-unknown:${g.itemKey}`,
+    );
+  }
+
+  /** Record a group the bot is in as the item's active group, with its
+   *  membership baseline (a stranger disables it and alerts the operator). */
+  private async adopt(itemKey: string, jid: string, subject: string, members: string[], requestId: number | null): Promise<void> {
+    const { store } = this.d;
+    const strangers = await unexpectedMembers(members, this.d.selfIds(), this.d.isOperator);
+    const tripped = strangers.length > 0 ? `unexpected members: ${strangers.length}` : null;
+    this.d.seedMembers(jid, members, tripped);
+    store.recordGroup(itemKey, { jid, subject, status: "active", reason: tripped, members });
+    if (requestId !== null) store.finishRequest(requestId, "done", jid);
+    this.d.onActive(jid);
+    if (tripped) {
+      this.d.alertOperator(
+        `Item #${itemKey}: the new WhatsApp group has ${strangers.length} member(s) besides the bot and you. ` +
+          `Commands from that group are ignored; use the DM (#${itemKey} …) or the dashboard.`,
+        `intake:group-tripped:${jid}`,
+      );
     }
   }
 
@@ -501,31 +674,22 @@ export class GroupExecutor {
     }
     const operator = this.d.operatorJid();
     if (!operator) return fallback("no operator number (WHATSAPP_ALLOWED_DM_JIDS) to add");
-    const subject = (req.subject ?? `#${req.itemKey}`).slice(0, 100);
+    const subject = subjectWithToken(req.subject ?? `#${req.itemKey}`, req.id);
     let g: { jid: string; members: string[] };
     try {
       g = await this.d.api.create(subject, [operator]);
     } catch (e) {
-      return fallback(`creating the group failed: ${(e as Error).message}`);
+      const why = `creating the group failed: ${(e as Error).message}`;
+      if (classifyCreateError(e) === "rejected") return fallback(why);
+      // The group may exist: look for it by its token later.
+      this.markUnknown(req.itemKey, req.id, subject, why);
+      log.warn({ item: req.itemKey, reason: why }, "whatsapp: intake group creation outcome unknown");
+      return;
     }
     // The membership baseline is the create response, not the first list a
-    // message shows. A member that is neither the bot nor the operator
-    // disables the group (no command from it is read) and alerts the
-    // operator.
-    const strangers = await unexpectedMembers(g.members, this.d.selfIds(), this.d.isOperator);
-    const tripped = strangers.length > 0 ? `unexpected members at creation: ${strangers.length}` : null;
-    this.d.seedMembers(g.jid, g.members, tripped);
-    store.recordGroup(req.itemKey, { jid: g.jid, subject, status: "active", reason: tripped, members: g.members });
-    store.finishRequest(req.id, "done", g.jid);
-    this.d.onActive(g.jid);
+    // message shows.
+    await this.adopt(req.itemKey, g.jid, subject, g.members, req.id);
     log.info({ item: req.itemKey, jid: g.jid, members: g.members.length }, "whatsapp: intake group created");
-    if (tripped) {
-      this.d.alertOperator(
-        `Item #${req.itemKey}: the new WhatsApp group has ${strangers.length} member(s) besides the bot and you. ` +
-          `Commands from that group are ignored; use the DM (#${req.itemKey} …) or the dashboard.`,
-        `intake:group-tripped:${g.jid}`,
-      );
-    }
     // The item was closed while the group was being created: leave now.
     if (store.closeRequested(req.itemKey)) {
       for (const close of store.pendingRequests(50, this.now() + 366 * 24 * 60 * 60 * 1000).filter((r) => r.itemKey === req.itemKey && r.action === "close")) {

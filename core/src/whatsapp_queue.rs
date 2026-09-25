@@ -382,9 +382,10 @@ pub async fn active_intake_groups(pool: &SqlitePool) -> Result<Vec<(String, Stri
 /// The bot's record of an item's group (`intake_groups`).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct IntakeGroup {
-    /// `active`, `fallback` (not created: the thread runs in the DM),
-    /// `unknown` (the bot stopped while creating it; it may exist), `closed`
-    /// (the bot confirmed it left).
+    /// `active`, `fallback` (WhatsApp refused it: the thread runs in the
+    /// DM), `unknown` (the creation's outcome is not known; it may exist),
+    /// `absent` (an unknown creation confirmed never to have happened),
+    /// `closed` (the bot confirmed it left).
     pub status: String,
     pub jid: Option<String>,
     pub reason: Option<String>,

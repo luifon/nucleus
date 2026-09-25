@@ -1150,3 +1150,24 @@ async fn a_change_during_the_scan_stops_the_push() {
     assert_eq!(item1(&f).await.stage(), Stage::Stale);
     assert!(!remote_has(&f, "nucleus/item-1"));
 }
+
+#[tokio::test]
+async fn an_unknown_group_is_never_counted_as_closed() {
+    let f = fixture().await;
+    group_pending(&f).await;
+    sqlx::query("INSERT INTO intake_groups (item_key, status, reason, created_at) VALUES ('1', 'unknown', 'timed out', 't')")
+        .execute(&f.ctx.wa)
+        .await
+        .unwrap();
+    tick(&f).await;
+    assert_eq!(item1(&f).await.surface, "dm", "the thread moves to the DM");
+    cancel(&f.ctx, 1, "cli").await.unwrap();
+    for _ in 0..3 {
+        tick(&f).await;
+    }
+    assert!(item1(&f).await.group_closed_at.is_none(), "an unknown creation stays unresolved");
+    // The bot found it absent from the groups it participates in.
+    sqlx::query("UPDATE intake_groups SET status = 'absent' WHERE item_key = '1'").execute(&f.ctx.wa).await.unwrap();
+    tick(&f).await;
+    assert!(item1(&f).await.group_closed_at.is_some());
+}
