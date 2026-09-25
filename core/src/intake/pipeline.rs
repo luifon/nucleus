@@ -1487,7 +1487,7 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     // write conditional on an issue revision; the last read is the
     // authorization point for that one write).
     let _ = final_read!(ctx, item, "push", first);
-    git::push(&mirror, &remote, &sha, &branch, item.id, &remote_default).await?;
+    git::push(&mirror, &remote, &sha, &branch, item.id, &remote_default, item.pushed_sha.as_deref()).await?;
     store::update(&ctx.db, item.id, Stage::Pr, vec![("pushed_sha", sha.clone().into())]).await?;
     let url = match github::find_pr(&*ctx.gh, &item.repo, &branch).await? {
         Some(u) => u,

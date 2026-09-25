@@ -1218,3 +1218,20 @@ async fn the_comment_is_written_only_after_a_fresh_read_that_follows_the_lookup(
     assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
     assert_eq!(f.gh.calls_with("issue comment"), 0);
 }
+
+#[tokio::test]
+async fn an_existing_branch_is_never_overwritten_by_the_first_push() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    sh(&f.remote, "git branch nucleus/item-1 main");
+    let r = super::tick(&f.ctx, false).await.unwrap();
+    assert!(r.errors.iter().any(|e| e.contains("pushing nucleus/item-1 failed")), "{r:?}");
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.pushed_sha.as_deref()), (Stage::Pr, None));
+    assert_eq!(remote_git(&f, &["rev-parse", "nucleus/item-1"]), remote_git(&f, &["rev-parse", "main"]), "the branch is untouched");
+    assert_eq!(f.gh.calls_with("pr create"), 0);
+}

@@ -65,7 +65,7 @@ async fn global_git_config_has_no_effect() {
     let mut files = git::changed_files(&mirror, &base, &sha).await.unwrap();
     files.sort();
     assert_eq!(files, ["a.txt", "b.txt"], "the global ignore file is not used");
-    git::push(&mirror, &remote, &sha, "nucleus/item-1", 1, "main").await.unwrap();
+    git::push(&mirror, &remote, &sha, "nucleus/item-1", 1, "main", None).await.unwrap();
     assert!(!marker.exists(), "no global hook, fsmonitor, ssh command or filter ran");
     let branches = std::process::Command::new("git").args(["branch", "--list"]).current_dir(root.join("remote.git")).output().unwrap();
     assert!(String::from_utf8_lossy(&branches.stdout).contains("nucleus/item-1"), "pushed to the configured remote");

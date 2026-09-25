@@ -562,21 +562,45 @@ pub fn check_push_target(branch: &str, item: i64, default_branch: &str) -> Resul
     Ok(())
 }
 
-/// Push exactly `sha` to `refs/heads/<branch>` at the configured URL. No
-/// force, no other ref, no pre-push hook; the mirror is reset first.
+/// Push exactly `sha` to `refs/heads/<branch>` at the configured URL, no
+/// other ref, no pre-push hook; the mirror is reset first.
 /// `remote_default` is the remote's default branch, read live by the
 /// caller while preparing (so no network read sits between the caller's
 /// final source check and the push); it is refused as a target.
-pub async fn push(mirror: &Path, remote: &Remote, sha: &str, branch: &str, item: i64, remote_default: &str) -> Result<()> {
+///
+/// The push is leased on the exact ref: `last_pushed` is `None` for the
+/// first push, which then only creates the branch (it fails when the
+/// branch exists, whatever it holds, so a branch that became the default
+/// or someone else's cannot be overwritten); later pushes succeed only
+/// while the remote branch still holds the commit Nucleus pushed last.
+pub async fn push(
+    mirror: &Path,
+    remote: &Remote,
+    sha: &str,
+    branch: &str,
+    item: i64,
+    remote_default: &str,
+    last_pushed: Option<&str>,
+) -> Result<()> {
     reset_mirror(mirror, remote).await?;
     check_push_target(branch, item, remote_default)?;
-    if !sha.chars().all(|c| c.is_ascii_hexdigit()) || sha.len() < 40 {
-        bail!("{sha:?} is not a commit id");
+    for id in std::iter::once(sha).chain(last_pushed) {
+        if !id.chars().all(|c| c.is_ascii_hexdigit()) || id.len() < 40 {
+            bail!("{id:?} is not a commit id");
+        }
     }
     let out = mirror_git(
         mirror,
         &remote.credential_args(),
-        &["push", "--quiet", "--no-verify", "--no-follow-tags", &remote.url, &format!("{sha}:refs/heads/{branch}")],
+        &[
+            "push",
+            "--quiet",
+            "--no-verify",
+            "--no-follow-tags",
+            &format!("--force-with-lease=refs/heads/{branch}:{}", last_pushed.unwrap_or("")),
+            &remote.url,
+            &format!("{sha}:refs/heads/{branch}"),
+        ],
         &[],
     )
     .await?;
@@ -697,7 +721,7 @@ mod tests {
         assert_eq!(out(&mirror, &["--git-dir=.", "rev-parse", &format!("{sha}^")]).trim(), base);
         let header = commit_header(&mirror, &sha).await.unwrap();
         assert!(header.starts_with("Pipeline <pipeline@example.invalid>\nPipeline <pipeline@example.invalid>\nImplement #1"), "{header}");
-        push(&mirror, &remote, &sha, "nucleus/item-1", 1, "main").await.unwrap();
+        push(&mirror, &remote, &sha, "nucleus/item-1", 1, "main", None).await.unwrap();
         assert!(remote_branches(&root).contains("nucleus/item-1"));
         // A lost clone comes back on the branch with the imported work.
         let (_, restored) = prepare_clone(&mirror, &wt, "main", 1, Some("nucleus/item-1")).await.unwrap();
@@ -747,7 +771,7 @@ mod tests {
         std::fs::write(wt.join(".gitattributes"), "* filter=x diff=x merge=x\n").unwrap();
         std::fs::write(wt.join("a.txt"), "changed\n").unwrap();
         let sha = import(&mirror, &remote, &wt, &base, 2, &spec()).await.unwrap().unwrap();
-        push(&mirror, &remote, &sha, "nucleus/item-2", 2, "main").await.unwrap();
+        push(&mirror, &remote, &sha, "nucleus/item-2", 2, "main", None).await.unwrap();
         assert!(!marker.exists(), "no hook, fsmonitor, filter or driver ran");
         assert!(remote_branches(&root).contains("nucleus/item-2"), "pushed to the configured remote");
         assert!(out(&decoy, &["for-each-ref"]).is_empty(), "nothing reached the rewritten origin");
@@ -813,11 +837,41 @@ mod tests {
         let work = root.join("work");
         let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
         let sha = mirror_ok(&mirror, &["rev-parse", "refs/heads/main"]).await.unwrap();
-        assert!(push(&mirror, &remote, &sha, "main", 1, "main").await.is_err());
+        assert!(push(&mirror, &remote, &sha, "main", 1, "main", None).await.is_err());
         sh(&root.join("remote.git"), "git branch nucleus/item-1 main && git symbolic-ref HEAD refs/heads/nucleus/item-1");
         assert_eq!(remote_head(&mirror, &remote).await.unwrap(), "nucleus/item-1");
-        let e = push(&mirror, &remote, &sha, "nucleus/item-1", 1, "nucleus/item-1").await.unwrap_err();
+        let e = push(&mirror, &remote, &sha, "nucleus/item-1", 1, "nucleus/item-1", None).await.unwrap_err();
         assert!(format!("{e:#}").contains("protected"), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn pushes_are_leased_on_the_exact_ref() {
+        let (_d, root, remote) = fixture();
+        let work = root.join("work");
+        let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
+        let wt = worktree_path(&work, "acme/widget", 5);
+        let (base, _) = prepare_clone(&mirror, &wt, "main", 5, Some("nucleus/item-5")).await.unwrap();
+        std::fs::write(wt.join("a.txt"), "first\n").unwrap();
+        let first = import(&mirror, &remote, &wt, &base, 5, &spec()).await.unwrap().unwrap();
+        // The branch already exists on the remote (someone else's): the
+        // first push, create-only, fails.
+        sh(&root.join("remote.git"), "git branch nucleus/item-5 main");
+        let e = push(&mirror, &remote, &first, "nucleus/item-5", 5, "main", None).await.unwrap_err();
+        assert!(format!("{e:#}").contains("pushing nucleus/item-5 failed"), "{e:#}");
+        sh(&root.join("remote.git"), "git branch -D nucleus/item-5");
+        push(&mirror, &remote, &first, "nucleus/item-5", 5, "main", None).await.unwrap();
+        // A later push (a new commit on the base, not a fast-forward) leases
+        // on the commit pushed last.
+        std::fs::write(wt.join("a.txt"), "second\n").unwrap();
+        let second = import(&mirror, &remote, &wt, &base, 5, &spec()).await.unwrap().unwrap();
+        push(&mirror, &remote, &second, "nucleus/item-5", 5, "main", Some(&first)).await.unwrap();
+        assert_eq!(out(&root.join("remote.git"), &["rev-parse", "nucleus/item-5"]).trim(), second);
+        // The branch moved to another commit: the next push fails closed.
+        sh(&root.join("remote.git"), "git update-ref refs/heads/nucleus/item-5 refs/heads/main");
+        std::fs::write(wt.join("a.txt"), "third\n").unwrap();
+        let third = import(&mirror, &remote, &wt, &base, 5, &spec()).await.unwrap().unwrap();
+        assert!(push(&mirror, &remote, &third, "nucleus/item-5", 5, "main", Some(&second)).await.is_err());
+        assert_ne!(out(&root.join("remote.git"), &["rev-parse", "nucleus/item-5"]).trim(), third);
     }
 
     #[tokio::test]
