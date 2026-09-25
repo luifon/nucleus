@@ -148,14 +148,24 @@ bot's own behavior during and after those closes:
    outbound queue (ADR-033), so no message send uses an old socket.
 5. **Retry support.** Every message the bot sends is stored by message id in
    `sent_messages(id, jid, proto, sent_at)` in whatsapp.db
-   (`sent_store.ts`; `send.ts` stores its message too), kept 7 days and
-   pruned at boot and daily. The socket gets
+   (`sent_store.ts`; `send.ts` stores its message too), pruned at boot and
+   daily. WhatsApp accepts resend requests for 14 days
+   (`PLACEHOLDER_MAX_AGE_SECONDS` in Baileys rc14), so the content is kept
+   21 days by default (`[whatsapp.link] sent_retention_days`, never less
+   than the upstream window), and the table is capped at 50 000 rows
+   (`sent_max_rows`, oldest deleted first). The socket gets
    `getMessage: key => sent.get(key.id)` (undefined when not stored) and one
    process-level `msgRetryCounterCache`, so retry counts survive reconnects.
 6. **Version cache** (`wa_version.ts`). A successful version fetch is kept in
-   memory and in `memory/whatsapp-wa-version.json`. A failed fetch uses the
-   version in memory, then the one on disk; the bundled version is used only
-   when no version was ever fetched on the machine. `send.ts`, `check.ts`
+   memory and in `memory/whatsapp-wa-version.json` with its fetch time. A
+   failed fetch uses the version in memory, then the one on disk, while it
+   is younger than 7 days (`[whatsapp.link] wa_version_max_age_hours`); an
+   entry without a fetch time is not used. A 405 close calls
+   `invalidateWaVersion`: the refused version is deleted from memory and
+   disk and is not offered from the cache again in this process, so the
+   next connection fetches again and, if the fetch fails, uses the bundled
+   version. The bundled version is used only when there is no usable cached
+   version. `send.ts`, `check.ts`
    and `list-groups.ts` use the same function. Rule 8 still holds: the
    version comes from `fetchLatestWaWebVersion({})`, with
    `Browsers.macOS("Chrome")`.
@@ -163,9 +173,19 @@ bot's own behavior during and after those closes:
    start in the bot and in the one-shot scripts. A libsignal session line
    keeps its text and loses the session object ("Closing session: [signal
    session state redacted]"); in any other logged object the values of
-   key-named fields are replaced. `scripts/redact-signal-logs.mjs` removes
-   the key values from log files written before the filter (in place, with a
-   `--dry-run` mode that reports counts).
+   key-named fields are replaced. The redactor copies each object of the
+   graph once (a WeakMap from original to copy), so a shared reference or a
+   cycle leads to the redacted copy, never to the original. It walks Errors
+   (own fields and `cause`; message and stack kept), class instances, Maps
+   and Sets, and replaces anything nested deeper than 8 levels.
+   `scripts/redact-signal-logs.mjs` removes the key values from log files
+   written before the filter. It refuses (exit 3, naming the pid) any file
+   that a process has open for writing, according to `lsof`, unless
+   `--force` is given; if `lsof` cannot run, every file counts as open. It
+   writes a temp file in the same directory with the same mode and renames
+   it over the original, only if the file's size and modification time did
+   not change during processing. `--dry-run` reports counts and writers and
+   writes nothing.
 8. **Baileys 7.0.0-rc14** (pinned), from rc11. rc12 fixes GHSA-qvv5-jq5g-4cgg
    (message and app-state spoofing through protocol messages), rc13 fixes a
    regression of that fix for the account's own protocol messages, rc14 adds
@@ -178,11 +198,16 @@ Unit tests: drain gating with a fake socket (no send before `linkUp`, no
 attempt used by an outage, same message id after the link returns, many
 outages without an exit, a pending send whose link closed, a timeout during
 a close, rot exit on a link that reports open, message errors still
-counted); `sent_store` (round trip through `getMessage`, miss, prune);
-version cache (fetched, memory, disk, bundled, corrupt file); key redaction
-(a real libsignal `closeSession`, console arguments, the Baileys log file);
-`describeDisconnect`; the `detail` migration; the log redaction script on
-synthetic logs (dry run, in-place rewrite with the same inode, idempotence).
+counted); `sent_store` (round trip through `getMessage`, miss, a 13-day-old
+message kept, retention floor, row cap); version cache (fetched, memory,
+disk, bundled, corrupt file, age limit, 405 invalidation then bundled
+fallback); key redaction (a real libsignal `closeSession`, a session
+referenced twice, a cycle, an Error with a key in a field and in `cause`,
+class instances, deep nesting, the Baileys log file); `describeDisconnect`;
+the `detail` migration; `[whatsapp.link]` parsing; the log redaction script
+on synthetic logs (dry run, temp file and rename with the mode kept,
+idempotence, refusal while a child process holds the file open, refusal
+without `lsof`, a file changed during processing left as it was).
 
 After deploy, with `$T` the deploy time:
 
