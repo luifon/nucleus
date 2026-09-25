@@ -1434,8 +1434,10 @@ fn text_comments(m: &str, text: &str, html: &[(usize, usize)], out: &mut Vec<Raw
     }
 }
 
-/// One parsed tag: name (lower case), whether it closes, attributes (name
-/// in lower case, value), and its end.
+/// One tag token: name (ASCII lower case, every character the tokenizer
+/// takes into it), whether it is an end tag, attributes in source order
+/// (name in ASCII lower case, raw value), where it ends, and whether the
+/// literal ended before its `>`.
 struct Tag {
     name: String,
     closing: bool,
@@ -1444,75 +1446,159 @@ struct Tag {
     unterminated: bool,
 }
 
-/// Parse the tag at `i` (`m[i] == '<'`, `m` an HTML node's literal); `None`
-/// when it is not a tag. A tag without its closing `>` (or with an
-/// unterminated quoted value) is returned up to the end of its line and
-/// marked `unterminated`: in an HTML node the sanitizer drops what follows.
-fn parse_tag(m: &str, i: usize) -> Option<Tag> {
+/// What a `<` in raw HTML starts, per the WHATWG tokenizer (HTML Living
+/// Standard, 13.2.5 "Tokenization").
+enum Token {
+    /// The data state emits the `<` as text (13.2.5.1, 13.2.5.6: a `<` not
+    /// followed by an ASCII letter, `!`, `/` or `?`; `</` at the end).
+    Text,
+    /// `<!--` … (13.2.5.43–13.2.5.52), up to `-->`, `--!>`, `<!-->`,
+    /// `<!--->` or the end of the literal.
+    Comment { end: usize },
+    /// A bogus comment (13.2.5.41): `<!` not followed by `--` (declarations
+    /// and CDATA included, 13.2.5.42), `<?` (13.2.5.6), `</` followed by a
+    /// character that is not an ASCII letter, and `</>` (13.2.5.7). Up to
+    /// the first `>` or the end of the literal. Never rendered.
+    Bogus { end: usize },
+    Tag(Tag),
+}
+
+fn is_ws(c: u8) -> bool {
+    matches!(c, b'\t' | b'\n' | 0x0C | b' ')
+}
+
+/// The token a `<` at `i` starts in the raw-HTML literal `m`.
+fn tokenize(m: &str, i: usize) -> Token {
     let b = m.as_bytes();
-    let closing = b.get(i + 1) == Some(&b'/');
-    let n0 = i + 1 + closing as usize;
-    if !b.get(n0).is_some_and(|c| c.is_ascii_alphabetic()) {
-        return None;
+    let to_gt = |from: usize| m[from.min(m.len())..].find('>').map(|x| from + x + 1).unwrap_or(m.len());
+    match b.get(i + 1) {
+        Some(c) if c.is_ascii_alphabetic() => Token::Tag(tag_token(m, i + 1, false)),
+        Some(b'/') => match b.get(i + 2) {
+            Some(c) if c.is_ascii_alphabetic() => Token::Tag(tag_token(m, i + 2, true)),
+            Some(b'>') => Token::Bogus { end: i + 3 },
+            Some(_) => Token::Bogus { end: to_gt(i + 2) },
+            None => Token::Text,
+        },
+        Some(b'!') => {
+            if m[i..].starts_with("<!--") {
+                let r = &m[i + 4..];
+                let end = if r.starts_with('>') {
+                    i + 5
+                } else if r.starts_with("->") {
+                    i + 6
+                } else {
+                    let a = r.find("-->").map(|e| i + 4 + e + 3);
+                    let bang = r.find("--!>").map(|e| i + 4 + e + 4);
+                    match (a, bang) {
+                        (Some(x), Some(y)) => x.min(y),
+                        (Some(x), None) | (None, Some(x)) => x,
+                        (None, None) => m.len(),
+                    }
+                };
+                Token::Comment { end }
+            } else {
+                Token::Bogus { end: to_gt(i + 2) }
+            }
+        }
+        Some(b'?') => Token::Bogus { end: to_gt(i + 1) },
+        _ => Token::Text,
     }
-    let nl = b[n0..].iter().take_while(|c| c.is_ascii_alphanumeric() || **c == b'-').count();
-    let name = m[n0..n0 + nl].to_ascii_lowercase();
-    let mut j = n0 + nl;
-    if !matches!(b.get(j), None | Some(b' ' | b'\t' | b'\n' | b'/' | b'>')) {
-        return None;
+}
+
+/// A start or end tag whose name starts at `n0`, read with the tokenizer's
+/// tag states: tag name (13.2.5.8), before attribute name (13.2.5.32),
+/// attribute name (13.2.5.33), after attribute name (13.2.5.34), before
+/// attribute value (13.2.5.35), attribute value double-quoted, single-quoted
+/// and unquoted (13.2.5.36–38), after attribute value quoted (13.2.5.39),
+/// self-closing start tag (13.2.5.40). A `>` inside quotes does not end
+/// the tag; the end of the literal does (`unterminated`).
+fn tag_token(m: &str, n0: usize, closing: bool) -> Tag {
+    let b = m.as_bytes();
+    let n = b.len();
+    let mut j = n0;
+    while j < n && !is_ws(b[j]) && b[j] != b'/' && b[j] != b'>' {
+        j += 1;
     }
-    let mut attrs = Vec::new();
+    let name = m[n0..j].to_ascii_lowercase();
+    let mut attrs: Vec<(String, String)> = Vec::new();
+    let done = |attrs: Vec<(String, String)>, name: String, end: usize, unterminated: bool| Tag { name, closing, attrs, end, unterminated };
     loop {
-        while j < b.len() && matches!(b[j], b' ' | b'\t' | b'\n') {
+        // Before attribute name.
+        while j < n && is_ws(b[j]) {
             j += 1;
         }
-        match b.get(j) {
-            None => break,
-            Some(b'>') => return Some(Tag { name, closing, attrs, end: j + 1, unterminated: false }),
-            Some(b'/') if b.get(j + 1) == Some(&b'>') => {
-                return Some(Tag { name, closing, attrs, end: j + 2, unterminated: false })
+        if j >= n {
+            return done(attrs, name, n, true);
+        }
+        match b[j] {
+            b'>' => return done(attrs, name, j + 1, false),
+            b'/' => {
+                // Self-closing start tag: `>` ends; anything else is
+                // reconsumed in the before-attribute-name state.
+                j += 1;
+                if j >= n {
+                    return done(attrs, name, n, true);
+                }
+                if b[j] == b'>' {
+                    return done(attrs, name, j + 1, false);
+                }
+                continue;
             }
-            Some(b'<') => break,
             _ => {}
         }
+        // Attribute name (a leading `=` is part of the name).
         let a0 = j;
-        while j < b.len() && !matches!(b[j], b' ' | b'\t' | b'\n' | b'=' | b'>' | b'<') && !(b[j] == b'/' && b.get(j + 1) == Some(&b'>')) {
+        j += 1;
+        while j < n && !is_ws(b[j]) && b[j] != b'/' && b[j] != b'>' && b[j] != b'=' {
             j += 1;
-        }
-        if j == a0 {
-            j += 1; // a stray character: skip it
-            continue;
         }
         let an = m[a0..j].to_ascii_lowercase();
-        while j < b.len() && matches!(b[j], b' ' | b'\t') {
+        // After attribute name.
+        while j < n && is_ws(b[j]) {
             j += 1;
         }
-        let mut value = String::new();
-        if b.get(j) == Some(&b'=') {
+        if j < n && b[j] == b'=' {
             j += 1;
-            while j < b.len() && matches!(b[j], b' ' | b'\t' | b'\n') {
+            // Before attribute value.
+            while j < n && is_ws(b[j]) {
                 j += 1;
             }
-            match b.get(j) {
-                Some(&q @ (b'"' | b'\'')) => {
+            if j >= n {
+                attrs.push((an, String::new()));
+                return done(attrs, name, n, true);
+            }
+            match b[j] {
+                q @ (b'"' | b'\'') => {
                     let v0 = j + 1;
-                    let v1 = b[v0..].iter().position(|c| *c == q).map(|x| v0 + x);
-                    let Some(v1) = v1 else { break };
-                    value = m[v0..v1].to_string();
-                    j = v1 + 1;
+                    match b[v0..].iter().position(|c| *c == q) {
+                        Some(x) => {
+                            attrs.push((an, m[v0..v0 + x].to_string()));
+                            j = v0 + x + 1;
+                        }
+                        None => {
+                            attrs.push((an, m[v0..].to_string()));
+                            return done(attrs, name, n, true);
+                        }
+                    }
+                    // After attribute value (quoted): whitespace, `/`, `>`,
+                    // or anything else reconsumed as a new attribute name.
+                }
+                b'>' => {
+                    attrs.push((an, String::new()));
+                    return done(attrs, name, j + 1, false);
                 }
                 _ => {
                     let v0 = j;
-                    while j < b.len() && !matches!(b[j], b' ' | b'\t' | b'\n' | b'>') {
+                    while j < n && !is_ws(b[j]) && b[j] != b'>' {
                         j += 1;
                     }
-                    value = m[v0..j].to_string();
+                    attrs.push((an, m[v0..j].to_string()));
                 }
             }
+        } else {
+            attrs.push((an, String::new()));
         }
-        attrs.push((an, value));
     }
-    Some(Tag { name, closing, attrs, end: m[i..].find('\n').map(|x| i + x).unwrap_or(m.len()), unterminated: true })
 }
 
 /// The end of the `<details>` element whose open tag starts at source byte
@@ -1580,45 +1666,35 @@ fn tree_html(nodes: &[HtmlNode], m: &str, text: &str, out: &mut Vec<Raw>) -> Vec
         let lit = node.literal.as_str();
         let from = out.len();
         let b = lit.as_bytes();
-        let lower = lit.to_ascii_lowercase();
         let mut i = 0;
         while i < b.len() {
             if b[i] != b'<' {
                 i += 1;
                 continue;
             }
-            let rest = &lower[i..];
-            if rest.starts_with("<!--") {
-                let r = &lit[i + 4..];
-                let end = if r.starts_with('>') {
-                    i + 5
-                } else if r.starts_with("->") {
-                    i + 6
-                } else {
-                    r.find("-->").map(|e| i + 4 + e + 3).unwrap_or(lit.len())
-                };
-                out.push(raw(Kind::HtmlComment, node.src(i), node.src(end), shown(&lit[i..end])));
-                i = end;
-                continue;
-            }
-            let special_end = if rest.starts_with("<?") {
-                Some(rest.find("?>").map(|x| i + x + 2))
-            } else if rest.starts_with("<![cdata[") {
-                Some(rest.find("]]>").map(|x| i + x + 3))
-            } else if rest.len() > 2 && rest.as_bytes()[1] == b'!' && rest.as_bytes()[2].is_ascii_alphabetic() {
-                Some(rest.find('>').map(|x| i + x + 1))
-            } else {
-                None
-            };
-            if let Some(end) = special_end {
-                let end = end.unwrap_or(lit.len());
-                out.push(raw(Kind::HtmlTag, node.src(i), node.src(end), shown(&lit[i..end])));
-                i = end.max(i + 1);
-                continue;
-            }
-            let Some(tag) = parse_tag(lit, i) else {
-                i += 1;
-                continue;
+            let tag = match tokenize(lit, i) {
+                Token::Text => {
+                    i += 1;
+                    continue;
+                }
+                Token::Comment { end } => {
+                    out.push(raw(Kind::HtmlComment, node.src(i), node.src(end), shown(&lit[i..end])));
+                    if node.known {
+                        tags.push((node.src(i), node.src(end)));
+                    }
+                    i = end.max(i + 1);
+                    continue;
+                }
+                Token::Bogus { end } => {
+                    let src = shown(&lit[i..end]);
+                    out.push(raw(Kind::HtmlComment, node.src(i), node.src(end), format!("bogus comment (not rendered): {src}")));
+                    if node.known {
+                        tags.push((node.src(i), node.src(end)));
+                    }
+                    i = end.max(i + 1);
+                    continue;
+                }
+                Token::Tag(tag) => tag,
             };
             let (sa, se) = (node.src(i), node.src(tag.end));
             if node.known {
@@ -1627,9 +1703,21 @@ fn tree_html(nodes: &[HtmlNode], m: &str, text: &str, out: &mut Vec<Raw>) -> Vec
             let src = shown(&lit[i..tag.end]);
             let name = tag.name.as_str();
             if tag.unterminated {
-                out.push(raw(Kind::HtmlTag, sa, se, format!("unterminated tag: {src}")));
+                out.push(raw(Kind::HtmlTag, sa, se, format!("unterminated tag (no `>` before the end of the HTML): {src}")));
                 i = tag.end.max(i + 1);
                 continue;
+            }
+            // A duplicate attribute: the browser keeps the first; the later
+            // ones are never rendered. An end tag's attributes are dropped.
+            let mut seen: Vec<&str> = Vec::new();
+            for (a, _) in &tag.attrs {
+                if seen.contains(&a.as_str()) {
+                    out.push(raw(Kind::HtmlTag, sa, se, format!("duplicate attribute {a} (only the first is used): {src}")));
+                }
+                seen.push(a);
+            }
+            if tag.closing && !tag.attrs.is_empty() {
+                out.push(raw(Kind::HtmlTag, sa, se, format!("attributes on an end tag (dropped): {src}")));
             }
             if !VISIBLE_TAGS.contains(&name) {
                 out.push(raw(Kind::HtmlTag, sa, se, src));
@@ -1817,10 +1905,23 @@ fn scan_markdown_raw(text: &str) -> Vec<Raw> {
     // unknown. A finding from either counts, over the whole location.
     for node in tree.html.iter().filter(|h| !h.known) {
         let lit = node.literal.as_str();
-        let tag_spans: Vec<(usize, usize)> = (0..lit.len())
-            .filter(|&i| lit.as_bytes()[i] == b'<')
-            .filter_map(|i| parse_tag(lit, i).map(|t| (i, t.end)))
-            .collect();
+        let mut tag_spans: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < lit.len() {
+            if lit.as_bytes()[i] != b'<' {
+                i += 1;
+                continue;
+            }
+            let end = match tokenize(lit, i) {
+                Token::Text => i + 1,
+                Token::Comment { end } | Token::Bogus { end } => end,
+                Token::Tag(t) => t.end,
+            };
+            if end > i + 1 {
+                tag_spans.push((i, end));
+            }
+            i = end.max(i + 1);
+        }
         let mut found = Vec::new();
         invisible_findings(lit, &units(lit, &[], true, &tag_spans, &[(0, lit.len())]), &mut found);
         for mut f in found.into_iter().filter(|f| f.kind == Kind::InvisibleEntity) {
