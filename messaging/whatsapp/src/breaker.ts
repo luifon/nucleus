@@ -29,6 +29,37 @@ export const DEFAULT_BREAKER: BreakerConfig = {
   alertAfterOutageMs: 30 * 60_000,
 };
 
+/** Longest `connection_events.detail` stored. */
+export const DETAIL_MAX_CHARS = 2_000;
+
+/** The `connection_events.detail` value for a close: JSON of the
+ *  disconnect error's message and data (Baileys puts the stream-error node,
+ *  or the keep-alive / WebSocket cause, in the Boom `data`). Null when
+ *  there is no error. Buffers are summarized by length; the result is cut
+ *  at DETAIL_MAX_CHARS. Pure. */
+export function describeDisconnect(err: unknown): string | null {
+  if (err === null || err === undefined) return null;
+  const e = err as { message?: unknown; data?: unknown };
+  const message = typeof e.message === "string" ? e.message : String(err);
+  const seen = new WeakSet<object>();
+  let json: string;
+  try {
+    json = JSON.stringify({ message, data: e.data ?? null }, (_k, v) => {
+      if (v && typeof v === "object") {
+        if (v.type === "Buffer" && Array.isArray(v.data)) return `<${v.data.length} bytes>`;
+        if (v instanceof Uint8Array) return `<${v.length} bytes>`;
+        if (seen.has(v)) return "[circular]";
+        seen.add(v);
+      }
+      if (typeof v === "bigint") return v.toString();
+      return v;
+    });
+  } catch {
+    json = JSON.stringify({ message, data: "[unserializable]" });
+  }
+  return json.length > DETAIL_MAX_CHARS ? `${json.slice(0, DETAIL_MAX_CHARS - 1)}…` : json;
+}
+
 /** Baileys DisconnectReason → taxonomy class. Only loggedOut is
  *  non-reconnectable: the device was unlinked and ONLY the operator can
  *  re-pair (Rule 8). Everything else goes through the ladder. */

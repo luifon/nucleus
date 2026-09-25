@@ -53,6 +53,28 @@ test("ChatSessionStore heals a pre-media outbound_queue via PRAGMA detection", (
   db.close();
 });
 
+test("connection_events gains the detail column on an existing DB; old rows keep a null detail", () => {
+  const dbPath = tmpDb();
+  const db = new DatabaseSync(dbPath);
+  db.exec(`CREATE TABLE connection_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, class TEXT NOT NULL, code INTEGER, uptime_ms INTEGER
+  );
+  INSERT INTO connection_events (ts, class, code, uptime_ms) VALUES ('2026-09-01T00:00:00Z', 'connection-lost', 408, 10);`);
+  db.close();
+  const store = new ChatSessionStore(dbPath);
+  store.recordConnectionEvent("connection-closed", 428, 5000, '{"message":"Connection Terminated","data":null}');
+  const rows = store.connectionEvents();
+  assert.deepEqual(
+    rows.map((r) => [r.class, r.code, r.detail]),
+    [
+      ["connection-closed", 428, '{"message":"Connection Terminated","data":null}'],
+      ["connection-lost", 408, null],
+    ],
+  );
+  // Running the migration again changes nothing.
+  new ChatSessionStore(dbPath);
+});
+
 test("media enqueue round-trips through pending()", () => {
   const dbPath = tmpDb();
   new ChatSessionStore(dbPath);

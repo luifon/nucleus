@@ -101,8 +101,24 @@ export class ChatSessionStore {
         ts TEXT NOT NULL,
         class TEXT NOT NULL,
         code INTEGER,
-        uptime_ms INTEGER
+        uptime_ms INTEGER,
+        -- JSON {message, data} of lastDisconnect.error (connectionDetail).
+        detail TEXT
       );
+
+      -- ADR-027 amendment (2026-09): every message this device sent, by
+      -- WhatsApp message id, so Baileys' getMessage can answer a retry
+      -- request (a recipient device that could not decrypt the message asks
+      -- the sender to encrypt it again; without the content the recipient
+      -- shows "waiting for this message"). proto = the encoded
+      -- proto.Message. Pruned after 7 days.
+      CREATE TABLE IF NOT EXISTS sent_messages (
+        id      TEXT PRIMARY KEY,
+        jid     TEXT NOT NULL,
+        proto   BLOB NOT NULL,
+        sent_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sent_messages_sent_at ON sent_messages(sent_at);
 
       -- ADR-005a: brain-dump review-before-apply. Each capture produces
       -- a plan that's held here until the operator approves (or rejects,
@@ -209,6 +225,8 @@ export class ChatSessionStore {
       CREATE INDEX IF NOT EXISTS idx_chat_turns_chat_started
         ON chat_turns(chat_id, started_at DESC);
     `);
+    // ADR-027 amendment: the disconnect error's message and data.
+    addColumnsIfMissing(this.db, "connection_events", [["detail", "detail TEXT"]]);
     // ADR-018: heal pre-media DBs. Fresh installs get the full shape from
     // the CREATE above; existing DBs gain the columns here.
     addColumnsIfMissing(this.db, "outbound_queue", [
@@ -297,10 +315,22 @@ export class ChatSessionStore {
   }
 
   /** ADR-027: record one classified connection close. */
-  recordConnectionEvent(cls: string, code: number | undefined, uptimeMs: number | null): void {
+  recordConnectionEvent(
+    cls: string,
+    code: number | undefined,
+    uptimeMs: number | null,
+    detail: string | null = null,
+  ): void {
     this.db
-      .prepare(`INSERT INTO connection_events (ts, class, code, uptime_ms) VALUES (?, ?, ?, ?)`)
-      .run(new Date().toISOString(), cls, code ?? null, uptimeMs ?? null);
+      .prepare(`INSERT INTO connection_events (ts, class, code, uptime_ms, detail) VALUES (?, ?, ?, ?, ?)`)
+      .run(new Date().toISOString(), cls, code ?? null, uptimeMs ?? null, detail);
+  }
+
+  /** Recent connection events, newest first (tests, diagnostics). */
+  connectionEvents(limit = 20): Array<{ class: string; code: number | null; detail: string | null }> {
+    return this.db
+      .prepare(`SELECT class, code, detail FROM connection_events ORDER BY id DESC LIMIT ?`)
+      .all(limit) as Array<{ class: string; code: number | null; detail: string | null }>;
   }
 
   save(chatId: string, sessionId: string, isNew: boolean): void {
@@ -704,12 +734,18 @@ export class OutboundQueueStore {
 
   /** A send attempt timed out. The row stays in_flight — the send can still
    *  succeed — and becomes retryable after IN_FLIGHT_GRACE_MS; the attempt
-   *  counts toward `maxAttempts`. */
-  markTimedOut(id: number, error: string, maxAttempts: number): { status: "in_flight" | "failed" } {
+   *  counts toward `maxAttempts` unless `countAttempt` is false (the link
+   *  closed while the send was pending). */
+  markTimedOut(
+    id: number,
+    error: string,
+    maxAttempts: number,
+    countAttempt = true,
+  ): { status: "in_flight" | "failed" } {
     const row = this.db.prepare(`SELECT attempts FROM outbound_queue WHERE id = ?`).get(id) as
       | { attempts: number }
       | undefined;
-    const attempts = (row?.attempts ?? 0) + 1;
+    const attempts = (row?.attempts ?? 0) + (countAttempt ? 1 : 0);
     const status = attempts >= maxAttempts ? "failed" : "in_flight";
     this.db
       .prepare(
@@ -718,6 +754,19 @@ export class OutboundQueueStore {
       )
       .run(attempts, error, status, id);
     return { status };
+  }
+
+  /** A send failed because the WhatsApp link dropped, not because of the
+   *  message: the row goes back to pending (it keeps its message id, so a
+   *  retry of a message that did arrive is the same message) and the attempt
+   *  is not counted. An outage therefore cannot use up a row's attempts. */
+  markLinkLost(id: number, error: string): void {
+    this.db
+      .prepare(
+        `UPDATE outbound_queue SET status = 'pending', last_error = ?
+          WHERE id = ? AND status IN ('pending','in_flight')`,
+      )
+      .run(`${error} (link down; attempt not counted)`, id);
   }
 
   /** Terminal failure regardless of attempts — for non-retryable errors

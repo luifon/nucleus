@@ -10,15 +10,18 @@
 import {
   default as makeWASocket,
   useMultiFileAuthState,
-  fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
   Browsers,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
+import { installConsoleKeyFilter } from "./key_redaction.js";
+import { resolveWaVersion, waVersionCachePath } from "./wa_version.js";
 import path from "node:path";
 
 const log = pino({ level: process.env.NUCLEUS_LOG ?? "info" });
 const baileysLogger = pino({ level: "silent" });
+// libsignal prints Signal session state (private keys) through the console.
+installConsoleKeyFilter();
 
 async function main() {
   const workspaceRoot =
@@ -27,7 +30,7 @@ async function main() {
 
   const authDir = path.join(workspaceRoot, "messaging/whatsapp/auth");
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestWaWebVersion({});
+  const { version } = await resolveWaVersion({ cachePath: waVersionCachePath(workspaceRoot), log });
 
   const sock = makeWASocket({
     version,

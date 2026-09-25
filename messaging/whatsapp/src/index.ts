@@ -1,13 +1,13 @@
 import {
   default as makeWASocket,
   useMultiFileAuthState,
-  fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
   downloadMediaMessage,
   Browsers,
   BufferJSON,
   DisconnectReason,
   generateMessageIDV2,
+  type CacheStore,
   type WAMessage,
   type WASocket,
 } from "@whiskeysockets/baileys";
@@ -33,7 +33,21 @@ import {
   PendingPlansStore,
 } from "./db.js";
 import { record as recordDiary } from "./diary.js";
-import { ConnectionSupervisor, DEFAULT_BREAKER } from "./breaker.js";
+import { ConnectionSupervisor, DEFAULT_BREAKER, describeDisconnect } from "./breaker.js";
+import { installConsoleKeyFilter, makeBaileysLogger } from "./key_redaction.js";
+import { SentMessageStore } from "./sent_store.js";
+import { resolveWaVersion, waVersionCachePath } from "./wa_version.js";
+import NodeCache from "@cacheable/node-cache";
+
+// libsignal prints Signal session state (private keys included) through the
+// console, and stdout is the log file. Filter it before any socket exists.
+installConsoleKeyFilter();
+
+/** Baileys' per-message retry counts, shared by every socket of this
+ *  process: the socket's own cache would restart at zero on each reconnect,
+ *  and a message could then be retried without bound (ADR-027 amendment).
+ *  Same TTL as the Baileys default (1 h). */
+const msgRetryCounterCache = new NodeCache({ stdTTL: 60 * 60, useClones: false }) as unknown as CacheStore;
 
 // ADR-027: one supervisor for the process lifetime — reconnects re-enter
 // connect(), so breaker state must live outside it. Configured in main()
@@ -89,6 +103,21 @@ const ALL_TMUX_SESSIONS = [GROUP_TMUX_SESSION, DM_TMUX_SESSION, BRAINDUMP_TMUX_S
 // updates) reads it here instead of capturing a socket that may be closed.
 let liveSock: WASocket | null = null;
 
+/** Presence on the current connection; nothing while the link is down.
+ *  Handlers that outlive a reconnect (a long transcription, the plan
+ *  sweep) must not use the socket they were created with. */
+async function livePresence(state: "recording" | "composing" | "paused" | "available" | "unavailable", chatId: string): Promise<void> {
+  await liveSock?.sendPresenceUpdate(state, chatId).catch(() => {});
+}
+
+/** Media re-upload request (an expired media URL) on the current
+ *  connection. */
+function liveReupload(msg: WAMessage): Promise<WAMessage> {
+  const sock = liveSock;
+  if (!sock) return Promise.reject(new Error("Connection Closed (no live socket)"));
+  return sock.updateMediaMessage(msg);
+}
+
 // Synchronous destination — no worker-thread buffering. Logs appear in stdout
 // as soon as they're emitted, which matters when tailing to debug what stage
 // a message is at.
@@ -97,7 +126,10 @@ const log = pino(
   pino.destination({ sync: true }),
 );
 
-const baileysLogger = pino({ level: "silent" });
+// Baileys' own log (retry receipts, stream errors, pre-key uploads) goes to
+// memory/whatsapp-baileys.log, key material redacted; set in main() once
+// the workspace root is known. NUCLEUS_BAILEYS_LOG sets the level (info).
+let baileysLogger = makeBaileysLogger(null);
 
 /**
  * Resolved allowlist — JID → role. The role decides which pipeline runs:
@@ -254,6 +286,7 @@ async function main() {
     process.env.NUCLEUS_WORKSPACE_ROOT ??
     path.resolve(import.meta.dirname, "..", "..", "..");
   const config = loadConfig(workspaceRoot, discover);
+  baileysLogger = makeBaileysLogger(path.join(path.dirname(config.dbPath), "whatsapp-baileys.log"));
   supervisor = new ConnectionSupervisor(config.breaker);
   configurePersona(config.personaDisplayName);
   texts = config.turns.texts;
@@ -286,6 +319,19 @@ async function main() {
   // doesn't use it — corrections happen via follow-up captures + move ops
   // (see CLAUDE.md Rule 9 + ADR-005).
   const outbound = new OutboundQueueStore(config.dbPath);
+  // Sent-message content for Baileys retry requests (getMessage), kept 7
+  // days; pruned at boot and daily.
+  const sent = new SentMessageStore(config.dbPath);
+  const pruneSent = () => {
+    try {
+      const n = sent.prune();
+      if (n > 0) log.info({ pruned: n }, "whatsapp: pruned stored sent messages");
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "whatsapp: sent_messages prune failed");
+    }
+  };
+  pruneSent();
+  setInterval(pruneSent, 24 * 60 * 60 * 1000);
   // ADR-018: collect staged media files orphaned by a crash between
   // markSent and unlink, terminal rows whose unlink failed, or an
   // enqueue-media crash between copy and INSERT.
@@ -478,7 +524,16 @@ async function main() {
       if (process.env.NUCLEUS_WHATSAPP_FORCE_SEND_HANG === "1") return new Promise<never>(() => {});
       const sock = liveSock;
       if (!sock) return Promise.reject(new Error("Connection Closed (no live socket)"));
-      return sock.sendMessage(jid, content, opts);
+      // Store the content before returning, also for a send that resolves
+      // after the drain's timeout: a retry request can come at any time.
+      return sock.sendMessage(jid, content, opts).then((m) => {
+        try {
+          sent.record(m);
+        } catch (e) {
+          log.warn({ err: (e as Error).message, msgId: m?.key?.id }, "whatsapp: could not store the sent message");
+        }
+        return m;
+      });
     },
     newMessageId: () => generateMessageIDV2(liveSock?.user?.id),
     rules: () => secretRules.current(),
@@ -497,7 +552,7 @@ async function main() {
   });
 
   const inbound = new InboundGate(turnStore);
-  await connect({ config, store, engine, outbound, plansStore, docStore, jobStore, turnStore, inbound, drain });
+  await connect({ config, store, engine, outbound, plansStore, docStore, jobStore, turnStore, inbound, drain, sent });
 }
 
 /** Everything the connection and the message handlers use. */
@@ -513,6 +568,8 @@ interface Bot {
   /** ADR-033 inbound dedup: received → handled per WhatsApp message. */
   inbound: InboundGate;
   drain: OutboundDrain;
+  /** Sent-message content for Baileys' getMessage (retry requests). */
+  sent: SentMessageStore;
 }
 
 /** Run a `nucleus` subcommand detached, best-effort (no-op when the binary
@@ -580,15 +637,20 @@ function drainSessionInbox(
 }
 
 async function connect(bot: Bot): Promise<void> {
-  const { config, store, plansStore, drain } = bot;
+  const { config, store, plansStore, drain, sent } = bot;
   const authDir = path.join(config.workspaceRoot, "messaging/whatsapp/auth");
   fs.mkdirSync(authDir, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-  // Pin to WhatsApp Web's currently-published protocol version. Critical: a
-  // stale Baileys default causes silent pairing failure (status 405 loop).
-  const { version, isLatest } = await fetchLatestWaWebVersion({});
-  log.info({ version, isLatest }, "whatsapp: protocol version");
+  // Pin to WhatsApp Web's currently-published protocol version (Rule 8). A
+  // stale version causes a 405 login loop, so a failed fetch reuses the last
+  // fetched version (wa_version.ts), never the library's bundled one when a
+  // fetched one exists.
+  const { version, source, error: versionError } = await resolveWaVersion({
+    cachePath: waVersionCachePath(config.workspaceRoot),
+    log,
+  });
+  log.info({ version, source, err: versionError }, "whatsapp: protocol version");
 
   const sock = makeWASocket({
     version,
@@ -600,6 +662,10 @@ async function connect(bot: Bot): Promise<void> {
     markOnlineOnConnect: false,
     syncFullHistory: false,
     logger: baileysLogger as any,
+    // Retry requests for our messages are answered from the stored content;
+    // undefined (not stored) leaves the retry unanswered.
+    getMessage: async (key) => sent.get(key.id),
+    msgRetryCounterCache,
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -641,9 +707,12 @@ async function connect(bot: Bot): Promise<void> {
       }
       // Resolve the allowlist asynchronously so handler is ready before any
       // unexpected event fires. Then start the outbound drain — the
-      // drainer needs the allowlist to authorize each target.
+      // drainer needs the allowlist to authorize each target — unless this
+      // connection closed in the meantime (the next open starts it).
       resolveAllowlist(sock, config)
         .then(() => {
+          if (liveSock !== sock) return;
+          drain.linkUp();
           startOutboundDrain(drain);
           startPlanExpirySweep(braindumpDeps(sock, bot));
         })
@@ -661,18 +730,28 @@ async function connect(bot: Bot): Promise<void> {
       );
       hasConnectedOnce = true;
     } else if (connection === "close") {
+      // The link is down: no send starts until the next open (the drain
+      // timer is restarted there), and sends that fail now do not count
+      // against their rows or the connection-rot exit (outbound_drain.ts).
+      if (liveSock === sock) {
+        liveSock = null;
+        if (outboundDrainTimer) clearInterval(outboundDrainTimer);
+        outboundDrainTimer = null;
+        drain.linkDown();
+      }
       const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
+      const detail = describeDisconnect(lastDisconnect?.error);
       // ADR-027: classify, record, and let the breaker pick the response.
       // The breaker never touches auth state and never exits the process —
       // launchd stays the outer supervision layer for crashes only.
       const outcome = supervisor.onClose(reason);
       try {
-        store.recordConnectionEvent(outcome.cls, reason, outcome.uptimeMs);
+        store.recordConnectionEvent(outcome.cls, reason, outcome.uptimeMs, detail);
       } catch (e) {
         log.warn({ err: (e as Error).message }, "whatsapp: connection_events write failed");
       }
       log.warn(
-        { reason, cls: outcome.cls, uptimeMs: outcome.uptimeMs, decision: outcome.decision.action },
+        { reason, cls: outcome.cls, uptimeMs: outcome.uptimeMs, decision: outcome.decision.action, detail },
         "whatsapp: connection closed",
       );
       const reconnect = () =>
@@ -776,7 +855,8 @@ async function resolveAllowlist(sock: WASocket, config: Config): Promise<void> {
 }
 
 /** Drive the outbound drain (outbound_drain.ts) every second once the
- *  allowlist is resolved. Watchdog: a tick stuck past DRAIN_WATCHDOG_MS
+ *  connection is open and the allowlist is resolved; the close handler
+ *  clears the timer and the next open starts it again. Watchdog: a tick stuck past DRAIN_WATCHDOG_MS
  *  means an await escaped the per-send timeouts — unknown hang, exit for a
  *  launchd respawn with a clean slate (ADR-020). */
 function startOutboundDrain(drain: OutboundDrain): void {
@@ -981,11 +1061,11 @@ async function dispatchInbound(
 
   if (msg.message?.audioMessage) {
     inputKind = "voice";
-    await sock.sendPresenceUpdate("recording", chatId).catch(() => {});
+    await livePresence("recording", chatId);
     try {
       const buffer = (await downloadMediaMessage(msg, "buffer", {}, {
         logger: baileysLogger as any,
-        reuploadRequest: sock.updateMediaMessage,
+        reuploadRequest: liveReupload,
       })) as Buffer;
       const dur = msg.message.audioMessage.seconds ?? 0;
       log.info({ chatId, bytes: buffer.length, seconds: dur }, "whatsapp: transcribing voice memo");
@@ -1045,10 +1125,10 @@ function mediaDeps(sock: WASocket, bot: Bot): MediaDeps {
     download: async (msg) =>
       (await downloadMediaMessage(msg, "buffer", {}, {
         logger: baileysLogger as any,
-        reuploadRequest: sock.updateMediaMessage,
+        reuploadRequest: liveReupload,
       })) as Buffer,
     presence: async (chatId, state) => {
-      await sock.sendPresenceUpdate(state, chatId).catch(() => {});
+      await livePresence(state, chatId);
     },
     fireEnrich: (record, chatId, sourceKey) => {
       void fireEnrichJob({ jobStore, docStore, config, record, chatId, sourceKey });
@@ -1108,13 +1188,13 @@ function braindumpDeps(sock: WASocket, bot: Bot): BraindumpDeps {
       outbound.enqueue({ target: chatId, body: formatReply(body), source: "braindump", dedupKey });
     },
     presence: async (chatId, state) => {
-      await sock.sendPresenceUpdate(state, chatId).catch(() => {});
+      await livePresence(state, chatId);
     },
     extractText,
     transcribeVoice: async (msg) => {
       const buffer = (await downloadMediaMessage(msg, "buffer", {}, {
         logger: baileysLogger as any,
-        reuploadRequest: sock.updateMediaMessage,
+        reuploadRequest: liveReupload,
       })) as Buffer;
       return (await transcribe(buffer)).text;
     },
