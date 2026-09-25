@@ -103,7 +103,14 @@ pub fn copy_path(root: &OwnedFd, rel: &[u8], dest_root: &Path, limits: &ImportLi
         FileType::Symlink => {
             count(budget)?;
             let link = rustix::fs::readlinkat(&cur, OsStr::from_bytes(leaf), Vec::new())?;
-            budget.bytes += link.as_bytes().len() as u64;
+            let len = link.as_bytes().len() as u64;
+            if len > limits.max_file_bytes {
+                refuse!("the symlink {} has a target longer than the per-file limit; nothing was imported", show(rel));
+            }
+            match budget.bytes.checked_add(len) {
+                Some(t) if t <= limits.max_total_bytes => budget.bytes = t,
+                _ => refuse!("the clone's files exceed the total limit; nothing was imported"),
+            }
             std::os::unix::fs::symlink(OsStr::from_bytes(link.as_bytes()), &target)?;
             Ok(())
         }
@@ -144,7 +151,7 @@ pub fn copy_path(root: &OwnedFd, rel: &[u8], dest_root: &Path, limits: &ImportLi
             let out = std::fs::File::create(&target)?;
             let left = limits.max_total_bytes.saturating_sub(budget.bytes);
             let n = copy_limited(std::fs::File::from(fd), &out, rel, limits.max_file_bytes, left)?;
-            budget.bytes += n;
+            budget.bytes = budget.bytes.checked_add(n).context("byte count overflow")?;
             let exec = fst.st_mode & 0o111 != 0;
             std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(if exec { 0o755 } else { 0o644 }))?;
             Ok(())
@@ -174,6 +181,31 @@ mod tests {
             buf.fill(b'g');
             Ok(buf.len())
         }
+    }
+
+    #[test]
+    fn symlink_targets_count_against_the_limits() {
+        let d = tempfile::tempdir().unwrap();
+        let clone = d.path().join("clone");
+        let snap = d.path().join("snap");
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::create_dir_all(&snap).unwrap();
+        let long = "x".repeat(900);
+        std::os::unix::fs::symlink(&long, clone.join("long")).unwrap();
+        std::os::unix::fs::symlink("short", clone.join("short")).unwrap();
+        let root = open_root(&clone).unwrap();
+        let limits = ImportLimits { max_files: 10, max_file_bytes: 500, max_total_bytes: 1000 };
+        let mut b = Budget { files: 0, bytes: 0 };
+        let e = copy_path(&root, b"long", &snap, &limits, &mut b, false).unwrap_err();
+        assert!(e.downcast_ref::<ImportRefused>().unwrap().0.contains("longer than the per-file limit"));
+        assert!(std::fs::symlink_metadata(snap.join("long")).is_err(), "refused before the symlink was created");
+        let mut b = Budget { files: 0, bytes: 998 };
+        let e = copy_path(&root, b"short", &snap, &limits, &mut b, false).unwrap_err();
+        assert!(e.downcast_ref::<ImportRefused>().unwrap().0.contains("total limit"));
+        assert!(std::fs::symlink_metadata(snap.join("short")).is_err());
+        let mut b = Budget { files: 0, bytes: 0 };
+        copy_path(&root, b"short", &snap, &limits, &mut b, false).unwrap();
+        assert_eq!(b.bytes, 5);
     }
 
     #[test]
