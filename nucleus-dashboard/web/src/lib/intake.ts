@@ -4,7 +4,7 @@
 // be refused.
 
 import type { StatusKind } from "@/components/StatusPill";
-import type { IntakeItem, IntakeMessage, IntakeStage } from "@/lib/api/intake";
+import type { IntakeHiddenFinding, IntakeItem, IntakeMessage, IntakeStage } from "@/lib/api/intake";
 
 /** The stages in pipeline order, for the stage track. */
 export const STAGE_TRACK: readonly IntakeStage[] = ["queued", "eval", "refinement", "implementation", "pr", "review", "closed"];
@@ -36,6 +36,7 @@ export function stageKind(item: Pick<IntakeItem, "stage" | "pr_url" | "current_t
     case "cancelled":
       return "idle";
     case "review":
+    case "held":
       return "warn";
     case "refinement":
       return item.current_task_id ? "warn" : "idle";
@@ -53,6 +54,7 @@ export function waitingOn(item: IntakeItem): string | null {
   if (item.stage === "failed") return "failed — retry or cancel";
   if (item.stage === "blocked") return "blocked by the secret guard — fix, then retry or cancel";
   if (item.stage === "stale") return "stale — the issue changed; add the label again for a new item";
+  if (item.stage === "held") return "held — the issue has content GitHub's page does not show; review, then release or cancel";
   return null;
 }
 
@@ -73,6 +75,48 @@ export function canDecideComment(item: Pick<IntakeItem, "stage" | "comment_state
 
 export function canRetry(item: Pick<IntakeItem, "stage">): boolean {
   return item.stage === "failed" || item.stage === "blocked";
+}
+
+/** A held item can be released (after reading its findings) or cancelled. */
+export function canRelease(item: Pick<IntakeItem, "stage">): boolean {
+  return item.stage === "held";
+}
+
+/** Operator words for a finding kind (the values core/src/intake/hidden.rs writes). */
+export function findingKindLabel(kind: string): string {
+  switch (kind) {
+    case "html_comment":
+      return "HTML comment";
+    case "invisible_characters":
+      return "invisible characters";
+    case "invisible_entity":
+      return "entity for an invisible character";
+    case "details":
+      return "collapsed <details> block";
+    case "html_tag":
+      return "raw HTML";
+    case "link_definition":
+      return "link reference definition";
+    case "footnote_definition":
+      return "footnote definition";
+    case "image_alt":
+      return "image alt text";
+    case "link_title":
+      return "link title";
+    case "table_extra_cells":
+      return "table cells beyond the header";
+    case "math_styling":
+      return "math that hides or recolors text";
+    case "rendered_block":
+      return "diagram or map block";
+    default:
+      return kind;
+  }
+}
+
+/** `body 3:5` — where a finding is. */
+export function findingPlace(f: Pick<IntakeHiddenFinding, "location" | "line" | "column">): string {
+  return `${f.location} ${f.line}:${f.column}`;
 }
 
 export function canCancelItem(item: Pick<IntakeItem, "stage">): boolean {

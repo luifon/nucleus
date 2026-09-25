@@ -111,4 +111,22 @@ base_sha: string | null,
 /**
  * The commit Nucleus last pushed to the item's branch.
  */
-pushed_sha: string | null, };
+pushed_sha: string | null,
+/**
+ * The stage a held item was held in (a release returns there).
+ */
+hold_stage: string | null,
+/**
+ * The hidden-content findings the item was last held for
+ * ([`super::hidden::Finding`] list, JSON).
+ */
+hold_json: string | null,
+/**
+ * [`super::hidden::fingerprint`] of what the findings were computed on.
+ */
+hold_hash: string | null, held_at: string | null,
+/**
+ * The fingerprint the operator released: the item continues while the
+ * hidden content it carries is exactly this.
+ */
+released_hash: string | null, released_at: string | null, released_via: string | null, };
