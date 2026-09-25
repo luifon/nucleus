@@ -185,10 +185,13 @@ pub enum Kind {
     Special,
 }
 
+/// A directory's entries (name bytes, kind) and whether it holds `.git`.
+pub type Entries = (Vec<(Vec<u8>, Kind)>, bool);
+
 /// The entries of directory `dir` (names as bytes; `.`, `..` and `.git`
 /// left out), each with its type from `statat` without following symlinks,
 /// and whether the directory holds a `.git` entry (a repository).
-pub fn read_entries(dir: &OwnedFd) -> Result<(Vec<(Vec<u8>, Kind)>, bool)> {
+pub fn read_entries(dir: &OwnedFd) -> Result<Entries> {
     let mut out = Vec::new();
     let mut has_git = false;
     let mut d = rustix::fs::Dir::read_from(dir)?;

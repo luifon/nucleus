@@ -1551,9 +1551,9 @@ mod tests {
         let (_d, root, remote) = fixture();
         let seed = root.join("seed");
         // Listing keeps bytes whatever the file system allows.
-        let listed = b"100644 blob 0123\ta.txt\0100644 blob 4567\tdir/caf\xe9.txt\0";
+        let listed = b"100644 blob 0123\ta.txt\x00100644 blob 4567\tdir/caf\xe9.txt\x00";
         let t = BaseTree::parse(listed);
-        assert!(t.tracked.contains(&b"dir/caf\xe9.txt"[..].to_vec()) && t.dirs.contains(&b"dir"[..].to_vec()));
+        assert!(t.tracked.contains(&b"dir/caf\xe9.txt"[..]) && t.dirs.contains(&b"dir"[..]));
         assert_eq!(crate::intake::snapshot::dest_of(Path::new("/s"), b"caf\xe9.txt").as_os_str().as_bytes(), b"/s/caf\xe9.txt");
         let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
         if let Err(e) = std::fs::write(seed.join(name), "latin-1 name\n") {
