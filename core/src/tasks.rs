@@ -174,6 +174,104 @@ pub struct Task {
     pub delivery_failed_at: Option<String>,
     /// Why the delivery was given up.
     pub delivery_error: Option<String>,
+    /// Directory the worker session runs in; `None` = the workspace root.
+    /// Set only by in-process producers (the issue pipeline, ADR-036), never
+    /// from the CLI.
+    pub workdir: Option<String>,
+    /// The worker's tool posture ([`WorkerProfile`]): `agentic`,
+    /// `read-only` or `code`.
+    pub profile: String,
+}
+
+/// What a worker session may do. The Settings denylist always applies; a
+/// profile only adds refusals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerProfile {
+    /// Every tool the Settings posture allows (the default; chat and
+    /// operator tasks).
+    Agentic,
+    /// Reads files only: no Bash, no file writes, no web access, no
+    /// subagents. The issue pipeline's eval and refinement agents.
+    ReadOnly,
+    /// Edits files and runs local commands in its working directory; no web
+    /// tools and no commands that reach a remote (push, fetch, gh, curl…).
+    /// The issue pipeline's implementation agent. Nucleus code does every
+    /// network step (ADR-036).
+    Code,
+}
+
+impl WorkerProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agentic => "agentic",
+            Self::ReadOnly => "read-only",
+            Self::Code => "code",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "agentic" => Self::Agentic,
+            "read-only" => Self::ReadOnly,
+            "code" => Self::Code,
+            _ => return None,
+        })
+    }
+
+    /// Tool patterns the profile refuses, on top of the Settings denylist
+    /// and the worker denylist. A denylist is not isolation: a `code`
+    /// session can still write a script that opens a socket. OS sandboxing
+    /// is deferred (ADR-036); these refusals stop the ordinary paths.
+    pub fn disallowed_tools(self) -> Vec<String> {
+        match self {
+            Self::Agentic => vec![],
+            Self::ReadOnly => {
+                ["Bash", "Edit", "MultiEdit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+            Self::Code => {
+                let mut v: Vec<String> = ["WebFetch", "WebSearch"].iter().map(|s| s.to_string()).collect();
+                for cmd in [
+                    "git push",
+                    "git fetch",
+                    "git pull",
+                    "git remote",
+                    "git clone",
+                    "git submodule",
+                    "gh",
+                    "curl",
+                    "wget",
+                    "ssh",
+                    "scp",
+                    "rsync",
+                    "nc",
+                    "npm publish",
+                    "cargo publish",
+                ] {
+                    v.push(format!("Bash({cmd}:*)"));
+                }
+                v
+            }
+        }
+    }
+
+    /// Profile-specific instructions appended to the worker prompt.
+    fn prompt(self) -> &'static str {
+        match self {
+            Self::Agentic => "",
+            Self::ReadOnly => {
+                "\n\nThis session is read-only: you can read and search files; you cannot run \
+                 commands, edit files or use the web. Answer from what you read."
+            }
+            Self::Code => {
+                "\n\nYou work in a local git checkout. Edit files and run local commands (build, \
+                 tests). Do not reach the network: no push, fetch, pull, gh, curl or web tools. \
+                 Nucleus pushes and opens the pull request after you finish."
+            }
+        }
+    }
 }
 
 impl Task {
@@ -224,6 +322,10 @@ pub struct NewTask {
     pub parent_id: Option<String>,
     pub requested_by: String,
     pub links: Vec<(String, String)>,
+    /// Working directory of the worker session (`None`: the workspace root).
+    /// Must be an existing absolute directory.
+    pub workdir: Option<PathBuf>,
+    pub profile: WorkerProfile,
 }
 
 /// Which tasks a caller may see and act on.
@@ -323,13 +425,19 @@ ALTER TABLE tasks ADD COLUMN delivery_failed_at TEXT;
 ALTER TABLE tasks ADD COLUMN delivery_error TEXT;
 ALTER TABLE tasks ADD COLUMN delivery_noted_at TEXT";
 
+/// v5: the worker's working directory and tool profile (ADR-036: the issue
+/// pipeline runs its agents in a checkout of the target repo).
+const SCHEMA_V5: &str = "
+ALTER TABLE tasks ADD COLUMN workdir TEXT;
+ALTER TABLE tasks ADD COLUMN profile TEXT NOT NULL DEFAULT 'agentic'";
+
 /// The columns of [`Task`], in order. Reads name them instead of `SELECT *`:
 /// a connection that prepared a statement before a migration added a column
 /// would otherwise see a different column count than the row it steps.
 const TASK_COLUMNS: &str = "id, kind, title, brief, origin, origin_ref, parent_id, requested_by, \
     status, created_at, started_at, finished_at, heartbeat_at, cancel_requested_at, runner_pid, \
     session_id, tmux_window, transcript_path, result, error, delivered_at, delivery_claimed_at, \
-    delivery_queued_at, delivery_failed_at, delivery_error";
+    delivery_queued_at, delivery_failed_at, delivery_error, workdir, profile";
 
 /// Open (creating and migrating) tasks.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
@@ -356,6 +464,11 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
                 version: 4,
                 name: "delivery given up, operator note",
                 step: crate::migrate::Step::Sql(SCHEMA_V4),
+            },
+            crate::migrate::Migration {
+                version: 5,
+                name: "worker directory and profile",
+                step: crate::migrate::Step::Sql(SCHEMA_V5),
             },
         ],
     )
@@ -434,6 +547,11 @@ fn validate(t: &mut NewTask) -> Result<()> {
         ("whatsapp-dm", Some(r)) => Some(crate::whatsapp_queue::canonical_dm_chat(&r)?),
         (_, r) => r.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()),
     };
+    if let Some(dir) = &t.workdir {
+        if !dir.is_absolute() || !dir.is_dir() {
+            bail!("the task's working directory {} is not an existing absolute directory", dir.display());
+        }
+    }
     Ok(())
 }
 
@@ -452,8 +570,8 @@ pub async fn create(pool: &SqlitePool, mut t: NewTask, scope: &Scope) -> Result<
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query(
         "INSERT INTO tasks (id, kind, title, brief, origin, origin_ref, parent_id, requested_by,
-                            status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9)",
+                            status, created_at, workdir, profile)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?10, ?11)",
     )
     .bind(&id)
     .bind(&t.kind)
@@ -464,6 +582,8 @@ pub async fn create(pool: &SqlitePool, mut t: NewTask, scope: &Scope) -> Result<
     .bind(&parent)
     .bind(&t.requested_by)
     .bind(&now)
+    .bind(t.workdir.as_ref().map(|d| d.to_string_lossy().into_owned()))
+    .bind(t.profile.as_str())
     .execute(&mut *tx)
     .await?;
     for (rel, target) in &t.links {
@@ -599,6 +719,19 @@ async fn finish_if(
     }
     tx.commit().await?;
     Ok(done)
+}
+
+/// Test support for other modules (the issue pipeline): end a task the way
+/// its worker would, without a session.
+#[cfg(test)]
+pub(crate) async fn finish_for_tests(
+    pool: &SqlitePool,
+    id: &str,
+    status: TaskStatus,
+    result: Option<&str>,
+    error: Option<&str>,
+) -> Result<bool> {
+    finish(pool, id, status, result, error).await
 }
 
 /// Stop a task: the transition to `cancelled` happens here, at once and
@@ -1083,18 +1216,35 @@ async fn drive_session(
     task: &Task,
     sup: &mut Supervisor,
 ) -> Result<Outcome> {
+    let worker_profile = WorkerProfile::parse(&task.profile)
+        .with_context(|| format!("task {} has an unknown worker profile {:?}", task.short_id(), task.profile))?;
+    // The session's working directory: the task's own (a checkout of
+    // another repo, ADR-036) or the workspace root.
+    let workdir: PathBuf = match &task.workdir {
+        Some(d) => {
+            let d = PathBuf::from(d);
+            if !d.is_dir() {
+                bail!("the task's working directory {} does not exist", d.display());
+            }
+            d
+        }
+        None => workspace_root.to_path_buf(),
+    };
     let ctx = ProfileContext {
-        workspace_root,
+        workspace_root: &workdir,
         claude: &settings.claude,
         tmux_session: &settings.tasks.tmux_session,
         agent_label: TASKS_AGENT_LABEL,
     };
+    let mut denied = worker_denylist();
+    denied.extend(worker_profile.disallowed_tools());
     let profile = SessionProfile::one_shot_agentic(&ctx)
-        .system_prompt(WORKER_PROMPT)
+        .system_prompt(format!("{WORKER_PROMPT}{}", worker_profile.prompt()))
         .window_name(format!("task-{}", task.short_id()))
         .env(crate::proc_tree::ENV_SESSION, crate::proc_tree::SESSION_WORKER)
         .env(crate::caller::ENV_TASK_WORKER, task.id.clone())
-        .extend_disallowed_tools(worker_denylist());
+        .state_root(workspace_root)
+        .extend_disallowed_tools(denied);
     let brief = worker_message(task);
 
     // Spawn and type the brief under supervision: a cancel, the runtime
@@ -1797,6 +1947,8 @@ mod tests {
             parent_id: None,
             requested_by: "cli".into(),
             links: vec![("issue".into(), "example#1".into())],
+            workdir: None,
+            profile: WorkerProfile::Agentic,
         }
     }
 
@@ -1807,6 +1959,36 @@ mod tests {
         t.origin_ref = Some(chat.into());
         t.requested_by = "model".into();
         t
+    }
+
+    #[tokio::test]
+    async fn worker_directory_and_profile_are_validated_and_stored() {
+        let (d, pool) = temp_pool().await;
+        let t = create(&pool, new_task("default"), &Scope::Operator).await.unwrap();
+        assert_eq!((t.profile.as_str(), t.workdir.as_deref()), ("agentic", None));
+        let mut ro = new_task("read-only");
+        ro.workdir = Some(d.path().to_path_buf());
+        ro.profile = WorkerProfile::ReadOnly;
+        let t = create(&pool, ro, &Scope::Operator).await.unwrap();
+        assert_eq!(t.profile, "read-only");
+        assert_eq!(t.workdir.as_deref(), Some(d.path().to_string_lossy().as_ref()));
+        for bad in [d.path().join("missing"), PathBuf::from("relative/dir")] {
+            let mut t = new_task("bad dir");
+            t.workdir = Some(bad);
+            assert!(create(&pool, t, &Scope::Operator).await.is_err());
+        }
+        // The profiles only add refusals.
+        assert!(WorkerProfile::Agentic.disallowed_tools().is_empty());
+        let ro = WorkerProfile::ReadOnly.disallowed_tools();
+        for tool in ["Bash", "Edit", "Write", "WebFetch"] {
+            assert!(ro.contains(&tool.to_string()), "{tool}");
+        }
+        let code = WorkerProfile::Code.disallowed_tools();
+        assert!(code.contains(&"Bash(git push:*)".to_string()) && code.contains(&"WebFetch".to_string()));
+        assert!(!code.contains(&"Bash".to_string()) && !code.contains(&"Edit".to_string()));
+        for p in [WorkerProfile::Agentic, WorkerProfile::ReadOnly, WorkerProfile::Code] {
+            assert_eq!(WorkerProfile::parse(p.as_str()), Some(p));
+        }
     }
 
     #[tokio::test]
@@ -2307,6 +2489,8 @@ mod tests {
             delivery_queued_at: None,
             delivery_failed_at: None,
             delivery_error: None,
+            workdir: None,
+            profile: "agentic".into(),
         };
         let texts = crate::config::TaskTexts::default();
         assert_eq!(outcome_message(&t, &texts), "⚠️ Task 01234567 failed — T\nboom");
