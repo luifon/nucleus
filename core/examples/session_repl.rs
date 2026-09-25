@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
         resume_session_id: None,
         agent_label: None,
         env: vec![],
+        state_root: None,
     })
     .await?;
     println!(

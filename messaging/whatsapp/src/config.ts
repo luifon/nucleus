@@ -3,10 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { resolvePersona } from "./persona.js";
 import { textsFrom } from "./texts.js";
+import { intakeConfig, type IntakeWhatsAppConfig } from "./intake.js";
 
-/** Minimal TOML reader — supports flat tables, scalars, single-line AND
- * multi-line string arrays. Doesn't handle nested tables, inline tables,
- * dotted keys, etc. Fine for our config surface. */
+/** Minimal TOML reader — supports tables (dotted names nest), arrays of
+ * tables (`[[a.b]]`), scalars, single-line AND multi-line string arrays.
+ * Doesn't handle inline tables or dotted keys. Fine for our config surface. */
 export function parseToml(src: string): Record<string, any> {
   const out: Record<string, any> = {};
   let table: Record<string, any> = out;
@@ -48,6 +49,20 @@ export function parseToml(src: string): Record<string, any> {
   for (let line of lines) {
     line = line.trim();
     if (!line) continue;
+    // [[a.b]] appends a new table to the array a.b ([[intake.repos]]).
+    const arrayMatch = line.match(/^\[\[([^\]]+)\]\]$/);
+    if (arrayMatch) {
+      const parts = arrayMatch[1].split(".").map((p) => p.trim());
+      let parent: Record<string, any> = out;
+      for (const part of parts.slice(0, -1)) {
+        parent = parent[part] = (parent[part] as Record<string, any>) ?? {};
+      }
+      const last = parts[parts.length - 1];
+      const arr: Record<string, any>[] = Array.isArray(parent[last]) ? parent[last] : (parent[last] = []);
+      table = {};
+      arr.push(table);
+      continue;
+    }
     const tableMatch = line.match(/^\[([^\]]+)\]$/);
     if (tableMatch) {
       // Dotted names nest: [whatsapp.turns] → out.whatsapp.turns. (Before
@@ -155,6 +170,10 @@ export interface Config {
    *  the group path. Match happens after normalizing the inbound DM's
    *  chatId user-part to digits. */
   allowedDmSenders: Set<string>;
+  /** The operator: the first WHATSAPP_ALLOWED_DM_JIDS entry, normalized to
+   *  digits (ADR-005b). The only identity whose issue-pipeline commands
+   *  count (ADR-036); null when the list is empty. */
+  operatorId: string | null;
   /** Per-sender authorization: only messages whose participant matches
    *  one of these IDs are processed, even inside an allowlisted group.
    *  Holds normalized digit-only user parts; comparison is against the
@@ -202,6 +221,8 @@ export interface Config {
   link: LinkConfig;
   /** ADR-033: the `nucleus` binary (tasks CLI, skill review). */
   nucleusBin: string | null;
+  /** ADR-036: issue-pipeline groups ([intake.whatsapp] in nucleus.toml). */
+  intake: IntakeWhatsAppConfig;
 }
 
 export type { Config as default };
@@ -245,6 +266,7 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
         .map(normalizeSenderId)
         .filter((s) => s.length > 0),
     ),
+    operatorId: splitCsv(process.env.WHATSAPP_ALLOWED_DM_JIDS).map(normalizeSenderId).find((s) => s.length > 0) ?? null,
     allowedSenders: new Set(
       splitCsv(process.env.WHATSAPP_ALLOWED_SENDERS)
         .map(normalizeSenderId)
@@ -273,6 +295,7 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
     turns: turnsConfig(parsed.whatsapp?.turns ?? {}, parsed.whatsapp?.texts ?? {}),
     link: linkConfig(parsed.whatsapp?.link ?? {}),
     nucleusBin: findNucleusBin(workspaceRoot),
+    intake: intakeConfig(parsed.intake?.whatsapp ?? {}),
   };
 }
 

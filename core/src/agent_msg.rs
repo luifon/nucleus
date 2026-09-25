@@ -517,7 +517,7 @@ async fn await_reply(
 }
 
 fn transcripts_dir(workspace_root: &Path) -> PathBuf {
-    let encoded = workspace_root.to_string_lossy().replace('/', "-");
+    let encoded = crate::claude_session::project_dir_name(workspace_root);
     let home = std::env::var("HOME").unwrap_or_default();
     PathBuf::from(home).join(".claude").join("projects").join(encoded)
 }

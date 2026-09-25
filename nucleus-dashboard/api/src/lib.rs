@@ -217,6 +217,15 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     });
     app = app.nest("/tasks/api", handlers::tasks::router(tasks_state));
 
+    // Intake (ADR-036) — the issue pipeline's items. intake.db and tasks.db
+    // are read per request and tolerated missing.
+    let intake_state = Arc::new(handlers::intake::IntakeState {
+        workspace_root: workspace_root.clone(),
+        intake: settings.intake.clone(),
+        tasks: settings.tasks.clone(),
+    });
+    app = app.nest("/intake/api", handlers::intake::router(intake_state));
+
     // Diary router — per ADR-004, every bot writes to
     // memory/diaries/<agent>/<YYYY-MM-DD>.md.
     let diary_root = workspace_root.join(&settings.diary.root);

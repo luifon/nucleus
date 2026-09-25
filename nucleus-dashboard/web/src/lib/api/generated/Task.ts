@@ -39,4 +39,15 @@ delivery_failed_at: string | null,
 /**
  * Why the delivery was given up.
  */
-delivery_error: string | null, };
+delivery_error: string | null,
+/**
+ * Directory the worker session runs in; `None` = the workspace root.
+ * Set only by in-process producers (the issue pipeline, ADR-036), never
+ * from the CLI.
+ */
+workdir: string | null,
+/**
+ * The worker's tool posture ([`WorkerProfile`]): `agentic`,
+ * `read-only` or `code`.
+ */
+profile: string, };

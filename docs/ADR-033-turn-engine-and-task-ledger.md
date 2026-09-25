@@ -8,6 +8,13 @@ after a second review: caller detection from the process tree, the worker's
 run token, confirmed delivery, received/handled inbound dedup, and the
 typed-prompt limit.
 
+**Amended by [[ADR-036]] (2026-09-24):** tasks.db v5 adds a per-task working
+directory (`workdir`) and tool profile (`profile`: `agentic`, `read-only`,
+`code`), set only by in-process producers (the issue pipeline), never by
+`nucleus tasks start`; the WhatsApp target policy accepts the intake groups
+the bot created and has not left (through the drain only); the DM chat
+session gets the read-only `nucleus intake list|show|cancel` commands.
+
 **Builds on / changes:**
 - [[ADR-005b]] — the WhatsApp DM conversational path is replaced by the turn
   engine described here.
@@ -279,6 +286,11 @@ venue-agnostic so Discord and the planned issue pipeline can use it:
   pull requests.
 - Lifecycle: `queued` → `running` → `done` | `failed` | `cancelled`;
   `interrupted` when the worker process is gone.
+- (ADR-036) `workdir` and `profile`: the directory the worker session runs
+  in (default: the workspace root) and the tool refusals it adds on top of
+  the Settings and worker denylists. The issue pipeline runs its eval and
+  refinement agents `read-only` and its implementation agent `code` in a
+  worktree of the target repo.
 
 CLI:
 

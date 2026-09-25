@@ -29,6 +29,7 @@ pub mod db;
 pub mod diary;
 pub mod discord_sdk;
 pub mod health;
+pub mod intake;
 pub mod memory;
 pub mod migrate;
 pub mod proc_tree;

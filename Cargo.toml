@@ -57,3 +57,8 @@ reminders = { path = "chores/reminders" }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# The issue pipeline hashes git and gh before every spawn (ADR-036); an
+# unoptimized sha2 makes that slow in debug builds and tests.
+[profile.dev.package.sha2]
+opt-level = 3

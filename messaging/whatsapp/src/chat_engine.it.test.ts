@@ -16,6 +16,7 @@ import { spawnSync } from "node:child_process";
 import { ChatEngine, DEFAULT_TEXTS, type TurnsConfig } from "./chat_engine.js";
 import { ChatSessionStore, OutboundQueueStore } from "./db.js";
 import { TurnStore } from "./turn_store.js";
+import { projectDirName } from "./claude_session.js";
 
 const ENABLED = process.env.NUCLEUS_IT === "1";
 const TMUX = "nucleus-test-engine";
@@ -77,7 +78,7 @@ function setup() {
   const transcript = () => {
     const sid = store.lookup(CHAT);
     if (!sid) return [];
-    const p = path.join(os.homedir(), ".claude", "projects", ws.replace(/\//g, "-"), `${sid}.jsonl`);
+    const p = path.join(os.homedir(), ".claude", "projects", projectDirName(ws), `${sid}.jsonl`);
     if (!fs.existsSync(p)) return [];
     return fs
       .readFileSync(p, "utf8")

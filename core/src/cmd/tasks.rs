@@ -206,7 +206,20 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             let task = tasks::create(
                 &pool,
-                NewTask { kind, title, brief, origin, origin_ref, parent_id: parent, requested_by, links },
+                NewTask {
+                    kind,
+                    title,
+                    brief,
+                    origin,
+                    origin_ref,
+                    parent_id: parent,
+                    requested_by,
+                    links,
+                    // The CLI never sets these: a chat session must not
+                    // choose where a worker runs or relax its posture.
+                    workdir: None,
+                    profile: tasks::WorkerProfile::Agentic,
+                },
                 &scope,
             )
             .await?;

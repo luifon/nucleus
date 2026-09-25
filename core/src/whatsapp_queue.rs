@@ -1,11 +1,16 @@
-//! Rust-side writers for the WhatsApp bot's queue tables (ADR-020 / ADR-033).
+//! Rust-side writers for the WhatsApp bot's queue tables (ADR-020 / ADR-033 /
+//! ADR-036).
 //!
 //! `memory/whatsapp.db` is owned by the TypeScript bot. The one sanctioned
-//! cross-process write is a queue table the bot drains (ADR-020 §5). Two such
+//! cross-process write is a queue table the bot drains (ADR-020 §5). Three such
 //! tables exist:
 //!
 //! - `outbound_queue` — a message the bot sends to a WhatsApp chat (reminders,
-//!   task results).
+//!   task results, issue-pipeline thread messages).
+//! - `intake_group_requests` — the issue pipeline asks the bot to create or
+//!   leave an item's WhatsApp group (ADR-036). The bot records the result in
+//!   its own `intake_groups` table, and routes operator messages for items to
+//!   its own `intake_inbound` table; Rust only reads those two.
 //! - `session_inbox` — a message from another Nucleus process that the bot
 //!   types into one of its own chat sessions as context (task results,
 //!   `session-send --to whatsapp-dm`). The row carries the sender and the
@@ -93,7 +98,30 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     )
     .await?;
     add_columns_if_missing(&pool, "session_inbox", &[("dedup_key", "dedup_key TEXT")]).await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS intake_group_requests (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_key    TEXT    NOT NULL,
+            action      TEXT    NOT NULL,
+            subject     TEXT,
+            enqueued_at TEXT    NOT NULL,
+            status      TEXT    NOT NULL DEFAULT 'pending',
+            result      TEXT,
+            handled_at  TEXT,
+            dedup_key   TEXT,
+            attempts    INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            claimed_at  TEXT,
+            nonce       TEXT,
+            calling_at  TEXT
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
     for ddl in [
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_group_requests_dedup ON intake_group_requests(dedup_key) WHERE dedup_key IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_outbound_status_enqueued ON outbound_queue(status, enqueued_at)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_dedup ON outbound_queue(dedup_key) WHERE dedup_key IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_session_inbox_status ON session_inbox(status, id)",
@@ -284,6 +312,144 @@ pub async fn enqueue_text_once(pool: &SqlitePool, target: &str, body: &str, sour
     outbound_insert(&mut conn, target, body, source, dedup_key).await
 }
 
+// ── issue pipeline (ADR-036) ─────────────────────────────────────────────
+//
+// `intake_group_requests` is a queue table: the pipeline asks the bot to
+// create an item's WhatsApp group or to leave it, and the bot, which owns
+// the connection, does it and records the result in its own
+// `intake_groups` table. Operator messages the bot routes to an item land
+// in the bot's `intake_inbound` table. Rust only reads those two.
+
+/// Ask the bot to create (`create`, with the group subject) or leave
+/// (`close`) the WhatsApp group of pipeline item `item_key`. Idempotent per
+/// item and action.
+pub async fn request_intake_group(pool: &SqlitePool, item_key: &str, action: &str, subject: Option<&str>) -> Result<i64> {
+    if !matches!(action, "create" | "close") {
+        anyhow::bail!("unknown group action {action:?}");
+    }
+    let key = format!("intake:{item_key}:{action}");
+    sqlx::query(
+        "INSERT OR IGNORE INTO intake_group_requests (item_key, action, subject, enqueued_at, status, dedup_key)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+    )
+    .bind(item_key)
+    .bind(action)
+    .bind(subject)
+    .bind(crate::timestamp::now())
+    .bind(&key)
+    .execute(pool)
+    .await?;
+    Ok(sqlx::query_scalar("SELECT id FROM intake_group_requests WHERE dedup_key = ?1").bind(&key).fetch_one(pool).await?)
+}
+
+/// Ask the bot to leave item `item_key`'s group, unless a close request for
+/// it is already pending or being handled. The bot retries a failed leave
+/// with backoff; a request that failed for good (or finished while the
+/// group did not exist yet) can be asked again. Returns true when a request
+/// was added.
+pub async fn request_intake_close(pool: &SqlitePool, item_key: &str) -> Result<bool> {
+    let res = sqlx::query(
+        "INSERT INTO intake_group_requests (item_key, action, subject, enqueued_at, status, dedup_key)
+         SELECT ?1, 'close', NULL, ?2, 'pending', NULL
+          WHERE NOT EXISTS (SELECT 1 FROM intake_group_requests
+                             WHERE item_key = ?1 AND action = 'close' AND status IN ('pending', 'closing'))",
+    )
+    .bind(item_key)
+    .bind(crate::timestamp::now())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Ask the bot to mark item `item_key`'s unresolved group creation closed,
+/// as the operator decided by hand (`left` or `absent`).
+pub async fn request_intake_resolve(pool: &SqlitePool, item_key: &str, how: &str) -> Result<i64> {
+    if !matches!(how, "left" | "absent") {
+        anyhow::bail!("unknown resolution {how:?}");
+    }
+    let res = sqlx::query(
+        "INSERT INTO intake_group_requests (item_key, action, subject, enqueued_at, status, dedup_key)
+         VALUES (?1, 'resolve', ?2, ?3, 'pending', NULL)",
+    )
+    .bind(item_key)
+    .bind(how)
+    .bind(crate::timestamp::now())
+    .execute(pool)
+    .await?;
+    Ok(res.last_insert_rowid())
+}
+
+/// Every group the bot has as `active` (item key, JID).
+pub async fn active_intake_groups(pool: &SqlitePool) -> Result<Vec<(String, String)>> {
+    if !table_exists(pool, "intake_groups").await? {
+        return Ok(vec![]);
+    }
+    Ok(sqlx::query_as("SELECT item_key, jid FROM intake_groups WHERE status = 'active' AND jid IS NOT NULL")
+        .fetch_all(pool)
+        .await?)
+}
+
+/// The bot's record of an item's group (`intake_groups`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct IntakeGroup {
+    /// `active`, `fallback` (WhatsApp refused it: the thread runs in the
+    /// DM), `unknown` (the creation's outcome is not known; it may exist),
+    /// `quarantined` (found by its recovery nonce, never used, being left),
+    /// `closed` (the bot confirmed it left, or the operator resolved it).
+    pub status: String,
+    pub jid: Option<String>,
+    pub reason: Option<String>,
+}
+
+async fn table_exists(pool: &SqlitePool, table: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")
+        .bind(table)
+        .fetch_one(pool)
+        .await?
+        > 0)
+}
+
+/// The bot's state for item `item_key`'s group; `None` before the bot
+/// handled the request (or when the bot never created the table).
+pub async fn intake_group(pool: &SqlitePool, item_key: &str) -> Result<Option<IntakeGroup>> {
+    if !table_exists(pool, "intake_groups").await? {
+        return Ok(None);
+    }
+    Ok(sqlx::query_as("SELECT status, jid, reason FROM intake_groups WHERE item_key = ?1")
+        .bind(item_key)
+        .fetch_optional(pool)
+        .await?)
+}
+
+/// One operator message the bot routed to a pipeline item.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct IntakeInbound {
+    pub id: i64,
+    pub item_key: String,
+    pub chat_id: String,
+    pub wa_msg_id: String,
+    pub text: String,
+    pub received_at: String,
+    /// `text` when the operator typed it; `voice` (a transcription) or
+    /// `forwarded` otherwise. Only typed text can be a command.
+    pub input_kind: String,
+}
+
+/// Rows of `intake_inbound` with an id above `after`, oldest first.
+pub async fn intake_inbound_after(pool: &SqlitePool, after: i64, limit: i64) -> Result<Vec<IntakeInbound>> {
+    if !table_exists(pool, "intake_inbound").await? {
+        return Ok(vec![]);
+    }
+    Ok(sqlx::query_as(
+        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, input_kind FROM intake_inbound
+          WHERE id > ?1 ORDER BY id LIMIT ?2",
+    )
+    .bind(after)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Digits of the user part of a WhatsApp id or phone number: a formatted
 /// phone number, a `@s.whatsapp.net` JID with or without a `:<device>`
 /// suffix, and an `@lid` id all reduce to their digits. Mirrors `normalizeSenderId` in messaging/whatsapp.
@@ -397,6 +563,26 @@ mod tests {
         raw.close().await;
         let pool = open(dir.path()).await.unwrap();
         enqueue_inbox(&pool, "dm", "main", "x", "t", Some("k")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intake_group_requests_are_idempotent_and_bot_tables_may_be_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let pool = open(dir.path()).await.unwrap();
+        let a = request_intake_group(&pool, "3", "create", Some("#3 Fix")).await.unwrap();
+        let b = request_intake_group(&pool, "3", "create", Some("#3 Fix")).await.unwrap();
+        assert_eq!(a, b);
+        assert_ne!(request_intake_group(&pool, "3", "close", None).await.unwrap(), a);
+        assert!(request_intake_group(&pool, "3", "rename", None).await.is_err());
+        // One pending close at a time; another after it finished.
+        assert!(request_intake_close(&pool, "4").await.unwrap());
+        assert!(!request_intake_close(&pool, "4").await.unwrap());
+        sqlx::query("UPDATE intake_group_requests SET status = 'failed' WHERE item_key = '4'").execute(&pool).await.unwrap();
+        assert!(request_intake_close(&pool, "4").await.unwrap());
+        // Before the bot created its tables, nothing is there to read.
+        assert!(intake_group(&pool, "3").await.unwrap().is_none());
+        assert!(intake_inbound_after(&pool, 0, 10).await.unwrap().is_empty());
     }
 
     #[test]

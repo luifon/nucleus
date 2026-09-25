@@ -226,7 +226,9 @@ pub struct Session {
     agent_label: Option<String>,
     /// Unique id for this spawn's run-log row (distinct from `session_id`).
     run_id: String,
-    /// Workspace root, needed to resolve the `memory/logs/<agent>/` path.
+    /// Where Nucleus's own files go (`SpawnOptions::state_root`, else the
+    /// working directory): the `memory/logs/<agent>/` run-log and the
+    /// daily-session record.
     workspace_root: PathBuf,
     /// The config this session was spawned with, kept so `ask` can relaunch
     /// the window on the fallback model without the caller's help.
@@ -291,6 +293,12 @@ pub struct SpawnOptions {
     /// tool command it runs. The task ledger uses them to tell its CLI who is
     /// calling (ADR-033: a chat session's task scope, a worker's role).
     pub env: Vec<(String, String)>,
+    /// Where Nucleus keeps its own files for this session (the run-log under
+    /// `memory/logs/`, the ADR-029 daily-session record). `None` = the
+    /// working directory. A session that runs in another repository (the
+    /// issue pipeline's worktrees, ADR-036) sets it to the Nucleus workspace
+    /// root, so nothing of Nucleus is written into that repository.
+    pub state_root: Option<PathBuf>,
 }
 
 // NOTE (ADR-020): `Default` is deliberately NOT implemented for
@@ -409,7 +417,8 @@ impl Session {
                 ok: None,
                 claude_version: claude_version().await,
             };
-            if let Err(e) = crate::runlog::record_start(&opts.workspace_root, &row) {
+            let state_root = opts.state_root.as_ref().unwrap_or(&opts.workspace_root);
+            if let Err(e) = crate::runlog::record_start(state_root, &row) {
                 tracing::warn!("run-log record_start failed for {agent}: {e:#}");
             }
         }
@@ -421,7 +430,7 @@ impl Session {
             cursor,
             agent_label: opts.agent_label.clone(),
             run_id,
-            workspace_root: opts.workspace_root.clone(),
+            workspace_root: opts.state_root.clone().unwrap_or_else(|| opts.workspace_root.clone()),
             spawn_opts: opts,
             daily: None,
             last_submit: None,
@@ -973,6 +982,7 @@ impl SessionPool {
                 resume_session_id: resume_session_id.clone(),
                 agent_label: self.config.agent_label.clone(),
                 env: vec![],
+                state_root: None,
             })
             .await;
             match spawned {
@@ -1209,6 +1219,7 @@ impl SessionPool {
             resume_session_id: None,
             agent_label: self.config.agent_label.clone(),
             env: vec![],
+            state_root: None,
         })
         .await
         .context("daily_rotate: spawn new session")?;
@@ -1520,8 +1531,17 @@ fn private_add_dir(opts: &SpawnOptions) -> Option<PathBuf> {
     (!already_listed).then_some(private)
 }
 
+/// The directory name Claude Code gives a working directory under
+/// `~/.claude/projects/`: every character that is not an ASCII letter or digit
+/// becomes `-` (so `/w/acme__widget/.x` is `-w-acme--widget--x`). Replacing
+/// only `/` was enough for the workspace root, but not for the issue
+/// pipeline's worktrees (ADR-036), whose paths contain `_` and `.`.
+pub fn project_dir_name(dir: &Path) -> String {
+    dir.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
 pub(crate) fn transcript_path_for(workspace_root: &Path, session_id: &str) -> PathBuf {
-    let encoded = workspace_root.to_string_lossy().replace('/', "-");
+    let encoded = project_dir_name(workspace_root);
     let home = std::env::var("HOME").unwrap_or_default();
     PathBuf::from(home)
         .join(".claude")
@@ -2864,6 +2884,14 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn project_dir_names_follow_claude_code() {
+        // Observed with Claude Code 2.1.x: `_` and `.` become `-` like `/`.
+        assert_eq!(project_dir_name(Path::new("/w/acme__widget/item-1")), "-w-acme--widget-item-1");
+        assert_eq!(project_dir_name(Path::new("/a/.claude/x")), "-a--claude-x");
+        assert_eq!(project_dir_name(Path::new("/plain/Path9")), "-plain-Path9");
+    }
+
     fn args_test_opts(workspace_root: &Path, add_dirs: Vec<PathBuf>) -> SpawnOptions {
         SpawnOptions {
             workspace_root: workspace_root.to_path_buf(),
@@ -2878,6 +2906,7 @@ mod tests {
             resume_session_id: None,
             agent_label: None,
             env: vec![],
+            state_root: None,
         }
     }
 

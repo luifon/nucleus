@@ -540,6 +540,66 @@ JSON-parsed numbers.
   `nucleus session-send --to whatsapp-dm`; `session-send` refuses raw tmux
   injection into the `nucleus-whatsapp` and `nucleus-whatsapp-dm` sessions.
 
+## Rule 14 — The issue pipeline (ADR-036)
+
+- Sources become events through adapters (`core/src/intake/event.rs`) or
+  `nucleus events emit`; the store deduplicates by `(source, external_id)`.
+  A new source is a new adapter, not a change to the core.
+- An issue becomes an item only with the configured label, on a repo listed
+  in the untracked `nucleus.toml`. Repo names of the operator's projects
+  never go in a committed file; examples use `owner/repo`, tests use
+  `acme/widget`.
+- Agent steps are ADR-033 tasks (`origin = pipeline`) with a working
+  directory and a profile (`read-only` for eval and refinement, `code` for
+  implementation). Network steps — fetch, push, `gh pr create`,
+  `gh issue comment` — are Nucleus code in `core/src/intake/`, never an
+  agent. Nucleus opens draft PRs only, never merges, and comments on an
+  issue only after the operator approved the text.
+- Issue text and comments go into briefs only between the nonce data
+  markers of `briefs::Fence`; only collaborator comments are included.
+- Plan and comment approvals are decided by code from the operator's own
+  message (`#n approve`, `#n approve comment`), the operator's terminal, or
+  the dashboard. A chat session may list, show and cancel items; it never
+  approves.
+- Thread messages reach WhatsApp only through `outbound_queue` (target
+  policy, secret filter). Intake groups are created and left only by the
+  bot (`messaging/whatsapp/src/intake.ts`), within `[intake.whatsapp]
+  max_groups_per_day`. A group creation with an unknown result is never
+  counted as closed; only the bot leaving it or the operator running
+  `nucleus intake group-resolve` closes it.
+- Every write to `memory/intake.db` goes through `nucleus_core::intake`.
+  Nucleus keeps one bare mirror per repo and one clone per item under
+  `[intake] work_dir`, outside this checkout. Nucleus's own git commands
+  run with no global or system config (`GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_CONFIG_NOSYSTEM=1`), hooks disabled, the mirror's config rewritten,
+  an HTTPS remote URL from `nucleus.toml` and gh as the only credential
+  helper. `git` and `gh` run from canonical paths pinned by SHA-256 and started
+  only through one function that checks the hash immediately before each
+  spawn.
+  Nucleus never runs git against an item clone: it imports the
+  clone's file tree into the mirror as one commit with the configured
+  identity and a code-owned message. The import reads a private snapshot
+  built by Nucleus's own no-follow, descriptor-relative walk (no git command
+  reads the clone; ignore rules come from bounded private copies of each
+  `.gitignore`, decided by `git check-ignore --no-index` with the letter-case rule of
+  the clone's file system; every directory entry counts against
+  `[intake] import_max_entries` as it is read) under enforced
+  byte and file-count limits (`[intake] import_max_*`), refuses hard links and
+  special files, keeps base submodules and `.gitmodules` unchanged, and
+  installs new objects as one pack. Before pushing, Nucleus reads the remote
+  item ref: a commit it already pushed is recorded, an unknown one blocks
+  the item. The first push only creates `nucleus/item-<n>`; later pushes
+  lease on the recorded commit. PR and comment lookups match only Nucleus's
+  own (the item branch in the configured repo, the authenticated account, a
+  random per-comment marker). Do not add a git step that breaks this.
+- Nucleus reads the issue live (open, label added by a collaborator, no
+  edit since) before preparing and again right before every write: worker
+  start, push, PR creation (after the PR lookup) and comment (after the
+  comments lookup). The last read is the authorization point; a difference
+  from the first read fails closed. Task titles and branch names are code-owned;
+  issue text reaches a session only inside the data fence. The PR body is built from code-owned fields, and the
+  diff and all public text pass `tools/check-secrets.sh` first.
+
 ## When in doubt
 
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit

@@ -185,6 +185,8 @@ async fn tasks_run_needs_the_launch_token() {
             parent_id: None,
             requested_by: "cli".into(),
             links: vec![],
+            workdir: None,
+            profile: nucleus_core::tasks::WorkerProfile::Agentic,
         },
         &nucleus_core::tasks::Scope::Operator,
     )

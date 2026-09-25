@@ -400,8 +400,15 @@ export class Session {
 
 // ---- internals ----
 
+/** Claude Code's directory name for a working directory: every character
+ *  that is not an ASCII letter or digit becomes `-` (mirrors
+ *  `project_dir_name` in core/src/claude_session.rs). */
+export function projectDirName(dir: string): string {
+  return dir.replace(/[^A-Za-z0-9]/g, "-");
+}
+
 function transcriptPathFor(workspaceRoot: string, sessionId: string): string {
-  const encoded = workspaceRoot.replace(/\//g, "-");
+  const encoded = projectDirName(workspaceRoot);
   return path.join(os.homedir(), ".claude", "projects", encoded, `${sessionId}.jsonl`);
 }
 
