@@ -1291,7 +1291,7 @@ async fn limits_block_the_item_with_a_clear_reason() {
     tick(&f).await;
     let it = item1(&f).await;
     assert_eq!((it.stage(), it.failed_stage.as_deref()), (Stage::Blocked, Some("implementation")));
-    assert!(it.error.unwrap().contains("big.txt is 500 bytes"));
+    assert!(it.error.unwrap().contains("big.txt is larger than the per-file limit"));
 
     // A diff over the scan limit: blocked before the push, not cut.
     let f = fixture().await;

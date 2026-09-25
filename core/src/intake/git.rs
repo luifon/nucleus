@@ -149,7 +149,10 @@ pub fn check_repo_name(repo: &str) -> Result<()> {
 /// environment. Every inherited `GIT_*` variable is removed, so a caller's
 /// `GIT_DIR` or `GIT_INDEX_FILE` (a git hook's environment) cannot redirect
 /// the command, and no system or global configuration is read.
-async fn run(cwd: &Path, pre: &[String], args: &[&str], env: &[(&str, &str)]) -> Result<GitOut> {
+/// The one way intake builds a git process: the pinned git (hash checked
+/// right before), [`HARDENING`], no system or global configuration, no
+/// inherited `GIT_*` variable, then `env`.
+fn git_command(cwd: &Path, pre: &[String], args: &[&str], env: &[(&str, &str)]) -> Result<tokio::process::Command> {
     let mut cmd = super::tools::git_pin()?.command()?;
     for (k, _) in std::env::vars_os() {
         let k = k.to_string_lossy().into_owned();
@@ -165,7 +168,15 @@ async fn run(cwd: &Path, pre: &[String], args: &[&str], env: &[(&str, &str)]) ->
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.current_dir(cwd).args(HARDENING).args(pre).args(args).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    cmd.current_dir(cwd).args(HARDENING).args(pre).args(args).kill_on_drop(true);
+    Ok(cmd)
+}
+
+/// Run git in `cwd` with [`HARDENING`], extra `-c` options and extra
+/// environment (see [`git_command`]).
+async fn run(cwd: &Path, pre: &[String], args: &[&str], env: &[(&str, &str)]) -> Result<GitOut> {
+    let mut cmd = git_command(cwd, pre, args, env)?;
+    cmd.stdin(std::process::Stdio::null());
     let out = tokio::time::timeout(Duration::from_secs(600), cmd.output())
         .await
         .context("git did not finish within 600 s")?
@@ -268,6 +279,35 @@ fn mirror_config(url: &str) -> String {
     )
 }
 
+/// Name prefix of an import's scratch directory inside the mirror (its
+/// temporary object directory, index and snapshot).
+pub const SCRATCH_PREFIX: &str = "nucleus-import-";
+/// Scratch directories older than this are left by a stopped import and
+/// removed when the mirror is opened.
+pub const SCRATCH_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Remove scratch directories older than [`SCRATCH_MAX_AGE`].
+pub fn sweep_scratch(mirror: &Path) -> Result<usize> {
+    let mut removed = 0;
+    let Ok(entries) = std::fs::read_dir(mirror) else { return Ok(0) };
+    for e in entries.flatten() {
+        if !e.file_name().to_string_lossy().starts_with(SCRATCH_PREFIX) {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age > SCRATCH_MAX_AGE)
+            .unwrap_or(false);
+        if old && std::fs::remove_dir_all(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Files in a git directory that can run commands, redirect object or ref
 /// lookups, or add configuration. Removed from the mirror before every use.
 const MIRROR_STRAY: &[&str] = &["hooks", "objects/info/alternates", "objects/info/http-alternates", "commondir", "config.worktree", "info/attributes", "gitdir"];
@@ -316,6 +356,7 @@ pub async fn reset_mirror(mirror: &Path, remote: &Remote) -> Result<bool> {
     if changed {
         tracing::warn!(mirror = %mirror.display(), "intake: the mirror's remote was changed; it was reset to the configured URL");
     }
+    sweep_scratch(mirror)?;
     Ok(changed)
 }
 
@@ -505,17 +546,15 @@ pub async fn import(
     limits: &ImportLimits,
 ) -> Result<Option<String>> {
     reset_mirror(mirror, remote).await?;
-    let meta = std::fs::symlink_metadata(wt).with_context(|| format!("reading {}", wt.display()))?;
-    if !meta.is_dir() {
-        refuse!("the item's clone {} is not a directory (a symlink or a file)", wt.display());
-    }
+    let root = super::snapshot::open_root(wt)?;
     let drivers = mirror_git(mirror, &[], &["config", "--get-regexp", r"^(filter|diff|merge)\.[^.]+\."], &[]).await?;
     if !drivers.stdout.trim().is_empty() {
         bail!("the mirror's configuration defines a filter, diff or merge driver");
     }
-    let scratch = mirror.join(format!("nucleus-import-{item}-{}", uuid::Uuid::new_v4().simple()));
+    let scratch = mirror.join(format!("{SCRATCH_PREFIX}{item}-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(scratch.join("objects"))?;
-    let result = import_in(mirror, wt, base_sha, item, spec, limits, &scratch).await;
+    std::fs::create_dir_all(scratch.join("tree"))?;
+    let result = import_in(mirror, wt, &root, base_sha, item, spec, limits, &scratch).await;
     let _ = std::fs::remove_dir_all(&scratch);
     result
 }
@@ -524,6 +563,7 @@ pub async fn import(
 async fn import_in(
     mirror: &Path,
     wt: &Path,
+    root: &std::os::fd::OwnedFd,
     base_sha: &str,
     item: i64,
     spec: &CommitSpec,
@@ -532,76 +572,48 @@ async fn import_in(
 ) -> Result<Option<String>> {
     let index_s = scratch.join("index").to_string_lossy().into_owned();
     let objects_s = scratch.join("objects").to_string_lossy().into_owned();
+    let snapshot = scratch.join("tree");
     let mirror_objects = mirror.join("objects").to_string_lossy().into_owned();
-    let pre = vec![format!("--work-tree={}", wt.display())];
     let env = [
         ("GIT_INDEX_FILE", index_s.as_str()),
         ("GIT_OBJECT_DIRECTORY", objects_s.as_str()),
         ("GIT_ALTERNATE_OBJECT_DIRECTORIES", mirror_objects.as_str()),
     ];
-    let out = mirror_git(mirror, &pre, &["read-tree", base_sha], &env).await?;
+    let out = mirror_git(mirror, &[], &["read-tree", base_sha], &env).await?;
     if !out.ok {
         bail!("git read-tree failed: {}", out.stderr);
     }
     let base_links = gitlinks(&mirror_ok(mirror, &["ls-tree", "-r", "-z", base_sha]).await?, true);
 
     // Special files (FIFO, socket, device) anywhere in the clone, found by
-    // a walk that follows no symlink and skips `.git` directories. Git
-    // itself skips them, but none may be in a tree Nucleus imports.
+    // a walk that follows no symlink and skips `.git` directories.
     special_files(wt, limits.max_files.saturating_mul(50).max(100_000))?;
 
-    // Every path git would consider, listed without reading any content
-    // (bounded output), then checked with lstat before `git add`.
+    // The paths git would import (tracked and untracked, not ignored),
+    // listed as bytes through a bounded reader. Listing reads directory
+    // entries and the clone's ignore files; no file content.
     let cap = limits.max_files.saturating_mul(1024).saturating_add(1 << 20);
-    let listed = run_capped(
-        mirror,
-        &[vec![format!("--git-dir={}", mirror.display())], pre.clone()].concat(),
-        &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        &env,
-        cap,
-    )
-    .await?;
+    let pre_clone = vec![format!("--git-dir={}", mirror.display()), format!("--work-tree={}", wt.display())];
+    let listed = run_capped(mirror, &pre_clone, &["ls-files", "-z", "--cached", "--others", "--exclude-standard"], &env, cap).await?;
     let Some(listed) = listed else {
         refuse!("the clone has more than {} files; nothing was imported", limits.max_files);
     };
-    let paths: Vec<&str> = std::str::from_utf8(&listed).context("a path in the clone is not UTF-8")?.split('\0').filter(|p| !p.is_empty()).collect();
+    let paths = split_paths(&listed);
     if paths.len() > limits.max_files {
         refuse!("the clone has {} files, more than the limit of {}; nothing was imported", paths.len(), limits.max_files);
     }
-    let mut total: u64 = 0;
+
+    // The private snapshot: every listed path copied with descriptor-
+    // relative, no-follow operations and read limits (snapshot.rs).
+    let mut budget = super::snapshot::Budget { files: 0, bytes: 0 };
     for p in &paths {
-        let rel = p.trim_end_matches('/');
-        let full = wt.join(rel);
-        let m = match std::fs::symlink_metadata(&full) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // deleted
-            Err(e) => return Err(e).with_context(|| format!("reading {rel}")),
-        };
-        let ft = m.file_type();
-        if ft.is_symlink() {
-            continue;
-        }
-        if ft.is_dir() {
-            if base_links.iter().any(|(path, _)| path == rel) {
-                continue; // an unchanged submodule directory of the base
-            }
-            if full.join(".git").exists() {
-                refuse!("the clone contains a nested repository at {rel}; Nucleus does not publish one");
-            }
-            continue;
-        }
-        if !ft.is_file() {
-            refuse!("{rel} is not a regular file or a symlink (a FIFO, socket or device); nothing was imported");
-        }
-        if m.len() > limits.max_file_bytes {
-            refuse!("{rel} is {} bytes, more than the per-file limit of {}; nothing was imported", m.len(), limits.max_file_bytes);
-        }
-        total = total.saturating_add(m.len());
-        if total > limits.max_total_bytes {
-            refuse!("the clone's files exceed the total limit of {} bytes; nothing was imported", limits.max_total_bytes);
-        }
+        let rel: &[u8] = p.strip_suffix(b"/").unwrap_or(p);
+        let is_link = base_links.iter().any(|(path, _)| path.as_bytes() == rel);
+        super::snapshot::copy_path(root, rel, &snapshot, limits, &mut budget, is_link)?;
     }
 
+    // git add reads only the snapshot.
+    let pre = vec![format!("--work-tree={}", snapshot.display())];
     let out = mirror_git(mirror, &pre, &["add", "--all", "--", "."], &env).await?;
     if !out.ok {
         bail!("git add failed: {}", out.stderr);
@@ -625,6 +637,17 @@ async fn import_in(
         bail!("git write-tree failed: {}", tree.stderr);
     }
     let tree = tree.stdout.trim().to_string();
+    // `.gitmodules` must stay byte-identical to the base when the base has
+    // submodules or either tree has the file (a changed URL is a submodule
+    // change).
+    let modules = |t: String| {
+        let env = &env;
+        async move { mirror_git(mirror, &[], &["rev-parse", "--verify", "--quiet", &format!("{t}:.gitmodules")], env).await.map(|o| o.ok.then_some(o.stdout.trim().to_string())) }
+    };
+    let (base_mod, new_mod) = (modules(base_sha.to_string()).await?, modules(tree.clone()).await?);
+    if (!base_links.is_empty() || base_mod.is_some() || new_mod.is_some()) && base_mod != new_mod {
+        refuse!("the change modifies .gitmodules; Nucleus does not publish submodule changes");
+    }
     let base_tree = mirror_ok(mirror, &["rev-parse", &format!("{base_sha}^{{tree}}")]).await?;
     if tree == base_tree.trim() {
         return Ok(None);
@@ -642,9 +665,78 @@ async fn import_in(
         bail!("creating the item's commit failed: {}", commit.stderr);
     }
     let sha = commit.stdout.trim().to_string();
-    move_objects(&scratch.join("objects"), &mirror.join("objects"))?;
+    install_pack(mirror, &scratch.join("objects")).await?;
     mirror_ok(mirror, &["update-ref", &item_ref(item), &sha]).await?;
     Ok(Some(sha))
+}
+
+/// NUL-separated paths of `ls-files -z`, kept as bytes (a name that is not
+/// UTF-8 is not changed).
+fn split_paths(listed: &[u8]) -> Vec<&[u8]> {
+    listed.split(|b| *b == 0).filter(|p| !p.is_empty()).collect()
+}
+
+/// Every loose object id in an object directory.
+fn loose_ids(objects: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for d in std::fs::read_dir(objects)? {
+        let d = d?;
+        let dn = d.file_name().to_string_lossy().into_owned();
+        if dn.len() != 2 || !dn.chars().all(|c| c.is_ascii_hexdigit()) || !d.file_type()?.is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(d.path())? {
+            let f = f?.file_name().to_string_lossy().into_owned();
+            if f.chars().all(|c| c.is_ascii_hexdigit()) {
+                out.push(format!("{dn}{f}"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Pack the new objects of a temporary object directory and install the
+/// pack in the mirror: the `.pack` (and `.rev`) first, the `.idx` last, each
+/// by rename. Git ignores a pack without its index, so a crash leaves no
+/// half-visible objects.
+async fn install_pack(mirror: &Path, objects: &Path) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let ids = loose_ids(objects)?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let out_dir = objects.join("nucleus-pack");
+    std::fs::create_dir_all(&out_dir)?;
+    let objects_s = objects.to_string_lossy().into_owned();
+    let mirror_objects = mirror.join("objects").to_string_lossy().into_owned();
+    let base = out_dir.join("pack").to_string_lossy().into_owned();
+    let mut cmd = git_command(
+        mirror,
+        &[format!("--git-dir={}", mirror.display())],
+        &["pack-objects", "-q", &base],
+        &[("GIT_OBJECT_DIRECTORY", objects_s.as_str()), ("GIT_ALTERNATE_OBJECT_DIRECTORIES", mirror_objects.as_str())],
+    )?;
+    cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().context("running git pack-objects")?;
+    let mut stdin = child.stdin.take().context("no stdin")?;
+    stdin.write_all(format!("{}\n", ids.join("\n")).as_bytes()).await?;
+    drop(stdin);
+    let out = tokio::time::timeout(Duration::from_secs(600), child.wait_with_output()).await.context("git pack-objects timed out")??;
+    if !out.status.success() {
+        bail!("git pack-objects failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let dest = mirror.join("objects/pack");
+    std::fs::create_dir_all(&dest)?;
+    for ext in ["pack", "rev", "idx"] {
+        let from = out_dir.join(format!("pack-{hash}.{ext}"));
+        if from.exists() {
+            std::fs::rename(&from, dest.join(format!("pack-{hash}.{ext}"))).with_context(|| format!("installing pack-{hash}.{ext}"))?;
+        } else if ext != "rev" {
+            bail!("git pack-objects wrote no .{ext}");
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a FIFO, socket or device file anywhere under `root` (symlinks
@@ -694,24 +786,7 @@ fn gitlinks(out: &str, tree: bool) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Move every object file of a temporary object directory into the
-/// mirror's (same file system: a rename). An object the mirror already has
-/// is left in place.
-fn move_objects(from: &Path, to: &Path) -> Result<()> {
-    for entry in walk_files(from)? {
-        let rel = entry.strip_prefix(from).context("object path outside its directory")?;
-        let dest = to.join(rel);
-        if dest.exists() {
-            continue;
-        }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::rename(&entry, &dest).with_context(|| format!("moving object {}", rel.display()))?;
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn walk_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -733,28 +808,8 @@ fn walk_files(dir: &Path) -> Result<Vec<PathBuf>> {
 /// output is longer (the process is stopped). A failure is an error.
 async fn run_capped(cwd: &Path, pre: &[String], args: &[&str], env: &[(&str, &str)], max_bytes: usize) -> Result<Option<Vec<u8>>> {
     use tokio::io::AsyncReadExt;
-    let mut cmd = super::tools::git_pin()?.command()?;
-    for (k, _) in std::env::vars_os() {
-        let k = k.to_string_lossy().into_owned();
-        if k.starts_with("GIT_") {
-            cmd.env_remove(k);
-        }
-    }
-    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0");
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.current_dir(cwd)
-        .args(HARDENING)
-        .args(pre)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+    let mut cmd = git_command(cwd, pre, args, env)?;
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().context("running git")?;
     let mut stdout = child.stdout.take().context("no stdout")?;
     let mut buf = Vec::new();
@@ -1239,6 +1294,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_snapshot_refuses_hard_links_and_symlinked_parents() {
+        let (_d, root, remote) = fixture();
+        let seed = root.join("seed");
+        sh(&seed, "mkdir dir && echo f > dir/f.txt && git add dir && git commit -qm dir && git push -q origin HEAD:main");
+        let work = root.join("work");
+        let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
+        let wt = worktree_path(&work, "acme/widget", 8);
+        let (base, _) = prepare_clone(&mirror, &wt, "main", 8, Some("nucleus/item-8")).await.unwrap();
+        // A hard link (to a file outside the tree).
+        std::fs::write(root.join("outside.txt"), "secret\n").unwrap();
+        std::fs::hard_link(root.join("outside.txt"), wt.join("linked.txt")).unwrap();
+        let e = import(&mirror, &remote, &wt, &base, 8, &spec(), &LIMITS).await.unwrap_err();
+        assert!(e.downcast_ref::<ImportRefused>().unwrap().0.contains("linked.txt has more than one hard link"), "{e:#}");
+        std::fs::remove_file(wt.join("linked.txt")).unwrap();
+        // A tracked directory replaced by a symlink to elsewhere.
+        std::fs::remove_dir_all(wt.join("dir")).unwrap();
+        std::os::unix::fs::symlink(&seed, wt.join("dir")).unwrap();
+        let e = import(&mirror, &remote, &wt, &base, 8, &spec(), &LIMITS).await.unwrap_err();
+        let why = e.downcast_ref::<ImportRefused>().map(|r| r.0.clone()).unwrap_or_else(|| format!("{e:#}"));
+        assert!(why.contains("symlink") || why.contains("dir"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn gitmodules_must_stay_as_in_the_base() {
+        let (_d, root, remote) = fixture();
+        let seed = root.join("seed");
+        sh(&seed, "printf '[submodule \"lib\"]\\n\\turl = https://example.invalid/lib.git\\n' > .gitmodules && git add .gitmodules && git commit -qm m && git push -q origin HEAD:main");
+        let work = root.join("work");
+        let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
+        let wt = worktree_path(&work, "acme/widget", 9);
+        let (base, _) = prepare_clone(&mirror, &wt, "main", 9, Some("nucleus/item-9")).await.unwrap();
+        std::fs::write(wt.join(".gitmodules"), "[submodule \"lib\"]\n\turl = https://example.invalid/other.git\n").unwrap();
+        let e = import(&mirror, &remote, &wt, &base, 9, &spec(), &LIMITS).await.unwrap_err();
+        assert!(format!("{e:#}").contains("modifies .gitmodules"), "{e:#}");
+        // A new .gitmodules in a repo without one is refused too.
+        let (_d2, root2, remote2) = fixture();
+        let work2 = root2.join("work");
+        let mirror2 = sync_mirror(&work2, "acme/widget", &remote2).await.unwrap();
+        let wt2 = worktree_path(&work2, "acme/widget", 9);
+        let (base2, _) = prepare_clone(&mirror2, &wt2, "main", 9, Some("nucleus/item-9")).await.unwrap();
+        std::fs::write(wt2.join(".gitmodules"), "x").unwrap();
+        assert!(import(&mirror2, &remote2, &wt2, &base2, 9, &spec(), &LIMITS).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn objects_arrive_as_one_pack_and_old_scratch_is_swept() {
+        let (_d, root, remote) = fixture();
+        let work = root.join("work");
+        let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
+        let wt = worktree_path(&work, "acme/widget", 10);
+        let (base, _) = prepare_clone(&mirror, &wt, "main", 10, Some("nucleus/item-10")).await.unwrap();
+        let loose_before = loose_ids(&mirror.join("objects")).unwrap().len();
+        std::fs::write(wt.join("new.txt"), "new\n").unwrap();
+        let sha = import(&mirror, &remote, &wt, &base, 10, &spec(), &LIMITS).await.unwrap().unwrap();
+        assert_eq!(loose_ids(&mirror.join("objects")).unwrap().len(), loose_before, "no loose object is added");
+        let packs: Vec<String> = std::fs::read_dir(mirror.join("objects/pack")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(packs.iter().any(|p| p.ends_with(".pack")) && packs.iter().any(|p| p.ends_with(".idx")), "{packs:?}");
+        assert_eq!(out(&mirror, &["--git-dir=.", "cat-file", "-t", &sha]).trim(), "commit");
+        // Scratch left by a stopped import: an old one is removed on open, a
+        // recent one is kept.
+        let old = mirror.join(format!("{SCRATCH_PREFIX}1-old"));
+        let fresh = mirror.join(format!("{SCRATCH_PREFIX}1-fresh"));
+        std::fs::create_dir_all(old.join("objects")).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        sh(&mirror, &format!("touch -t 200001010000 '{}'", old.display()));
+        open_mirror(&work, "acme/widget", &remote).await.unwrap();
+        assert!(!old.exists() && fresh.exists());
+    }
+
+    #[tokio::test]
+    async fn non_utf8_file_names_survive_an_import() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_d, root, remote) = fixture();
+        let seed = root.join("seed");
+        // Listing keeps bytes whatever the file system allows.
+        let listed = b"a.txt\0caf\xe9.txt\0dir/\xff\xfe\0";
+        assert_eq!(split_paths(listed), [&b"a.txt"[..], &b"caf\xe9.txt"[..], &b"dir/\xff\xfe"[..]]);
+        assert_eq!(crate::intake::snapshot::dest_of(Path::new("/s"), b"caf\xe9.txt").as_os_str().as_bytes(), b"/s/caf\xe9.txt");
+        let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
+        if let Err(e) = std::fs::write(seed.join(name), "latin-1 name\n") {
+            // APFS refuses names that are not UTF-8 (EILSEQ): such a file
+            // cannot exist in a clone there.
+            eprintln!("skipping the on-disk part: {e}");
+            return;
+        }
+        sh(&seed, "git add -A && git commit -qm latin1 && git push -q origin HEAD:main");
+        let work = root.join("work");
+        let mirror = sync_mirror(&work, "acme/widget", &remote).await.unwrap();
+        let wt = worktree_path(&work, "acme/widget", 11);
+        let (base, _) = prepare_clone(&mirror, &wt, "main", 11, Some("nucleus/item-11")).await.unwrap();
+        assert!(wt.join(name).exists());
+        std::fs::write(wt.join("a.txt"), "ascii edit\n").unwrap();
+        let sha = import(&mirror, &remote, &wt, &base, 11, &spec(), &LIMITS).await.unwrap().unwrap();
+        assert_eq!(changed_files(&mirror, &base, &sha).await.unwrap(), ["a.txt"], "the non-UTF-8 file is unchanged");
+        let tree = std::process::Command::new("git").args(["--git-dir=.", "ls-tree", "-z", "--name-only", &sha]).current_dir(&mirror).output().unwrap();
+        assert!(tree.stdout.split(|b| *b == 0).any(|n| n == b"caf\xe9.txt"));
+    }
+
+    #[tokio::test]
     async fn submodules_of_the_base_may_stay_but_not_change() {
         let (_d, root, remote) = fixture();
         // The base gets a submodule entry (a gitlink to some commit).
@@ -1269,7 +1423,7 @@ mod tests {
         // Moving it to another commit is refused.
         sh(&wt.join("lib"), "git init -q && git -c user.email=a@example.invalid -c user.name=A commit -q --allow-empty -m other");
         let e = import(&mirror, &remote, &wt, &base, 7, &spec(), &LIMITS).await.unwrap_err();
-        assert!(format!("{e:#}").contains("moves the submodule lib"), "{e:#}");
+        assert!(format!("{e:#}").contains("touches the submodule lib"), "{e:#}");
         std::fs::remove_dir_all(wt.join("lib")).unwrap();
         std::fs::create_dir_all(wt.join("lib")).unwrap();
         // Adding one is refused.
