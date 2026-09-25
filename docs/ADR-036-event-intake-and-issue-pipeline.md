@@ -621,11 +621,22 @@ the remote's default branch (read live with `ls-remote --symref` during
 preparation) and for `main`, `master`, `develop`, `development`, `trunk`,
 `production`, `release`, `gh-pages`.
 
-**Bounded import (rounds 3 to 5).** No git command reads the agent's clone.
+**Bounded import (rounds 3 to 6).** No git command reads the agent's clone.
 Nucleus walks it itself, one directory level at a time: every path
 component is opened relative to its parent's descriptor with `O_NOFOLLOW`,
-entry types come from `statat` without following symlinks, `.git` entries
-are skipped, and the number of entries is capped. Each `.gitignore` is
+entry types come from `statat` without following symlinks, and `.git`
+entries (in any letter case) are skipped. Every directory entry counts
+against `[intake] import_max_entries` (default 1 000 000) as it is read,
+before it is stat-ed or kept, so the iterator stops at the limit. A nested
+repository is found by a direct no-follow `statat(".git")` in the child
+directory. The import probes, in its private scratch directory on the same
+file system as the clone, whether the file system folds letter case, and
+passes `core.ignoreCase` explicitly to `check-ignore` and to the snapshot's
+`git add`: on a case-insensitive file system a rule `secrets/` ignores
+`Secrets/token`, a `.GitIgnore` is read as the directory's ignore file,
+base-tracked paths are compared case-folded, and a `.GIT` directory is a
+repository, as git in the clone would treat them. A case variant of
+`.gitmodules` is refused on every file system. Each `.gitignore` is
 copied into a private rules directory under its own limit (`[intake]
 import_max_ignore_bytes`, default 1 MiB, counted toward the total), so a
 huge or sparse ignore file is refused without being parsed. Which entries of
@@ -633,7 +644,9 @@ the next level are ignored is decided by `git check-ignore --no-index
 --stdin -z` (pinned git, trusted configuration, no excludes file) with the
 rules directory as its work tree; directories exist there as empty
 directories so that directory patterns apply; the paths are written and
-the answer read concurrently, the answer through a capped reader. An
+the answer read concurrently, the answer through a capped reader, and the
+whole exchange is limited to 120 s (on expiry the process is killed and
+reaped and the import is refused). An
 ignored directory is not entered, unless the base tracks paths inside it;
 a file the base tracks is imported even when a rule matches it, as git
 does. A directory holding a repository is refused unless it is ignored; a
@@ -866,6 +879,16 @@ is written after the transaction; a crash between the two keeps the
 command's effect and loses the note.
 
 ### Verification of the amendment
+
+Round 6: the directory iterator stops right after the entry limit
+(`the_entry_budget_stops_the_iterator_at_the_limit`, counter asserted with a
+limit of 5); on the test's file system the imported files equal git's own
+view in the clone for `Secrets/token` under `secrets/`, `A.TMP` under
+`*.tmp` and a `sub/.GitIgnore`, a `.GIT` directory is refused as a nested
+repository when the file system folds case, and a `.GitModules` is refused
+(`letter_case_follows_the_clone_file_system_like_git`); a hanging
+`check-ignore` (a pinned fake git that sleeps) is killed and refuses the
+import within the limit (`core/tests/intake_check_ignore_timeout.rs`).
 
 Round 5: a 4 GiB sparse `.gitignore` is refused quickly without being
 parsed (`a_huge_sparse_gitignore_is_refused_without_being_parsed`); the
