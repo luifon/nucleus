@@ -199,10 +199,13 @@ pub fn is_dot_git(name: &[u8]) -> bool {
     name.eq_ignore_ascii_case(b".git")
 }
 
-/// The entries of directory `dir` (names as bytes; `.`, `..` and any
-/// `.git` case variant left out), each with its type from `statat` without
-/// following symlinks. Every entry read is counted in `budget` before it is
-/// stat-ed or kept; at the limit the walk stops and the import is refused.
+/// The entries of directory `dir` (names as bytes; `.`, `..` and `.git`
+/// left out), each with its type from `statat` without following symlinks.
+/// Every entry read is counted in `budget` before it is stat-ed or kept; at
+/// the limit the walk stops and the import is refused. Any other letter case
+/// of `.git` refuses the import: git refuses such a path on every file
+/// system, so dropping it would publish the change without it and without
+/// telling anyone.
 pub fn read_entries(dir: &OwnedFd, budget: &mut EntryBudget) -> Result<Vec<(Vec<u8>, Kind)>> {
     let mut out = Vec::new();
     let mut d = rustix::fs::Dir::read_from(dir)?;
@@ -213,8 +216,11 @@ pub fn read_entries(dir: &OwnedFd, budget: &mut EntryBudget) -> Result<Vec<(Vec<
             refuse!("the clone has more than {} entries on disk; nothing was imported", budget.max);
         }
         let name = e.file_name().to_bytes().to_vec();
-        if name == b"." || name == b".." || is_dot_git(&name) {
+        if name == b"." || name == b".." || name == b".git" {
             continue;
+        }
+        if is_dot_git(&name) {
+            refuse!("{} is a letter-case variant of .git, which git cannot store; nothing was imported", show(&name));
         }
         let st = match rustix::fs::statat(dir, OsStr::from_bytes(&name), AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) => st,

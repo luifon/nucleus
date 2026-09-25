@@ -1592,6 +1592,13 @@ mod tests {
             assert!(format!("{e:#}").contains("nested repository at nested"), "{e:#}");
             std::fs::remove_dir_all(wt.join("nested")).unwrap();
         }
+        // A letter-case variant of .git is refused on any file system (git
+        // cannot store it), never dropped: a nested repository where the
+        // file system folds case, a refused name where it does not.
+        sh(&wt, "mkdir -p odd && echo c > odd/.Git");
+        let e = format!("{:#}", import(&mirror, &remote, &wt, &base, 14, &spec(), &LIMITS).await.unwrap_err());
+        assert!(e.contains("nested repository at odd") || e.contains("letter-case variant of .git"), "{e}");
+        std::fs::remove_dir_all(wt.join("odd")).unwrap();
         // A case variant of .gitmodules is refused on any file system.
         std::fs::write(wt.join(".GitModules"), "x").unwrap();
         let e = import(&mirror, &remote, &wt, &base, 14, &spec(), &LIMITS).await.unwrap_err();

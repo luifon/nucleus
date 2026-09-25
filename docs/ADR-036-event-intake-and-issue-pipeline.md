@@ -625,7 +625,10 @@ preparation) and for `main`, `master`, `develop`, `development`, `trunk`,
 Nucleus walks it itself, one directory level at a time: every path
 component is opened relative to its parent's descriptor with `O_NOFOLLOW`,
 entry types come from `statat` without following symlinks, and `.git`
-entries (in any letter case) are skipped. Every directory entry counts
+entries are skipped. Any other letter case of `.git` refuses the import:
+git refuses such a path on every file system, even with `core.ignoreCase`
+and `core.protectHFS` off, so skipping it would publish the change without
+that file and without saying so. Every directory entry counts
 against `[intake] import_max_entries` (default 1 000 000) as it is read,
 before it is stat-ed or kept, so the iterator stops at the limit. A nested
 repository is found by a direct no-follow `statat(".git")` in the child
