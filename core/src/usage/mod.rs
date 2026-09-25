@@ -58,11 +58,25 @@ pub async fn open_read_only(workspace_root: &Path) -> Result<Option<SqlitePool>>
 
 /// Whether a refresh holds the lock right now. Probes the advisory lock
 /// without waiting; the probe holds it for the duration of one system call.
+/// A lock that looks held is probed again twice over about 20 ms:
+/// a child process that another thread of this process is starting holds a
+/// copy of every descriptor between its fork and its exec, so a lock that
+/// was just released can look held for that moment. A refresh holds the
+/// lock for its whole run, so it is still seen.
 pub fn refresh_running(workspace_root: &Path) -> bool {
     let Ok(f) = std::fs::OpenOptions::new().read(true).open(workspace_root.join(LOCK_PATH)) else {
         return false;
     };
-    matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+    for attempt in 0..3 {
+        match f.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) if attempt < 2 => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return true,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The refresh lock: an exclusive advisory lock (`flock`) on
