@@ -557,10 +557,32 @@ JSON-parsed numbers.
   issue only after the operator approved the text.
 - Issue text and comments go into briefs only between the nonce data
   markers of `briefs::Fence`; only collaborator comments are included.
-- Plan and comment approvals are decided by code from the operator's own
+- Before the clone and before every agent task (eval, each refinement turn,
+  implementation), `core/src/intake/hidden.rs` scans the bound issue title,
+  body and used collaborator comments for content GitHub's page does not
+  show. Markdown structure comes from comrak's GFM syntax tree (code,
+  fences, tables, links, images, math, raw HTML nodes, in any container),
+  never from hand-written rules; the source text is read only where the
+  tree has no node (reference definitions, entities). Invisible characters
+  are scanned on the raw text, code included, with character references
+  decoded into the same stream exactly as each range's renderer does:
+  CommonMark in Markdown text (only references ending in `;`), the WHATWG
+  rules in raw HTML nodes (`hidden/charref.rs`, the full named table, the
+  attribute-value rule in tags), both for an HTML node of unknown
+  position. A finding moves the item to `held` (`[intake]
+  hidden_content_hold`, default true) with the complete findings and raw
+  sources stored; no agent runs until the operator releases it or cancels
+  it. Every release names the hold the operator reviewed (`nucleus intake
+  release <n> --hold <code>` from the terminal, the dashboard's rendered
+  fingerprint, or `#<n> release <code>` typed by the operator); a release
+  of an earlier hold is refused, checked again in the transaction that
+  changes the stage, and a changed issue or used comment refuses it and
+  makes the item stale. The hidden content is never stripped; released
+  briefs carry `briefs::RELEASED_NOTE` outside the fence.
+- Plan and comment approvals and releases of held items are decided by code from the operator's own
   message (`#n approve`, `#n approve comment`), the operator's terminal, or
   the dashboard. A chat session may list, show and cancel items; it never
-  approves.
+  approves or releases.
 - Thread messages reach WhatsApp only through `outbound_queue` (target
   policy, secret filter). Intake groups are created and left only by the
   bot (`messaging/whatsapp/src/intake.ts`), within `[intake.whatsapp]

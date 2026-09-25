@@ -36,6 +36,7 @@ pub mod briefs;
 pub mod event;
 pub mod git;
 pub mod github;
+pub mod hidden;
 pub mod pipeline;
 pub mod publish;
 pub mod snapshot;

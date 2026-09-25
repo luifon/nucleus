@@ -1,7 +1,8 @@
 # ADR-036 — Event intake and the issue pipeline
 
 **Status:** Accepted (2026-09-24) — Implemented (2026-09-24), amended after an adversarial
-review (2026-09-24, see "Amendment: review findings"); live verification pending (real `gh`
+review (2026-09-24, see "Amendment: review findings"), amended with the hidden-content hold
+(2026-09-25, see "Amendment: the hidden-content hold", revised after its review the same day); live verification pending (real `gh`
 against the configured repos, real WhatsApp group creation).
 
 **Builds on / changes:**
@@ -141,6 +142,7 @@ repo. Its stage is one of:
 | `stale` | terminal; the source changed after the gate was satisfied (finding 1); re-adding the label starts a new item |
 | `failed` | a step failed; `retry` resumes it |
 | `blocked` | the secret guard stopped a publishing step (finding 4); `retry` scans again, `cancel` stops it |
+| `held` | the issue text or a comment the item uses has content GitHub's page does not show; no agent runs until the operator releases or cancels the item (Amendment: the hidden-content hold) |
 
 `core/src/intake/stage.rs::transition` is the only place that decides a
 stage change; it refuses events that do not apply (no skipping from `eval`
@@ -355,16 +357,16 @@ implementation summary, Nucleus's test result, the PR, the proposed comment
 (editable, approve or post nothing), the stage tasks from the ledger and the
 stage log. Retry and cancel are row actions. Every confirmation uses
 `InlineConfirm`. API: `/intake/api/{list,detail,reply,approve-plan,
-approve-comment,skip-comment,cancel,retry}`; wire types are generated (Rule
+approve-comment,skip-comment,cancel,retry,release}`; wire types are generated (Rule
 12). Writes accept JSON bodies only and refuse requests a browser marks as
 cross-site, as the Tasks cancel does (ADR-033 §7).
 
 ### 11. CLI and the DM session
 
-`nucleus intake tick [--poll] | list [--all] [--json] | show <n> [--json] |
+`nucleus intake tick [--poll] | list [--all] [--json] | show <n> [--json] [--hidden] |
 reply <n> --text T | approve-plan <n> [--version V] | approve-comment <n>
-[--text T] | skip-comment <n> | cancel <n> | retry <n> | group-resolve <n>
---left|--absent`.
+[--text T] | skip-comment <n> | cancel <n> | retry <n> | release <n> --hold <code> |
+group-resolve <n> --left|--absent`.
 
 `list` and `show` print JSON with `--json`. JSON is for programs and is not
 fenced; only when the caller is the WhatsApp DM session is the output (JSON
@@ -374,7 +376,7 @@ WhatsApp group creation whose outcome is unknown (finding 6).
 
 | Caller (`crate::caller`) | May |
 |---|---|
-| Operator | every command (`group-resolve` only from the operator) |
+| Operator | every command (`group-resolve` and `release` only from the operator) |
 | WhatsApp DM chat session | `list`, `show`, `cancel` (not in a turn that read an agent message) |
 | Detached process (launchd, the bot, the dashboard) | `tick` |
 | Workers, other sessions, unscoped chats, unknown | nothing |
@@ -412,7 +414,7 @@ operator how to approve; it cannot approve, reply in a thread, or retry.
 `work_dir`, `label`, `min_confidence`, `test_timeout_minutes`,
 `commit_author_name`, `commit_author_email`, `import_max_files`,
 `import_max_file_bytes`, `import_max_total_bytes`, `scan_max_bytes`,
-`[[intake.repos]]` (`repo`, `test_command`, `default_branch`,
+`hidden_content_hold` (default true), `[[intake.repos]]` (`repo`, `test_command`, `default_branch`,
 `pr_issue_keyword`), `[intake.github]` (`gh_bin`, `poll_interval_secs`,
 `collaborator_cache_secs`, `max_pages`, `remote_url`), `[intake.whatsapp]`
 (`refinement_groups`, `max_groups_per_day`, `group_wait_minutes`),
@@ -997,6 +999,427 @@ creations not repeated, items closed before and during creation, a
 disabled baseline with an alert, leave retries with backoff and give-up,
 `closed_at` only after leaving, `input_kind` stored.
 
+## Amendment: the hidden-content hold (2026-09-25)
+
+### Why
+
+The operator reads an issue on its GitHub page before adding the label. The
+page is GitHub's rendering of the Markdown; the pipeline reads the raw text
+through the API. GitHub's rendering drops some text (HTML comments, link
+reference definitions, table cells beyond the header), collapses some
+(`<details>`), shows some only on hover (link titles) or only when an image
+fails to load (alt text), removes tags and attributes it does not allow, and
+draws nothing for invisible characters. An issue author can put an
+instruction in one of those places. The operator does not see it, the label
+admits the issue, and the instruction reaches an agent that can edit files
+and run commands with no OS sandbox (§4, Threat model). The data fence (§6)
+tells the agent that the text is data, but it does not tell the operator
+that the text exists.
+
+### What is detected
+
+`core/src/intake/hidden.rs` scans the raw issue title, the raw issue body,
+and the raw body of every collaborator comment the item uses.
+
+**How the Markdown is read (fix round 1).** The body and each comment are
+parsed with `comrak` 0.55 (a port of GitHub's cmark-gfm) with the
+extensions GitHub enables for issues: tables, strikethrough, autolinks,
+task lists, footnotes, `$`/`` $` `` math and alerts, with source positions
+on. (The tag filter is a rendering step; the tags it escapes are flagged
+anyway.) Line endings are normalized first (CRLF and a bare CR become LF;
+GitHub ends a line at a bare CR), and an offset map takes every position
+back to the raw text. The syntax tree decides what is code — fenced and
+indented code blocks and code spans, at any depth of block quotes and list
+items.
+
+Which checks read the tree and which read the text (fix round 2):
+
+- **The tree** (node kind, literal content, source position): fences and
+  their info strings, tables, links, images, footnote definitions, math
+  (inline, display, `` $`…`$ ``, math fences), and all raw HTML. Every
+  `HtmlBlock` and `HtmlInline` node is read from its literal, wherever the
+  tree places it (quotes, lists, table cells, any depth): comments,
+  forbidden elements and attributes, incomplete or unterminated tags, and
+  `<details>`. The literal's positions are mapped back line by line (each
+  literal line is a suffix of its source line after the container prefix).
+  Reading HTML from raw lines was the round-1 gap: a tag after `> ` or
+  `- ` was not at a line start, so an unterminated `<iframe title="…` in a
+  quote went unflagged.
+- **The text**, with the code the tree found masked, only where the tree
+  gives nothing to read: link reference definitions (comrak removes them
+  and keeps no node); HTML entities (the tree hands back decoded text, the
+  source keeps the entity and its position); `<!--` outside every HTML
+  node (a backstop in case GitHub starts a comment where comrak reads
+  text); the always-flagged math macros outside the math nodes (in case
+  GitHub reads math where comrak does not).
+- **Invisible characters** are read from the raw text, code included,
+  with every character reference outside code decoded into the same
+  character stream, so the emoji and joining rules apply to `&zwj;`
+  exactly as to a literal ZWJ.
+
+**Character references (fix rounds 3 and 4).** GitHub decodes references
+in two places with different rules, and the hold decodes each range
+exactly as its renderer does. Decoding more than the renderer is not
+stricter: it changes the characters the exemptions look at (round 4: with
+`&copy` decoded in Markdown, `&copy&#xFE0F;` looked like the sequence
+©+VS16, while GitHub shows `&copy` as text and the VS16 after `y` is
+invisible).
+
+- **Markdown text** (outside code and outside the placed HTML nodes):
+  CommonMark decodes only references that end in `;` — `&#` and 1–7
+  digits, `&#x` and 1–6 hex digits, or a name of the table below — and
+  maps code point 0 and invalid ones to U+FFFD, with no Windows-1252
+  remapping (`&#128;` is the C1 control U+0080, flagged). A
+  backslash-escaped `&` stays text. An unescaped `*` may be an emphasis
+  delimiter the page does not show, so it stands in the character stream
+  as U+FFFC, which no exemption accepts as a neighbour.
+- **Raw HTML** (the placed HTML nodes): the browser's WHATWG rules
+  (`hidden/charref.rs`, "character reference state"): numeric references
+  with or without `;`, U+FFFD for 0, surrogates and values past U+10FFFF,
+  the Windows-1252 mapping of 0x80–0x9F; every named reference of the
+  WHATWG table (`hidden/entities.rs`, generated from
+  `https://html.spec.whatwg.org/entities.json`, last modified 2025-11-12:
+  2,231 names, 106 legacy names valid without `;`), by longest match; the
+  attribute-value rule inside tags (a legacy name without `;` followed by
+  `=` or a letter or digit stays text). `<div>ig&#8203nore</div>` shows
+  `ignore` with a zero-width space.
+- **An HTML node whose position is unknown**: which rule applies is not
+  known, so its source is read as Markdown with the rest of the text, and
+  its literal is read again with the WHATWG rules; a finding from either
+  counts, over the whole location.
+
+Only inline HTML tags are raw HTML: in `<span>&copy&#xFE0F;</span>` on a
+line of its own the text between the tags is Markdown text (a `<span>` does
+not start an HTML block), so `&copy` stays text and the VS16 is flagged; in
+an HTML block (`<div>…</div>`) it is decoded and not flagged. A reference
+that produces two characters (`&caps;` is ∩ + VARIATION SELECTOR-1) gives
+two characters with the reference's range; the finding lists the hidden
+ones. The exemptions that look at neighbours (variation sequences, RGI ZWJ
+sequences, joining scripts) all read this rendered stream.
+
+**Positions (fix round 3).** comrak reports shifted positions for the
+inline nodes of a paragraph that starts with a reference definition it
+removed. Every code span and inline HTML node is checked against the
+source at its reported position. When it does not match, the nodes of the
+same leaf block (paragraph, heading, table cell) with the same kind and
+literal are matched in document order against their occurrences in the
+block's source, skipping placed code spans, backslash-escaped `<` and
+reference definitions, and multi-line literals are matched line by line.
+A reported position counts only when the node is there and the place is
+not inside a reference definition (or, for HTML, inside code that checked
+out); when any node of a leaf block fails, every node of that block goes
+through the matcher (round 4), so a wrong reported position that happens
+to hold the same literal inside a definition is never used.
+Only a one-to-one match places them. Otherwise nothing is guessed: a code
+span stays unmasked (its content is read), and an HTML node's findings say
+"position unknown" and cover the whole location. HTML blocks keep comrak's
+position (block positions are exact). Tests:
+`comrak_positions_after_a_reference_definition_do_not_hide_anything`,
+`shifted_html_is_placed_in_document_order_or_reported_unknown`.
+
+**Each finding** stores its location (`title`, `body`, `comment <id>`), its
+kind, its raw line and column (characters; CR, LF and CRLF each end a
+line), its range in the raw text (`start`..`end`, in characters) and its
+complete hidden text, never shortened: invisible characters as code points
+(`U+200B ZERO WIDTH SPACE ×2`; tag characters also as the ASCII text they
+spell), everything else as its literal source with any invisible character
+in it shown as `[U+XXXX]`. The hold also stores the complete raw text of
+every location that has findings.
+
+| Kind | What | Why it is hidden |
+|---|---|---|
+| `html_comment` | `<!-- … -->`, also unclosed, `<!-->`, `<!--->` | not rendered |
+| `invisible_characters` | every Unicode Cf character; the other default-ignorable code points; blank-rendering characters (Hangul fillers U+115F, U+1160, U+3164, U+FFA0; U+2800); line and paragraph separators; control characters other than tab, LF, CR; private-use characters | drawn as nothing (private use: a box at most) |
+| `invisible_entity` | a character reference that produces one of those, with or without `;` as the WHATWG rules allow (`&#8203`, `&#x2060;`, `&zwj;`, `&shy`, `&caps;`, …) | GitHub decodes it; the page shows nothing |
+| `details` | a `<details>` block without `open` (with `open` the block is shown and only its content is checked) | collapsed until clicked |
+| `html_tag` | in any HTML node of the tree: a tag outside `VISIBLE_TAGS`; an attribute outside `attribute_allowed`; an incomplete or unterminated tag; nested `<sub>`/`<sup>`; declarations, processing instructions, CDATA | removed by the sanitizer, or hides or restyles content |
+| `link_definition` | `[label]: url "title"` (every definition, used or not) | renders as nothing |
+| `footnote_definition` | `[^label]: text` | shown only at the page bottom, only when referenced |
+| `image_alt` | non-empty alt text (Markdown images and `<img alt>`) | not shown while the image loads |
+| `link_title` | `[a](url "title")`, also on images | shown only on hover |
+| `link_destination` | a link (Markdown or `<a href>`) whose visible text, normalized, is not its destination | the destination shows only on hover |
+| `image_source` | an image address that is not one of the exact attachment shapes below | the page shows the picture, not the address |
+| `table_extra_cells` | cells beyond the header's column count, in any container | GFM drops them |
+| `math_styling` | in `$…$`, `$$…$$`, `` $`…`$ `` and `math` blocks, a macro outside `MATH_VISIBLE` or in `MATH_ALWAYS_FLAG`, a CSS-like `[…]` argument, or a comment (an unescaped `%` to the end of its line; `\%` is a percent sign); `MATH_ALWAYS_FLAG` macros also outside math | can draw nothing, move, recolor or link text; MathJax skips a comment |
+| `rendered_block` | a fence with info `mermaid`, `geojson`, `topojson` or `stl`, in any container | rendered as a picture; the source is not on the page |
+| `fence_info` | text after the first word of a fence info string, or a first word outside `[A-Za-z0-9_+#.-]{1,32}` | GitHub shows neither |
+
+**Invisible characters.** The list is one table (`INVISIBLE`) from the
+Unicode 16.0 Character Database (`DerivedGeneralCategory.txt` for Cf,
+`DerivedCoreProperties.txt` for `Default_Ignorable_Code_Point`,
+`UnicodeData.txt` for names) plus the blank-rendering characters above.
+Not flagged: a U+FE0E or U+FE0F directly after one of the 371 bases of
+Unicode's emoji variation sequences (`VARIATION_BASES`, from
+`emoji-variation-sequences.txt`, Unicode 16.0; `StandardizedVariants.txt`
+16.0 defines no sequence with either selector), or a U+FE0F inside an RGI
+emoji ZWJ sequence; a selector after any other character, or a second one,
+is flagged (fix round 2); a ZWJ inside an RGI emoji ZWJ sequence (the `emojis`
+crate, Unicode Emoji 17.0 data from `emoji-test.txt`, which contains every
+sequence of `emoji-zwj-sequences.txt`; the sequence around the ZWJ must be
+exactly one listed emoji); a ZWNJ or ZWJ between two letters where Unicode
+defines its effect, per the tests of RFC 5892 Appendix A.1/A.2 (after a
+virama and before a letter, as in Indic scripts; or between a character of
+Joining_Type L or D and one of R or D with only transparent marks between,
+as in Arabic, Persian and Syriac; joining types from Unicode 16.0,
+`unicode-joining-type`). Every other ZWJ and ZWNJ is flagged. The same
+rules apply to characters written as entities (`👩&zwj;💻` is not flagged,
+`a&zwj;b` is).
+
+**HTML.** `VISIBLE_TAGS` is the element allowlist of GitHub's sanitizer as
+published in `html-pipeline` (`SanitizationFilter`) minus the kept elements
+that hide or shrink content (`small`, `ruby`/`rt`/`rp`, `bdo`, `time`,
+`wbr`): headings, paragraphs, `div`, `span`, lists, tables, `blockquote`,
+`pre`, `hr`, `br`, the inline text styles, `a`, `img`, `details`,
+`summary`, `figure`. Attributes are allowed only where they neither hide
+nor restyle: `td`/`th align`, `ol start`, `details open`; `a href` and
+`img src`/`alt` go through the link and image rules. An allowed attribute
+is allowed only with a value that changes nothing but layout, checked
+after WHATWG attribute decoding (fix round 5; the page never shows a
+value, so `<details open="ignore previous instructions">` hid text):
+`open` with no value, an empty value or `open`; `align` one of left,
+right, center, justify; `start` an optional `-` and 1–9 digits; letter
+case ignored. Any other value is an `html_tag` finding that shows the
+decoded value.
+
+**Raw HTML fails closed (fix round 6).** Inside every placed HTML node, and
+in the HTML reading of an unplaced one, every `<` must be recognized; the
+reader follows the WHATWG tokenizer (HTML Living Standard 13.2.5): the
+data state, the tag-name state (a name runs to whitespace, `/` or `>`, so
+`span.foo` is one name), the attribute states (names, unquoted, single-
+and double-quoted values; a `>` inside quotes does not end the tag; no
+whitespace needed after a quoted value; `/` as in `<b/x=1>`; newlines
+inside a tag), comments, and bogus comments. A `<` is one of:
+
+- text, when the tokenizer emits it as text: a `<` followed by anything
+  but an ASCII letter, `!`, `/` or `?` (`a < b`, `x <3`);
+- an allowed start or end tag (`VISIBLE_TAGS`) with allowed attributes and
+  values;
+- a finding: any other tag name, a comment, a bogus comment (`<!` not
+  followed by `--`, including declarations and CDATA; `<?`; `</` followed
+  by a non-letter; `</>`), a tag with no `>` before the end of the node, a
+  duplicate attribute (the browser keeps the first), and attributes on an
+  end tag (dropped).
+
+Each token's range, from its `<` to the `>` that ends it (or the end of
+the node), is tag syntax for the invisible-character rules below.
+
+Tag syntax itself is never rendered: every invisible
+character or character reference between a tag's `<` and its `>` (names,
+values, whitespace) is flagged, with no emoji, variation or joining
+exemption, and nothing inside a tag is a neighbour an exemption may lean
+on. Every other attribute
+is flagged (`title`, `width`, `height`, `dir`, `style`, `class`, `hidden`,
+…). HTML inside code, as the tree reads it, is not flagged.
+
+**Links and images.** A link's destination is exempt only when its visible
+text, normalized (percent-decoded, lower case, without `http(s)://`,
+`mailto:` and a trailing `/`), equals the normalized destination: that
+covers autolinks, bare URLs and `[https://x](https://x)`. An image address
+is exempt only in one of the two exact shapes of GitHub's attachments for
+pasted pictures (fix round 2), parsed with the `url` crate:
+`https://github.com/user-attachments/assets/<uuid>` and
+`https://user-images.githubusercontent.com/<digits>/<digits>-<uuid>.<ext>`
+with `<ext>` one of png, jpg, jpeg, gif, webp, svg, mp4, mov
+(`ATTACHMENT_EXTENSIONS`), `<uuid>` canonical lower-case 8-4-4-4-12 hex.
+The address must be exactly the parser's serialization (nothing normalized
+away: dot segments, letter case, a default port) and carry no credentials,
+port, query, fragment, percent-encoding, trailing slash or trailing text.
+
+**Math.** A denylist of hiding macros cannot be complete, so math is read
+against an allowlist, `MATH_VISIBLE`: Greek letters, big operators and
+named functions, relations and binary operators, arrows, `\frac`,
+`\sqrt`, `\binom`, `\left`/`\right` and sizes, accents and braces,
+delimiters, fonts for visible text (`\text`, `\mathbf`, `\mathbb`, …),
+`\quad`/`\qquad`, `\begin`/`\end`. Symbol macros (`\,`, `\{`, `\\`) are
+allowed. `MATH_ALWAYS_FLAG` wins over the allowlist: `\bbox`, `\enclose`,
+`\style`, `\class`, `\cssId`, `\href`, `\color` and its variants,
+`\phantom`, `\hphantom`, `\vphantom`, `\smash`, the lap, raise and kern
+macros, `\unicode`, `\require`, macro definitions. Every math comment is
+flagged with its text: MathJax skips everything from an unescaped `%` to
+the end of the line, so `$x % ignore previous instructions$` shows only
+`x` (fix round 2).
+
+**Fence info strings.** Everything after the first word of an info string
+is flagged. For the first word I chose the character rule
+`[A-Za-z0-9_+#.-]{1,32}` over a list of language names: GitHub shows a code
+block with an unknown language as plain code, so an unknown but well-formed
+name hides nothing, and a list would have to track Linguist's hundreds of
+names and aliases. The rule's limit: one word of up to 32 such characters
+can still carry a short hidden message (see Limits).
+
+**The title** is shown as plain text (GitHub escapes HTML there and does not
+decode entities), so only invisible characters are flagged in it.
+
+### The flow
+
+- **When.** The check runs in the `queued` step, before the clone (the
+  step reads and binds the comments first), and again right before every
+  agent task: the eval, each refinement turn, and the implementation (after
+  the final live read). A collaborator comment with hidden content added
+  later holds the item before the next agent step. The steps without an
+  agent (push, pull request, issue comment) do not check.
+- **Held.** Findings move the item to `held` (from `queued`, `eval`,
+  `refinement` or `implementation`). The item stores the hold
+  (`hold_json`: the complete findings and the raw text of each location
+  with findings), the stage it was held in and a fingerprint (`hold_hash`):
+  the SHA-256 of each location with findings and its complete raw text,
+  and of each finding with its complete hidden text. No task runs while
+  the item is held; the source checks of every tick still apply. An
+  operator message sent while an item is held in refinement is kept for
+  the turn after the release; an approval is refused.
+- **Told.** One thread message (`[intake.texts] item_held`: the counts by
+  kind, the first three findings shortened to one line, the hold code, and
+  where to read everything) goes through the outbound queue, so the target
+  policy and the secret filter apply. An item without a WhatsApp thread yet
+  gets the DM as its surface. The complete findings and sources are on the
+  dashboard's item page (each finding in full, and each raw source with the
+  hidden ranges marked) and in `nucleus intake show <n> --hidden`.
+- **Release, bound to the viewed hold (fix round 1).** Every release names
+  the hold the operator reviewed: `nucleus intake release <n> --hold
+  <code>` (operator terminal only; `show` prints the code and the
+  fingerprint), the dashboard's release button (sends the `hold_hash` the
+  panel rendered), or `#<n> release <code>` typed by the operator (the
+  hold code is the first 6 hex characters of the fingerprint and is in the
+  held message; only the operator's identity and `text` input count). A
+  release without a code, or with the code of another hold, is refused
+  with the current code. The named hold is compared with the current
+  `hold_hash` before the live read, and again in the statement that
+  changes the stage (`store::advance_if_hold`), so a release of hold A that
+  arrives after the item was held again for hold B changes nothing. Then
+  the source is read live: a changed title, body or used comment makes the
+  item `stale`; a fingerprint that differs for another reason (a new
+  comment with hidden content) is refused and makes the item `stale` too.
+  Otherwise the item returns to the stage it was held in.
+- **After the release.** The next check with the same fingerprint lets the
+  item go on; a new comment without findings keeps it, a new one with
+  findings holds the item again. The hidden content is not removed; it
+  reaches the agent inside the data fence, and every brief of a released
+  item carries the fixed line `briefs::RELEASED_NOTE` outside the fence.
+- **Cancel** works as for any open item.
+- **Off.** `[intake] hidden_content_hold = false` turns the check off; a
+  held item can still be released or cancelled.
+
+### Limits
+
+- The check finds content that GitHub does not show. It cannot find
+  content that GitHub shows but a person misses: a line far down a long
+  body, look-alike characters from another script, an instruction written
+  in plain sight, visible but tiny text made in ways not listed above.
+- A fence info word that passes the character rule is not flagged, so up to
+  32 characters such as `please_run_the_install_script` can hide in a
+  fence's first word.
+- comrak follows cmark-gfm but is not GitHub's renderer; the sanitizer
+  list is the published `html-pipeline` one, which GitHub's production
+  sanitizer may differ from. Rendering features GitHub adds later are not
+  covered until the lists are extended.
+- The checks lean toward flagging: every non-autolink Markdown link and
+  every image not in an exact attachment shape is a finding, a
+  reference-definition-shaped line inside a paragraph is flagged, a ZWJ in
+  a minimally-qualified emoji sequence (without its U+FE0F) is flagged,
+  math macros outside the allowlist are flagged. A false finding costs the
+  operator one release.
+- Content in a comment the item does not use (by a non-collaborator) is not
+  scanned, because it never reaches an agent. The repository the agent
+  reads is not scanned. Text that changes at GitHub between the last live
+  read and the agent's start (one API call) is not seen for that step.
+- The hold code has 6 hex characters: two holds of one item share a code
+  with probability 1 in 16.7 million, in which case the code check passes
+  and the fingerprint comparison in the live read decides.
+
+### Verification of the hold
+
+Detector (`cargo test -p nucleus-core intake::hidden`, tests in
+`core/src/intake/hidden/tests.rs`): each kind with the case that must be
+flagged and the case next to it that must not — an emoji with U+FE0F, RGI
+ZWJ sequences and joiners in Persian and Devanagari (not flagged) next to
+a ZWJ between non-sequence emoji, in Latin text and after a right-joining
+letter (flagged); `<!-- x -->` in a fence, an indented block, a fence in a
+quote and in a list item (not flagged) next to a fence of a list item that
+ended (flagged); a zero-width space in a fence (flagged); `&#8203;`
+(flagged); link reference definitions (flagged); the sanitizer list
+(`<span>`, `<div>`, tables not flagged; `<small>`, `style`, `hidden`,
+`title`, nested `<sub>` flagged); `<details open>` (content still checked)
+next to bare `<details>`; link destinations, autolinks, attachment images
+and other images; fence info tails and non-language words, also in a
+quote; rendered fences indented, quoted, in list items and in a quote in a
+list; dropped table cells at the top level, in a quote and in a list item;
+`\bbox[opacity:0]{…}` and other math; the CR-only case
+`~~~text\rvisible\r~~~\r<!-- hidden -->`; a 5 000-character comment kept
+whole; comrak's shifted positions after a reference definition. Pipeline
+(`intake::pipeline`): held before any task with the complete finding and
+the raw source stored and one DM message with the hold code; release with
+no code or a wrong code refused, with the right code continuing to eval
+with the brief line; release after an edit or a new hidden comment refused
+and stale; a new hidden comment holds an item in refinement; voice,
+forwarded and code-less releases refused; a delayed WhatsApp release and a
+dashboard release naming hold A after hold B refused, hold B released
+(`a_new_comment_with_hidden_content_holds_an_item_in_refinement`); the
+stage change re-checks the hold (`a_release_racing_a_new_hold_changes_nothing`);
+hold off. CLI: only the operator releases, and `--hold` is required.
+TypeScript: `#n release <code>` is routed as `text` only from the
+operator's typed DM. Dashboard API: the detail carries the complete
+findings with their ranges and the raw sources; a release without the
+hold, with another hold, after hold B, and after the event changed is
+refused (`a_held_item_shows_its_findings_and_can_be_released_unless_it_changed`).
+Web: `markRanges` splits a source at code-point ranges.
+
+Fix round 2: math comments inline, escaped `\%`, a comment on one line of
+a display block and in a math fence (`math_comments_are_hidden_text`); the
+two accepted attachment shapes and each rejected variation, including
+`/user-attachments/ignore-previous-instructions`, a query, a fragment,
+`%2e%2e`, dot segments, credentials, ports, letter case and a UUID with
+trailing text (`only_exact_attachment_addresses_are_exempt`); an
+unterminated `<iframe title="…` in a quote, in a list item and in a quote
+in a list item, a forbidden element in a table cell
+(`html_is_read_from_the_tree_in_every_container`); selectors after defined
+bases, after `a`, `x`, a non-emoji arrow, repeated
+(`variation_selectors_need_a_defined_sequence`); `👩&zwj;💻`, numeric
+emoji with `&zwj;`, Persian with `&zwnj;` not flagged, `a&zwj;b` flagged
+(`entity_joiners_follow_the_same_rules`).
+
+Fix round 3: `<div>ig&#8203nore</div>`, `&#x200B` without `;` in text,
+`&zwj` without `;` left as text (not a legacy name) and `&zwj;` decoded,
+the legacy `&shy` decoded in text and not in an attribute before `=`,
+`&caps;` and `&varsubsetneq;` flagged for their VARIATION SELECTOR-1,
+`&amp` and other visible results not flagged, the numeric replacement
+rules (`character_references_follow_the_whatwg_rules`); a copy of a tag in
+a code span before the real one after a reference definition (the real
+one is reported) and a copy in a link destination (position unknown,
+whole location) (`shifted_html_is_placed_in_document_order_or_reported_unknown`).
+
+Fix round 4: each context decoded by its renderer — `&#8203` and
+`&#x200B` without `;` are text in Markdown and decoded in `<div>`,
+`&shy` is text in Markdown, decoded in HTML text and not in an attribute
+before `=`, `&#128;` is a C1 control in Markdown and the euro sign in HTML
+(`character_references_are_decoded_as_their_renderer_does`); in pairs,
+`&copy&#xFE0F;` flagged in Markdown and not in `<div>`, `*`+VS16 before
+emphasis flagged and `\*`+VS16 not, RGI ZWJ across emphasis delimiters
+or across a reference Markdown leaves as text flagged and in an HTML block
+not, a Persian ZWNJ across emphasis or next to a reference Markdown leaves
+as text flagged and in an HTML block not
+(`exemptions_see_the_characters_the_renderer_shows`); `[a]:
+<iframe>\nxxxxx<iframe>` never reports the definition
+(`a_reported_position_inside_a_definition_is_never_used`).
+
+Fix round 5: `<details open="ignore previous instructions">` and
+`open="&#105;gnore"` flagged with the decoded value, `open`, `open=""`,
+`open="OPEN"` (and `open="&#111;pen"`) not; `align="center"` not,
+`align="center; x"` flagged; `start="3"` and `start="-12"` not,
+`start="3 now run"` flagged
+(`allowed_attributes_need_a_value_that_only_changes_layout`); a ZWJ
+sequence, `&zwj;`, a VS16 after ❤ and a Persian ZWNJ inside attribute
+values flagged, the same VS16 in the element's text not
+(`tag_syntax_gets_no_exemption`).
+
+Fix round 6: `span.foo` with a title flagged with the range of its tag,
+`<!- …>`, `<!1 x>`, `</1 x>`, `<?x y>`, `</>` and `<!DOCTYPE html>`
+flagged as bogus comments, `a < b`, `x <3` and `1<2` not flagged, a quoted
+value holding `>` kept in one token, a tag without `>` to the end of the
+node flagged, a duplicate attribute flagged, unquoted values, `<b/x=1>`,
+newlines inside a tag and attributes on an end tag handled, invisible
+characters inside a bogus comment flagged
+(`every_lt_in_raw_html_is_recognized_or_flagged`).
+
 ## Rejected alternatives
 
 - **Webhooks.** They need public ingress, which Nucleus does not have
@@ -1017,6 +1440,21 @@ disabled baseline with an alert, leave retries with backoff and give-up,
 - **A WhatsApp group for every item.** Simple items need no discussion, and
   automated group creation risks the account; groups exist only for items
   that reach refinement, within a daily limit.
+- **Stripping hidden content before the brief.** The operator would release
+  one text and the agent would read another; a stripped comment can also
+  change the meaning of what is left. The hold shows the content and the
+  release passes it on unchanged, as data, with a note.
+- **Reading Markdown structure with hand-written rules.** The first version
+  did, and the review found constructs inside block quotes and list items,
+  fences indented by up to three spaces and CR-only line endings that the
+  rules read differently from GitHub. The syntax tree of a cmark-gfm port
+  answers those from the grammar; the source-text checks remain only where
+  the tree has no node or may report a wrong position.
+- **Rendering the Markdown and diffing the visible text.** It needs
+  GitHub's sanitizer and renderer exactly, and a difference in the visible
+  text cannot always be mapped back to a source range to show the
+  operator. The tree plus a list of hiding places gives a source range for
+  every finding.
 - **Running the pipeline inside the WhatsApp bot or the dashboard.** Git,
   `gh` and test runs would block processes that must stay responsive, and
   intake.db would get a second writer family.

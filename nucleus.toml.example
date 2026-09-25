@@ -237,6 +237,12 @@ max_runtime_hours = 12
 # import_max_entries = 1000000         # directory entries the walk reads, counted as read
 # # Largest diff the secret guard reads; a longer diff blocks the item.
 # scan_max_bytes = 16777216            # 16 MiB
+# # Hold an item whose issue title, body or a collaborator comment it uses
+# # has content GitHub's page does not show (HTML comments, invisible
+# # characters, <details>, raw HTML, link definitions, alt text, …). No agent
+# # runs until you release it (`nucleus intake release <n> --hold <code>`, the
+# # dashboard, or `#<n> release <code>` typed in WhatsApp) or cancel it.
+# hidden_content_hold = true
 #
 # [[intake.repos]]
 # repo = "owner/repo"

@@ -6,6 +6,7 @@ import {
   approveComment,
   approvePlan,
   getIntakeDetail,
+  releaseItem,
   replyToItem,
   skipComment,
   type IntakeItem,
@@ -14,7 +15,12 @@ import {
   authorLabel,
   canApprovePlan,
   canDecideComment,
+  canRelease,
   canReply,
+  findingKindLabel,
+  findingPlace,
+  holdCode,
+  markRanges,
   surfaceLabel,
   threadOrder,
 } from "@/lib/intake";
@@ -27,7 +33,7 @@ import { clockTime, shortId, shortTime, taskDuration, taskStatusKind } from "@/l
 // row derives it from the item, so a list refresh that changes the item
 // refreshes this panel too).
 
-type Confirm = "plan" | "comment" | "skip" | null;
+type Confirm = "plan" | "comment" | "skip" | "release" | null;
 
 export default function ItemDetailPanel({
   itemId,
@@ -58,7 +64,9 @@ export default function ItemDetailPanel({
   if (!detail.data || !item) {
     return <div className="border-t border-[var(--color-nucleus-border)] px-4 py-3 text-xs text-[var(--color-nucleus-faint)]">fetching…</div>;
   }
-  const { event, eval: ev, tasks, transitions } = detail.data;
+  const { event, eval: ev, hidden, hidden_sources, tasks, transitions } = detail.data;
+  // The hold this panel shows; a release names it.
+  const shownHold = item.hold_hash ?? "";
   const messages = threadOrder(detail.data.messages);
 
   const act = async (fn: () => Promise<IntakeItem>, after?: () => void) => {
@@ -116,6 +124,60 @@ export default function ItemDetailPanel({
             <Pre tone="text-[var(--color-status-down)]">{item.error}</Pre>
           </Field>
         )
+      )}
+      {hidden.length > 0 && (
+        <Field
+          label={
+            item.stage === "held"
+              ? `held (hold ${holdCode(item.hold_hash)}): content GitHub's page does not show (${hidden.length})`
+              : `hidden content (${hidden.length}), released via ${item.released_via ?? "?"} ${shortTime(item.released_at ?? "")}`
+          }
+        >
+          <ul className="space-y-1.5">
+            {hidden.map((f, i) => (
+              <li key={i} className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-3 py-1.5">
+                <div className="text-[10px] text-[var(--color-nucleus-faint)]">
+                  {findingPlace(f)} · <span className="text-[var(--color-status-warn)]">{findingKindLabel(f.kind)}</span>
+                </div>
+                <div className="whitespace-pre-wrap break-all font-mono text-[var(--color-nucleus-text)]">{f.text}</div>
+              </li>
+            ))}
+          </ul>
+          {hidden_sources.map((s) => (
+            <div key={s.location} className="mt-2">
+              <div className="mb-0.5 text-[10px] text-[var(--color-nucleus-faint)]">raw {s.location}, hidden parts marked</div>
+              <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-3 py-2 font-mono text-xs text-[var(--color-nucleus-text)]">
+                {markRanges(
+                  s.text,
+                  hidden.filter((f) => f.location === s.location),
+                ).map((p, i) =>
+                  p.flagged ? (
+                    <mark key={i} className="bg-[var(--color-status-warn)] text-[var(--color-nucleus-bg)]">
+                      {p.text}
+                    </mark>
+                  ) : (
+                    <span key={i}>{p.text}</span>
+                  ),
+                )}
+              </pre>
+            </div>
+          ))}
+          {canRelease(item) && confirm !== "release" && (
+            <ActionButton onClick={() => setConfirm("release")} disabled={busy}>
+              release
+            </ActionButton>
+          )}
+        </Field>
+      )}
+      {confirm === "release" && (
+        <InlineConfirm
+          className="px-0 py-2"
+          message={`Release item #${item.id} (hold ${holdCode(shownHold)})? The agent reads this hidden content as data. Refused if the item was held again or the issue changed since.`}
+          confirmLabel={busy ? "releasing…" : "release"}
+          busy={busy}
+          onConfirm={() => void act(() => releaseItem(item.id, shownHold))}
+          onCancel={() => setConfirm(null)}
+        />
       )}
       {item.gate_event_id && (
         <Field label="gate">

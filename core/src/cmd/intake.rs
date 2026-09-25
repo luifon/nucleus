@@ -6,7 +6,8 @@
 //! items and take the operator's decisions.
 //!
 //! Who may do what (`crate::caller`):
-//! - the operator: every command;
+//! - the operator: every command (`release` of a held item only from the
+//!   operator, like `approve-plan`);
 //! - the WhatsApp DM chat session: `list`, `show`, and `cancel` (not in a
 //!   turn that read an agent message). Approvals are the operator's own
 //!   messages in the item's thread, read by code, never a session's
@@ -55,6 +56,10 @@ enum Cmd {
         item: String,
         #[arg(long)]
         json: bool,
+        /// Print every hidden-content finding in full, and the raw text of
+        /// each location that has one.
+        #[arg(long)]
+        hidden: bool,
     },
     /// Write in an item's thread (refinement only). `--text -` reads stdin.
     Reply {
@@ -81,6 +86,15 @@ enum Cmd {
     Cancel { item: String },
     /// Resume a failed item at the stage it failed in.
     Retry { item: String },
+    /// Release an item held for hidden content (`show <n> --hidden` lists
+    /// what was hidden); refused when the issue changed since.
+    Release {
+        item: String,
+        /// The hold you reviewed: its code (or fingerprint) as `show` prints
+        /// it. Refused when the item was held again since.
+        #[arg(long)]
+        hold: String,
+    },
     /// End an unresolved WhatsApp group creation of an item by hand: you
     /// left the group (`--left`) or checked that none exists (`--absent`).
     GroupResolve {
@@ -124,7 +138,7 @@ fn authorize(caller: &Caller, cmd: &Cmd) -> Result<()> {
 }
 
 /// `intake show` output: JSON, or text for the terminal.
-async fn render_show(db: &sqlx::SqlitePool, n: i64, json: bool, label: &str) -> Result<String> {
+async fn render_show(db: &sqlx::SqlitePool, n: i64, json: bool, label: &str, hidden: bool) -> Result<String> {
     let mut out = String::new();
     let it = store::item(db, n).await?;
     let ev = store::event(db, it.event_id).await?;
@@ -150,6 +164,50 @@ async fn render_show(db: &sqlx::SqlitePool, n: i64, json: bool, label: &str) -> 
         writeln!(out, "  nothing more is done for this item; remove and add the `{}` label again for a new item", label)?;
     } else if let Some(e) = &it.error {
         writeln!(out, "error: {e}")?;
+    }
+    let hold: crate::intake::hidden::Hold =
+        it.hold_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+    let fp = it.hold_hash.clone().unwrap_or_default();
+    let code = crate::intake::hidden::hold_code(&fp);
+    if it.stage == "held" {
+        writeln!(
+            out,
+            "HELD (hold {code}, fingerprint {fp}): the issue text has content GitHub's page does not show ({}).",
+            crate::intake::hidden::summary(&hold.findings)
+        )?;
+        writeln!(
+            out,
+            "  read every finding in full with `nucleus intake show {n} --hidden`, then `nucleus intake release {n} --hold {code}`, or cancel"
+        )?;
+        if !hidden {
+            for f in &hold.findings {
+                writeln!(out, "  - {}", crate::intake::hidden::describe(f, 120))?;
+            }
+        }
+    } else if let Some(v) = &it.released_via {
+        writeln!(out, "hidden content (hold {code}) released via {v} at {}", it.released_at.as_deref().unwrap_or("?"))?;
+    }
+    if hidden {
+        if hold.findings.is_empty() {
+            writeln!(out, "no hidden content recorded")?;
+        }
+        for (k, f) in hold.findings.iter().enumerate() {
+            let label = crate::intake::hidden::Kind::parse(&f.kind).map(|k| k.label()).unwrap_or("hidden content");
+            writeln!(
+                out,
+                "\n[{}] {} line {} column {} (characters {}..{}): {label}\n{}",
+                k + 1,
+                f.location,
+                f.line,
+                f.column,
+                f.start,
+                f.end,
+                f.text
+            )?;
+        }
+        for s in &hold.sources {
+            writeln!(out, "\n── raw text of {} ──\n{}\n── end of {} ──", s.location, s.text, s.location)?;
+        }
     }
     if let (Some(g), Some(a)) = (&it.gate_event_id, &it.gate_actor) {
         writeln!(out, "gate: {g} by {a} at {}", it.gate_at.as_deref().unwrap_or("?"))?;
@@ -279,11 +337,11 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             emit(out);
             Ok(())
         }
-        Cmd::Show { item, json } => {
+        Cmd::Show { item, json, hidden } => {
             let n = item_number(&item)?;
             // JSON is for programs and stays plain; only a chat session's
             // copy (JSON or text) is fenced, because a session reads it.
-            emit(render_show(&ctx.db, n, json, &ctx.cfg.label).await?);
+            emit(render_show(&ctx.db, n, json, &ctx.cfg.label, hidden).await?);
             Ok(())
         }
         Cmd::Reply { item, text } => {
@@ -321,6 +379,10 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             let n = item_number(&item)?;
             pipeline::retry(&ctx, n, via).await.map(|i| println!("item #{n} resumed at {}", i.stage))
         }
+        Cmd::Release { item, hold } => {
+            let n = item_number(&item)?;
+            pipeline::release(&ctx, n, Some(&hold), via).await.map(|i| println!("item #{n} released; it continues at {}", i.stage))
+        }
         Cmd::GroupResolve { item, left, absent } => {
             let n = item_number(&item)?;
             let how = if left { "left" } else if absent { "absent" } else { unreachable!("clap requires one") };
@@ -348,10 +410,10 @@ mod tests {
         let (_d, pool) = crate::intake::store::tests::temp_db().await;
         let (ev, _, _) = crate::intake::store::upsert_event(&pool, &crate::intake::store::tests::issue(1, &["nucleus"], "open")).await.unwrap();
         crate::intake::store::tests::new_item(&pool, &ev, "labeled:1").await.unwrap();
-        let out = render_show(&pool, 1, true, "nucleus").await.unwrap();
+        let out = render_show(&pool, 1, true, "nucleus", false).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).expect("show --json prints JSON");
         assert_eq!(v["item"]["id"], 1);
-        let text = render_show(&pool, 1, false, "nucleus").await.unwrap();
+        let text = render_show(&pool, 1, false, "nucleus", false).await.unwrap();
         assert!(text.starts_with("#1 queued"), "{text}");
     }
 
@@ -368,7 +430,7 @@ mod tests {
     #[test]
     fn authorization_by_caller() {
         let chat = Role::Chat { origin: "whatsapp-dm".into(), chat: "5511999999999@s.whatsapp.net".into() };
-        let show = || Cmd::Show { item: "1".into(), json: false };
+        let show = || Cmd::Show { item: "1".into(), json: false, hidden: false };
         let approve = || Cmd::ApprovePlan { item: "1".into(), version: None };
         let cancel = || Cmd::Cancel { item: "1".into() };
         let tick = || Cmd::Tick { poll: false };
@@ -379,6 +441,13 @@ mod tests {
         assert!(authorize(&caller(chat.clone(), 1), &cancel()).is_err());
         assert!(authorize(&caller(chat.clone(), 0), &approve()).is_err(), "a session never approves");
         assert!(authorize(&caller(chat.clone(), 0), &Cmd::Reply { item: "1".into(), text: "x".into() }).is_err());
+        // A release is the operator's, like a plan approval.
+        let release = || Cmd::Release { item: "1".into(), hold: "a1b2c3".into() };
+        assert!(authorize(&caller(Role::Operator, 0), &release()).is_ok());
+        assert!(authorize(&caller(Role::Operator, 1), &release()).is_err(), "reacting to an agent message");
+        assert!(authorize(&caller(chat.clone(), 0), &release()).is_err(), "a session never releases");
+        assert!(authorize(&caller(Role::Detached, 0), &release()).is_err());
+        assert!(authorize(&caller(Role::Worker { task_id: None }, 0), &release()).is_err());
         let resolve = || Cmd::GroupResolve { item: "1".into(), left: true, absent: false };
         assert!(authorize(&caller(chat, 0), &resolve()).is_err(), "only the operator resolves a group");
         assert!(authorize(&caller(Role::Detached, 0), &resolve()).is_err());

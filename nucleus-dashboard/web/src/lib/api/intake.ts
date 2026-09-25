@@ -10,9 +10,12 @@ import type { IntakeReplyReq } from "./generated/IntakeReplyReq";
 import type { IntakeApprovePlanReq } from "./generated/IntakeApprovePlanReq";
 import type { IntakeApproveCommentReq } from "./generated/IntakeApproveCommentReq";
 import type { IntakeItemReq } from "./generated/IntakeItemReq";
+import type { IntakeReleaseReq } from "./generated/IntakeReleaseReq";
 import type { Task } from "./tasks";
 
 export type { IntakeEval } from "./generated/IntakeEval";
+export type { IntakeHiddenFinding } from "./generated/IntakeHiddenFinding";
+export type { IntakeHiddenSource } from "./generated/IntakeHiddenSource";
 export type { IntakeEvent } from "./generated/IntakeEvent";
 export type { IntakeTransition } from "./generated/IntakeTransition";
 
@@ -28,7 +31,8 @@ export type IntakeStage =
   | "failed"
   | "cancelled"
   | "stale"
-  | "blocked";
+  | "blocked"
+  | "held";
 
 /** UI-layer refinement of IntakeItem.comment_state. */
 export type CommentState = "none" | "proposed" | "approved" | "posted" | "skipped";
@@ -80,3 +84,10 @@ export const skipComment = (id: number) => jsonPost<IntakeItem, IntakeItemReq>("
 export const cancelItem = (id: number) => jsonPost<IntakeItem, IntakeItemReq>("/intake/api/cancel", { id });
 
 export const retryItem = (id: number) => jsonPost<IntakeItem, IntakeItemReq>("/intake/api/retry", { id });
+
+/** Continue a held item with the hidden content the detail lists. `hold`
+ *  is the fingerprint (`hold_hash`) the panel rendered: refused (409) when
+ *  the item was held again since; refused, and the item goes stale, when
+ *  the issue changed since. */
+export const releaseItem = (id: number, hold: string) =>
+  jsonPost<IntakeItem, IntakeReleaseReq>("/intake/api/release", { id, hold });

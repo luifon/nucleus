@@ -671,6 +671,12 @@ pub struct IntakeConfig {
     /// (it is never cut and passed).
     #[serde(default = "default_intake_scan_max_bytes")]
     pub scan_max_bytes: usize,
+    /// Hold an item when its issue text or a comment it uses has content
+    /// that GitHub's page does not show (an HTML comment, invisible
+    /// characters, collapsed or dropped Markdown): no agent runs until the
+    /// operator releases or cancels it (ADR-036, "The hidden-content hold").
+    #[serde(default = "default_true_bool")]
+    pub hidden_content_hold: bool,
     #[serde(default)]
     pub repos: Vec<IntakeRepo>,
     #[serde(default)]
@@ -744,7 +750,11 @@ pub struct IntakeWhatsAppConfig {
 /// `{n}` item number, `{title}`, `{ref}` (`owner/name#12`), `{url}`,
 /// `{stage}`, `{version}`, `{error}`, `{pr_url}`, `{tests}`, `{comment}`,
 /// `{summary}`, `{classification}`, `{failed_in}` (the stage a failed item
-/// failed in), `{label}` (the gate label). Operator commands start with `#{n}`: in the
+/// failed in), `{label}` (the gate label). `item_held` also has `{count}`
+/// (the number of findings), `{kinds}` (the findings counted by kind),
+/// `{findings}` (the first findings, one per line, shortened) and `{code}`
+/// (the hold code a WhatsApp release must name); `item_released` has
+/// `{via}` (where the operator released it) and `{code}`. Operator commands start with `#{n}`: in the
 /// DM the marker routes the message to the item; in the item's group it is
 /// optional.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -767,6 +777,11 @@ pub struct IntakeTexts {
     /// The secret guard stopped a publishing step (`{error}` lists the
     /// finding categories, never the matched text).
     pub item_blocked: String,
+    /// The item is held: its issue text has content GitHub's page does not
+    /// show (`{count}`, `{kinds}`, `{findings}`).
+    pub item_held: String,
+    /// The operator released a held item (`{via}`, `{stage}`).
+    pub item_released: String,
     pub stage_note: String,
     pub no_plan: String,
     pub refinement_busy: String,
@@ -808,6 +823,15 @@ impl Default for IntakeTexts {
             item_blocked: "🛑 Item #{n} — {title} is blocked: {error}. Nothing was published. Fix the \
                            cause, then retry with `nucleus intake retry {n}` or on the dashboard, or \
                            cancel the item."
+                .into(),
+            item_held: "🔍 Item #{n} — {title} is held (hold {code}): the issue text has content that \
+                        GitHub's page does not show ({kinds}). No agent runs until you decide.\n{findings}\nRead \
+                        every finding in full on the dashboard (Intake page) or with `nucleus intake show {n} \
+                        --hidden`. Then reply `#{n} release {code}` to continue with this content (the agent reads \
+                        it as data), or `#{n} cancel`."
+                .into(),
+            item_released: "▶️ Item #{n} released via {via} (hold {code}); it continues in the {stage} stage. The \
+                            hidden content reaches the agent as data, marked as released by you."
                 .into(),
             stage_note: "Item #{n} is in the {stage} stage; messages reach an agent only during \
                          refinement. Your message is saved in the item's thread."
@@ -899,6 +923,7 @@ impl Default for IntakeConfig {
             import_max_ignore_bytes: default_intake_import_max_ignore_bytes(),
             import_max_entries: default_intake_import_max_entries(),
             scan_max_bytes: default_intake_scan_max_bytes(),
+            hidden_content_hold: true,
             repos: vec![],
             github: IntakeGithubConfig::default(),
             whatsapp: IntakeWhatsAppConfig::default(),

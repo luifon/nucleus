@@ -162,12 +162,33 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 )";
 
+/// The hidden-content hold (ADR-036, "The hidden-content hold"): what an
+/// item was held for, and what the operator released.
+///
+/// - `hold_stage`: the stage the item was held in (a release returns there).
+/// - `hold_json`: the findings ([`super::hidden::Finding`] list, JSON).
+/// - `hold_hash`: [`super::hidden::fingerprint`] of what the findings were
+///   computed on; a release is refused when the source no longer matches.
+/// - `released_hash`: the fingerprint the operator released; a later check
+///   with the same fingerprint lets the item continue.
+const SCHEMA_V2: &str = "
+ALTER TABLE items ADD COLUMN hold_stage TEXT;
+ALTER TABLE items ADD COLUMN hold_json TEXT;
+ALTER TABLE items ADD COLUMN hold_hash TEXT;
+ALTER TABLE items ADD COLUMN held_at TEXT;
+ALTER TABLE items ADD COLUMN released_hash TEXT;
+ALTER TABLE items ADD COLUMN released_at TEXT;
+ALTER TABLE items ADD COLUMN released_via TEXT";
+
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(super::INTAKE_DB_PATH)).await?;
     crate::migrate::migrate(
         &pool,
-        &[crate::migrate::Migration { version: 1, name: "intake schema", step: crate::migrate::Step::Sql(SCHEMA_V1) }],
+        &[
+            crate::migrate::Migration { version: 1, name: "intake schema", step: crate::migrate::Step::Sql(SCHEMA_V1) },
+            crate::migrate::Migration { version: 2, name: "hidden-content hold", step: crate::migrate::Step::Sql(SCHEMA_V2) },
+        ],
     )
     .await
     .context("migrating intake.db")?;
@@ -175,7 +196,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// True when `pool` (a read-only intake.db) has the full schema: the
 /// migration ledger records [`SCHEMA_VERSION`] and the item tables exist.
@@ -512,6 +533,19 @@ pub struct Item {
     pub base_sha: Option<String>,
     /// The commit Nucleus last pushed to the item's branch.
     pub pushed_sha: Option<String>,
+    /// The stage a held item was held in (a release returns there).
+    pub hold_stage: Option<String>,
+    /// The hidden-content findings the item was last held for
+    /// ([`super::hidden::Finding`] list, JSON).
+    pub hold_json: Option<String>,
+    /// [`super::hidden::fingerprint`] of what the findings were computed on.
+    pub hold_hash: Option<String>,
+    pub held_at: Option<String>,
+    /// The fingerprint the operator released: the item continues while the
+    /// hidden content it carries is exactly this.
+    pub released_hash: Option<String>,
+    pub released_at: Option<String>,
+    pub released_via: Option<String>,
 }
 
 impl Item {
@@ -577,7 +611,8 @@ const ITEM_COLUMNS: &str = "id, event_id, repo, title, stage, failed_stage, erro
     base_ref, impl_summary, head_sha, tests_status, tests_output, pr_url, comment_draft, comment_state, comment_url, comment_op, \
     surface, group_requested_at, group_jid, group_closed_at, current_task_id, last_task_id, step_errors, \
     created_at, updated_at, closed_at, rev_title, rev_body, revision_hash, gate_event_id, label_event_id, \
-    gate_actor, gate_at, stale_reason, base_sha, pushed_sha";
+    gate_actor, gate_at, stale_reason, base_sha, pushed_sha, hold_stage, hold_json, hold_hash, held_at, \
+    released_hash, released_at, released_via";
 
 /// What a new item is bound to: the event's revision and the gate event.
 #[derive(Debug, Clone)]
@@ -755,6 +790,13 @@ const SETTABLE: &[&str] = &[
     "stale_reason",
     "base_sha",
     "pushed_sha",
+    "hold_stage",
+    "hold_json",
+    "hold_hash",
+    "held_at",
+    "released_hash",
+    "released_at",
+    "released_via",
 ];
 
 fn set_clause(set: &[(&str, Val)], first_param: usize) -> Result<String> {
@@ -801,8 +843,22 @@ pub async fn advance_caused(
     from: Stage,
     ev: StageEvent,
     reason: &str,
+    set: Vec<(&str, Val)>,
+    cause: Option<&str>,
+) -> Result<bool> {
+    advance_where(pool, id, from, ev, reason, set, cause, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn advance_where(
+    pool: &SqlitePool,
+    id: i64,
+    from: Stage,
+    ev: StageEvent,
+    reason: &str,
     mut set: Vec<(&str, Val)>,
     cause: Option<&str>,
+    hold: Option<&str>,
 ) -> Result<bool> {
     let to = transition(from, &ev)?;
     let now = crate::timestamp::now();
@@ -820,13 +876,19 @@ pub async fn advance_caused(
         set.push(("closed_at", now.clone().into()));
     }
     let extra = set_clause(&set, 5)?;
+    let hold_param = 5 + set.len();
     let sql = format!(
-        "UPDATE items SET stage = ?2, updated_at = ?3{}{extra} WHERE id = ?1 AND stage = ?4",
-        if extra.is_empty() { "" } else { ", " }
+        "UPDATE items SET stage = ?2, updated_at = ?3{}{extra} WHERE id = ?1 AND stage = ?4{}",
+        if extra.is_empty() { "" } else { ", " },
+        if hold.is_some() { format!(" AND hold_hash = ?{hold_param}") } else { String::new() }
     );
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let q = sqlx::query(&sql).bind(id).bind(to.as_str()).bind(&now).bind(from.as_str());
-    let moved = bind_vals(q, &set).execute(&mut *tx).await?.rows_affected() == 1;
+    let mut q = bind_vals(q, &set);
+    if let Some(h) = hold {
+        q = q.bind(h.to_string());
+    }
+    let moved = q.execute(&mut *tx).await?.rows_affected() == 1;
     if moved {
         sqlx::query(
             "INSERT INTO item_transitions (item_id, at, from_stage, to_stage, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -842,6 +904,23 @@ pub async fn advance_caused(
     }
     tx.commit().await?;
     Ok(moved)
+}
+
+/// Release a held item (`ev` is a [`StageEvent::Release`]) only while its
+/// `hold_hash` is still `hold`: the hold the operator reviewed. The check and
+/// the stage change are one statement in one transaction, so a release
+/// that races a new hold changes nothing and returns `false`.
+#[allow(clippy::too_many_arguments)]
+pub async fn advance_if_hold(
+    pool: &SqlitePool,
+    id: i64,
+    ev: StageEvent,
+    reason: &str,
+    set: Vec<(&str, Val)>,
+    cause: Option<&str>,
+    hold: &str,
+) -> Result<bool> {
+    advance_where(pool, id, Stage::Held, ev, reason, set, cause, Some(hold)).await
 }
 
 async fn mark_applied(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, cause: Option<&str>) -> Result<()> {

@@ -5,7 +5,12 @@ import {
   canApprovePlan,
   canCancelItem,
   canDecideComment,
+  canRelease,
   canReply,
+  findingKindLabel,
+  findingPlace,
+  holdCode,
+  markRanges,
   canRetry,
   isWorking,
   stageKind,
@@ -63,6 +68,13 @@ function item(over: Partial<IntakeItem> = {}): IntakeItem {
     stale_reason: null,
     base_sha: null,
     pushed_sha: null,
+    hold_stage: null,
+    hold_json: null,
+    hold_hash: null,
+    held_at: null,
+    released_hash: null,
+    released_at: null,
+    released_via: null,
     ...over,
   };
 }
@@ -130,6 +142,35 @@ describe("display", () => {
       wa_state: null,
     });
     expect(threadOrder([m(3), m(1), m(2)]).map((x) => x.id)).toEqual([1, 2, 3]);
+  });
+});
+
+describe("held items", () => {
+  test("a held item can be released or cancelled, never retried", () => {
+    const h = item({ stage: "held", hold_stage: "queued" });
+    expect(canRelease(h)).toBe(true);
+    expect(canCancelItem(h)).toBe(true);
+    expect(canRetry(h)).toBe(false);
+    expect(isWorking(h)).toBe(false);
+    expect(stageKind(h)).toBe("warn");
+    expect(waitingOn(h)).toMatch(/release or cancel/);
+    expect(canRelease(item())).toBe(false);
+  });
+  test("findings read as place and kind", () => {
+    expect(findingPlace({ location: "comment 55", line: 3, column: 7 })).toBe("comment 55 3:7");
+    expect(findingKindLabel("html_comment")).toBe("HTML comment");
+    expect(findingKindLabel("something_new")).toBe("something_new");
+  });
+  test("the raw source is split at the finding ranges, in code points", () => {
+    const text = "a\u{1F600}<!-- x -->b";
+    expect(markRanges(text, [{ start: 2, end: 12 }])).toEqual([
+      { text: "a\u{1F600}", flagged: false },
+      { text: "<!-- x -->", flagged: true },
+      { text: "b", flagged: false },
+    ]);
+    expect(markRanges("abc", [])).toEqual([{ text: "abc", flagged: false }]);
+    expect(markRanges("abcd", [{ start: 0, end: 2 }, { start: 1, end: 3 }]).map((p) => p.flagged)).toEqual([true, false]);
+    expect(holdCode("a1b2c3d4")).toBe("a1b2c3");
   });
 });
 

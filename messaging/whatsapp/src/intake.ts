@@ -223,6 +223,36 @@ export function routeDm(
   return null;
 }
 
+/** A DM message routed to an item, with how it was written. */
+export interface RoutedDm {
+  item: string;
+  text: string;
+  inputKind: InputKind;
+}
+
+/** Decide whether a DM message goes to an issue-pipeline item. Only the
+ *  operator's own DM is routed (another allowed DM sender's message goes to
+ *  the chat session, so it can never approve, release or cancel), and the
+ *  message keeps how it was written: `voice` for a transcription,
+ *  `forwarded` for a forwarded message, `text` only for what the operator
+ *  typed. The Rust side acts on a command (`approve`, `release`, …) only
+ *  when it is `text`. */
+export async function routeOperatorDm(input: {
+  chatId: string;
+  operatorId: string | null;
+  pnForLid: (lid: string) => Promise<string | null | undefined>;
+  text: string;
+  quotedItem: string | null;
+  hasDmThread: (item: string) => boolean;
+  /** `voice` for a transcribed voice note; otherwise how the message was
+   *  sent (`text` or `forwarded`). */
+  inputKind: InputKind;
+}): Promise<RoutedDm | null> {
+  if (!(await isOperatorId(input.chatId, input.operatorId, input.pnForLid))) return null;
+  const routed = routeDm(input.text, input.quotedItem, input.hasDmThread);
+  return routed ? { ...routed, inputKind: input.inputKind } : null;
+}
+
 /** In an item's group the `#<n>` marker is optional; remove it when it
  *  names that item. */
 export function stripGroupMarker(text: string, itemKey: string): string {
