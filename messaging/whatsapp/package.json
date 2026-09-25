@@ -22,8 +22,9 @@
     "start:prod": "node dist/index.js"
   },
   "dependencies": {
+    "@cacheable/node-cache": "^1.7.6",
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^7.0.0-rc11",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
     "pino": "^9.5.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0"
