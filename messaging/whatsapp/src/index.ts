@@ -84,7 +84,7 @@ import { makeVaultManifestHook } from "./docstore_vault.js";
 import { transcribe } from "./transcribe.js";
 import { GroupAllowlist, resolveTarget } from "./target_policy.js";
 import { handleBrainDump, sweepExpiredPlans, type BraindumpDeps } from "./braindump_flow.js";
-import { GroupExecutor, IntakeStore, isOperatorId, routeDm, stripGroupMarker, type InputKind } from "./intake.js";
+import { GroupExecutor, IntakeStore, isOperatorId, routeOperatorDm, stripGroupMarker, type InputKind } from "./intake.js";
 import { planCapture, applyPlan, interpretResponse, BRAINDUMP_TMUX_SESSION } from "./braindump.js";
 
 // Every tmux session this process spawns claude windows into. Defined once
@@ -262,7 +262,7 @@ When the operator asks about items in plain language, read them:
 - ./target/release/nucleus intake show <n> — stage, eval, plan, thread, pull request
 - ./target/release/nucleus intake cancel <n> — stop an item, only when the operator asks
 
-You cannot approve plans or comments and cannot write in an item's thread: the operator approves by replying "#n approve" (or "#n approve comment") in the item's thread, or on the dashboard's Intake page. Tell the operator that when it applies.`;
+You cannot approve plans or comments, cannot release a held item and cannot write in an item's thread: the operator approves by replying "#n approve" (or "#n approve comment") in the item's thread, or on the dashboard's Intake page. An item is "held" when its issue text has content GitHub's page does not show (an HTML comment, invisible characters, …); \`intake show <n>\` lists it, and the operator releases the item by typing "#n release" in its thread, on the dashboard, or with \`nucleus intake release <n>\` in a terminal. Tell the operator that when it applies.`;
 
 /** ADR-036: the intake commands the DM session may run (the CLI refuses the
  *  others for a chat session). */
@@ -1224,12 +1224,19 @@ async function dispatchInbound(
   // for the item) goes to the item's thread, not to the chat session. Only
   // the operator's own DM is routed; another allowed DM sender's message
   // goes to the chat session as before.
-  if (role === "dm" && (await isOperatorId(chatId, config.operatorId, pnForLid))) {
+  if (role === "dm") {
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? null;
-    const quotedItem = quoted ? bot.intakeStore.itemForSentMessage(quoted) : null;
-    const routed = routeDm(text, quotedItem, (n) => bot.intakeStore.hasDmThread(n));
+    const routed = await routeOperatorDm({
+      chatId,
+      operatorId: config.operatorId,
+      pnForLid,
+      text,
+      quotedItem: quoted ? bot.intakeStore.itemForSentMessage(quoted) : null,
+      hasDmThread: (n) => bot.intakeStore.hasDmThread(n),
+      inputKind: inputKind === "voice" ? "voice" : typedKind(msg),
+    });
     if (routed) {
-      routeToItem(bot, routed.item, chatId, msg, routed.text, inputKind === "voice" ? "voice" : typedKind(msg));
+      routeToItem(bot, routed.item, chatId, msg, routed.text, routed.inputKind);
       return;
     }
   }
