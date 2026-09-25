@@ -103,15 +103,50 @@ export function findingKindLabel(kind: string): string {
       return "image alt text";
     case "link_title":
       return "link title";
+    case "link_destination":
+      return "link destination";
+    case "image_source":
+      return "image address";
+    case "fence_info":
+      return "code fence info string";
     case "table_extra_cells":
       return "table cells beyond the header";
     case "math_styling":
-      return "math that hides or recolors text";
+      return "math macro outside the visible-only list";
     case "rendered_block":
       return "diagram or map block";
     default:
       return kind;
   }
+}
+
+/** A piece of a raw source: flagged when a finding covers it. */
+export interface SourcePiece {
+  text: string;
+  flagged: boolean;
+}
+
+/** Split a raw source into pieces at the finding ranges (`start`/`end` in
+ *  code points, end exclusive), so the whole source can be shown with the
+ *  hidden parts marked. Overlapping ranges merge. */
+export function markRanges(text: string, ranges: readonly Pick<IntakeHiddenFinding, "start" | "end">[]): SourcePiece[] {
+  const cps = Array.from(text);
+  const flag = new Array<boolean>(cps.length).fill(false);
+  for (const r of ranges) {
+    for (let i = Math.max(0, r.start); i < Math.min(cps.length, r.end); i++) flag[i] = true;
+  }
+  const out: SourcePiece[] = [];
+  for (let i = 0; i < cps.length; i++) {
+    const last = out[out.length - 1];
+    if (last && last.flagged === flag[i]) last.text += cps[i];
+    else out.push({ text: cps[i], flagged: flag[i] });
+  }
+  return out;
+}
+
+/** The short hold code the operator types in WhatsApp (`#12 release a1b2c3`). */
+export function holdCode(hash: string | null): string {
+  return (hash ?? "").slice(0, 6);
 }
 
 /** `body 3:5` — where a finding is. */

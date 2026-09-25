@@ -9,6 +9,8 @@ import {
   canReply,
   findingKindLabel,
   findingPlace,
+  holdCode,
+  markRanges,
   canRetry,
   isWorking,
   stageKind,
@@ -158,6 +160,17 @@ describe("held items", () => {
     expect(findingPlace({ location: "comment 55", line: 3, column: 7 })).toBe("comment 55 3:7");
     expect(findingKindLabel("html_comment")).toBe("HTML comment");
     expect(findingKindLabel("something_new")).toBe("something_new");
+  });
+  test("the raw source is split at the finding ranges, in code points", () => {
+    const text = "a\u{1F600}<!-- x -->b";
+    expect(markRanges(text, [{ start: 2, end: 12 }])).toEqual([
+      { text: "a\u{1F600}", flagged: false },
+      { text: "<!-- x -->", flagged: true },
+      { text: "b", flagged: false },
+    ]);
+    expect(markRanges("abc", [])).toEqual([{ text: "abc", flagged: false }]);
+    expect(markRanges("abcd", [{ start: 0, end: 2 }, { start: 1, end: 3 }]).map((p) => p.flagged)).toEqual([true, false]);
+    expect(holdCode("a1b2c3d4")).toBe("a1b2c3");
   });
 });
 

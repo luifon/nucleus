@@ -305,8 +305,9 @@ pub enum OperatorCommand {
     ApproveComment,
     SkipComment,
     Cancel,
-    /// Release an item held for hidden content.
-    Release,
+    /// Release an item held for hidden content; the code names the hold
+    /// the operator reviewed (`None` is refused with the current code).
+    Release(Option<String>),
     /// Anything else: a message for the refinement agent or the thread.
     Message,
 }
@@ -325,7 +326,10 @@ pub fn parse_command(text: &str) -> OperatorCommand {
         ["approve", "comment"] => OperatorCommand::ApproveComment,
         ["skip", "comment"] => OperatorCommand::SkipComment,
         ["cancel"] | ["cancel", "item"] => OperatorCommand::Cancel,
-        ["release"] | ["release", "item"] => OperatorCommand::Release,
+        ["release"] | ["release", "item"] => OperatorCommand::Release(None),
+        ["release", code] if code.len() <= 64 && code.bytes().all(|c| c.is_ascii_hexdigit()) => {
+            OperatorCommand::Release(Some(code.to_string()))
+        }
         _ => OperatorCommand::Message,
     }
 }
@@ -528,7 +532,9 @@ mod tests {
         assert_eq!(parse_command("approve comment"), ApproveComment);
         assert_eq!(parse_command("skip comment."), SkipComment);
         assert_eq!(parse_command("cancel"), Cancel);
-        assert_eq!(parse_command("Release"), Release);
+        assert_eq!(parse_command("Release"), Release(None));
+        assert_eq!(parse_command("release A1b2C3"), Release(Some("a1b2c3".into())));
+        assert_eq!(parse_command("release now"), Message);
         assert_eq!(parse_command("release the item now"), Message);
         assert_eq!(parse_command("I approve of the idea but change step 2"), Message);
         assert_eq!(parse_command("approve vX"), Message);

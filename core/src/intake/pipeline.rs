@@ -564,7 +564,9 @@ pub async fn operator_text(ctx: &Ctx, item: &Item, text: &str, msg_ref: &str, in
             OperatorCommand::ApproveComment => approve_comment_caused(ctx, item.id, None, "whatsapp", cause).await.map(|_| ()),
             OperatorCommand::SkipComment => skip_comment_caused(ctx, item.id, "whatsapp", cause).await.map(|_| ()),
             OperatorCommand::Cancel => cancel_caused(ctx, item.id, "whatsapp", cause).await.map(|_| ()),
-            OperatorCommand::Release => release_caused(ctx, item.id, "whatsapp", cause).await.map(|_| ()),
+            OperatorCommand::Release(code) => {
+                release_caused(ctx, item.id, code.as_deref(), "whatsapp", cause).await.map(|_| ())
+            }
             OperatorCommand::Message => unreachable!("handled above"),
         }
     };
@@ -764,15 +766,18 @@ pub async fn retry(ctx: &Ctx, n: i64, via: &str) -> Result<Item> {
 
 /// Release an item held for hidden content: it continues at the stage it
 /// was held in, and its briefs say that the operator released the hidden
-/// content. The release is bound to what the operator was shown: the issue
-/// is read again now, and when the issue or a comment the item uses changed
-/// since the findings were computed, the release is refused and the item
-/// goes stale (a changed title, body or used comment) like any other edit.
-pub async fn release(ctx: &Ctx, n: i64, via: &str) -> Result<Item> {
-    release_caused(ctx, n, via, None).await
+/// content. `hold` is the hold the operator reviewed: the full fingerprint
+/// (dashboard) or its short code (CLI `--hold`, WhatsApp `#n release
+/// <code>`). It must name the current hold; this is checked before the live
+/// read and again in the transaction that changes the stage, so a release
+/// of an earlier hold never releases a later one. The issue is then read
+/// again: when it or a comment the item uses changed since the findings
+/// were computed, the release is refused and the item goes stale.
+pub async fn release(ctx: &Ctx, n: i64, hold: Option<&str>, via: &str) -> Result<Item> {
+    release_caused(ctx, n, hold, via, None).await
 }
 
-async fn release_caused(ctx: &Ctx, n: i64, via: &str, cause: Option<&str>) -> Result<Item> {
+async fn release_caused(ctx: &Ctx, n: i64, hold: Option<&str>, via: &str, cause: Option<&str>) -> Result<Item> {
     let item = store::item(&ctx.db, n).await?;
     if item.stage() != Stage::Held {
         return refuse(format!("Item #{n} is not held (it is {}); there is nothing to release.", item.stage));
@@ -780,6 +785,22 @@ async fn release_caused(ctx: &Ctx, n: i64, via: &str, cause: Option<&str>) -> Re
     let (Some(shown), Some(held_in)) = (item.hold_hash.clone(), item.hold_stage.as_deref().and_then(Stage::parse)) else {
         return refuse(format!("Item #{n} has no record of what it was held for; cancel it and add the label again."));
     };
+    let code = hidden::hold_code(&shown).to_string();
+    match hold {
+        None => {
+            return refuse(format!(
+                "Item #{n}: name the hold you reviewed. Its current code is {code}: reply `#{n} release {code}` after \
+                 reading the findings (dashboard or `nucleus intake show {n} --hidden`)."
+            ))
+        }
+        Some(h) if !hidden::names_hold(h, &shown) => {
+            return refuse(format!(
+                "Item #{n} was not released: {h:?} is not its current hold. The item was held again since; its current \
+                 code is {code}. Read the new findings, then release with that code."
+            ))
+        }
+        Some(_) => {}
+    }
     let d = match live_gate(ctx, &item, "the release", None).await? {
         Gate::Pass { discussion, .. } => discussion,
         Gate::Stopped | Gate::Changed => {
@@ -792,31 +813,30 @@ async fn release_caused(ctx: &Ctx, n: i64, via: &str, cause: Option<&str>) -> Re
         }
     };
     let (title, body) = revision_text(&item);
-    let findings = hidden::scan_revision(title, body, &d.trusted);
-    if hidden::fingerprint(title, body, &d.trusted, &findings) != shown {
+    if hidden::fingerprint(&hidden::scan_revision(title, body, &d.trusted)) != shown {
         let why = "the issue or a comment it uses changed after the hidden content was shown; the release was refused";
         mark_stale(ctx, &item, why).await?;
         return refuse(format!("Item #{n} was not released: {why}. It is stale now."));
     }
-    let moved = store::advance_caused(
+    let moved = store::advance_if_hold(
         &ctx.db,
         n,
-        Stage::Held,
         StageEvent::Release { held_in },
-        &format!("released via {via}"),
+        &format!("released via {via} (hold {code})"),
         vec![
-            ("released_hash", shown.into()),
+            ("released_hash", shown.clone().into()),
             ("released_at", crate::timestamp::now().into()),
             ("released_via", via.into()),
         ],
         cause,
+        &shown,
     )
     .await?;
     if !moved {
-        return refuse(format!("Item #{n} changed while releasing; look at it again."));
+        return refuse(format!("Item #{n} changed while releasing (held again or stopped); look at it again."));
     }
     let item = store::item(&ctx.db, n).await?;
-    note(ctx, n, &fill_item(&ctx.cfg.texts.item_released, &item_vars(ctx, &item), &[("via", via)])).await?;
+    note(ctx, n, &fill_item(&ctx.cfg.texts.item_released, &item_vars(ctx, &item), &[("via", via), ("code", &code)])).await?;
     tracing::info!(item = n, via, "intake: held item released");
     Ok(item)
 }
@@ -1060,25 +1080,27 @@ async fn hold_check(ctx: &Ctx, item: &Item, d: &Discussion) -> Result<bool> {
         return Ok(true);
     }
     let (title, body) = revision_text(item);
-    let findings = hidden::scan_revision(title, body, &d.trusted);
-    if findings.is_empty() {
+    let found = hidden::scan_revision(title, body, &d.trusted);
+    if found.findings.is_empty() {
         return Ok(true);
     }
-    let fp = hidden::fingerprint(title, body, &d.trusted, &findings);
+    let fp = hidden::fingerprint(&found);
     if item.released_hash.as_deref() == Some(fp.as_str()) {
         return Ok(true);
     }
-    hold(ctx, item, &findings, &fp).await?;
+    hold(ctx, item, &found, &fp).await?;
     Ok(false)
 }
 
-/// Findings listed in the WhatsApp message; the dashboard shows all.
+/// Findings listed in the WhatsApp message; the dashboard and `nucleus
+/// intake show <n> --hidden` show all of them in full.
 const HELD_MESSAGE_FINDINGS: usize = 3;
 
-async fn hold(ctx: &Ctx, item: &Item, findings: &[hidden::Finding], fp: &str) -> Result<()> {
+async fn hold(ctx: &Ctx, item: &Item, found: &hidden::Hold, fp: &str) -> Result<()> {
+    let findings = &found.findings;
     let kinds = hidden::summary(findings);
     let mut set = vec![
-        ("hold_json", Val::from(serde_json::to_string(findings)?)),
+        ("hold_json", Val::from(serde_json::to_string(found)?)),
         ("hold_hash", fp.into()),
         ("held_at", crate::timestamp::now().into()),
         ("hold_stage", item.stage.clone().into()),
@@ -1089,19 +1111,20 @@ async fn hold(ctx: &Ctx, item: &Item, findings: &[hidden::Finding], fp: &str) ->
     if item.surface == "none" {
         set.push(("surface", "dm".into()));
     }
-    let reason = format!("held: {} piece(s) of content GitHub's page does not show ({kinds})", findings.len());
+    let code = hidden::hold_code(fp);
+    let reason = format!("held (hold {code}): {} piece(s) of content GitHub's page does not show ({kinds})", findings.len());
     if store::advance(&ctx.db, item.id, item.stage(), StageEvent::Hold, &reason, set).await? {
         tracing::warn!(item = item.id, kinds, "intake: item held for hidden content");
         let it = store::item(&ctx.db, item.id).await?;
         let mut lines: Vec<String> =
-            findings.iter().take(HELD_MESSAGE_FINDINGS).map(|f| format!("- {}", hidden::describe(f, 120))).collect();
+            findings.iter().take(HELD_MESSAGE_FINDINGS).map(|f| format!("- {}", hidden::describe(f, 80))).collect();
         if findings.len() > HELD_MESSAGE_FINDINGS {
             lines.push(format!("- … and {} more", findings.len() - HELD_MESSAGE_FINDINGS));
         }
         let text = fill_item(
             &ctx.cfg.texts.item_held,
             &item_vars(ctx, &it),
-            &[("count", &findings.len().to_string()), ("kinds", &kinds), ("findings", &lines.join("\n"))],
+            &[("count", &findings.len().to_string()), ("kinds", &kinds), ("findings", &lines.join("\n")), ("code", code)],
         );
         note_once(ctx, item.id, &text, &format!("held:{}:{fp}", item.id)).await?;
     }

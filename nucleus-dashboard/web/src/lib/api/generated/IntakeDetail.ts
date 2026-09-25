@@ -2,6 +2,7 @@
 import type { IntakeEval } from "./IntakeEval";
 import type { IntakeEvent } from "./IntakeEvent";
 import type { IntakeHiddenFinding } from "./IntakeHiddenFinding";
+import type { IntakeHiddenSource } from "./IntakeHiddenSource";
 import type { IntakeItem } from "./IntakeItem";
 import type { IntakeMessage } from "./IntakeMessage";
 import type { IntakeTransition } from "./IntakeTransition";
@@ -12,7 +13,12 @@ export type IntakeDetail = { item: IntakeItem, event: IntakeEvent, eval: IntakeE
  * What the item was last held for: content in the issue text or a
  * comment that GitHub's page does not show. Empty when never held.
  */
-hidden: Array<IntakeHiddenFinding>, messages: Array<IntakeMessage>,
+hidden: Array<IntakeHiddenFinding>,
+/**
+ * The raw text of each location that has findings (title, body,
+ * `comment <id>`), complete, for review with the ranges marked.
+ */
+hidden_sources: Array<IntakeHiddenSource>, messages: Array<IntakeMessage>,
 /**
  * Every stage task of the item, oldest first (from the task ledger).
  */

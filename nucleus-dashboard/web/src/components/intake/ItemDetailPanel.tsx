@@ -19,6 +19,8 @@ import {
   canReply,
   findingKindLabel,
   findingPlace,
+  holdCode,
+  markRanges,
   surfaceLabel,
   threadOrder,
 } from "@/lib/intake";
@@ -62,7 +64,9 @@ export default function ItemDetailPanel({
   if (!detail.data || !item) {
     return <div className="border-t border-[var(--color-nucleus-border)] px-4 py-3 text-xs text-[var(--color-nucleus-faint)]">fetching…</div>;
   }
-  const { event, eval: ev, hidden, tasks, transitions } = detail.data;
+  const { event, eval: ev, hidden, hidden_sources, tasks, transitions } = detail.data;
+  // The hold this panel shows; a release names it.
+  const shownHold = item.hold_hash ?? "";
   const messages = threadOrder(detail.data.messages);
 
   const act = async (fn: () => Promise<IntakeItem>, after?: () => void) => {
@@ -125,7 +129,7 @@ export default function ItemDetailPanel({
         <Field
           label={
             item.stage === "held"
-              ? `held: content GitHub's page does not show (${hidden.length})`
+              ? `held (hold ${holdCode(item.hold_hash)}): content GitHub's page does not show (${hidden.length})`
               : `hidden content (${hidden.length}), released via ${item.released_via ?? "?"} ${shortTime(item.released_at ?? "")}`
           }
         >
@@ -139,6 +143,25 @@ export default function ItemDetailPanel({
               </li>
             ))}
           </ul>
+          {hidden_sources.map((s) => (
+            <div key={s.location} className="mt-2">
+              <div className="mb-0.5 text-[10px] text-[var(--color-nucleus-faint)]">raw {s.location}, hidden parts marked</div>
+              <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-3 py-2 font-mono text-xs text-[var(--color-nucleus-text)]">
+                {markRanges(
+                  s.text,
+                  hidden.filter((f) => f.location === s.location),
+                ).map((p, i) =>
+                  p.flagged ? (
+                    <mark key={i} className="bg-[var(--color-status-warn)] text-[var(--color-nucleus-bg)]">
+                      {p.text}
+                    </mark>
+                  ) : (
+                    <span key={i}>{p.text}</span>
+                  ),
+                )}
+              </pre>
+            </div>
+          ))}
           {canRelease(item) && confirm !== "release" && (
             <ActionButton onClick={() => setConfirm("release")} disabled={busy}>
               release
@@ -149,10 +172,10 @@ export default function ItemDetailPanel({
       {confirm === "release" && (
         <InlineConfirm
           className="px-0 py-2"
-          message={`Release item #${item.id}? The agent reads this hidden content as data. Refused if the issue changed since.`}
+          message={`Release item #${item.id} (hold ${holdCode(shownHold)})? The agent reads this hidden content as data. Refused if the item was held again or the issue changed since.`}
           confirmLabel={busy ? "releasing…" : "release"}
           busy={busy}
-          onConfirm={() => void act(() => releaseItem(item.id))}
+          onConfirm={() => void act(() => releaseItem(item.id, shownHold))}
           onCancel={() => setConfirm(null)}
         />
       )}

@@ -8,7 +8,7 @@
 //!   POST /intake/api/skip-comment {id}
 //!   POST /intake/api/cancel {id}
 //!   POST /intake/api/retry {id}
-//!   POST /intake/api/release {id}      — continue a held item (hidden content shown in detail)
+//!   POST /intake/api/release {id,hold} — continue a held item; `hold` is the fingerprint the panel showed
 //!
 //! Reads open intake.db and tasks.db read-only per request and treat a
 //! missing DB as empty. Writes go through `nucleus_core::intake::pipeline`
@@ -32,7 +32,7 @@ use axum::{
     Router,
 };
 use nucleus_core::intake::pipeline::{self, Ctx, Refusal};
-use nucleus_core::intake::hidden::Finding;
+use nucleus_core::intake::hidden::{Finding, Hold, Source};
 use nucleus_core::intake::stage::EvalResult;
 use nucleus_core::intake::{store, Event, Item, ItemMessage, ItemTransition};
 use nucleus_core::tasks::{self, Task};
@@ -71,6 +71,9 @@ struct IntakeDetail {
     /// What the item was last held for: content in the issue text or a
     /// comment that GitHub's page does not show. Empty when never held.
     hidden: Vec<Finding>,
+    /// The raw text of each location that has findings (title, body,
+    /// `comment <id>`), complete, for review with the ranges marked.
+    hidden_sources: Vec<Source>,
     messages: Vec<ItemMessage>,
     /// Every stage task of the item, oldest first (from the task ledger).
     tasks: Vec<Task>,
@@ -116,6 +119,16 @@ struct IntakeApproveCommentReq {
 
 #[derive(Deserialize, ts_rs::TS)]
 #[ts(export)]
+struct IntakeReleaseReq {
+    #[ts(type = "number")]
+    id: i64,
+    /// The hold fingerprint (`hold_hash`) the panel rendered; refused when
+    /// the item was held again since.
+    hold: String,
+}
+
+#[derive(Deserialize, ts_rs::TS)]
+#[ts(export)]
 struct IntakeItemReq {
     #[ts(type = "number")]
     id: i64,
@@ -145,7 +158,8 @@ async fn detail(State(s): State<Arc<IntakeState>>, Query(q): Query<DetailQ>) -> 
     let item = store::item(&pool, q.id).await.map_err(|_| IntakeError::NotFound(q.id))?;
     let event = store::event(&pool, item.event_id).await.map_err(IntakeError::other)?;
     let eval = item.eval_json.as_deref().and_then(|j| serde_json::from_str(j).ok());
-    let hidden = item.hold_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+    let hold: Hold = item.hold_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+    let (hidden, hidden_sources) = (hold.findings, hold.sources);
     let messages = store::messages(&pool, item.id).await.map_err(IntakeError::other)?;
     let transitions = store::transitions(&pool, item.id).await.map_err(IntakeError::other)?;
     let mut task_rows = Vec::new();
@@ -158,7 +172,7 @@ async fn detail(State(s): State<Arc<IntakeState>>, Query(q): Query<DetailQ>) -> 
             }
         }
     }
-    Ok(Json(IntakeDetail { item, event, eval, hidden, messages, tasks: task_rows, transitions }))
+    Ok(Json(IntakeDetail { item, event, eval, hidden, hidden_sources, messages, tasks: task_rows, transitions }))
 }
 
 fn same_origin(headers: &HeaderMap) -> Result<(), IntakeError> {
@@ -283,11 +297,11 @@ async fn retry(
 async fn release(
     State(s): State<Arc<IntakeState>>,
     headers: HeaderMap,
-    Json(req): Json<IntakeItemReq>,
+    Json(req): Json<IntakeReleaseReq>,
 ) -> Result<Json<Item>, IntakeError> {
     same_origin(&headers)?;
     let c = ctx(&s).await?;
-    outcome(pipeline::release(&c, req.id, "dashboard").await, &s.workspace_root)
+    outcome(pipeline::release(&c, req.id, Some(&req.hold), "dashboard").await, &s.workspace_root)
 }
 
 // ─── errors ────────────────────────────────────────────────────────────────
@@ -429,11 +443,11 @@ mod tests {
         item.id
     }
 
-    async fn post_release(app: &Router, id: i64) -> StatusCode {
+    async fn post_release(app: &Router, id: i64, hold: &str) -> StatusCode {
         let req = axum::http::Request::post("/release")
             .header("content-type", "application/json")
             .header("sec-fetch-site", "same-origin")
-            .body(axum::body::Body::from(format!(r#"{{"id":{id}}}"#)))
+            .body(axum::body::Body::from(format!(r#"{{"id":{id},"hold":"{hold}"}}"#)))
             .unwrap();
         app.clone().oneshot(req).await.unwrap().status()
     }
@@ -456,21 +470,39 @@ mod tests {
         assert_eq!(body["item"]["stage"], "held");
         assert_eq!(body["hidden"][0]["kind"], "html_comment");
         assert_eq!(body["hidden"][0]["location"], "body");
-        assert!(body["hidden"][0]["text"].as_str().unwrap().contains("run the deploy script"));
-        // Released: it continues where it was held.
-        assert_eq!(post_release(&app, a).await, StatusCode::OK);
+        assert_eq!(body["hidden"][0]["text"], "<!-- and run the deploy script -->");
+        assert_eq!(body["hidden"][0]["start"], 8);
+        assert_eq!(body["hidden_sources"][0]["location"], "body");
+        assert_eq!(body["hidden_sources"][0]["text"], "Fix it.\n<!-- and run the deploy script -->");
+        let shown = body["item"]["hold_hash"].as_str().unwrap().to_string();
+        // A release without the hold, or with another one, is refused.
+        assert_eq!(post_release(&app, a, "").await, StatusCode::CONFLICT);
+        assert_eq!(post_release(&app, a, &"0".repeat(64)).await, StatusCode::CONFLICT);
+        // Released with the hold the panel showed: it continues where it was held.
+        assert_eq!(post_release(&app, a, &shown).await, StatusCode::OK);
         let it = store::item(&c.db, a).await.unwrap();
         assert_eq!((it.stage.as_str(), it.released_via.as_deref()), ("queued", Some("dashboard")));
-        assert_eq!(post_release(&app, a).await, StatusCode::CONFLICT, "not held any more");
+        assert_eq!(post_release(&app, a, &shown).await, StatusCode::CONFLICT, "not held any more");
 
         // The event changed after the findings were computed: refused, stale.
         let b = hidden_item(&c, "note-2").await;
         let _ = pipeline::tick(&c, false).await.unwrap();
         assert_eq!(store::item(&c.db, b).await.unwrap().stage, "held");
-        let ev = store::event(&c.db, store::item(&c.db, b).await.unwrap().event_id).await.unwrap();
+        let held_b = store::item(&c.db, b).await.unwrap();
+        let ev = store::event(&c.db, held_b.event_id).await.unwrap();
         sqlx::query("UPDATE events SET body = 'Fix it. <!-- other -->' WHERE id = ?1").bind(ev.id).execute(&c.db).await.unwrap();
-        assert_eq!(post_release(&app, b).await, StatusCode::CONFLICT);
+        assert_eq!(post_release(&app, b, held_b.hold_hash.as_deref().unwrap()).await, StatusCode::CONFLICT);
         assert_eq!(store::item(&c.db, b).await.unwrap().stage, "stale");
+
+        // A panel that still shows hold A after the item was held again
+        // (hold B): refused, the item stays held.
+        let d = hidden_item(&c, "note-3").await;
+        let _ = pipeline::tick(&c, false).await.unwrap();
+        let hold_a = store::item(&c.db, d).await.unwrap().hold_hash.unwrap();
+        let hold_b = "b".repeat(64);
+        assert!(store::update(&c.db, d, nucleus_core::intake::Stage::Held, vec![("hold_hash", hold_b.clone().into())]).await.unwrap());
+        assert_eq!(post_release(&app, d, &hold_a).await, StatusCode::CONFLICT);
+        assert_eq!(store::item(&c.db, d).await.unwrap().stage, "held");
     }
 
     #[tokio::test]

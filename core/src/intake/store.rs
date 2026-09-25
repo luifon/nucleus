@@ -843,8 +843,22 @@ pub async fn advance_caused(
     from: Stage,
     ev: StageEvent,
     reason: &str,
+    set: Vec<(&str, Val)>,
+    cause: Option<&str>,
+) -> Result<bool> {
+    advance_where(pool, id, from, ev, reason, set, cause, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn advance_where(
+    pool: &SqlitePool,
+    id: i64,
+    from: Stage,
+    ev: StageEvent,
+    reason: &str,
     mut set: Vec<(&str, Val)>,
     cause: Option<&str>,
+    hold: Option<&str>,
 ) -> Result<bool> {
     let to = transition(from, &ev)?;
     let now = crate::timestamp::now();
@@ -862,13 +876,19 @@ pub async fn advance_caused(
         set.push(("closed_at", now.clone().into()));
     }
     let extra = set_clause(&set, 5)?;
+    let hold_param = 5 + set.len();
     let sql = format!(
-        "UPDATE items SET stage = ?2, updated_at = ?3{}{extra} WHERE id = ?1 AND stage = ?4",
-        if extra.is_empty() { "" } else { ", " }
+        "UPDATE items SET stage = ?2, updated_at = ?3{}{extra} WHERE id = ?1 AND stage = ?4{}",
+        if extra.is_empty() { "" } else { ", " },
+        if hold.is_some() { format!(" AND hold_hash = ?{hold_param}") } else { String::new() }
     );
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let q = sqlx::query(&sql).bind(id).bind(to.as_str()).bind(&now).bind(from.as_str());
-    let moved = bind_vals(q, &set).execute(&mut *tx).await?.rows_affected() == 1;
+    let mut q = bind_vals(q, &set);
+    if let Some(h) = hold {
+        q = q.bind(h.to_string());
+    }
+    let moved = q.execute(&mut *tx).await?.rows_affected() == 1;
     if moved {
         sqlx::query(
             "INSERT INTO item_transitions (item_id, at, from_stage, to_stage, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -884,6 +904,23 @@ pub async fn advance_caused(
     }
     tx.commit().await?;
     Ok(moved)
+}
+
+/// Release a held item (`ev` is a [`StageEvent::Release`]) only while its
+/// `hold_hash` is still `hold`: the hold the operator reviewed. The check and
+/// the stage change are one statement in one transaction, so a release
+/// that races a new hold changes nothing and returns `false`.
+#[allow(clippy::too_many_arguments)]
+pub async fn advance_if_hold(
+    pool: &SqlitePool,
+    id: i64,
+    ev: StageEvent,
+    reason: &str,
+    set: Vec<(&str, Val)>,
+    cause: Option<&str>,
+    hold: &str,
+) -> Result<bool> {
+    advance_where(pool, id, Stage::Held, ev, reason, set, cause, Some(hold)).await
 }
 
 async fn mark_applied(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, cause: Option<&str>) -> Result<()> {

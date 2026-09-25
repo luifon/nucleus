@@ -751,9 +751,10 @@ pub struct IntakeWhatsAppConfig {
 /// `{stage}`, `{version}`, `{error}`, `{pr_url}`, `{tests}`, `{comment}`,
 /// `{summary}`, `{classification}`, `{failed_in}` (the stage a failed item
 /// failed in), `{label}` (the gate label). `item_held` also has `{count}`
-/// (the number of findings), `{kinds}` (the findings counted by kind) and
-/// `{findings}` (the first findings, one per line); `item_released` has
-/// `{via}` (where the operator released it). Operator commands start with `#{n}`: in the
+/// (the number of findings), `{kinds}` (the findings counted by kind),
+/// `{findings}` (the first findings, one per line, shortened) and `{code}`
+/// (the hold code a WhatsApp release must name); `item_released` has
+/// `{via}` (where the operator released it) and `{code}`. Operator commands start with `#{n}`: in the
 /// DM the marker routes the message to the item; in the item's group it is
 /// optional.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -823,13 +824,14 @@ impl Default for IntakeTexts {
                            cause, then retry with `nucleus intake retry {n}` or on the dashboard, or \
                            cancel the item."
                 .into(),
-            item_held: "🔍 Item #{n} — {title} is held: the issue text has content that GitHub's page does \
-                        not show ({kinds}). No agent runs until you decide.\n{findings}\nSee the dashboard \
-                        (Intake page) for the full list. Reply `#{n} release` to continue with this content (the \
-                        agent reads it as data), or `#{n} cancel`."
+            item_held: "🔍 Item #{n} — {title} is held (hold {code}): the issue text has content that \
+                        GitHub's page does not show ({kinds}). No agent runs until you decide.\n{findings}\nRead \
+                        every finding in full on the dashboard (Intake page) or with `nucleus intake show {n} \
+                        --hidden`. Then reply `#{n} release {code}` to continue with this content (the agent reads \
+                        it as data), or `#{n} cancel`."
                 .into(),
-            item_released: "▶️ Item #{n} released via {via}; it continues in the {stage} stage. The hidden \
-                            content reaches the agent as data, marked as released by you."
+            item_released: "▶️ Item #{n} released via {via} (hold {code}); it continues in the {stage} stage. The \
+                            hidden content reaches the agent as data, marked as released by you."
                 .into(),
             stage_note: "Item #{n} is in the {stage} stage; messages reach an agent only during \
                          refinement. Your message is saved in the item's thread."

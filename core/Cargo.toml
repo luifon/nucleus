@@ -29,6 +29,11 @@ libc = "0.2"
 reqwest = { workspace = true }
 ts-rs = { workspace = true }
 unicode-normalization = "0.1"
+# ADR-036 hidden-content hold: GitHub-flavored Markdown with source positions,
+# RGI emoji sequences, Unicode joining types.
+comrak = { version = "0.55", default-features = false }
+emojis = "0.9"
+unicode-joining-type = "1"
 rustix = { version = "1", features = ["fs"] }
 sha2 = "0.10"
 async-trait = { workspace = true }

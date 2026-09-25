@@ -13,11 +13,18 @@ location: string,
  */
 kind: string,
 /**
- * 1-based line and column (in characters) of its start.
+ * 1-based line and column (in characters) of its start in the raw
+ * text; CR, LF and CRLF each end a line.
  */
 line: number, column: number,
 /**
- * The hidden content made visible: code points for invisible
- * characters, the literal source (length-capped) for everything else.
+ * Its range in the raw text of the location, in characters (Unicode
+ * scalar values), end exclusive.
+ */
+start: number, end: number,
+/**
+ * The complete hidden content made visible, never shortened:
+ * invisible characters as code points, everything else as its literal
+ * source (with any invisible character in it shown as `[U+XXXX]`).
  */
 text: string, };
