@@ -568,12 +568,17 @@ JSON-parsed numbers.
 - Every write to `memory/intake.db` goes through `nucleus_core::intake`.
   Nucleus keeps one bare mirror per repo and one clone per item under
   `[intake] work_dir`, outside this checkout. Nucleus's own git commands
-  run with hooks disabled, the mirror's config rewritten, and the remote
-  URL from `nucleus.toml`; do not add a git step that uses the clone's
-  config or `origin`.
-- Before implementation starts and before every push or comment, Nucleus
-  reads the issue live (open, label added by a collaborator, no edit since)
-  and fails closed. The PR body is built from code-owned fields, and the
+  run with no global or system config (`GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_CONFIG_NOSYSTEM=1`), hooks disabled, the mirror's config rewritten,
+  an HTTPS remote URL from `nucleus.toml` and gh as the only credential
+  helper. Nucleus never runs git against an item clone: it imports the
+  clone's file tree into the mirror as one commit with the configured
+  identity and a code-owned message. Do not add a git step that breaks this.
+- For implementation start, every push and every comment, Nucleus reads the
+  issue live (open, label added by a collaborator, no edit since) before
+  preparing and again as the last step before the action, and fails closed
+  if the two reads differ. Task titles and branch names are code-owned;
+  issue text reaches a session only inside the data fence. The PR body is built from code-owned fields, and the
   diff and all public text pass `tools/check-secrets.sh` first.
 
 ## When in doubt
