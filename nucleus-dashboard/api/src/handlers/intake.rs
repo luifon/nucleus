@@ -157,6 +157,7 @@ fn same_origin(headers: &HeaderMap) -> Result<(), IntakeError> {
 
 async fn ctx(s: &IntakeState) -> Result<Ctx, IntakeError> {
     let ws = &s.workspace_root;
+    let tools = nucleus_core::intake::tools::ToolPins::pin(&s.intake.github.gh_bin).map_err(IntakeError::other)?;
     Ok(Ctx {
         ws: ws.clone(),
         cfg: s.intake.clone(),
@@ -164,9 +165,10 @@ async fn ctx(s: &IntakeState) -> Result<Ctx, IntakeError> {
         db: store::open(ws).await.map_err(IntakeError::other)?,
         tasks_db: tasks::open(ws).await.map_err(IntakeError::other)?,
         wa: nucleus_core::whatsapp_queue::open(ws).await.map_err(IntakeError::other)?,
-        gh: Arc::new(nucleus_core::intake::github::GhCli { bin: s.intake.github.gh_bin.clone() }),
+        gh: Arc::new(nucleus_core::intake::github::GhCli { bin: tools.gh_path(&s.intake.github.gh_bin) }),
         launcher: Arc::new(pipeline::WorkerLauncher),
         guard: Arc::new(nucleus_core::intake::publish::ScriptGuard { workspace_root: ws.clone() }),
+        tools: Arc::new(tools),
     })
 }
 

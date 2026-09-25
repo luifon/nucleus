@@ -28,9 +28,10 @@ pub enum Stage {
     /// comment the item used, the label event): the item stops for good.
     /// Re-adding the label starts a new item from the current text.
     Stale,
-    /// The secret guard found something in what was about to be published
-    /// (the diff, the pull request text, the issue comment). Nothing was
-    /// published; `retry` scans again, `cancel` stops the item.
+    /// A check before a privileged step stopped it: the secret guard found
+    /// something in what was about to be published, or a pinned executable
+    /// changed. Nothing was published; `retry` checks again, `cancel` stops
+    /// the item.
     Blocked,
 }
 
@@ -115,8 +116,9 @@ pub fn transition(from: Stage, ev: &StageEvent) -> Result<Stage> {
         (Pr, E::PrOpened) => Review,
         (Review, E::Finished) => Closed,
         (Failed, E::Failed) => bail!("item already failed"),
-        (Pr | Review, E::Blocked) => Blocked,
-        (Blocked, E::Retry { failed_in: failed_in @ (Pr | Review) }) => *failed_in,
+        (Queued | Eval | Refinement | Implementation | Pr | Review, E::Blocked) => Blocked,
+        (Blocked, E::Retry { failed_in: Queued | Eval }) => Queued,
+        (Blocked, E::Retry { failed_in: failed_in @ (Refinement | Implementation | Pr | Review) }) => *failed_in,
         (_, E::Failed) => Failed,
         (_, E::Cancel) => Cancelled,
         (_, E::SourceClosed) => Closed,
@@ -387,6 +389,9 @@ mod tests {
         ok(Review, E::Blocked, Blocked);
         ok(Blocked, E::Retry { failed_in: Pr }, Pr);
         ok(Blocked, E::Retry { failed_in: Review }, Review);
+        ok(Queued, E::Blocked, Blocked);
+        ok(Implementation, E::Blocked, Blocked);
+        ok(Blocked, E::Retry { failed_in: Queued }, Queued);
         ok(Blocked, E::Cancel, Cancelled);
         ok(Blocked, E::Stale, Stale);
         ok(Failed, E::Cancel, Cancelled);
@@ -417,9 +422,9 @@ mod tests {
         bad(Failed, E::Failed);
         bad(Refinement, E::Retry { failed_in: Eval });
         bad(Failed, E::Retry { failed_in: Closed });
-        bad(Implementation, E::Blocked);
+        bad(Failed, E::Blocked);
         bad(Blocked, E::Blocked);
-        bad(Blocked, E::Retry { failed_in: Eval });
+        bad(Blocked, E::Retry { failed_in: Closed });
         // Terminal stages never change.
         for s in [Closed, Cancelled, Stale] {
             for ev in [E::Cancel, E::Failed, E::SourceClosed, E::Stale, E::Retry { failed_in: Eval }] {

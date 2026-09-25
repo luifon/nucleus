@@ -128,6 +128,19 @@ impl Remote {
     }
 }
 
+/// The `git` every Nucleus git command runs: resolved once through `PATH`
+/// and canonicalized (symlinks followed to the real file), never looked up
+/// again. [`super::tools::ToolPins`] pins its hash.
+pub fn git_bin() -> Result<&'static Path> {
+    static GIT: std::sync::OnceLock<std::result::Result<PathBuf, String>> = std::sync::OnceLock::new();
+    GIT.get_or_init(|| {
+        resolve_bin("git").and_then(|p| p.canonicalize().context("canonicalizing git")).map_err(|e| format!("{e:#}"))
+    })
+    .as_ref()
+    .map(PathBuf::as_path)
+    .map_err(|e| anyhow::anyhow!("git: {e}"))
+}
+
 /// `name` as an absolute path: itself when absolute, else the first
 /// executable file of that name on `PATH`.
 pub fn resolve_bin(name: &str) -> Result<PathBuf> {
@@ -167,7 +180,7 @@ pub fn check_repo_name(repo: &str) -> Result<()> {
 /// `GIT_DIR` or `GIT_INDEX_FILE` (a git hook's environment) cannot redirect
 /// the command, and no system or global configuration is read.
 async fn run(cwd: &Path, pre: &[String], args: &[&str], env: &[(&str, &str)]) -> Result<GitOut> {
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = tokio::process::Command::new(git_bin()?);
     for (k, _) in std::env::vars_os() {
         let k = k.to_string_lossy().into_owned();
         if k.starts_with("GIT_") {

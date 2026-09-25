@@ -40,6 +40,7 @@ pub mod pipeline;
 pub mod publish;
 pub mod stage;
 pub mod store;
+pub mod tools;
 
 pub use event::{Event, NewEvent};
 pub use stage::Stage;

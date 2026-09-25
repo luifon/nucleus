@@ -67,6 +67,10 @@ async fn fixture() -> Fixture {
         gh: gh.clone(),
         launcher: Arc::new(NoLaunch),
         guard: Arc::new(crate::intake::publish::ScriptGuard { workspace_root: ws.clone() }),
+        tools: Arc::new(crate::intake::tools::ToolPins {
+            git: crate::intake::tools::Pin::new(git::git_bin().unwrap()).unwrap(),
+            gh: Some(crate::intake::tools::Pin::new(&fake_gh_file(&work)).unwrap()),
+        }),
     };
     // A stand-in for tools/check-secrets.sh with the same interface: exit 2
     // and a `    - <category>:<value>` line for a hit.
@@ -140,6 +144,14 @@ async fn poll_again(f: &Fixture, n: u32, labels: &[&str], state: &str, body: &st
     e.body = body.into();
     e.raw = serde_json::json!({ "number": n, "stamp": stamp });
     record_event(&f.ctx, &e).await.unwrap();
+}
+
+/// A file standing in for the `gh` executable (the pipeline talks to the
+/// scripted FakeGh; the file is only pinned and hashed).
+fn fake_gh_file(dir: &Path) -> PathBuf {
+    let p = dir.join("gh");
+    std::fs::write(&p, "#!/bin/sh\nexit 1\n").unwrap();
+    p
 }
 
 async fn item1(f: &Fixture) -> Item {
@@ -1234,4 +1246,22 @@ async fn an_existing_branch_is_never_overwritten_by_the_first_push() {
     assert_eq!((it.stage(), it.pushed_sha.as_deref()), (Stage::Pr, None));
     assert_eq!(remote_git(&f, &["rev-parse", "nucleus/item-1"]), remote_git(&f, &["rev-parse", "main"]), "the branch is untouched");
     assert_eq!(f.gh.calls_with("pr create"), 0);
+}
+
+#[tokio::test]
+async fn a_changed_executable_blocks_the_next_privileged_step() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    // A worker replaced gh during this process's life.
+    let gh = f.ctx.tools.gh.as_ref().unwrap().path.clone();
+    std::fs::write(&gh, "#!/bin/sh\necho replaced\n").unwrap();
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.failed_stage.as_deref()), (Stage::Blocked, Some("pr")));
+    assert!(it.error.unwrap().contains("executable-changed: gh"));
+    assert!(!remote_has(&f, "nucleus/item-1"), "nothing was pushed");
 }

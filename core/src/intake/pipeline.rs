@@ -63,11 +63,15 @@ pub struct Ctx {
     pub launcher: Arc<dyn Launcher>,
     /// Scans every diff and text before it is published.
     pub guard: Arc<dyn SecretGuard>,
+    /// `git` and `gh`, pinned when this process started.
+    pub tools: Arc<super::tools::ToolPins>,
 }
 
 impl Ctx {
     /// The production context: the configured `gh`, detached workers.
     pub async fn open(ws: &Path, settings: &Settings) -> Result<Ctx> {
+        // Pinned first, before this process reads anything a worker wrote.
+        let tools = super::tools::ToolPins::pin(&settings.intake.github.gh_bin)?;
         Ok(Ctx {
             ws: ws.to_path_buf(),
             cfg: settings.intake.clone(),
@@ -75,9 +79,10 @@ impl Ctx {
             db: store::open(ws).await?,
             tasks_db: tasks::open(ws).await?,
             wa: crate::whatsapp_queue::open(ws).await?,
-            gh: Arc::new(github::GhCli { bin: settings.intake.github.gh_bin.clone() }),
+            gh: Arc::new(github::GhCli { bin: tools.gh_path(&settings.intake.github.gh_bin) }),
             launcher: Arc::new(WorkerLauncher),
             guard: Arc::new(publish::ScriptGuard { workspace_root: ws.to_path_buf() }),
+            tools: Arc::new(tools),
         })
     }
 }
@@ -1146,7 +1151,7 @@ fn worktree(item: &Item) -> Result<PathBuf> {
 
 /// The configured remote of the item's repo (never read from a clone).
 fn remote_for(ctx: &Ctx, repo: &str) -> Result<git::Remote> {
-    git::Remote::for_repo(&ctx.cfg.github.remote_url, repo, &ctx.cfg.github.gh_bin)
+    git::Remote::for_repo(&ctx.cfg.github.remote_url, repo, &ctx.tools.gh_path(&ctx.cfg.github.gh_bin))
         .map_err(|e| anyhow::Error::new(Fatal(format!("{e:#}"))))
 }
 
@@ -1156,6 +1161,9 @@ async fn step_queued(ctx: &Ctx, item: &Item) -> Result<()> {
     let repo = repo_cfg(ctx, item)?;
     let wd = work_dir(ctx)?;
     let remote = remote_for(ctx, &item.repo)?;
+    if !tools_unchanged(ctx, item, "the fetch").await? {
+        return Ok(());
+    }
     let mirror = git::sync_mirror(&wd, &item.repo, &remote).await?;
     let base_ref = git::default_branch(&mirror, &remote, repo.default_branch.as_deref()).await?;
     let wt = git::worktree_path(&wd, &item.repo, item.id);
@@ -1348,6 +1356,9 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
                     // with the work the mirror collected before.
                     let wd = work_dir(ctx)?;
                     let remote = remote_for(ctx, &item.repo)?;
+                    if !tools_unchanged(ctx, item, "the fetch").await? {
+                        return Ok(());
+                    }
                     let mirror = git::sync_mirror(&wd, &item.repo, &remote).await?;
                     let b = existing.clone().unwrap_or_else(|| stage::branch_name(item.id));
                     let (base_sha, restored) = git::prepare_clone(&mirror, &wt, &base_ref, item.id, Some(&b)).await?;
@@ -1434,8 +1445,23 @@ fn pr_link(item: &Item, ev: &Event, repo: &IntakeRepo) -> String {
 /// The secret guard found something in what a step was about to publish:
 /// the item stops in `blocked` with the finding categories.
 async fn block(ctx: &Ctx, item: &Item, what: &str, categories: &[String]) -> Result<()> {
-    let why = format!("the secret guard found {} in {what}", categories.join(", "));
-    tracing::warn!(item = item.id, why, "intake: publishing blocked");
+    block_because(ctx, item, format!("the secret guard found {} in {what}", categories.join(", "))).await
+}
+
+/// A pinned executable changed since this process started: the item stops
+/// in `blocked` before the privileged step. Returns false when blocked.
+async fn tools_unchanged(ctx: &Ctx, item: &Item, what: &str) -> Result<bool> {
+    match ctx.tools.verify() {
+        Ok(()) => Ok(true),
+        Err(why) => {
+            block_because(ctx, item, format!("{why} (checked before {what}); nothing was run")).await?;
+            Ok(false)
+        }
+    }
+}
+
+async fn block_because(ctx: &Ctx, item: &Item, why: String) -> Result<()> {
+    tracing::warn!(item = item.id, why, "intake: step blocked");
     if store::advance(
         &ctx.db,
         item.id,
@@ -1487,12 +1513,18 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     // write conditional on an issue revision; the last read is the
     // authorization point for that one write).
     let _ = final_read!(ctx, item, "push", first);
+    if !tools_unchanged(ctx, item, "the push").await? {
+        return Ok(());
+    }
     git::push(&mirror, &remote, &sha, &branch, item.id, &remote_default, item.pushed_sha.as_deref()).await?;
     store::update(&ctx.db, item.id, Stage::Pr, vec![("pushed_sha", sha.clone().into())]).await?;
     let url = match github::find_pr(&*ctx.gh, &item.repo, &branch).await? {
         Some(u) => u,
         None => {
             let _ = final_read!(ctx, item, "the pull request", first);
+            if !tools_unchanged(ctx, item, "the pull request").await? {
+                return Ok(());
+            }
             github::create_draft_pr(&*ctx.gh, &item.repo, &branch, &base_ref, &title, &body).await?
         }
     };
@@ -1539,6 +1571,9 @@ async fn step_review(ctx: &Ctx, item: &Item) -> Result<()> {
                 Some(u) => Some(u),
                 None => {
                     let _ = final_read!(ctx, item, "the issue comment", first);
+                    if !tools_unchanged(ctx, item, "the issue comment").await? {
+                        return Ok(());
+                    }
                     a.post_reply(&ev, &draft, &marker).await?
                 }
             };
