@@ -31,6 +31,7 @@ ts-rs = { workspace = true }
 unicode-normalization = "0.1"
 rustix = { version = "1", features = ["fs"] }
 sha2 = "0.10"
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
