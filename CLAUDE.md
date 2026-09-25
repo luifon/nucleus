@@ -573,14 +573,21 @@ JSON-parsed numbers.
   run with no global or system config (`GIT_CONFIG_GLOBAL=/dev/null`,
   `GIT_CONFIG_NOSYSTEM=1`), hooks disabled, the mirror's config rewritten,
   an HTTPS remote URL from `nucleus.toml` and gh as the only credential
-  helper. `git` and `gh` run from canonical paths pinned by SHA-256 when the
-  process starts and checked again before every fetch, push, PR and comment.
+  helper. `git` and `gh` run from canonical paths pinned by SHA-256 and started
+  only through one function that checks the hash immediately before each
+  spawn.
   Nucleus never runs git against an item clone: it imports the
   clone's file tree into the mirror as one commit with the configured
-  identity and a code-owned message, after checking file types, counts and
-  sizes (`[intake] import_max_*`) and that base submodules are unchanged.
-  The first push only creates `nucleus/item-<n>`; later pushes lease on the
-  recorded commit. Do not add a git step that breaks this.
+  identity and a code-owned message. The import reads a private snapshot
+  copied with no-follow, descriptor-relative reads under enforced byte and
+  file-count limits (`[intake] import_max_*`), refuses hard links and
+  special files, keeps base submodules and `.gitmodules` unchanged, and
+  installs new objects as one pack. Before pushing, Nucleus reads the remote
+  item ref: a commit it already pushed is recorded, an unknown one blocks
+  the item. The first push only creates `nucleus/item-<n>`; later pushes
+  lease on the recorded commit. PR and comment lookups match only Nucleus's
+  own (the item branch in the configured repo, the authenticated account, a
+  random per-comment marker). Do not add a git step that breaks this.
 - Nucleus reads the issue live (open, label added by a collaborator, no
   edit since) before preparing and again right before every write: worker
   start, push, PR creation (after the PR lookup) and comment (after the
