@@ -11,6 +11,8 @@ import type { IntakeReplyResult as IntakeReplyResultWire } from "./generated/Int
 import type { IntakeApprovePlanReq } from "./generated/IntakeApprovePlanReq";
 import type { IntakeItemReq } from "./generated/IntakeItemReq";
 import type { IntakeReleaseReq } from "./generated/IntakeReleaseReq";
+import type { IntakeAnswerReq } from "./generated/IntakeAnswerReq";
+import type { IntakeQuestion as IntakeQuestionWire } from "./generated/IntakeQuestion";
 import type { Task } from "./tasks";
 
 export type { IntakeEval } from "./generated/IntakeEval";
@@ -54,16 +56,30 @@ export type IntakeMessage = Omit<IntakeMessageWire, "author" | "via"> & {
   via: "whatsapp" | "dashboard" | "cli" | "pipeline" | "whatsapp-session";
 };
 
-/** `plans` holds every accepted plan version, oldest first. */
-export type IntakeDetail = Omit<IntakeDetailWire, "item" | "messages" | "tasks"> & {
+/** UI-layer refinement of the decisions (core/src/intake/decide.rs). */
+export type IntakeDecision = "approve_plan" | "release" | "cancel";
+
+/** The confirmation question open on an item page. */
+export type IntakeQuestion = Omit<IntakeQuestionWire, "decision"> & { decision: IntakeDecision };
+
+/** `plans` holds every accepted plan version, oldest first; `question` is
+ *  the confirmation question open on the page, if any. */
+export type IntakeDetail = Omit<IntakeDetailWire, "item" | "messages" | "tasks" | "question"> & {
   item: IntakeItem;
   messages: IntakeMessage[];
   tasks: Task[];
+  question: IntakeQuestion | null;
 };
 
-/** What a dashboard reply did: saved in the thread in every stage;
- *  `reaches_agent` false with a `note` when no agent reads it now. */
-export type IntakeReplyResult = Omit<IntakeReplyResultWire, "item"> & { item: IntakeItem };
+/** UI-layer refinement of IntakeReplyResult.outcome. */
+export type IntakeReplyOutcome = "discussion" | "decision" | "question" | "unclear" | "declined" | "refused";
+
+/** What text typed on the item page, or a Yes / No on the board, did. */
+export type IntakeReplyResult = Omit<IntakeReplyResultWire, "item" | "outcome" | "decision"> & {
+  item: IntakeItem;
+  outcome: IntakeReplyOutcome;
+  decision: IntakeDecision | null;
+};
 
 /** Newest first. `all: false` leaves out closed and cancelled items, and
  *  stale items a newer item of the same issue replaced. */
@@ -77,10 +93,18 @@ export const getIntakeDetail = (id: number, signal?: AbortSignal) =>
 // (wrong stage, a newer plan, the agent still answering); ApiError carries
 // that message.
 
-/** Discussion only: saved in every stage (409 only for an empty or
- *  too-long message). */
+/** Text typed on the item page. While the item waits for the operator the
+ *  server reads it like his WhatsApp messages (a decision, a confirmation
+ *  question, discussion, or unclear); otherwise, and for canvas responses,
+ *  it is discussion. 409 for an empty or too-long message, or when the
+ *  message could not be read. */
 export const replyToItem = (id: number, text: string) =>
   jsonPost<IntakeReplyResult, IntakeReplyReq>("/intake/api/reply", { id, text });
+
+/** Yes or No to the page's open confirmation question (`question`: its
+ *  id). 409 when the question is no longer open. */
+export const answerQuestion = (id: number, question: number, yes: boolean) =>
+  jsonPost<IntakeReplyResult, IntakeAnswerReq>("/intake/api/answer", { id, question, yes });
 
 export const approvePlan = (id: number, version: number) =>
   jsonPost<IntakeItem, IntakeApprovePlanReq>("/intake/api/approve-plan", { id, version });

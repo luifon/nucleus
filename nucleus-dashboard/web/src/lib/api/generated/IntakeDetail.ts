@@ -6,6 +6,7 @@ import type { IntakeHiddenSource } from "./IntakeHiddenSource";
 import type { IntakeItem } from "./IntakeItem";
 import type { IntakeMessage } from "./IntakeMessage";
 import type { IntakePlanVersion } from "./IntakePlanVersion";
+import type { IntakeQuestion } from "./IntakeQuestion";
 import type { IntakeTransition } from "./IntakeTransition";
 import type { Task } from "./Task";
 
@@ -29,4 +30,9 @@ plans: Array<IntakePlanVersion>, messages: Array<IntakeMessage>,
 /**
  * Every stage task of the item, oldest first (from the task ledger).
  */
-tasks: Array<Task>, transitions: Array<IntakeTransition>, };
+tasks: Array<Task>, transitions: Array<IntakeTransition>,
+/**
+ * The confirmation question open on this item's page (asked after
+ * text typed there), shown on the board as a Yes / No step.
+ */
+question: IntakeQuestion | null, };

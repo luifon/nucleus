@@ -1,8 +1,11 @@
 //! Intake surface (ADR-036): the issue pipeline's items.
 //!
 //!   GET  /intake/api/list?all=          — items, newest first (open only unless all)
-//!   GET  /intake/api/detail?id=         — one item: event, eval, plan versions, thread, tasks, stage log
-//!   POST /intake/api/reply {id,text}    — operator message in the item's thread (discussion only, any stage)
+//!   GET  /intake/api/detail?id=         — one item: event, eval, plan versions, thread, tasks, stage log,
+//!                                         the open confirmation question of its page
+//!   POST /intake/api/reply {id,text}    — text typed on the item page: read like a WhatsApp message
+//!                                         while the item waits for the operator, discussion otherwise
+//!   POST /intake/api/answer {id,question,yes} — Yes or No on the board for the page's open question
 //!   POST /intake/api/approve-plan {id,version}
 //!   POST /intake/api/cancel {id}
 //!   POST /intake/api/retry {id}
@@ -16,10 +19,13 @@
 //!
 //! Threat model: as for the Tasks page (ADR-033 §7). The dashboard is on the
 //! tailnet only and acts with the operator's scope. Every write accepts a
-//! JSON body only and refuses a request a browser marks as cross-site. Text
-//! typed on the dashboard is discussion only: it is stored in the thread
-//! (the refinement agent reads it during refinement) and never interpreted
-//! as a decision; decisions are the explicit routes. A plan approval names
+//! JSON body only and refuses a request a browser marks as cross-site. The
+//! dashboard is the operator's own authenticated surface, so text typed on
+//! an item page is his (ADR-036, "The decision board"): while the item waits
+//! for him it goes through the interpreter path of his WhatsApp messages,
+//! limited to that item (`pipeline::dashboard_message`), with the same
+//! binding and confirmation rules; a click on an agent's canvas question is
+//! discussion only. A plan approval names
 //! the version the operator saw; the pipeline refuses
 //! it when a newer plan exists or the agent is still answering. A release
 //! of a held item is refused, and the item goes stale, when the issue or a
@@ -32,7 +38,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use nucleus_core::intake::pipeline::{self, Ctx, Refusal};
+use nucleus_core::intake::decide::Interpreter;
+use nucleus_core::intake::pipeline::{self, Ctx, DashboardOutcome, Outcome, Refusal};
 use nucleus_core::intake::hidden::{Finding, Hold, Source};
 use nucleus_core::intake::stage::EvalResult;
 use nucleus_core::intake::{store, Event, Item, ItemMessage, ItemTransition, PlanVersion};
@@ -47,6 +54,9 @@ pub struct IntakeState {
     pub tasks: nucleus_core::config::TasksConfig,
     /// `NUCLEUS_PUBLIC_URL`, for the item link in WhatsApp notices.
     pub public_url: Option<String>,
+    /// Reads text typed on an item page while the item waits for the
+    /// operator (`decide::SessionInterpreter` in production).
+    pub interpreter: Arc<dyn Interpreter>,
 }
 
 pub fn router(state: Arc<IntakeState>) -> Router {
@@ -54,6 +64,7 @@ pub fn router(state: Arc<IntakeState>) -> Router {
         .route("/list", get(list))
         .route("/detail", get(detail))
         .route("/reply", post(reply))
+        .route("/answer", post(answer))
         .route("/approve-plan", post(approve_plan))
         .route("/cancel", post(cancel))
         .route("/retry", post(retry))
@@ -83,6 +94,29 @@ struct IntakeDetail {
     /// Every stage task of the item, oldest first (from the task ledger).
     tasks: Vec<Task>,
     transitions: Vec<ItemTransition>,
+    /// The confirmation question open on this item's page (asked after
+    /// text typed there), shown on the board as a Yes / No step.
+    question: Option<IntakeQuestion>,
+}
+
+/// A confirmation question open on an item page. Code-owned: the decision
+/// and what it binds to, from the pipeline's `confirmations` row.
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
+struct IntakeQuestion {
+    /// Named by the answer (`POST /answer`).
+    #[ts(type = "number")]
+    id: i64,
+    /// `approve_plan`, `release` or `cancel`.
+    decision: String,
+    /// The plan version an approval binds to.
+    #[ts(type = "number | null")]
+    plan_version: Option<i64>,
+    /// The hold fingerprint a release binds to.
+    hold_hash: Option<String>,
+    /// The question as the thread shows it.
+    question: String,
+    expires_at: String,
 }
 
 #[derive(Deserialize)]
@@ -103,17 +137,50 @@ struct IntakeReplyReq {
     text: String,
 }
 
-/// What `POST /reply` did: the message is saved in the item's thread in
-/// every stage.
+/// What `POST /reply` or `POST /answer` did.
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export)]
 struct IntakeReplyResult {
     item: Item,
+    /// `discussion` (saved in the thread; `reaches_agent` says whether the
+    /// refinement agent reads it), `decision` (a decision ran: `decision`),
+    /// `question` (a confirmation question was asked; the detail's
+    /// `question` holds it), `unclear` (not understood: `note` has the
+    /// question and the options), `declined` (a No to a question) or
+    /// `refused` (the decision was refused: `note` says why).
+    outcome: String,
+    /// The decision that ran: `approve_plan`, `release` or `cancel`.
+    decision: Option<String>,
     /// The refinement agent reads the message at its next turn.
     reaches_agent: bool,
-    /// Why no agent reads it (the item is not in refinement), for the
-    /// operator; null when the agent does.
+    /// What Nucleus answered, for the operator (also in the thread for an
+    /// interpreted message); null when there is nothing to say.
     note: Option<String>,
+}
+
+impl From<DashboardOutcome> for IntakeReplyResult {
+    fn from(o: DashboardOutcome) -> Self {
+        let (outcome, decision, reaches_agent, note) = match o.outcome {
+            Outcome::Decided { decision, .. } => ("decision", Some(decision.as_str().to_string()), false, None),
+            Outcome::Asked { question, .. } => ("question", None, false, Some(question)),
+            Outcome::Discussed { to_agent, answer, .. } => ("discussion", None, to_agent, answer),
+            Outcome::Unclear { answer } => ("unclear", None, false, Some(answer)),
+            Outcome::Declined { answer } => ("declined", None, false, Some(answer)),
+            Outcome::Refused { answer } => ("refused", None, false, Some(answer)),
+        };
+        IntakeReplyResult { item: o.item, outcome: outcome.into(), decision, reaches_agent, note }
+    }
+}
+
+#[derive(Deserialize, ts_rs::TS)]
+#[ts(export)]
+struct IntakeAnswerReq {
+    #[ts(type = "number")]
+    id: i64,
+    /// The question's id (`IntakeQuestion.id`) the board showed.
+    #[ts(type = "number")]
+    question: i64,
+    yes: bool,
 }
 
 #[derive(Deserialize, ts_rs::TS)]
@@ -181,7 +248,19 @@ async fn detail(State(s): State<Arc<IntakeState>>, Query(q): Query<DetailQ>) -> 
             }
         }
     }
-    Ok(Json(IntakeDetail { item, event, eval, hidden, hidden_sources, plans, messages, tasks: task_rows, transitions }))
+    let question = if item.stage().is_terminal() {
+        None
+    } else {
+        pipeline::dashboard_question(&pool, item.id).await.map_err(IntakeError::other)?.map(|c| IntakeQuestion {
+            id: c.id,
+            decision: c.decision,
+            plan_version: c.plan_version,
+            hold_hash: c.hold_hash,
+            question: c.question,
+            expires_at: c.expires_at,
+        })
+    };
+    Ok(Json(IntakeDetail { item, event, eval, hidden, hidden_sources, plans, messages, tasks: task_rows, transitions, question }))
 }
 
 fn same_origin(headers: &HeaderMap) -> Result<(), IntakeError> {
@@ -214,9 +293,7 @@ async fn ctx(s: &IntakeState) -> Result<Ctx, IntakeError> {
         guard: Arc::new(nucleus_core::intake::publish::ScriptGuard { workspace_root: ws.clone() }),
         tools: Arc::new(tools),
         viewer: tokio::sync::OnceCell::new(),
-        // The dashboard takes explicit decisions; it never reads WhatsApp
-        // messages.
-        interpreter: Arc::new(nucleus_core::intake::decide::NoInterpreter),
+        interpreter: s.interpreter.clone(),
         public_url: s.public_url.clone(),
     })
 }
@@ -260,9 +337,18 @@ async fn reply(
 ) -> Result<Json<IntakeReplyResult>, IntakeError> {
     same_origin(&headers)?;
     let c = ctx(&s).await?;
-    let r = pipeline::reply(&c, req.id, &req.text, "dashboard")
-        .await
-        .map(|o| IntakeReplyResult { item: o.item, reaches_agent: o.reaches_agent, note: o.note });
+    let r = pipeline::dashboard_message(&c, req.id, &req.text).await.map(IntakeReplyResult::from);
+    outcome(r, &s.workspace_root)
+}
+
+async fn answer(
+    State(s): State<Arc<IntakeState>>,
+    headers: HeaderMap,
+    Json(req): Json<IntakeAnswerReq>,
+) -> Result<Json<IntakeReplyResult>, IntakeError> {
+    same_origin(&headers)?;
+    let c = ctx(&s).await?;
+    let r = pipeline::dashboard_answer(&c, req.id, req.question, req.yes).await.map(IntakeReplyResult::from);
     outcome(r, &s.workspace_root)
 }
 
@@ -337,7 +423,35 @@ impl IntoResponse for IntakeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nucleus_core::intake::decide::Request;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+
+    /// A stand-in for the interpreter model: "approve", "release" and
+    /// "cancel" at the start are decisions on the page's item, a bare yes or
+    /// no answers a question shown, anything else is discussion. Counts its
+    /// calls.
+    #[derive(Default)]
+    struct Rules {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Interpreter for Rules {
+        async fn interpret(&self, r: &Request) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let m = r.message.trim().to_lowercase();
+            let item: i64 = r.origin.rsplit("item #").next().and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+            let decision = ["approve_plan", "release", "cancel"].into_iter().find(|d| m.starts_with(d.split('_').next().unwrap()));
+            let reading = match (m.as_str(), &r.confirmation, decision) {
+                ("yes", Some(_), _) => serde_json::json!({ "kind": "confirm", "item": null, "decision": null, "question": null }),
+                ("no", Some(_), _) => serde_json::json!({ "kind": "decline", "item": null, "decision": null, "question": null }),
+                (_, _, Some(d)) => serde_json::json!({ "kind": "decision", "item": item, "decision": d, "question": null }),
+                _ => serde_json::json!({ "kind": "discussion", "item": null, "decision": null, "question": null }),
+            };
+            Ok(reading.to_string())
+        }
+    }
 
     fn state(dir: &std::path::Path) -> Arc<IntakeState> {
         Arc::new(IntakeState {
@@ -345,6 +459,7 @@ mod tests {
             intake: Default::default(),
             tasks: Default::default(),
             public_url: None,
+            interpreter: Arc::new(Rules::default()),
         })
     }
 
@@ -402,9 +517,13 @@ mod tests {
     }
 
     fn enabled_state(dir: &std::path::Path) -> Arc<IntakeState> {
+        enabled_state_with(dir, Arc::new(Rules::default()))
+    }
+
+    fn enabled_state_with(dir: &std::path::Path, interpreter: Arc<dyn Interpreter>) -> Arc<IntakeState> {
         let mut intake = nucleus_core::config::IntakeConfig { enabled: true, ..Default::default() };
         intake.github.gh_bin = "sh".into();
-        Arc::new(IntakeState { workspace_root: dir.to_path_buf(), intake, tasks: Default::default(), public_url: None })
+        Arc::new(IntakeState { workspace_root: dir.to_path_buf(), intake, tasks: Default::default(), public_url: None, interpreter })
     }
 
     /// An operator-accepted event (`nucleus events emit --accept`, no
@@ -552,6 +671,70 @@ mod tests {
         assert_eq!(body["reaches_agent"], true);
         // An empty message is refused.
         assert_eq!(post_reply(&app, n, "   ").await.0, StatusCode::CONFLICT);
+    }
+
+    async fn post_answer(app: &Router, id: i64, question: i64, yes: bool) -> (StatusCode, serde_json::Value) {
+        let req = axum::http::Request::post("/answer")
+            .header("content-type", "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .body(axum::body::Body::from(serde_json::json!({ "id": id, "question": question, "yes": yes }).to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn get_detail(app: &Router, id: i64) -> serde_json::Value {
+        let req = axum::http::Request::get(format!("/detail?id={id}")).body(axum::body::Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn text_on_a_waiting_item_is_interpreted_and_its_question_answered_on_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let rules = Arc::new(Rules::default());
+        let st = enabled_state_with(dir.path(), rules.clone());
+        let app = router(st.clone());
+        let c = ctx(&st).await.unwrap();
+        let n = hidden_item(&c, "note-q").await;
+        let _ = pipeline::tick(&c, false).await.unwrap();
+        let hold = store::item(&c.db, n).await.unwrap().hold_hash.unwrap();
+        assert!(get_detail(&app, n).await["question"].is_null());
+
+        // A cancel typed on the page asks first; the board answers No.
+        let (status, body) = post_reply(&app, n, "cancel it").await;
+        assert_eq!((status, body["outcome"].as_str()), (StatusCode::OK, Some("question")), "{body}");
+        assert_eq!(body["note"], format!("Cancel item #{n}? Answer yes or no."));
+        let q = get_detail(&app, n).await["question"].clone();
+        assert_eq!(q["decision"], "cancel");
+        let (_, body) = post_answer(&app, n, q["id"].as_i64().unwrap(), false).await;
+        assert_eq!(body["outcome"], "declined");
+        assert!(get_detail(&app, n).await["question"].is_null());
+        assert_eq!(store::item(&c.db, n).await.unwrap().stage, "held");
+
+        // A release asks first, bound to the hold the item showed; Yes runs it.
+        let (_, body) = post_reply(&app, n, "release it").await;
+        assert_eq!(body["outcome"], "question");
+        let q = get_detail(&app, n).await["question"].clone();
+        assert_eq!((q["decision"].as_str(), q["hold_hash"].as_str()), (Some("release"), Some(hold.as_str())));
+        let (status, body) = post_answer(&app, n, q["id"].as_i64().unwrap(), true).await;
+        assert_eq!((status, body["outcome"].as_str(), body["decision"].as_str()), (StatusCode::OK, Some("decision"), Some("release")), "{body}");
+        let it = store::item(&c.db, n).await.unwrap();
+        assert_eq!((it.stage.as_str(), it.released_via.as_deref()), ("queued", Some("dashboard")));
+        // The answered question cannot be answered again.
+        assert_eq!(post_answer(&app, n, q["id"].as_i64().unwrap(), true).await.0, StatusCode::CONFLICT);
+        assert_eq!(rules.calls.load(Ordering::SeqCst), 2);
+
+        // Nothing waits now (queued): discussion, and no interpreter.
+        let (_, body) = post_reply(&app, n, "cancel it").await;
+        assert_eq!((body["outcome"].as_str(), body["reaches_agent"].as_bool()), (Some("discussion"), Some(false)));
+        assert_eq!(rules.calls.load(Ordering::SeqCst), 2);
+        let thread: Vec<(String, String)> =
+            store::messages(&c.db, n).await.unwrap().into_iter().map(|m| (m.author, m.via)).collect();
+        assert!(thread.iter().filter(|(a, _)| a == "operator").all(|(_, v)| v == "dashboard"), "{thread:?}");
     }
 
     #[tokio::test]

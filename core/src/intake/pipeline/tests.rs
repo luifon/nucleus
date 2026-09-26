@@ -2743,3 +2743,141 @@ async fn a_public_url_the_guard_flags_does_not_replace_the_notice() {
     assert!(n.starts_with("🧭 Item #1 needs a plan: Issue 1."), "{n}");
     assert!(n.ends_with("https://FAKE-SECRET-VALUE.example.invalid/intake?item=1"), "{n}");
 }
+
+// ── text typed on the dashboard (ADR-036, "The decision board") ──────────
+
+/// Item #1 in refinement with plan v2 proposed and no turn running, and
+/// item #2 in eval.
+async fn with_plan_v2(f: &Fixture) {
+    with_plan(f).await;
+    reply(&f.ctx, 1, "Split step one", "cli").await.unwrap();
+    tick(f).await;
+    finish_current(f, TaskStatus::Done, Some("===PLAN===\n1. do it\n2. test it\n===END PLAN==="), None).await;
+    accept(f, 2).await;
+    tick(f).await;
+    let it = item1(f).await;
+    assert_eq!((it.plan_version, it.current_task_id.as_deref()), (2, None));
+    assert_eq!(store::item(&f.ctx.db, 2).await.unwrap().stage(), Stage::Eval);
+}
+
+/// Bodies of item #1's thread messages by `author`.
+async fn thread_of(f: &Fixture, author: &str) -> Vec<(String, String)> {
+    store::messages(&f.ctx.db, 1).await.unwrap().into_iter().filter(|m| m.author == author).map(|m| (m.via, m.body)).collect()
+}
+
+#[tokio::test]
+async fn approving_the_plan_typed_on_the_dashboard_approves_the_pending_version() {
+    let f = fixture().await;
+    with_plan_v2(&f).await;
+    let wa_before = outbound(&f).await.len();
+    let r = dashboard_message(&f.ctx, 1, "approve the plan").await.unwrap();
+    assert_eq!(r.outcome, Outcome::Decided { item: 1, decision: Decision::ApprovePlan });
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.approved_version, it.approved_via.as_deref()), (Stage::Implementation, Some(2), Some("dashboard")));
+    assert_eq!(r.item.stage(), Stage::Implementation);
+    // The interpreter read this item only, as the dashboard's.
+    let req = f.interp.last();
+    assert_eq!(pending_of(&req), vec![(1, vec!["approve_plan".to_string(), "cancel".to_string()], Some(2))]);
+    assert!(req.origin.contains("dashboard page of item #1"), "{}", req.origin);
+    assert!(thread_of(&f, "operator").await.contains(&("dashboard".into(), "approve the plan".into())));
+    // Nothing answers on WhatsApp; the next tick sends the implementation
+    // notice.
+    assert_eq!(outbound(&f).await.len(), wa_before);
+    tick(&f).await;
+    let out = outbound(&f).await;
+    assert_eq!(out.len(), wa_before + 1, "{out:?}");
+    assert!(out.last().unwrap().1.starts_with("🛠 Item #1: implementation started."), "{out:?}");
+}
+
+#[tokio::test]
+async fn cancelling_typed_on_the_dashboard_asks_first_on_the_board() {
+    let f = fixture().await;
+    with_plan_v2(&f).await;
+    let r = dashboard_message(&f.ctx, 1, "cancel it").await.unwrap();
+    let Outcome::Asked { item: 1, question } = r.outcome else { panic!("{:?}", r.outcome) };
+    assert_eq!(question, "Cancel item #1? Answer yes or no.");
+    assert_eq!(item1(&f).await.stage(), Stage::Refinement);
+    // The question is in the thread, open for this page, and not on WhatsApp.
+    let q = dashboard_question(&f.ctx.db, 1).await.unwrap().expect("an open question");
+    assert_eq!((q.scope.as_str(), q.decision.as_str()), ("dashboard:1", "cancel"));
+    assert!(thread_of(&f, "nucleus").await.iter().any(|(_, b)| b == &question));
+    assert!(!outbound(&f).await.iter().any(|(_, b)| b.contains("Cancel item #1?")));
+    // A WhatsApp "yes" does not answer the dashboard's question.
+    assert!(store::open_confirmation(&f.ctx.db, "dm", "", &crate::timestamp::now()).await.unwrap().is_none());
+
+    // No on the board: nothing is done.
+    let r = dashboard_answer(&f.ctx, 1, q.id, false).await.unwrap();
+    assert_eq!(r.outcome, Outcome::Declined { answer: "Nothing was done for item #1.".into() });
+    assert_eq!(item1(&f).await.stage(), Stage::Refinement);
+    assert!(dashboard_question(&f.ctx.db, 1).await.unwrap().is_none());
+    // The same question cannot be answered twice.
+    assert!(dashboard_answer(&f.ctx, 1, q.id, true).await.unwrap_err().downcast_ref::<Refusal>().is_some());
+
+    // Asked again, answered yes in words: cancelled.
+    dashboard_message(&f.ctx, 1, "cancel it").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let r = dashboard_message(&f.ctx, 1, "yes").await.unwrap();
+    assert_eq!(r.outcome, Outcome::Decided { item: 1, decision: Decision::Cancel });
+    assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
+    assert!(store::transitions(&f.ctx.db, 1).await.unwrap().iter().any(|t| t.reason == "cancelled via dashboard"));
+
+    // Yes on the board runs the decision bound to what the question showed.
+    let f = fixture().await;
+    with_plan_v2(&f).await;
+    dashboard_message(&f.ctx, 1, "cancel it").await.unwrap();
+    let q = dashboard_question(&f.ctx.db, 1).await.unwrap().unwrap();
+    let r = dashboard_answer(&f.ctx, 1, q.id, true).await.unwrap();
+    assert_eq!(r.outcome, Outcome::Decided { item: 1, decision: Decision::Cancel });
+    assert_eq!(r.item.stage(), Stage::Cancelled);
+}
+
+#[tokio::test]
+async fn discussion_typed_on_the_dashboard_reaches_the_agent() {
+    let f = fixture().await;
+    with_plan_v2(&f).await;
+    let r = dashboard_message(&f.ctx, 1, "use JSON please").await.unwrap();
+    assert_eq!(r.outcome, Outcome::Discussed { item: 1, to_agent: true, answer: None });
+    assert_eq!(f.interp.calls(), 1);
+    let m = store::messages(&f.ctx.db, 1).await.unwrap().pop().unwrap();
+    assert_eq!((m.author.as_str(), m.via.as_str(), m.body.as_str(), m.pending_agent), ("operator", "dashboard", "use JSON please", 1));
+    tick(&f).await;
+    let t = tasks::get(&f.ctx.tasks_db, item1(&f).await.current_task_id.as_deref().unwrap(), &Scope::Operator).await.unwrap();
+    assert!(t.brief.contains("Operator (via dashboard)") && t.brief.contains("use JSON please"));
+
+    // Unclear: the question and the option list, in the thread.
+    f.interp.answer(reading("unclear", None, None, Some("Which *plan* do you mean?")));
+    finish_current(&f, TaskStatus::Done, Some("===PLAN===\n1. JSON\n===END PLAN==="), None).await;
+    tick(&f).await;
+    let r = dashboard_message(&f.ctx, 1, "the other one").await.unwrap();
+    let Outcome::Unclear { answer } = r.outcome else { panic!("{:?}", r.outcome) };
+    assert!(answer.starts_with("Which plan do you mean?") && answer.contains("approve plan v3"), "{answer}");
+    assert!(thread_of(&f, "nucleus").await.iter().any(|(_, b)| b == &answer));
+}
+
+#[tokio::test]
+async fn nothing_waiting_starts_no_interpreter() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    tick(&f).await; // eval
+    let r = dashboard_message(&f.ctx, 1, "cancel it").await.unwrap();
+    let Outcome::Discussed { item: 1, to_agent: false, answer: Some(note) } = r.outcome else { panic!("{:?}", r.outcome) };
+    assert!(note.contains("in the eval stage, not in refinement"), "{note}");
+    assert_eq!(f.interp.calls(), 0);
+    assert_eq!(item1(&f).await.stage(), Stage::Eval);
+
+    // A click on a question the agent asked is discussion, even while a
+    // plan waits: it never reaches the interpreter.
+    let f = fixture().await;
+    with_plan(&f).await;
+    let click = "<canvas-response v=\"1\" id=\"pick-format\" type=\"decision\">\n{\"choice\":\"approve\"}\n</canvas-response>";
+    let r = dashboard_message(&f.ctx, 1, click).await.unwrap();
+    assert_eq!(r.outcome, Outcome::Discussed { item: 1, to_agent: true, answer: None });
+    assert_eq!(f.interp.calls(), 0);
+    assert_eq!(item1(&f).await.stage(), Stage::Refinement);
+}
+
+#[test]
+fn a_reply_preview_leaves_canvas_blocks_out() {
+    let reply = "Which format?\n<canvas v=\"1\" type=\"decision\" id=\"f\">\n{\"options\":[{\"key\":\"a\",\"label\":\"JSON\"}]}\n</canvas>\nThanks.";
+    assert_eq!(reply_preview(reply).as_deref(), Some("Which format? [a question with options on the dashboard] Thanks."));
+}

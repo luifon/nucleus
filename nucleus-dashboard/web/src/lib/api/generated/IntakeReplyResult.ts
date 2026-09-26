@@ -2,16 +2,28 @@
 import type { IntakeItem } from "./IntakeItem";
 
 /**
- * What `POST /reply` did: the message is saved in the item's thread in
- * every stage.
+ * What `POST /reply` or `POST /answer` did.
  */
 export type IntakeReplyResult = { item: IntakeItem,
+/**
+ * `discussion` (saved in the thread; `reaches_agent` says whether the
+ * refinement agent reads it), `decision` (a decision ran: `decision`),
+ * `question` (a confirmation question was asked; the detail's
+ * `question` holds it), `unclear` (not understood: `note` has the
+ * question and the options), `declined` (a No to a question) or
+ * `refused` (the decision was refused: `note` says why).
+ */
+outcome: string,
+/**
+ * The decision that ran: `approve_plan`, `release` or `cancel`.
+ */
+decision: string | null,
 /**
  * The refinement agent reads the message at its next turn.
  */
 reaches_agent: boolean,
 /**
- * Why no agent reads it (the item is not in refinement), for the
- * operator; null when the agent does.
+ * What Nucleus answered, for the operator (also in the thread for an
+ * interpreted message); null when there is nothing to say.
  */
 note: string | null, };

@@ -1,4 +1,5 @@
-//! Operator decisions from WhatsApp (ADR-036, "Operator decisions").
+//! Operator decisions in plain words (ADR-036, "Operator decisions"), from
+//! WhatsApp and from the dashboard's item page.
 //!
 //! The operator writes in plain words. Every message of his that reaches
 //! the pipeline is read by an interpreter: a one-shot model session with no
@@ -20,8 +21,9 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// A decision the operator can take in chat. The CLI and the dashboard keep
-/// their own explicit commands.
+/// A decision the operator can take in plain words. The CLI keeps its own
+/// explicit commands; the dashboard has the decision board, the explicit
+/// routes, and text typed on the item page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
@@ -68,14 +70,18 @@ pub struct Pending {
     pub discussion: bool,
 }
 
-/// Where an operator message came from. Every message reaches the pipeline
-/// through the operator's DM: per-item WhatsApp groups were removed (ADR-036,
-/// "No WhatsApp groups").
+/// Where an operator message came from. WhatsApp messages reach the
+/// pipeline through the operator's DM (per-item WhatsApp groups were
+/// removed, ADR-036, "No WhatsApp groups"); dashboard messages come from one
+/// item's page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     /// The operator's DM. `item` is the item the message names: it starts
     /// with the `#n` marker or replies to a message about item n.
     Dm { item: Option<i64> },
+    /// The composer of item `item`'s page on the dashboard: the operator's
+    /// own authenticated surface, always about that item.
+    Dashboard { item: i64 },
 }
 
 impl Origin {
@@ -83,14 +89,25 @@ impl Origin {
     pub fn item(&self) -> Option<i64> {
         match self {
             Origin::Dm { item } => *item,
+            Origin::Dashboard { item } => Some(*item),
         }
     }
 
     /// Where a confirmation question was asked: its answer must come from
-    /// the same place.
+    /// the same place. Each item page is its own place.
     pub fn scope(&self) -> String {
         match self {
             Origin::Dm { .. } => "dm".into(),
+            Origin::Dashboard { item } => dashboard_scope(*item),
+        }
+    }
+
+    /// The `via` of the operator's message in the thread and of the
+    /// decision it takes.
+    pub fn via(&self) -> &'static str {
+        match self {
+            Origin::Dm { .. } => "whatsapp",
+            Origin::Dashboard { .. } => "dashboard",
         }
     }
 
@@ -99,8 +116,34 @@ impl Origin {
         match self {
             Origin::Dm { item: Some(n) } => format!("the operator's WhatsApp DM; the message is addressed to item #{n}"),
             Origin::Dm { item: None } => "the operator's WhatsApp DM; the message does not name an item".into(),
+            Origin::Dashboard { item } => {
+                format!("the dashboard page of item #{item}, typed by the operator; the message is addressed to item #{item}")
+            }
         }
     }
+}
+
+/// The confirmation scope of item `n`'s dashboard page.
+pub fn dashboard_scope(n: i64) -> String {
+    format!("dashboard:{n}")
+}
+
+/// A message made only of canvas responses (ADR-012): the operator's answer
+/// to a question the refinement agent asked as a canvas block, posted by a
+/// click. It is discussion and never reaches the interpreter, so a choice
+/// in an agent's block can never become a decision.
+pub fn is_canvas_response(text: &str) -> bool {
+    const CLOSE: &str = "</canvas-response>";
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some(after) = rest.strip_prefix("<canvas-response") else { return false };
+        let Some(end) = after.find(CLOSE) else { return false };
+        rest = after[end + CLOSE.len()..].trim_start();
+    }
+    true
 }
 
 /// Everything the interpreter receives. Deliberately no item, event or
@@ -135,8 +178,8 @@ pub fn pending_line(p: &Pending) -> String {
 
 /// The interpreter's instructions (the session's appended system prompt).
 pub const SYSTEM_PROMPT: &str = "\
-You classify one WhatsApp message that the operator of Nucleus wrote about the items of its issue \
-pipeline. You have no tools and you do nothing else. Each prompt gives you the message (between \
+You classify one message that the operator of Nucleus wrote, on WhatsApp or on the dashboard, about \
+the items of its issue pipeline. You have no tools and you do nothing else. Each prompt gives you the message (between \
 data markers), where it came from, the items that wait for a decision with the decisions each allows, \
 and sometimes a yes/no question Nucleus asked the operator.
 
@@ -331,17 +374,6 @@ impl Interpreter for SessionInterpreter {
     }
 }
 
-/// For a context that never reads WhatsApp messages (the dashboard's
-/// write routes).
-pub struct NoInterpreter;
-
-#[async_trait::async_trait]
-impl Interpreter for NoInterpreter {
-    async fn interpret(&self, _request: &Request) -> Result<String> {
-        bail!("this process does not interpret operator messages")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +413,24 @@ mod tests {
         ] {
             assert_eq!(d(bad), unclear, "{bad}");
         }
+    }
+
+    #[test]
+    fn only_a_message_made_of_canvas_responses_is_one() {
+        let one = "<canvas-response v=\"1\" id=\"a\" type=\"decision\">\n{\"choice\":\"x\"}\n</canvas-response>";
+        assert!(is_canvas_response(one));
+        assert!(is_canvas_response(&format!("  {one}\n{one}  ")));
+        for not in ["", "approve", &format!("approve {one}"), &format!("{one} and approve"), "<canvas-response v=\"1\" id=\"a\">"] {
+            assert!(!is_canvas_response(not), "{not}");
+        }
+    }
+
+    #[test]
+    fn a_dashboard_origin_names_its_item_and_page() {
+        let o = Origin::Dashboard { item: 7 };
+        assert_eq!((o.item(), o.scope(), o.via()), (Some(7), "dashboard:7".to_string(), "dashboard"));
+        assert!(o.describe().contains("addressed to item #7"));
+        assert_eq!(Origin::Dm { item: None }.via(), "whatsapp");
     }
 
     #[test]

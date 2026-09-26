@@ -1,6 +1,6 @@
 // Synthetic intake records for tests (the repo is public: no real values).
 
-import type { IntakeDetail, IntakeEvent, IntakeItem, IntakeMessage, IntakeReplyResult } from "@/lib/api/intake";
+import type { IntakeDetail, IntakeEvent, IntakeItem, IntakeMessage, IntakeQuestion, IntakeReplyResult } from "@/lib/api/intake";
 
 export function fixtureItem(over: Partial<IntakeItem> = {}): IntakeItem {
   return {
@@ -107,6 +107,7 @@ export function fixtureDetail(item: IntakeItem = fixtureItem(), over: Partial<In
     messages: [],
     tasks: [],
     transitions: [],
+    question: null,
     ...over,
   };
 }
@@ -116,5 +117,17 @@ export function fixturePlans(...texts: string[]): IntakeDetail["plans"] {
 }
 
 export function fixtureReplyResult(over: Partial<IntakeReplyResult> = {}): IntakeReplyResult {
-  return { item: fixtureItem(), reaches_agent: true, note: null, ...over };
+  return { item: fixtureItem(), outcome: "discussion", decision: null, reaches_agent: true, note: null, ...over };
+}
+
+export function fixtureQuestion(over: Partial<IntakeQuestion> = {}): IntakeQuestion {
+  return {
+    id: 9,
+    decision: "cancel",
+    plan_version: null,
+    hold_hash: null,
+    question: "Cancel item #4? Answer yes or no.",
+    expires_at: "2026-09-24T10:20:00.000Z",
+    ...over,
+  };
 }

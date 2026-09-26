@@ -1419,7 +1419,8 @@ impl InboundState {
     }
 }
 
-/// Record that operator message `msg_ref` (WhatsApp row `row_id`) was read;
+/// Record that operator message `msg_ref` (WhatsApp row `row_id`; 0 for a
+/// message typed on the dashboard, which has no WhatsApp row) was read;
 /// returns its state (a message read before keeps its state).
 pub async fn inbound_receive(pool: &SqlitePool, msg_ref: &str, row_id: i64, item_key: &str) -> Result<InboundState> {
     let now = crate::timestamp::now();
