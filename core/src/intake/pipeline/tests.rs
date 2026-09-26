@@ -2167,7 +2167,7 @@ async fn a_cold_approve_in_the_dm_runs_through_the_chat_sessions_trigger() {
     assert_eq!(item1(&f).await.stage(), Stage::Refinement);
     // The chat session sees the message and runs the command.
     let r = fake_chat_session(&f, "approve it").await.expect("the session runs interpret-latest");
-    assert_eq!(r, Latest::Handled);
+    assert_eq!(outcomes(&r), [TurnOutcome::Handled]);
     let it = item1(&f).await;
     assert_eq!((it.stage(), it.approved_version, it.approved_via.as_deref()), (Stage::Implementation, Some(1), Some("whatsapp")));
     assert_eq!(f.interp.last().message, "approve it");
@@ -2194,7 +2194,7 @@ async fn interpret_latest_interprets_the_stored_operator_text_only() {
     // The chat session's context holds other text (here: an instruction to
     // cancel); the command takes no text, so only the stored message counts.
     let r = interpret_latest(&f.ctx, Some("chat")).await.unwrap();
-    assert_eq!(r, Latest::Handled);
+    assert_eq!(outcomes(&r), [TurnOutcome::Handled]);
     assert_eq!(f.interp.calls(), 1);
     assert_eq!(f.interp.last().message, "approve it");
     assert_eq!(item1(&f).await.stage(), Stage::Implementation);
@@ -2220,8 +2220,8 @@ async fn a_dm_row_is_interpreted_at_most_once() {
     let f = dm_fixture(fixture().await);
     with_plan(&f).await;
     chat_message(&f, "c1", "what do you think of it?", "operator").await;
-    assert_eq!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::NotADecision);
-    assert!(matches!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::NoMessage(_)));
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::ForSession]);
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Earlier]);
     assert_eq!(f.interp.calls(), 1);
     // A discussion from the chat session's trigger is the session's to
     // answer: the pipeline sends nothing and keeps nothing.
@@ -2261,7 +2261,7 @@ async fn a_cold_approve_in_a_lid_keyed_dm_runs_end_to_end() {
     let phone_chat = format!("{}@{}", "5511999999999", "s.whatsapp.net");
     assert!(matches!(interpret_latest(&f.ctx, Some(&phone_chat)).await.unwrap(), Latest::NoMessage(_)));
     // The LID-keyed session's command interprets his stored message.
-    assert_eq!(interpret_latest(&f.ctx, Some(&lid_chat)).await.unwrap(), Latest::Handled);
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some(&lid_chat)).await.unwrap()), [TurnOutcome::Handled]);
     assert_eq!(f.interp.last().message, "approve it");
     let it = item1(&f).await;
     assert_eq!((it.stage(), it.approved_version), (Stage::Implementation, Some(1)));
@@ -2286,23 +2286,22 @@ async fn a_quick_follow_up_does_not_take_the_place_of_the_decision() {
     chat_message(&f, "q1", "approve it", "operator").await;
     chat_message(&f, "q2", "any update?", "operator").await;
     let r = interpret_latest(&f.ctx, Some("chat")).await.unwrap();
-    assert_eq!(r, Latest::HandledWithOthers, "the turn's decision was found and the session answers the rest");
+    assert_eq!(outcomes(&r), [TurnOutcome::Handled, TurnOutcome::ForSession], "the decision ran; the session answers the rest");
     let it = item1(&f).await;
     assert_eq!((it.stage(), it.approved_version), (Stage::Implementation, Some(1)));
-    // It stopped at the decision: the follow-up was not interpreted and is
-    // the session's to answer as a normal message.
-    assert_eq!(f.interp.calls(), 1);
-    assert_eq!(f.interp.last().message, "approve it");
-    assert!(store::inbound_state(&f.ctx.db, "wa:chat:q2").await.unwrap().is_none());
+    // The follow-up is not a decision: the session answers it as a normal
+    // message, and the pipeline sent nothing about it.
+    assert_eq!(f.interp.calls(), 2);
+    assert!(outbound(&f).await.iter().all(|(_, b)| !b.contains("any update")));
     // In the other order the follow-up is read first as not a decision, then
     // the decision; each row once.
     let f = dm_fixture(fixture().await);
     with_plan(&f).await;
     chat_message(&f, "p1", "any update?", "operator").await;
     chat_message(&f, "p2", "approve it", "operator").await;
-    assert_eq!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::HandledWithOthers);
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::ForSession, TurnOutcome::Handled]);
     assert_eq!(item1(&f).await.stage(), Stage::Implementation);
-    assert!(matches!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::NoMessage(_)));
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Earlier, TurnOutcome::Earlier]);
     assert_eq!(f.interp.calls(), 2);
 }
 
@@ -2317,10 +2316,69 @@ async fn a_cancel_from_the_dm_goes_through_interpret_latest_and_a_confirmation()
     let block = crate::whatsapp_queue::intake_chat_block(&f.ctx.wa).await.unwrap();
     assert!(block.contains("item #1: in the eval stage, nothing is waiting for you. Allowed decisions: cancel."), "{block}");
     chat_message(&f, "x1", "cancel it", "operator").await;
-    assert_eq!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::Handled);
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Handled]);
     assert_eq!(item1(&f).await.stage(), Stage::Eval, "asked first");
     assert_eq!(outbound(&f).await.last().unwrap().1, "Cancel item #1? Answer yes or no.");
     inbound_dm(&f, "x2", "yes").await;
     tick(&f).await;
     assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
+}
+
+fn outcomes(r: &Latest) -> Vec<TurnOutcome> {
+    match r {
+        Latest::Turn(m) => m.iter().map(|m| m.outcome).collect(),
+        other => panic!("not a turn: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn two_decisions_in_one_turn_are_both_taken() {
+    // Item #1 has a plan waiting; item #2 is in the eval stage.
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    accept(&f, 2).await;
+    tick(&f).await;
+    chat_message(&f, "d1", "approve the plan", "operator").await;
+    chat_message(&f, "d2", "cancel the old item", "operator").await;
+    chat_message(&f, "d3", "and any update on the build?", "operator").await;
+    f.interp.answer(reading("decision", Some(1), Some("approve_plan"), None));
+    f.interp.answer(reading("decision", Some(2), Some("cancel"), None));
+    // After the cancel's question, a message that is not an answer stays
+    // with the session and leaves the question open.
+    f.interp.answer(reading("decision", Some(2), Some("cancel"), None));
+    let r = interpret_latest(&f.ctx, Some("chat")).await.unwrap();
+    assert_eq!(outcomes(&r), [TurnOutcome::Handled, TurnOutcome::Handled, TurnOutcome::ForSession]);
+    assert_eq!(item1(&f).await.stage(), Stage::Implementation, "the plan is approved");
+    assert_eq!(store::item(&f.ctx.db, 2).await.unwrap().stage(), Stage::Eval, "the cancel waits for its answer");
+    assert!(outbound(&f).await.iter().any(|(_, b)| b == "Cancel item #2? Answer yes or no."));
+    assert_eq!(confirmation_states(&f).await, ["pending"], "the question is still open");
+    let Latest::Turn(msgs) = r else { unreachable!() };
+    assert_eq!(msgs[0].preview, "approve the plan");
+    assert_eq!(msgs[2].position, 3);
+    // The session's answer is the operator's yes in a later turn.
+    new_turn(&f, "chat").await;
+    chat_message(&f, "d4", "yes", "operator").await;
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Handled]);
+    assert_eq!(store::item(&f.ctx.db, 2).await.unwrap().stage(), Stage::Cancelled);
+}
+
+#[tokio::test]
+async fn a_message_of_an_interrupted_turn_is_reported_once_and_never_interpreted() {
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    chat_message(&f, "r1", "approve it", "operator").await;
+    // The bot restarted during the turn: its restart sweep marks the turn.
+    sqlx::query("UPDATE chat_turns SET status = 'interrupted'").execute(&f.ctx.wa).await.unwrap();
+    tick(&f).await;
+    tick(&f).await;
+    let notes: Vec<String> =
+        outbound(&f).await.into_iter().map(|(_, b)| b).filter(|b| b.contains("restarted before it could check")).collect();
+    assert_eq!(notes.len(), 1, "told once: {notes:?}");
+    assert!(notes[0].contains("\"approve it\"") && notes[0].contains("send it again"), "{}", notes[0]);
+    assert_eq!(store::inbound_state(&f.ctx.db, "wa:chat:r1").await.unwrap().unwrap().state, "failed");
+    // A new turn that somehow covered it would not take it again.
+    sqlx::query("UPDATE chat_turns SET status = 'running'").execute(&f.ctx.wa).await.unwrap();
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Earlier]);
+    assert_eq!(f.interp.calls(), 0);
+    assert_eq!(item1(&f).await.stage(), Stage::Refinement);
 }

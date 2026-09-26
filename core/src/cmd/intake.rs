@@ -147,15 +147,50 @@ fn latest_text(r: &pipeline::Latest) -> String {
              in this chat itself. End your turn with exactly this line and nothing else: {}",
             pipeline::INTAKE_HANDLED
         ),
-        pipeline::Latest::HandledWithOthers => "HANDLED: the issue pipeline took one of the operator's messages in this \
-             turn as a decision and answered it in this chat itself. His other messages in this turn are not \
-             decisions: answer those normally, and do not repeat or comment on the decision."
-            .to_string(),
+        pipeline::Latest::Turn(msgs) => turn_text(msgs),
         pipeline::Latest::NotADecision => "NOT A DECISION: the interpreter did not read a pipeline decision in the \
              operator's latest message. Answer the operator normally."
             .to_string(),
         pipeline::Latest::NoMessage(why) => format!("NO MESSAGE: {why}. Answer the operator normally."),
     }
+}
+
+/// `interpret-latest`'s output for the chat session's turn: which of the
+/// operator's messages the pipeline handled and which the session answers.
+fn turn_text(msgs: &[pipeline::TurnMessage]) -> String {
+    use pipeline::TurnOutcome;
+    let list = |o: TurnOutcome| -> Vec<String> {
+        msgs.iter().filter(|m| m.outcome == o).map(|m| format!("{} \"{}\"", m.position, m.preview)).collect()
+    };
+    let handled = list(TurnOutcome::Handled);
+    let earlier = list(TurnOutcome::Earlier);
+    let rest = list(TurnOutcome::ForSession);
+    if handled.is_empty() && rest.is_empty() {
+        return "NO MESSAGE: the operator's messages in this turn were already interpreted. Answer the operator normally."
+            .into();
+    }
+    if handled.is_empty() {
+        return "NOT A DECISION: the interpreter did not read a pipeline decision in the operator's messages of this \
+                turn. Answer the operator normally."
+            .into();
+    }
+    let mut out = format!(
+        "HANDLED: the issue pipeline took these messages of the operator as decisions and answered him in this chat \
+         itself: {}.",
+        handled.join("; ")
+    );
+    if !earlier.is_empty() {
+        out.push_str(&format!(" Already handled before: {}.", earlier.join("; ")));
+    }
+    if rest.is_empty() {
+        out.push_str(&format!(" Nothing is left for you. End your turn with exactly this line and nothing else: {}", pipeline::INTAKE_HANDLED));
+    } else {
+        out.push_str(&format!(
+            " Not handled, answer only these normally and do not repeat or comment on the decisions: {}.",
+            rest.join("; ")
+        ));
+    }
+    out
 }
 
 /// `intake show` output: JSON, or text for the terminal.
@@ -444,6 +479,19 @@ mod tests {
         let mark = out.find("OBEY-MARK").unwrap();
         assert!(open < mark && mark < end, "{out}");
         assert_eq!(out.matches("<<<END-DATA-").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn the_turn_output_says_what_the_session_still_answers() {
+        use pipeline::{TurnMessage, TurnOutcome};
+        let m = |position, preview: &str, outcome| TurnMessage { position, preview: preview.into(), outcome };
+        let all = turn_text(&[m(1, "approve the plan", TurnOutcome::Handled), m(2, "cancel it", TurnOutcome::Handled)]);
+        assert!(all.contains("1 \"approve the plan\"; 2 \"cancel it\"") && all.ends_with(pipeline::INTAKE_HANDLED), "{all}");
+        let rest = turn_text(&[m(1, "approve it", TurnOutcome::Handled), m(2, "any update?", TurnOutcome::ForSession)]);
+        assert!(rest.contains("answer only these normally") && rest.contains("2 \"any update?\""), "{rest}");
+        assert!(!rest.contains(pipeline::INTAKE_HANDLED), "{rest}");
+        assert!(turn_text(&[m(1, "hi", TurnOutcome::ForSession)]).starts_with("NOT A DECISION"));
+        assert!(turn_text(&[m(1, "hi", TurnOutcome::Earlier)]).starts_with("NO MESSAGE"));
     }
 
     #[test]

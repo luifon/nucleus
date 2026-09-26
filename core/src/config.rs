@@ -854,6 +854,10 @@ pub struct IntakeTexts {
     /// interpret-latest` (`{handled}`: the line it ends its turn with when
     /// the pipeline handled the message).
     pub chat_block_instruction: String,
+    /// After a restart: operator DM messages whose chat turn was
+    /// interrupted before they could be checked for a decision
+    /// (`{messages}`: short previews, quoted, separated by `; `).
+    pub interrupted_messages: String,
     /// The comment Nucleus posts on the issue once the draft PR is open
     /// (`{pr_url}` only). Code-owned and posted without approval, so it
     /// must not take model output or issue text.
@@ -941,6 +945,10 @@ impl Default for IntakeTexts {
                                      run `./target/release/nucleus intake interpret-latest` and follow its output. \
                                      When it prints HANDLED, do exactly what its output says (usually: end your turn \
                                      with only this line: {handled}). Otherwise answer normally."
+                .into(),
+            interrupted_messages: "Nucleus restarted before it could check these messages of yours for an issue \
+                                   pipeline decision, so nothing was done for them: {messages}. If one of them was a \
+                                   decision, send it again."
                 .into(),
             pr_comment: "Draft pull request: {pr_url}".into(),
         }

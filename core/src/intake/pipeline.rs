@@ -199,6 +199,9 @@ pub async fn tick(ctx: &Ctx, force_poll: bool) -> Result<TickReport> {
         if let Err(e) = reconcile_groups(ctx).await {
             r.errors.push(format!("reconciling WhatsApp groups: {e:#}"));
         }
+        if let Err(e) = report_interrupted(ctx).await {
+            r.errors.push(format!("reporting interrupted DM messages: {e:#}"));
+        }
     }
     let mut ids: Vec<i64> = store::active_item_ids(&ctx.db).await?;
     ids.extend(cleanup_candidates(&ctx.db).await?);
@@ -559,7 +562,9 @@ enum Trigger {
     /// The DM chat session ran `nucleus intake interpret-latest` on the
     /// operator's latest DM message: only a decision (or the answer to a
     /// question) is handled here; anything else goes back to the session.
-    ChatSession,
+    /// `answer_only`: a question was asked earlier in the same turn, so only
+    /// an answer to it is handled; the question stays open otherwise.
+    ChatSession { answer_only: bool },
 }
 
 /// What [`interpret_latest`] did with the operator's latest DM message.
@@ -568,15 +573,40 @@ pub enum Latest {
     /// The pipeline took the message as a decision (or an answer to its
     /// question) and replied to the operator itself.
     Handled,
-    /// As `Handled`, and the session's turn covers other operator messages
-    /// that are not decisions: the session answers those normally.
-    HandledWithOthers,
+    /// The chat session's turn: what happened to each operator message it
+    /// covers, in order.
+    Turn(Vec<TurnMessage>),
     /// The interpreter did not read a decision; the chat session answers.
     NotADecision,
     /// No operator DM message from the last 15 minutes waits for an
     /// interpretation (none, too old, or already interpreted).
     NoMessage(String),
 }
+
+/// One operator message of the chat session's turn, for
+/// `interpret-latest`'s output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnMessage {
+    /// 1-based position in the turn.
+    pub position: usize,
+    /// The first words of the message (the operator's own text).
+    pub preview: String,
+    pub outcome: TurnOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOutcome {
+    /// The pipeline handled it and answered the operator.
+    Handled,
+    /// Not a decision (or not an answer to the question asked in this
+    /// turn): the chat session answers it.
+    ForSession,
+    /// Interpreted by an earlier run of the command.
+    Earlier,
+}
+
+/// Characters of a message shown in `interpret-latest`'s output.
+const TURN_PREVIEW_CHARS: usize = 60;
 
 /// The line a chat session ends its turn with after [`Latest::Handled`]:
 /// the turn engine sends no reply for a turn whose final text is exactly
@@ -597,41 +627,92 @@ const LATEST_MAX_AGE_MINUTES: i64 = 15;
 /// ones the session's current turn covers (the running `chat_turns` row
 /// and its `chat_inbound` rows, which the turn engine records), so a
 /// follow-up that arrived before the command ran does not take the place
-/// of the message that started the turn. They are interpreted in order,
-/// and the first decision (or answer to a question) stops it. From the
-/// operator's terminal (`chat` = None), the newest stored message of the
-/// last 15 minutes.
+/// of the message that started the turn. Every one is interpreted, in
+/// order: running a decision does not stop the loop, so a second decision
+/// in the same turn is not lost. A confirmation question does: once the
+/// loop has asked one, a later message is handled only when it answers
+/// that question, and left to the session otherwise. From the operator's
+/// terminal (`chat` = None), the newest stored message of the last 15
+/// minutes.
 pub async fn interpret_latest(ctx: &Ctx, chat: Option<&str>) -> Result<Latest> {
     let Some(chat) = chat else { return interpret_newest(ctx).await };
     let rows = crate::whatsapp_queue::current_turn_messages(&ctx.wa, chat).await?;
     if rows.is_empty() {
         return Ok(Latest::NoMessage("the session's current turn covers no stored operator message".into()));
     }
-    let mut seen = false;
-    for row in &rows {
-        match interpret_row(ctx, row).await? {
-            Latest::Handled | Latest::HandledWithOthers => {
-                return Ok(if rows.len() > 1 { Latest::HandledWithOthers } else { Latest::Handled });
+    let mut asked: Option<i64> = None;
+    let mut out = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let before = open_dm_question(ctx).await?;
+        let answer_only = asked.is_some() && before == asked;
+        let outcome = match interpret_row(ctx, row, answer_only).await? {
+            Latest::Handled => TurnOutcome::Handled,
+            Latest::NoMessage(_) => TurnOutcome::Earlier,
+            _ => TurnOutcome::ForSession,
+        };
+        if outcome == TurnOutcome::Handled {
+            let after = open_dm_question(ctx).await?;
+            if after.is_some() && after != before {
+                asked = after;
             }
-            Latest::NotADecision => seen = true,
-            Latest::NoMessage(_) => {}
+        }
+        out.push(TurnMessage { position: i + 1, preview: clip(&publish::plain_line(&row.text, 500), TURN_PREVIEW_CHARS), outcome });
+    }
+    Ok(Latest::Turn(out))
+}
+
+/// Operator DM messages the chat session never got to hand to the
+/// interpreter because a restart interrupted their turn. While items are
+/// open (one of them could have been a decision), the operator is told
+/// once, with short previews, and asked to send them again. Either way they
+/// are marked final, so no later `interpret-latest` takes them.
+async fn report_interrupted(ctx: &Ctx) -> Result<()> {
+    let mut lost = Vec::new();
+    for row in crate::whatsapp_queue::interrupted_chat_messages(&ctx.wa).await? {
+        let msg_ref = format!("wa:{}:{}", row.chat_id, row.wa_msg_id);
+        if store::inbound_state(&ctx.db, &msg_ref).await?.is_none() {
+            lost.push((row, msg_ref));
         }
     }
-    Ok(if seen {
-        Latest::NotADecision
-    } else {
-        Latest::NoMessage("the operator messages of the current turn were already interpreted".into())
-    })
+    if lost.is_empty() {
+        return Ok(());
+    }
+    if !pending_decisions(ctx, &Origin::Dm { item: None }).await?.is_empty() {
+        let previews: Vec<String> = lost
+            .iter()
+            .map(|(r, _)| format!("\"{}\"", clip(&publish::plain_line(&r.text, 500), TURN_PREVIEW_CHARS)))
+            .collect();
+        let body = fill(&ctx.cfg.texts.interrupted_messages, &[("messages", &previews.join("; "))]);
+        crate::whatsapp_queue::enqueue_text_once(
+            &ctx.wa,
+            crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM,
+            &body,
+            "intake:note",
+            &format!("intake:interrupted:{}", lost[0].0.id),
+        )
+        .await?;
+    }
+    for (row, msg_ref) in &lost {
+        store::inbound_receive(&ctx.db, msg_ref, row.id, &row.item_key).await?;
+        store::inbound_finish(&ctx.db, msg_ref, "failed", Some("the chat turn was interrupted by a restart before interpretation")).await?;
+    }
+    Ok(())
+}
+
+/// The confirmation question open in the DM, if any.
+async fn open_dm_question(ctx: &Ctx) -> Result<Option<i64>> {
+    Ok(store::open_confirmation(&ctx.db, "dm", "", &crate::timestamp::now()).await?.map(|c| c.id))
 }
 
 /// Interpret one stored row once, on the chat session's request.
-async fn interpret_row(ctx: &Ctx, row: &crate::whatsapp_queue::IntakeInbound) -> Result<Latest> {
+async fn interpret_row(ctx: &Ctx, row: &crate::whatsapp_queue::IntakeInbound, answer_only: bool) -> Result<Latest> {
     let msg_ref = format!("wa:{}:{}", row.chat_id, row.wa_msg_id);
     let state = store::inbound_receive(&ctx.db, &msg_ref, row.id, &row.item_key).await?;
     if state.is_final() {
         return Ok(Latest::NoMessage("already interpreted".into()));
     }
-    let r = handle_message(ctx, &Origin::Dm { item: None }, &row.text, &msg_ref, &row.input_kind, Trigger::ChatSession).await;
+    let r =
+        handle_message(ctx, &Origin::Dm { item: None }, &row.text, &msg_ref, &row.input_kind, Trigger::ChatSession { answer_only }).await;
     if let Err(e) = &r {
         let _ = store::inbound_attempt_failed(&ctx.db, &msg_ref, &clip(&format!("{e:#}"), 1_000)).await;
     }
@@ -650,7 +731,7 @@ async fn interpret_newest(ctx: &Ctx) -> Result<Latest> {
     if age > LATEST_MAX_AGE_MINUTES {
         return Ok(Latest::NoMessage(format!("the operator's latest DM message is older than {LATEST_MAX_AGE_MINUTES} minutes")));
     }
-    match interpret_row(ctx, &row).await? {
+    match interpret_row(ctx, &row, false).await? {
         Latest::NoMessage(_) => Ok(Latest::NoMessage("the operator's latest DM message was already interpreted".into())),
         other => Ok(other),
     }
@@ -688,7 +769,7 @@ async fn handle_message(
     };
     if pending.is_empty() && open.is_none() {
         // Nothing waits for a decision: no model is asked.
-        if trigger == Trigger::ChatSession {
+        if matches!(trigger, Trigger::ChatSession { .. }) {
             return not_a_decision("nothing waits for a decision; the chat session answers").await;
         }
         let body = paragraphs(&[late.as_deref(), Some(&decide::options_text(t, &pending))]);
@@ -708,13 +789,12 @@ async fn handle_message(
     // From the chat session, only a decision or an answer to the open
     // question belongs to the pipeline; anything else is the session's to
     // answer, and the pipeline sends nothing.
-    if trigger == Trigger::ChatSession {
-        let mine = matches!(
-            (&reading, &open),
-            (Reading::Decision { .. }, _) | (Reading::Confirm, Some(_)) | (Reading::Decline, Some(_))
-        );
+    if let Trigger::ChatSession { answer_only } = trigger {
+        let answer = matches!((&reading, &open), (Reading::Confirm, Some(_)) | (Reading::Decline, Some(_)));
+        let mine = answer || (!answer_only && matches!(reading, Reading::Decision { .. }));
         if !mine {
-            return not_a_decision("not a decision; the chat session answers").await;
+            // The question asked earlier in this turn stays open.
+            return not_a_decision("not a decision for the pipeline now; the chat session answers").await;
         }
     }
     let handled = match (reading, open) {

@@ -515,6 +515,38 @@ pub async fn current_turn_messages(pool: &SqlitePool, chat: &str) -> Result<Vec<
     .await?)
 }
 
+/// Operator DM messages (`item_key = chat`, `sender = operator`) of the
+/// last 7 days whose chat turn the bot marked `interrupted` on a restart
+/// (the message itself, or the turn that read it), oldest first. The
+/// caller filters out the ones already interpreted.
+pub async fn interrupted_chat_messages(pool: &SqlitePool) -> Result<Vec<IntakeInbound>> {
+    for t in ["intake_inbound", "chat_turns", "chat_inbound"] {
+        if !table_exists(pool, t).await? {
+            return Ok(vec![]);
+        }
+    }
+    let has_sender: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('intake_inbound') WHERE name = 'sender'")
+        .fetch_one(pool)
+        .await?;
+    if !has_sender {
+        return Ok(vec![]);
+    }
+    let since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    Ok(sqlx::query_as(
+        "SELECT DISTINCT i.id, i.item_key, i.chat_id, i.wa_msg_id, i.text, i.received_at, i.input_kind, i.sender
+           FROM intake_inbound i
+           JOIN chat_inbound c ON c.chat_id = i.chat_id AND c.wa_msg_id = i.wa_msg_id
+           LEFT JOIN chat_turns t ON t.id = c.turn_id
+          WHERE i.item_key = ?1 AND i.sender = 'operator' AND i.received_at >= ?2
+            AND (c.status = 'interrupted' OR t.status = 'interrupted')
+          ORDER BY i.id",
+    )
+    .bind(INTAKE_CHAT_KEY)
+    .bind(since)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Replace the block the bot adds to every operator message it types into
 /// the DM chat session (`intake_chat_block`, one row): what waits for an
 /// intake decision. Empty when nothing waits. Rust writes it; the bot only
