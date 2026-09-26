@@ -223,6 +223,12 @@ async fn ctx(s: &IntakeState) -> Result<Ctx, IntakeError> {
 
 /// Start `nucleus intake tick` detached, so a decision takes effect now.
 fn kick_tick(ws: &std::path::Path) {
+    // In a test the current executable is the test binary: `intake tick`
+    // would run it again with those words as test filters, and every
+    // successful write in those tests would start another one.
+    if cfg!(test) {
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else { return };
     let spawned = std::process::Command::new(exe)
         .args(["intake", "tick"])
