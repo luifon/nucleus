@@ -1669,7 +1669,12 @@ result (`outbound_queue.wa_ts`). Both must hold: the question's row is
 both WhatsApp timestamps are known, the question's is earlier than the
 message's (whole seconds; equal is not earlier). For a message that
 arrived earlier, the question is not shown to the interpreter, is not
-answered and is not replaced.
+answered and is not replaced. When either WhatsApp timestamp is missing for
+a message received over WhatsApp, the order cannot be confirmed and the
+check fails closed: a yes or no is not taken as an answer, the question
+stays open and is sent again with the same fixed text, and the next answer
+is checked against the re-sent question. A path that never carries WhatsApp
+timestamps (none exists today) is judged by the arrival order alone.
 
 A plan approval typed in the item's own group, or in the DM naming the item,
 or in the DM while only that item waits, runs at once.
@@ -1763,6 +1768,10 @@ thread runs in a group is also answered in the DM with the result note.
   it against the block and running `interpret-latest`. When the session
   misses it, the operator gets an ordinary chat answer; the chat session
   itself still cannot decide anything.
+- A LID listed in `WHATSAPP_OPERATOR_LIDS` counts as the operator without
+  the live mapping, on purpose: the variable exists for the times the
+  mapping is unavailable, so the operator must keep it limited to his own
+  LIDs.
 - A LID that is neither listed in `WHATSAPP_OPERATOR_LIDS` nor resolved
   to the operator's phone by the connection's mapping is not the operator:
   its chat gets no block, its messages are not stored for

@@ -558,7 +558,7 @@ pub async fn operator_message(
     received_at: &str,
     wa_ts: Option<i64>,
 ) -> Result<()> {
-    let arrived = Arrived { at: received_at, wa_ts };
+    let arrived = Arrived { at: received_at, wa_ts, whatsapp: true };
     handle_message(ctx, origin, text, msg_ref, input_kind, arrived, Trigger::Routed).await.map(|_| ())
 }
 
@@ -732,7 +732,7 @@ async fn interpret_row(ctx: &Ctx, row: &crate::whatsapp_queue::IntakeInbound, as
             &row.text,
             &msg_ref,
             &row.input_kind,
-            Arrived { at: &row.received_at, wa_ts: row.wa_ts },
+            Arrived { at: &row.received_at, wa_ts: row.wa_ts, whatsapp: true },
             Trigger::ChatSession { asked },
         )
         .await;
@@ -767,23 +767,43 @@ struct Arrived<'a> {
     at: &'a str,
     /// WhatsApp's `messageTimestamp` in seconds, when known.
     wa_ts: Option<i64>,
+    /// The message came over WhatsApp, so both WhatsApp timestamps are
+    /// required before it can answer a question. Every current caller reads
+    /// a WhatsApp row; a path without WhatsApp timestamps would set false.
+    whatsapp: bool,
 }
 
-/// True when the confirmation question `c` was sent before the message
-/// arrived: its `sent_at` is earlier than the message's arrival stamp, and,
-/// when both WhatsApp timestamps are known, the question's server timestamp
-/// is earlier than the message's (whole seconds: equal is not earlier).
-/// Only then can the message answer it.
-async fn question_seen(ctx: &Ctx, c: &store::Confirmation, arrived: Arrived<'_>) -> Result<bool> {
+/// Whether a message can answer the confirmation question it came after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    /// Sent before the message arrived, by the bot's clock and by
+    /// WhatsApp's timestamps.
+    Yes,
+    /// Not sent yet, or sent after the message arrived.
+    No,
+    /// Sent before the message by the bot's clock, but a WhatsApp timestamp
+    /// is missing: the order cannot be confirmed, so it does not count; the
+    /// question is asked again.
+    Unverified,
+}
+
+/// Whether confirmation question `c` was sent before the message arrived:
+/// its `sent_at` must be earlier than the message's arrival stamp and, for
+/// a WhatsApp message, the question's server timestamp must be earlier than
+/// the message's (whole seconds: equal is not earlier). A missing WhatsApp
+/// timestamp fails closed ([`Seen::Unverified`]).
+async fn question_seen(ctx: &Ctx, c: &store::Confirmation, arrived: Arrived<'_>) -> Result<Seen> {
     let Some((sent_at, q_ts)) = crate::whatsapp_queue::sent_by_dedup(&ctx.wa, &format!("intake:answer:{}", c.asked_by)).await? else {
-        return Ok(false);
+        return Ok(Seen::No);
     };
     if crate::timestamp::to_sortable(&sent_at) >= crate::timestamp::to_sortable(arrived.at) {
-        return Ok(false);
+        return Ok(Seen::No);
     }
     Ok(match (q_ts, arrived.wa_ts) {
-        (Some(q), Some(m)) => q < m,
-        _ => true,
+        (Some(q), Some(m)) if q < m => Seen::Yes,
+        (Some(_), Some(_)) => Seen::No,
+        _ if arrived.whatsapp => Seen::Unverified,
+        _ => Seen::Yes,
     })
 }
 
@@ -815,10 +835,16 @@ async fn handle_message(
         fill(&t.confirmation_expired, &[("n", &c.item_id.to_string()), ("minutes", &CONFIRMATION_MINUTES.to_string())])
     });
     // A question counts for this message only when it was sent before the
-    // message arrived; otherwise it is neither shown nor replaced.
-    let open = match store::open_confirmation(&ctx.db, &scope, msg_ref, &now).await? {
-        Some(c) if question_seen(ctx, &c, arrived).await? => Some(c),
-        _ => None,
+    // message arrived; otherwise it is neither shown nor replaced. One whose
+    // order cannot be confirmed (a missing WhatsApp timestamp) is shown, so
+    // an answer to it is recognized and the question asked again.
+    let (open, unverified) = match store::open_confirmation(&ctx.db, &scope, msg_ref, &now).await? {
+        Some(c) => match question_seen(ctx, &c, arrived).await? {
+            Seen::Yes => (Some(c), false),
+            Seen::Unverified => (Some(c), true),
+            Seen::No => (None, false),
+        },
+        None => (None, false),
     };
     let pending = pending_decisions(ctx, origin).await?;
     let not_a_decision = |why: &'static str| async move {
@@ -843,6 +869,20 @@ async fn handle_message(
     let reading = decide::parse_reading(&ctx.interpreter.interpret(&request).await?);
     tracing::info!(msg = %msg_ref, ?reading, "intake: operator message interpreted");
     let typed = input_kind == "text";
+    if unverified {
+        if let (Reading::Confirm | Reading::Decline, Some(c)) = (&reading, &open) {
+            // Fail closed: not taken as an answer. The same question is
+            // sent again and becomes the one the next answer is checked
+            // against.
+            keep_message(ctx, c.item_id, text, msg_ref).await?;
+            answer(ctx, origin, &c.question, msg_ref, true).await?;
+            store::reask_confirmation(&ctx.db, c.id, msg_ref).await?;
+            return Ok(Latest::Handled);
+        }
+    }
+    // A question whose order is unconfirmed is neither answered nor replaced
+    // by another kind of message.
+    let open = if unverified { None } else { open };
     // From the chat session, only a decision or an answer to the open
     // question belongs to the pipeline; anything else is the session's to
     // answer, and the pipeline sends nothing.

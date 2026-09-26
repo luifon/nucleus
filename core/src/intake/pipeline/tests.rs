@@ -289,15 +289,18 @@ async fn inbound_kind(f: &Fixture, item: i64, msg_id: &str, text: &str, kind: &s
 async fn inbound_row(f: &Fixture, key: &str, chat: &str, msg_id: &str, text: &str, kind: &str, sender: &str) -> i64 {
     // The operator writes after he received what was queued before: the bot
     // delivered those messages (a question can only be answered once sent).
-    let before = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    sqlx::query("UPDATE outbound_queue SET status = 'sent', sent_at = ?1 WHERE status = 'pending'")
+    // Both clocks: the bot's `sent_at` and WhatsApp's server timestamp.
+    let now = chrono::Utc::now();
+    let before = (now - chrono::Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    sqlx::query("UPDATE outbound_queue SET status = 'sent', sent_at = ?1, wa_ts = ?2 WHERE status = 'pending'")
         .bind(before)
+        .bind(now.timestamp() - 1)
         .execute(&f.ctx.wa)
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender)
-         VALUES (?1, ?2, ?3, ?4, ?7, ?5, ?6)",
+        "INSERT INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender, wa_ts)
+         VALUES (?1, ?2, ?3, ?4, ?7, ?5, ?6, ?8)",
     )
     .bind(key)
     .bind(chat)
@@ -306,6 +309,7 @@ async fn inbound_row(f: &Fixture, key: &str, chat: &str, msg_id: &str, text: &st
     .bind(kind)
     .bind(sender)
     .bind(crate::timestamp::now())
+    .bind(now.timestamp())
     .execute(&f.ctx.wa)
     .await
     .unwrap()
@@ -2492,4 +2496,33 @@ async fn a_yes_that_arrived_before_the_question_was_sent_does_not_confirm() {
     sqlx::query("UPDATE intake_inbound SET wa_ts = 1790000006 WHERE id = ?1").bind(t).execute(&f.ctx.wa).await.unwrap();
     assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Handled]);
     assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
+}
+
+#[tokio::test]
+async fn a_yes_to_a_question_without_a_whatsapp_timestamp_is_asked_again() {
+    let f = fixture().await;
+    accept_with_body(&f, 1, HIDDEN_BODY).await;
+    tick(&f).await;
+    inbound(&f, 1, "w1", "release").await;
+    tick(&f).await;
+    let question = "Release item #1 (held for hidden content, 1 findings)? Answer yes or no.";
+    assert_eq!(outbound(&f).await.last().unwrap().1, question);
+    // The question was sent, but the send result had no WhatsApp timestamp.
+    let before = (chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    sqlx::query("UPDATE outbound_queue SET status = 'sent', sent_at = ?1, wa_ts = NULL WHERE status = 'pending'")
+        .bind(before)
+        .execute(&f.ctx.wa)
+        .await
+        .unwrap();
+    inbound_dm(&f, "w2", "yes").await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Held, "not released: the order is not confirmed");
+    let out = outbound(&f).await;
+    assert_eq!(out.iter().filter(|(_, b)| b == question).count(), 2, "the same question again: {out:?}");
+    assert_eq!(confirmation_states(&f).await, ["pending"], "the question stays open");
+    // The re-asked question is delivered with a timestamp; a yes after it
+    // releases.
+    inbound_dm(&f, "w3", "yes").await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.released_via.as_deref(), Some("whatsapp"));
 }

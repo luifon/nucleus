@@ -1372,6 +1372,22 @@ pub async fn decline_confirmation(pool: &SqlitePool, id: i64, msg_ref: &str) -> 
     Ok(())
 }
 
+/// The question was asked again (an answer to it could not be verified):
+/// operator message `msg_ref`, whose reply carried the question again, is
+/// now the one the next answer is checked against, and it is applied, in
+/// one transaction. The question stays open with its expiry.
+pub async fn reask_confirmation(pool: &SqlitePool, id: i64, msg_ref: &str) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("UPDATE confirmations SET asked_by = ?2 WHERE id = ?1 AND state = 'pending'")
+        .bind(id)
+        .bind(msg_ref)
+        .execute(&mut *tx)
+        .await?;
+    mark_applied(&mut tx, Some(msg_ref)).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Another message came instead of an answer: the open questions in
 /// `scope` are replaced.
 pub async fn replace_confirmations(pool: &SqlitePool, scope: &str) -> Result<()> {
