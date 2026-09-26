@@ -596,18 +596,21 @@ JSON-parsed numbers.
   Markdown and passed through the secret guard. Only the operator's exact
   identity counts, decided by one function (`isOperatorId` in
   `messaging/whatsapp/src/intake.ts`: his phone digits, a LID listed in
-  `WHATSAPP_ALLOWED_DM_JIDS`, or a LID the connection maps to his phone)
-  for approvals, the DM fast paths, the stored `chat` rows and the block.
+  `WHATSAPP_OPERATOR_LIDS`, or a LID the connection maps to his phone) for
+  both inbound gates, approvals, the DM fast paths, the stored `chat` rows
+  and the block. Other `WHATSAPP_ALLOWED_DM_JIDS` entries are contacts the
+  bot chats with, never the operator.
   The terminal and the dashboard keep explicit commands.
   A `#n` message, a quote of a pipeline message or an answer within 15
   minutes of a DM question goes straight to the interpreter; any other DM
   message goes to the DM chat session, which gets a code-built block of
   the waiting decisions (no issue text) with each operator message and runs
   `nucleus intake interpret-latest` when he asks for one. That command takes
-  no text: it interprets his latest stored DM row (`item_key = chat`,
-  `sender = operator`), each row once, and only the DM chat session and the
-  operator's terminal may run it. A chat session may list, show and cancel
-  items and trigger that interpretation; it never approves or releases.
+  no text: it interprets the stored DM rows (`item_key = chat`, `sender =
+  operator`) that the session's current turn covers, in order, stopping at
+  the first decision, each row once; only the DM chat session and the
+  operator's terminal may run it. A chat session may list and show items
+  and trigger that interpretation; it never cancels, approves or releases.
 - Thread messages reach WhatsApp only through `outbound_queue` (target
   policy, secret filter). Intake groups are created and left only by the
   bot (`messaging/whatsapp/src/intake.ts`), within `[intake.whatsapp]

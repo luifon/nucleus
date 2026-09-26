@@ -384,12 +384,12 @@ WhatsApp group creation whose outcome is unknown (finding 6).
 | Caller (`crate::caller`) | May |
 |---|---|
 | Operator | every command (`group-resolve` and `release` only from the operator) |
-| WhatsApp DM chat session | `list`, `show`, `cancel`, `interpret-latest` (not in a turn that read an agent message) |
+| WhatsApp DM chat session | `list`, `show`, `interpret-latest` (not in a turn that read an agent message); it changes no item itself: a cancel, like an approval or a release, is the operator's stored message read through `interpret-latest` and confirmed |
 | Detached process (launchd, the bot, the dashboard) | `tick` |
 | Workers, other sessions, unscoped chats, unknown | nothing |
 
 The DM persona gets an "Issue pipeline items" section and the pre-approved
-patterns `Bash(./target/release/nucleus intake list|show|cancel|interpret-latest:*)`. The
+patterns `Bash(./target/release/nucleus intake list|show|interpret-latest:*)`. The
 session answers questions about items in plain language and tells the
 operator where to decide (the item's group, or a DM message that starts
 with `#n` or replies to an item's message); it cannot approve, release,
@@ -837,7 +837,7 @@ the group (no message from it is read) and alerts the operator.
 
 Limit: an `@lid` sender whose phone number the connection does not know is
 not recognized as the operator, unless that LID is listed in
-`WHATSAPP_ALLOWED_DM_JIDS` ("Amendment: operator decisions in plain
+`WHATSAPP_OPERATOR_LIDS` ("Amendment: operator decisions in plain
 words").
 
 ### Finding 6 — group lifecycle
@@ -1492,11 +1492,18 @@ function decides it for every check of the pipeline (`isOperatorId` in
 `messaging/whatsapp/src/intake.ts`): a chat or sender id is the operator
 when its digits are the operator's phone digits (the first
 `WHATSAPP_ALLOWED_DM_JIDS` entry), when it is an `@lid` id whose digits are
-in `WHATSAPP_ALLOWED_DM_JIDS` (the operator's LID listed there), or when it
-is an `@lid` id that the connection's LID mapping resolves to the operator's
-phone. The same function decides approvals, the members of a new group, the
-DM fast paths, the stored `chat` rows and the decision block, so a DM chat
-keyed `<digits>@lid` is the operator's DM everywhere. The bot
+in `WHATSAPP_OPERATOR_LIDS` (the operator's own LIDs, a separate variable),
+or when it is an `@lid` id that the connection's LID mapping resolves to
+the operator's phone. `WHATSAPP_ALLOWED_DM_JIDS` is a general DM allowlist:
+its other entries are contacts the bot chats with, never the operator. The
+same function decides both inbound gates (the DM gate admits the allowlist
+as normal chat and the operator by this check, so a LID only the mapping
+resolves is admitted as the operator; the intake-group sender gate admits
+only this check), approvals, the members of a new group, the DM fast paths,
+the stored `chat` rows and the decision block, so a DM chat keyed
+`<digits>@lid` is the operator's DM everywhere. A LID the mapping resolved
+is remembered for the synchronous checks (role lookup and the target
+policy, which then sends replies to that chat). The bot
 routes to the pipeline: every operator message in an item's group; and, in
 the operator's DM, a message that starts with an item's `#n` marker, a reply
 that quotes a message the pipeline sent (a thread message names its item; a
@@ -1527,18 +1534,25 @@ message):
   `item_key = chat` and `sender = operator`; the tick skips these rows. When
   the operator's message asks for one of the listed decisions, the chat
   session runs `nucleus intake interpret-latest`. The command takes no text:
-  code reads the newest `chat` row with `sender = operator` from the
-  calling session's own DM chat (the exact chat id, phone or LID form, that
-  keys both the session's task scope and the stored row; from the
-  operator's terminal, any DM chat),
-  no older than 15 minutes, and runs the same interpreter flow on that
-  stored text (`pipeline::interpret_latest`). A row is interpreted at most
-  once: its `inbound_commands` state is final after the first run. On a
-  decision (or an answer to an open question) the full flow runs,
-  confirmations and replies included, and the command prints `HANDLED`
-  with the line the session ends its turn with (`[handled by the issue
-  pipeline]`); the turn engine sends no reply for a turn whose whole final
-  text is that line, because the pipeline already answered. On a discussion
+  code reads the `chat` rows with `sender = operator` that the calling
+  session's current turn covers: the turn engine's running `chat_turns` row
+  for the session's own DM chat (the exact chat id, phone or LID form, that
+  keys both the session's task scope and the stored rows) and the
+  `chat_inbound` rows it marked with that turn, joined by WhatsApp message
+  id. A follow-up that arrived before the command ran therefore cannot take
+  the place of the message that started the turn. The rows are interpreted
+  in order with the same interpreter flow (`pipeline::interpret_latest`),
+  and the first decision or answer to a question stops it. From the
+  operator's terminal it reads the newest stored row of the last 15
+  minutes. A row is interpreted at most once: its `inbound_commands` state
+  is final after the first run. On a decision (or an answer to an open
+  question) the full flow runs, confirmations and replies included, and the
+  command prints `HANDLED` with the line the session ends its turn with
+  (`[handled by the issue pipeline]`); the turn engine sends no reply for a
+  turn whose whole final text is that line, because the pipeline already
+  answered. When the turn also covers other operator messages, `HANDLED`
+  tells the session to answer those normally instead, without repeating the
+  decision. On a discussion
   or anything unclear, the pipeline sends and keeps nothing, and the
   command prints `NOT A DECISION`; the session answers normally.
 
@@ -1677,11 +1691,12 @@ thread runs in a group is also answered in the DM with the result note.
   it against the block and running `interpret-latest`. When the session
   misses it, the operator gets an ordinary chat answer; the chat session
   itself still cannot decide anything.
-- A LID that is neither listed in `WHATSAPP_ALLOWED_DM_JIDS` nor resolved
+- A LID that is neither listed in `WHATSAPP_OPERATOR_LIDS` nor resolved
   to the operator's phone by the connection's mapping is not the operator:
   its chat gets no block, its messages are not stored for
-  `interpret-latest` and never reach the pipeline. Listing the operator's
-  LID in the allowlist removes the dependence on the mapping.
+  `interpret-latest` and never reach the pipeline (an allowlisted contact's
+  LID still chats normally). Listing the operator's LIDs in
+  `WHATSAPP_OPERATOR_LIDS` removes the dependence on the mapping.
 - The 15-minute window for an unmarked DM answer starts when the question
   was sent; an unrelated DM message sent in that window goes to the
   pipeline (and gets the list) instead of the chat session.
@@ -1708,7 +1723,19 @@ gets none of it (`intake.test.ts`, "the operator's DM in LID form …"); a
 cold "approve it" stored under a LID-keyed chat runs end to end through
 that chat's session, a phone-keyed session takes nothing from it, and an
 unmarked unknown-LID row is never interpreted
-(`a_cold_approve_in_a_lid_keyed_dm_runs_end_to_end`).
+(`a_cold_approve_in_a_lid_keyed_dm_runs_end_to_end`). Review fixes: a
+second allowlisted LID is admitted as normal chat and never the operator,
+an operator LID from `WHATSAPP_OPERATOR_LIDS` is the operator without a
+mapping, a LID only the mapping resolves is admitted by the DM gate as the
+operator, and the intake-group gate (the same check) admits an operator LID
+with the mapping unavailable (`intake.test.ts`); operator LIDs are sendable
+(`target_policy.test.ts`); the chat session is refused `cancel`,
+`approve-plan` and `release` (`authorization_by_caller`); a cancel from the
+DM goes through `interpret-latest` and a confirmation
+(`a_cancel_from_the_dm_goes_through_interpret_latest_and_a_confirmation`);
+"approve it" followed at once by "any update?" in one turn approves the plan
+and leaves the follow-up to the session, in either order, each row once
+(`a_quick_follow_up_does_not_take_the_place_of_the_decision`).
 
 Rust (`cargo test -p nucleus-core intake`, fake interpreter): "looks good,
 go ahead" in item #1's group approves plan v1 at once
