@@ -45,6 +45,7 @@ async fn spawn_ask_close_round_trip() {
         agent_label: None,
         env: vec![],
         state_root: None,
+        no_tools: false,
     })
     .await
     .expect("spawn");

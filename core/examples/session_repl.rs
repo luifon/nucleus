@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
         agent_label: None,
         env: vec![],
         state_root: None,
+        no_tools: false,
     })
     .await?;
     println!(

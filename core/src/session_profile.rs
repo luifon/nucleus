@@ -80,6 +80,7 @@ fn base_spawn(ctx: &ProfileContext) -> SpawnOptions {
         agent_label: Some(ctx.agent_label.to_string()),
         env: vec![],
         state_root: None,
+        no_tools: false,
     }
 }
 
@@ -122,6 +123,29 @@ impl SessionProfile {
         let mut p = Self::one_shot_agentic(ctx);
         p.spawn.allowed_tools = allowed_tools;
         p
+    }
+
+    /// One-shot with no tools at all: a model reads the message and answers
+    /// in text, and can do nothing else (ADR-036, the intake interpreter).
+    /// No built-in tool (`--tools ""`), no MCP server, no skill, no
+    /// `--add-dir`, no `--allowed-tools`, and `dontAsk` in place of the
+    /// configured permission mode, so a tool call that got through anyway
+    /// is refused instead of approved. [`SpawnOptions::no_tools`] makes
+    /// the argv ignore `add_dirs` and `allowed_tools`, so the chainable
+    /// setters cannot widen it. 120s ceiling.
+    pub fn one_shot_no_tools(ctx: &ProfileContext) -> Self {
+        let mut spawn = base_spawn(ctx);
+        spawn.permission_mode = Some(PermissionMode::DontAsk);
+        spawn.no_tools = true;
+        Self {
+            spawn,
+            ask: AskOptions {
+                max_wait: Duration::from_secs(120),
+                quiescent_window: Duration::from_secs(3),
+                await_turn_complete: true,
+            },
+            daily_key: None,
+        }
     }
 
     // ── overrides (chainable). Deliberately absent: await_turn_complete,
@@ -349,6 +373,35 @@ mod tests {
             assert_eq!(spawn.permission_mode, Some(PermissionMode::Auto));
             assert_eq!(spawn.agent_label.as_deref(), Some("test"));
         }
+    }
+
+    #[test]
+    fn the_no_tools_profile_grants_no_tool_directory_or_skill() {
+        let ws = tempfile::tempdir().unwrap();
+        // The operator-private tree exists: an ordinary profile adds it.
+        std::fs::create_dir_all(crate::skills::private_dir(ws.path())).unwrap();
+        let (_, claude) = ctx_fixture();
+        let ctx = ProfileContext { workspace_root: ws.path(), claude: &claude, tmux_session: "nucleus-test", agent_label: "test" };
+        let (spawn, ask) = SessionProfile::one_shot_no_tools(&ctx)
+            .add_dirs(vec![ws.path().join("extra")])
+            .into_parts();
+        assert!(ask.await_turn_complete);
+        let mut spawn = spawn;
+        spawn.allowed_tools = vec!["Bash".into(), "mcp__x__y".into()];
+        let args = crate::claude_session::build_claude_args("sid", false, &spawn, None);
+        let value = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+        assert_eq!(value("--tools").as_deref(), Some(""), "{args:?}");
+        assert_eq!(value("--permission-mode").as_deref(), Some("dontAsk"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--disable-slash-commands"), "{args:?}");
+        for flag in ["--add-dir", "--allowed-tools", "--allowedTools", "--mcp-config", "--dangerously-skip-permissions"] {
+            assert!(!args.iter().any(|a| a == flag), "{flag} in {args:?}");
+        }
+        assert!(!args.iter().any(|a| a.contains("Bash") && a != "Bash(rm *)"), "{args:?}");
+        // The ordinary utility profile does add the private tree.
+        let (plain, _) = SessionProfile::one_shot_utility(&ctx).into_parts();
+        let plain_args = crate::claude_session::build_claude_args("sid", false, &plain, None);
+        assert!(plain_args.iter().any(|a| a == "--add-dir"), "{plain_args:?}");
     }
 
     #[test]
