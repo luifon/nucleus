@@ -836,7 +836,9 @@ and alerts the operator in DM; a later change of the member list disables
 the group (no message from it is read) and alerts the operator.
 
 Limit: an `@lid` sender whose phone number the connection does not know is
-not recognized as the operator.
+not recognized as the operator, unless that LID is listed in
+`WHATSAPP_ALLOWED_DM_JIDS` ("Amendment: operator decisions in plain
+words").
 
 ### Finding 6 — group lifecycle
 
@@ -1485,7 +1487,16 @@ WhatsApp, and GitHub gets no summary.
 
 ### Which messages are read
 
-Only messages from the operator's exact identity count (finding 5). The bot
+Only messages from the operator's exact identity count (finding 5). One
+function decides it for every check of the pipeline (`isOperatorId` in
+`messaging/whatsapp/src/intake.ts`): a chat or sender id is the operator
+when its digits are the operator's phone digits (the first
+`WHATSAPP_ALLOWED_DM_JIDS` entry), when it is an `@lid` id whose digits are
+in `WHATSAPP_ALLOWED_DM_JIDS` (the operator's LID listed there), or when it
+is an `@lid` id that the connection's LID mapping resolves to the operator's
+phone. The same function decides approvals, the members of a new group, the
+DM fast paths, the stored `chat` rows and the decision block, so a DM chat
+keyed `<digits>@lid` is the operator's DM everywhere. The bot
 routes to the pipeline: every operator message in an item's group; and, in
 the operator's DM, a message that starts with an item's `#n` marker, a reply
 that quotes a message the pipeline sent (a thread message names its item; a
@@ -1509,15 +1520,17 @@ message):
   decisions; no issue text), and an instruction (`[intake.texts]
   chat_block_header`, `chat_block_instruction`). The bot types the block
   after every operator message in the operator's DM chat session while it
-  is not empty (the turn engine's `operatorContext`; only for a DM chat id
-  whose digits are the operator's).
+  is not empty (passed with the message to the turn engine), only in a DM
+  chat that `isOperatorId` accepts, in phone or LID form.
 - **The chat session can only trigger.** The bot also stores each operator
   DM message that goes to the chat session in `intake_inbound` with
   `item_key = chat` and `sender = operator`; the tick skips these rows. When
   the operator's message asks for one of the listed decisions, the chat
   session runs `nucleus intake interpret-latest`. The command takes no text:
   code reads the newest `chat` row with `sender = operator` from the
-  calling session's own DM chat (from the operator's terminal, any DM chat),
+  calling session's own DM chat (the exact chat id, phone or LID form, that
+  keys both the session's task scope and the stored row; from the
+  operator's terminal, any DM chat),
   no older than 15 minutes, and runs the same interpreter flow on that
   stored text (`pipeline::interpret_latest`). A row is interpreted at most
   once: its `inbound_commands` state is final after the first run. On a
@@ -1664,9 +1677,11 @@ thread runs in a group is also answered in the DM with the result note.
   it against the block and running `interpret-latest`. When the session
   misses it, the operator gets an ordinary chat answer; the chat session
   itself still cannot decide anything.
-- The block reaches the DM chat session only for a chat id whose digits are
-  the operator's number; a DM that arrives in `@lid` form without a phone
-  number gets no block (the fast paths still work).
+- A LID that is neither listed in `WHATSAPP_ALLOWED_DM_JIDS` nor resolved
+  to the operator's phone by the connection's mapping is not the operator:
+  its chat gets no block, its messages are not stored for
+  `interpret-latest` and never reach the pipeline. Listing the operator's
+  LID in the allowlist removes the dependence on the mapping.
 - The 15-minute window for an unmarked DM answer starts when the question
   was sent; an unrelated DM message sent in that window goes to the
   pipeline (and gets the list) instead of the chat session.
@@ -1686,7 +1701,14 @@ waiting starts no interpreter (`an_unrelated_dm_message_starts_no_interpreter`);
 the caller rules (`cmd::intake::tests::authorization_by_caller`); the block
 after the operator's message and the silent handled turn
 (`chat_engine.test.ts`); the block table and the `chat` rows
-(`intake.test.ts`).
+(`intake.test.ts`). The operator's DM in LID form: a chat keyed
+`<digits>@lid` with those digits allowlisted, and one the mapping resolves,
+get the block, their text is kept and the fast paths route; an unknown LID
+gets none of it (`intake.test.ts`, "the operator's DM in LID form …"); a
+cold "approve it" stored under a LID-keyed chat runs end to end through
+that chat's session, a phone-keyed session takes nothing from it, and an
+unmarked unknown-LID row is never interpreted
+(`a_cold_approve_in_a_lid_keyed_dm_runs_end_to_end`).
 
 Rust (`cargo test -p nucleus-core intake`, fake interpreter): "looks good,
 go ahead" in item #1's group approves plan v1 at once

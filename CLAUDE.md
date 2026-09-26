@@ -594,7 +594,11 @@ JSON-parsed numbers.
   confirmed first (stored in `confirmations`, 15 minutes). Replies are
   `[intake.texts]` texts; the interpreter's question is cut, stripped of
   Markdown and passed through the secret guard. Only the operator's exact
-  identity counts. The terminal and the dashboard keep explicit commands.
+  identity counts, decided by one function (`isOperatorId` in
+  `messaging/whatsapp/src/intake.ts`: his phone digits, a LID listed in
+  `WHATSAPP_ALLOWED_DM_JIDS`, or a LID the connection maps to his phone)
+  for approvals, the DM fast paths, the stored `chat` rows and the block.
+  The terminal and the dashboard keep explicit commands.
   A `#n` message, a quote of a pipeline message or an answer within 15
   minutes of a DM question goes straight to the interpreter; any other DM
   message goes to the DM chat session, which gets a code-built block of
