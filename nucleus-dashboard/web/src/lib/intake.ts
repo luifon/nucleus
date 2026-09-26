@@ -389,7 +389,7 @@ export function boardFor(
     case "held":
       return {
         kind: "board",
-        title: "Held: the issue has content GitHub's page does not show. Read the findings above, then decide.",
+        title: "Held: the issue has content GitHub's page does not show, listed below. Review it, then decide.",
         options: [
           { key: "release", label: `Release (hold ${holdCode(item.hold_hash)})`, hint: "the agent reads the hidden content as data", tone: "accent" },
           DISCUSS,

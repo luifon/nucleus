@@ -167,7 +167,7 @@ export default function DecisionBoard({
                 <span className="text-[10px] text-[var(--color-nucleus-faint)]">
                   {findingPlace(f)} · <span className="text-[var(--color-status-warn)]">{findingKindLabel(f.kind)}</span>
                 </span>
-                <div className="whitespace-pre-wrap break-all font-mono text-[var(--color-nucleus-text)]">{f.text}</div>
+                <div className="whitespace-pre-wrap break-all font-mono text-[var(--color-nucleus-text)] [font-variant-ligatures:none]">{f.text}</div>
               </li>
             ))}
           </ul>

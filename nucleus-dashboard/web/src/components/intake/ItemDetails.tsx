@@ -45,14 +45,14 @@ export default function ItemDetails({
                 <div className="text-[10px] text-[var(--color-nucleus-faint)]">
                   {findingPlace(f)} · <span className="text-[var(--color-status-warn)]">{findingKindLabel(f.kind)}</span>
                 </div>
-                <div className="whitespace-pre-wrap break-all font-mono text-[var(--color-nucleus-text)]">{f.text}</div>
+                <div className="whitespace-pre-wrap break-all font-mono text-[var(--color-nucleus-text)] [font-variant-ligatures:none]">{f.text}</div>
               </li>
             ))}
           </ul>
           {hidden_sources.map((s) => (
             <div key={s.location} className="mt-2">
               <div className="mb-0.5 text-[10px] text-[var(--color-nucleus-faint)]">raw {s.location}, hidden parts marked</div>
-              <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-3 py-2 font-mono text-xs text-[var(--color-nucleus-text)]">
+              <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-3 py-2 font-mono text-xs text-[var(--color-nucleus-text)] [font-variant-ligatures:none]">
                 {markRanges(
                   s.text,
                   hidden.filter((f) => f.location === s.location),
