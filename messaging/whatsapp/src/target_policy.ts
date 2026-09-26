@@ -125,21 +125,48 @@ export async function resolveQueuedTarget(input: {
   operatorDm: () => string | null;
   operatorPhone: string | null;
   isOperator: (jid: string) => Promise<boolean>;
+  /** Called when the live check rejects an `@lid` target of an
+   *  operator-only or task-result row; `to` is the operator's phone JID the
+   *  row is redirected to (the caller drops the LID's verification and
+   *  moves the row). */
+  onStaleLid?: (lid: string, to: string) => void;
 }): Promise<string | null> {
   const { target, config, groups } = input;
+  const phone = () => (input.operatorPhone ? resolveTarget(input.operatorPhone, config, groups) : null);
+  const stale = (lid: string): string | null => {
+    const to = phone();
+    if (to) input.onStaleLid?.(lid, to);
+    return to;
+  };
   if (target === "dm") {
     const chat = input.operatorDm();
     const jid = chat ? resolveTarget(chat, config, groups) : null;
     if (jid && (await input.isOperator(jid))) return jid;
-    return input.operatorPhone ? resolveTarget(input.operatorPhone, config, groups) : null;
+    if (jid && jid.endsWith("@lid")) return stale(jid);
+    return phone();
   }
   const jid = resolveTarget(target, config, groups);
-  // An `@lid` DM that is not on the lists may still be the operator by the
-  // live check (a task result for his LID chat after the cached
-  // verification expired).
-  if (!jid && target.endsWith("@lid") && (await input.isOperator(target))) return target;
-  if (!jid || jid.endsWith("@g.us") || !isOperatorOnly(target, input.source)) return jid;
+  const operatorOnly = isOperatorOnly(target, input.source);
+  if (target.endsWith("@lid")) {
+    const digits = normalizeSenderId(target);
+    // Another allowed contact's LID keeps its own replies and task results.
+    if (!operatorOnly && jid && config.allowedDmSenders.has(digits)) return jid;
+    if (operatorOnly || isTaskResult(input.source) || !jid) {
+      if (await input.isOperator(target)) return jid ?? target;
+      // The LID is no longer the operator's by the live mapping: an
+      // operator-only row or a task result goes to his phone instead of
+      // being dropped; anything else is refused.
+      return operatorOnly || isTaskResult(input.source) ? stale(target) : null;
+    }
+    return jid;
+  }
+  if (!jid || jid.endsWith("@g.us") || !operatorOnly) return jid;
   return (await input.isOperator(jid)) ? jid : null;
+}
+
+/** A task's result or delivery note (tasks.rs uses the sender `task:<id>`). */
+export function isTaskResult(source: string): boolean {
+  return source.startsWith("task:");
 }
 
 /** The JID to send `target` to, or null when it is not allowed. `dm` is

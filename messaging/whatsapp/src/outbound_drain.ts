@@ -28,6 +28,7 @@
 // `fatal` (the process exits for a launchd respawn). A link close resets the
 // count, so the failures that precede a normal close never cause an exit.
 
+import { waSeconds } from "./intake.js";
 import { BufferJSON, type AnyMessageContent, type WAMessage } from "@whiskeysockets/baileys";
 import type { OutboundQueueStore, OutboundRow } from "./db.js";
 import {
@@ -103,7 +104,7 @@ export interface DrainDeps {
   /** Allowlisted JID for a row target, or null. */
   /** The target policy for one row (target_policy.ts); `source` tells
    *  operator-only messages from replies in the writer's chat. */
-  resolveTarget: (target: string, source: string) => string | null | Promise<string | null>;
+  resolveTarget: (target: string, source: string, id: number) => string | null | Promise<string | null>;
   send: (jid: string, content: AnyMessageContent, opts: { messageId: string; quoted?: WAMessage }) => Promise<WAMessage | undefined>;
   newMessageId: () => string;
   rules: () => SecretRules;
@@ -204,10 +205,13 @@ export class OutboundDrain {
     if (rows.length === 0) return;
     this.d.log.info({ count: rows.length }, "whatsapp: draining outbound queue");
     let mediaSent = 0;
-    for (const r of rows) {
+    for (const listed of rows) {
       if (!this.up) break;
-      if (r.kind !== "text" && mediaSent >= MAX_MEDIA_SENDS_PER_TICK) continue;
-      const jid = await this.d.resolveTarget(r.target, r.source);
+      if (listed.kind !== "text" && mediaSent >= MAX_MEDIA_SENDS_PER_TICK) continue;
+      // Claim and read in one step: the row is sent as it is at the claim.
+      const r = this.d.store.claimForSend(listed.id, listed.msgId ?? this.d.newMessageId());
+      if (!r) continue;
+      const jid = await this.d.resolveTarget(r.target, r.source, r.id);
       if (!jid) {
         const { status } = this.d.store.markFailure(r.id, `unknown target: ${r.target}`, OUTBOUND_MAX_ATTEMPTS);
         if (status === "failed") cleanupMedia(r);
@@ -257,7 +261,8 @@ export class OutboundDrain {
 
   /** Returns true when the tick should stop (a hung socket or a lost link). */
   private async sendRow(r: OutboundRow, jid: string, content: AnyMessageContent): Promise<boolean> {
-    const msgId = this.d.store.markInFlight(r.id, r.msgId ?? this.d.newMessageId());
+    // claimForSend fixed the row's WhatsApp id.
+    const msgId = r.msgId ?? this.d.store.markInFlight(r.id, this.d.newMessageId());
     const quoted = parseQuoted(r.quotedJson, jid);
     const epoch = this.epoch;
     const linkLost = () => !this.up || this.epoch !== epoch;
@@ -293,7 +298,7 @@ export class OutboundDrain {
       if (!lost) this.countRot();
       void settled.then((late) => {
         if (late.ok) {
-          this.d.store.markSent(r.id, late.sent?.key?.id ?? msgId);
+          this.d.store.markSent(r.id, late.sent?.key?.id ?? msgId, waSeconds(late.sent?.messageTimestamp));
           cleanupMedia(r);
           this.d.log.warn({ id: r.id }, "whatsapp: timed-out send completed late — marked sent");
         } else if (this.d.store.status(r.id) === "in_flight") {
@@ -313,7 +318,7 @@ export class OutboundDrain {
       return true;
     }
     if (outcome.ok) {
-      this.d.store.markSent(r.id, outcome.sent?.key?.id ?? msgId);
+      this.d.store.markSent(r.id, outcome.sent?.key?.id ?? msgId, waSeconds(outcome.sent?.messageTimestamp));
       cleanupMedia(r);
       this.resetRot();
       this.d.log.info({ id: r.id, kind: r.kind, target: r.target, jid }, "whatsapp: outbound sent");

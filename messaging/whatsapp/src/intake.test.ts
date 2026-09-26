@@ -26,6 +26,8 @@ import {
   isOperatorId,
   OperatorLidCache,
   OPERATOR_LID_TTL_MS,
+  stampBatch,
+  waSeconds,
   type OperatorIds,
   MAX_CLOSE_ATTEMPTS,
   routeDm,
@@ -212,6 +214,58 @@ test("the next DM message answers a question the pipeline asked, for 15 minutes"
   assert.equal(store.expectsDmAnswer(sentAt + 3000), true);
   store.recordInbound({ itemKey: DM_KEY, chatId: `${OP}@s.whatsapp.net`, waMsgId: "d1", text: "yes", inputKind: "text", sender: "operator", nowMs: sentAt + 4000 });
   assert.equal(store.expectsDmAnswer(sentAt + 5000), false);
+});
+
+test("a batch's messages keep the arrival stamped before handling, and WhatsApp's own timestamp", async () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  const out = new OutboundQueueStore(db);
+  const opChat = `${OP}@s.whatsapp.net`;
+  const t0 = Date.now() - 60_000;
+  // "cancel item" and "yes" arrive in one upsert batch.
+  const batch = [
+    { id: "b1", text: "cancel item", ts: 1790000000 },
+    { id: "b2", text: "yes", ts: { low: 1790000000, toNumber: () => 1790000000 } },
+  ];
+  const stamps = stampBatch(batch, (m) => m.ts, t0);
+  // Handling the first message takes time; its question is sent before the
+  // second message is even recorded.
+  store.recordInbound({ itemKey: "chat", chatId: opChat, waMsgId: "b1", text: "cancel item", inputKind: "text", sender: "operator", arrival: stamps.get(batch[0]) });
+  const q = out.enqueue({ target: "dm", body: "Cancel item #1? Answer yes or no.", source: "intake:ask", dedupKey: "intake:answer:b1" });
+  out.markSent(q, "WAQ", 1790000003);
+  // A voice "yes" is recorded after its transcription finished, later still.
+  store.recordInbound({ itemKey: "chat", chatId: opChat, waMsgId: "b2", text: "yes", inputKind: "voice", sender: "operator", arrival: stamps.get(batch[1]) });
+  const d = new DatabaseSync(db);
+  const yes = d.prepare(`SELECT received_at, wa_ts FROM intake_inbound WHERE wa_msg_id = 'b2'`).get() as { received_at: string; wa_ts: number };
+  const sent = d.prepare(`SELECT sent_at, wa_ts FROM outbound_queue WHERE id = ?`).get(q) as { sent_at: string; wa_ts: number };
+  assert.equal(yes.received_at, new Date(t0).toISOString(), "the arrival, not the recording time");
+  assert.ok(yes.received_at < sent.sent_at, "the yes arrived before the question was sent");
+  assert.equal(yes.wa_ts, 1790000000);
+  assert.equal(sent.wa_ts, 1790000003, "the question's WhatsApp timestamp from the send result");
+  assert.equal(waSeconds("1790000001"), 1790000001);
+  assert.equal(waSeconds(undefined), null);
+});
+
+test("an appended line is in the claimed body or refused, never lost", () => {
+  const db = tmpDb();
+  const out = new OutboundQueueStore(db);
+  const d = new DatabaseSync(db);
+  // The Rust append (whatsapp_queue::append_to_pending): only a pending row.
+  const append = (key: string) =>
+    Number(d.prepare(`UPDATE outbound_queue SET body = body || ? WHERE dedup_key = ? AND status = 'pending'`).run("\n\nAlso received: 'x'", key).changes) === 1;
+  // Append first, then the claim: the claimed body has the line.
+  const a = out.enqueue({ target: "dm", body: "Question A?", source: "intake:ask", dedupKey: "qa" });
+  assert.equal(append("qa"), true);
+  const claimedA = out.claimForSend(a, "WA-A");
+  assert.ok(claimedA?.body.endsWith("Also received: 'x'"), claimedA?.body);
+  // Claim first, then the append: refused, so the caller queues the
+  // separate note; the claimed body is what is sent.
+  const b = out.enqueue({ target: "dm", body: "Question B?", source: "intake:ask", dedupKey: "qb" });
+  const claimedB = out.claimForSend(b, "WA-B");
+  assert.equal(claimedB?.body, "Question B?");
+  assert.equal(append("qb"), false, "refused on a claimed row");
+  // A claimed row is not claimed twice while its send is fresh.
+  assert.equal(out.claimForSend(b, "WA-B2"), null);
 });
 
 test("a remapped LID stops being the operator", async () => {

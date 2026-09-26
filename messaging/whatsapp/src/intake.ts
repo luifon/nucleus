@@ -190,6 +190,37 @@ export async function isOperatorId(
   return false;
 }
 
+/** When a message reached the bot (ADR-036): `atMs`, taken in the
+ *  `messages.upsert` handler before any await (so a batch's later message,
+ *  or a voice note still being transcribed, keeps its real arrival time),
+ *  and `waTs`, WhatsApp's own `messageTimestamp` in seconds when known. A
+ *  message can answer only a question sent before both. */
+export interface Arrival {
+  atMs: number;
+  waTs: number | null;
+}
+
+/** WhatsApp's `messageTimestamp` (a number, or a protobuf Long) in
+ *  seconds, or null. */
+export function waSeconds(ts: unknown): number | null {
+  if (typeof ts === "number" && Number.isFinite(ts)) return Math.floor(ts);
+  if (ts && typeof ts === "object") {
+    const t = ts as { toNumber?: () => number; low?: number };
+    if (typeof t.toNumber === "function") return Math.floor(t.toNumber());
+    if (typeof t.low === "number") return t.low;
+  }
+  if (typeof ts === "string" && /^\d+$/.test(ts)) return Number(ts);
+  return null;
+}
+
+/** The arrival of every message of one `messages.upsert` batch, stamped at
+ *  once, before the batch is handled. */
+export function stampBatch<T>(messages: readonly T[], tsOf: (m: T) => unknown, nowMs = Date.now()): Map<T, Arrival> {
+  const out = new Map<T, Arrival>();
+  for (const m of messages) out.set(m, { atMs: nowMs, waTs: waSeconds(tsOf(m)) });
+  return out;
+}
+
 /** How long a LID the mapping resolved to the operator counts for the
  *  checks that cannot ask the mapping (role lookup, target policy). */
 export const OPERATOR_LID_TTL_MS = 10 * 60 * 1000;
@@ -217,6 +248,13 @@ export class OperatorLidCache {
     if (!digits) return;
     this.verified.set(digits, nowMs);
     this.persist?.verified(digits, nowMs);
+  }
+
+  /** The live check rejected LID `digits`: forget it at once. */
+  forget(digits: string): void {
+    if (!digits) return;
+    this.verified.delete(digits);
+    this.persist?.dropped(digits);
   }
 
   /** The entries verified within the TTL. */
@@ -461,7 +499,8 @@ export class IntakeStore {
         text        TEXT NOT NULL,
         received_at TEXT NOT NULL,
         input_kind  TEXT NOT NULL DEFAULT 'unknown',
-        sender      TEXT NOT NULL DEFAULT 'unknown'
+        sender      TEXT NOT NULL DEFAULT 'unknown',
+        wa_ts       INTEGER
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_inbound_msg
         ON intake_inbound(chat_id, wa_msg_id);
@@ -487,6 +526,7 @@ export class IntakeStore {
       (c) => c.name,
     );
     if (!cols.includes("sender")) this.db.exec(`ALTER TABLE intake_inbound ADD COLUMN sender TEXT NOT NULL DEFAULT 'unknown'`);
+    if (!cols.includes("wa_ts")) this.db.exec(`ALTER TABLE intake_inbound ADD COLUMN wa_ts INTEGER`);
   }
 
   /** Pending requests that are due (a close waiting for its backoff is
@@ -688,21 +728,25 @@ export class IntakeStore {
     text: string;
     inputKind: InputKind;
     sender: "operator";
+    /** When the message reached the bot (`Arrival`), not when it was
+     *  handled; now when unknown. */
+    arrival?: Arrival | null;
     nowMs?: number;
   }): boolean {
     const res = this.db
       .prepare(
-        `INSERT OR IGNORE INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender, wa_ts)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.itemKey,
         input.chatId,
         input.waMsgId,
         input.text,
-        new Date(input.nowMs ?? Date.now()).toISOString(),
+        new Date(input.arrival?.atMs ?? input.nowMs ?? Date.now()).toISOString(),
         input.inputKind,
         input.sender,
+        input.arrival?.waTs ?? null,
       );
     return Number(res.changes) > 0;
   }

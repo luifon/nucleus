@@ -94,6 +94,8 @@ import {
   OperatorLidCache,
   OPERATOR_LID_TTL_MS,
   routeOperatorDm,
+  stampBatch,
+  type Arrival,
   stripGroupMarker,
   type InputKind,
   type OperatorIds,
@@ -164,6 +166,10 @@ let baileysLogger = makeBaileysLogger(null);
  */
 type ChatRole = "whatsapp-group" | "braindump" | "intake" | "dm";
 let groupAllowlist: GroupAllowlist | null = null;
+
+/** ADR-036: when each message reached the bot (stamped in the
+ *  `messages.upsert` handler), for the intake rows. */
+const arrivals = new WeakMap<WAMessage, Arrival>();
 
 /** ADR-036: LIDs the live mapping resolved to the operator, for the
  *  synchronous checks (role lookup, target policy), which cannot ask the
@@ -582,7 +588,7 @@ async function main() {
   const secretRules = new SecretRuleSource(config.workspaceRoot);
   const drain = new OutboundDrain({
     store: outbound,
-    resolveTarget: (target, source) => resolveOutboundTarget(target, source, config, store),
+    resolveTarget: (target, source, id) => resolveOutboundTarget(target, source, id, config, store, outbound),
     send: (jid, content, opts) => {
       if (process.env.NUCLEUS_WHATSAPP_FORCE_SEND_FAIL === "1") {
         return Promise.reject(new Error("Connection Closed (synthetic — NUCLEUS_WHATSAPP_FORCE_SEND_FAIL)"));
@@ -937,6 +943,8 @@ async function connect(bot: Bot): Promise<void> {
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
+    // ADR-036: every message's arrival, stamped before any await.
+    for (const [m, a] of stampBatch(messages, (x) => x.messageTimestamp)) arrivals.set(m, a);
     for (const msg of messages) {
       await handleMessage(sock, msg, bot).catch((e) => {
         log.error({ err: e?.message }, "whatsapp: handler failed");
@@ -1017,7 +1025,14 @@ function startOutboundDrain(drain: OutboundDrain): void {
  *  group by JID or name. An operator-only message (the pipeline, reminders,
  *  `dm`) reaches a DM only when it is the operator by the live check.
  *  Returns null for anything else — no sending to arbitrary chats. */
-async function resolveOutboundTarget(target: string, source: string, config: Config, store: ChatSessionStore): Promise<string | null> {
+async function resolveOutboundTarget(
+  target: string,
+  source: string,
+  id: number,
+  config: Config,
+  store: ChatSessionStore,
+  outbound: OutboundQueueStore,
+): Promise<string | null> {
   return resolveQueuedTarget({
     target,
     source,
@@ -1026,6 +1041,13 @@ async function resolveOutboundTarget(target: string, source: string, config: Con
     operatorDm: () => operatorDmChat(config, store),
     operatorPhone: config.operatorId,
     isOperator: (jid) => isOperatorId(jid, botOperatorIds(config), pnForLid),
+    // ADR-036: a LID the live mapping no longer resolves to the operator
+    // loses its verification, and the row goes to his phone JID.
+    onStaleLid: (lid, to) => {
+      operatorLidCache.forget(normalizeSenderId(lid));
+      outbound.retarget(id, to);
+      log.warn({ id, to }, "whatsapp: operator LID no longer verified — row redirected to the operator's phone");
+    },
   });
 }
 
@@ -1331,6 +1353,7 @@ async function dispatchInbound(
         text,
         inputKind: inputKind === "voice" ? "voice" : typedKind(msg),
         sender: "operator",
+        arrival: arrivals.get(msg),
       });
     }
   }
@@ -1413,6 +1436,7 @@ function routeToItem(bot: Bot, itemKey: string, chatId: string, msg: WAMessage, 
     text,
     inputKind,
     sender: "operator",
+    arrival: arrivals.get(msg),
   });
   log.info({ chatId, item: itemKey, fresh, inputKind }, "whatsapp: message routed to an issue-pipeline item");
   if (fresh) runNucleus(bot.config, ["intake", "tick"]);
