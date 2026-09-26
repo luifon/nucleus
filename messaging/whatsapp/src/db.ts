@@ -241,6 +241,10 @@ export class ChatSessionStore {
       // the WhatsApp message id every attempt of the row reuses).
       ["in_flight_at", "in_flight_at TEXT"],
       ["dedup_key", "dedup_key TEXT"],
+      // ADR-036: WhatsApp's server timestamp of the sent message (seconds),
+      // from the send result; a reply can answer a question only when it
+      // is later.
+      ["wa_ts", "wa_ts INTEGER"],
     ]);
     addColumnsIfMissing(this.db, "session_inbox", [["dedup_key", "dedup_key TEXT"]]);
     addColumnsIfMissing(this.db, "chat_inbound", [
@@ -300,6 +304,13 @@ export class ChatSessionStore {
   /** Most recently active chat whose id normalizes to one of `digits` — the
    *  chat key the operator's DM currently runs under (@s.whatsapp.net or
    *  @lid). */
+  /** Every chat with a session, most recently active first. */
+  chatsByRecency(): string[] {
+    return (this.db.prepare("SELECT chat_id FROM chat_sessions ORDER BY last_active DESC").all() as Array<{ chat_id: string }>).map(
+      (r) => r.chat_id,
+    );
+  }
+
   latestChatAmong(match: (chatId: string) => boolean): string | null {
     const rows = this.db
       .prepare("SELECT chat_id FROM chat_sessions ORDER BY last_active DESC")
@@ -689,15 +700,56 @@ export class OutboundQueueStore {
     return row?.msg_id ?? msgId;
   }
 
-  markSent(id: number, msgId: string): void {
+  markSent(id: number, msgId: string, waTs: number | null = null): void {
     const now = new Date().toISOString();
     this.db
       .prepare(
         `UPDATE outbound_queue
-            SET status = 'sent', sent_at = COALESCE(sent_at, ?), msg_id = COALESCE(NULLIF(?, ''), msg_id)
+            SET status = 'sent', sent_at = COALESCE(sent_at, ?), msg_id = COALESCE(NULLIF(?, ''), msg_id),
+                wa_ts = COALESCE(wa_ts, ?)
           WHERE id = ?`,
       )
-      .run(now, msgId, id);
+      .run(now, msgId, waTs, id);
+  }
+
+  /** Claim row `id` for a send and read it, in one statement (ADR-036):
+   *  status becomes `in_flight` and the body is read as of that moment, so
+   *  a producer's change to a `pending` row (an appended line) is either in
+   *  the body sent or refused, never lost. Also takes a stale `in_flight`
+   *  row (older than IN_FLIGHT_GRACE_MS). Null when the row is not
+   *  claimable. `msgId` is the WhatsApp id to keep (the first claim stores
+   *  it). */
+  claimForSend(id: number, msgId: string, nowMs = Date.now()): OutboundRow | null {
+    const cutoff = new Date(nowMs - IN_FLIGHT_GRACE_MS).toISOString();
+    const r = this.db
+      .prepare(
+        `UPDATE outbound_queue
+            SET status = 'in_flight', in_flight_at = ?, msg_id = COALESCE(msg_id, ?)
+          WHERE id = ? AND (status = 'pending' OR (status = 'in_flight' AND in_flight_at < ?))
+          RETURNING id, target, body, source, enqueued_at, attempts, kind, media_path, mimetype, filename, quoted_json, msg_id`,
+      )
+      .get(new Date(nowMs).toISOString(), msgId, id, cutoff) as any;
+    if (!r) return null;
+    return {
+      id: r.id,
+      target: r.target,
+      body: r.body,
+      source: r.source,
+      enqueuedAt: r.enqueued_at,
+      attempts: r.attempts,
+      kind: (r.kind as OutboundKind) ?? "text",
+      mediaPath: r.media_path,
+      mimetype: r.mimetype,
+      filename: r.filename,
+      quotedJson: r.quoted_json,
+      msgId: r.msg_id,
+    };
+  }
+
+  /** Send row `id` to `target` instead (ADR-036: an operator LID the live
+   *  mapping no longer accepts; the row goes to his phone JID). */
+  retarget(id: number, target: string): void {
+    this.db.prepare(`UPDATE outbound_queue SET target = ? WHERE id = ?`).run(target, id);
   }
 
   /** A server acknowledgement for WhatsApp message `msgId` arrived: the row

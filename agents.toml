@@ -195,3 +195,13 @@ runtime       = "rust"
 # The ledger is memory/tasks.db; worker logs in memory/logs/tasks/; raw
 # session output via the runs.jsonl index.
 tmux_session  = "nucleus-tasks"
+
+[[agent]]
+name          = "intake-interpreter"
+class         = "ephemeral"
+launch        = "on-demand"
+runtime       = "rust"
+# ADR-036: reads each operator WhatsApp message about the issue pipeline in a
+# one-shot session with no tools, started by `nucleus intake tick`. It only
+# classifies the message; code decides what happens.
+tmux_session  = "nucleus-intake"

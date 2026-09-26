@@ -1,6 +1,7 @@
 //! Pipeline stages, their transitions, and the pure decisions the pipeline
-//! makes from agent output and operator messages (ADR-036). Everything here
-//! is pure and unit-tested; `pipeline.rs` applies it.
+//! makes from agent output (ADR-036). Everything here is pure and
+//! unit-tested; `pipeline.rs` applies it. Operator messages are read in
+//! `decide.rs`.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,10 +17,9 @@ pub enum Stage {
     Refinement,
     /// The implementation agent runs, then Nucleus runs the tests.
     Implementation,
-    /// Nucleus pushes the branch and opens the draft pull request.
+    /// Nucleus pushes the branch, opens the draft pull request and posts
+    /// its link on the issue; the item then closes.
     Pr,
-    /// The draft PR is open; the issue comment waits for the operator.
-    Review,
     Closed,
     /// A step failed; `nucleus intake retry` or the dashboard resumes it.
     Failed,
@@ -40,13 +40,12 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Stage; 12] = [
+    pub const ALL: [Stage; 11] = [
         Stage::Queued,
         Stage::Eval,
         Stage::Refinement,
         Stage::Implementation,
         Stage::Pr,
-        Stage::Review,
         Stage::Closed,
         Stage::Failed,
         Stage::Cancelled,
@@ -62,7 +61,6 @@ impl Stage {
             Stage::Refinement => "refinement",
             Stage::Implementation => "implementation",
             Stage::Pr => "pr",
-            Stage::Review => "review",
             Stage::Closed => "closed",
             Stage::Failed => "failed",
             Stage::Cancelled => "cancelled",
@@ -92,8 +90,8 @@ pub enum StageEvent {
     EvalNeedsPlan,
     PlanApproved,
     ImplementationDone,
-    PrOpened,
-    /// The review stage ended: the comment was posted or skipped.
+    /// The pull request stage ended: the draft PR is open and its link is
+    /// posted on the issue (or the source has no reply channel).
     Finished,
     Failed,
     Cancel,
@@ -125,12 +123,11 @@ pub fn transition(from: Stage, ev: &StageEvent) -> Result<Stage> {
         (Eval, E::EvalNeedsPlan) => Refinement,
         (Refinement, E::PlanApproved) => Implementation,
         (Implementation, E::ImplementationDone) => Pr,
-        (Pr, E::PrOpened) => Review,
-        (Review, E::Finished) => Closed,
+        (Pr, E::Finished) => Closed,
         (Failed, E::Failed) => bail!("item already failed"),
-        (Queued | Eval | Refinement | Implementation | Pr | Review, E::Blocked) => Blocked,
+        (Queued | Eval | Refinement | Implementation | Pr, E::Blocked) => Blocked,
         (Blocked, E::Retry { failed_in: Queued | Eval }) => Queued,
-        (Blocked, E::Retry { failed_in: failed_in @ (Refinement | Implementation | Pr | Review) }) => *failed_in,
+        (Blocked, E::Retry { failed_in: failed_in @ (Refinement | Implementation | Pr) }) => *failed_in,
         (Queued | Eval | Refinement | Implementation, E::Hold) => Held,
         (Held, E::Release { held_in: held_in @ (Queued | Eval | Refinement | Implementation) }) => *held_in,
         (_, E::Failed) => Failed,
@@ -140,7 +137,7 @@ pub fn transition(from: Stage, ev: &StageEvent) -> Result<Stage> {
         (Failed, E::Retry { failed_in }) => match failed_in {
             // An eval is run again from the start.
             Queued | Eval => Queued,
-            Refinement | Implementation | Pr | Review | Held => *failed_in,
+            Refinement | Implementation | Pr | Held => *failed_in,
             Closed | Failed | Cancelled | Stale | Blocked => bail!("nothing to retry in stage {}", failed_in.as_str()),
         },
         (s, e) => bail!("{e:?} does not apply to an item in the {} stage", s.as_str()),
@@ -296,44 +293,6 @@ pub fn split_plan(reply: &str, label: &str) -> (String, Option<String>) {
     (shown.trim().to_string(), (!plan.is_empty()).then_some(plan))
 }
 
-/// An operator message in an item's thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OperatorCommand {
-    /// Approve the latest plan; `Some(v)` names the version the operator
-    /// read, which must be the latest.
-    ApprovePlan(Option<u32>),
-    ApproveComment,
-    SkipComment,
-    Cancel,
-    /// Release an item held for hidden content; the code names the hold
-    /// the operator reviewed (`None` is refused with the current code).
-    Release(Option<String>),
-    /// Anything else: a message for the refinement agent or the thread.
-    Message,
-}
-
-/// Read an operator message. Only a message that consists of the command
-/// alone is a command, so a sentence that contains "approve" stays a
-/// message. Approval is decided by code from the operator's own message
-/// (never by the model), because it releases implementation work.
-pub fn parse_command(text: &str) -> OperatorCommand {
-    let t = text.trim().trim_end_matches(['.', '!']).trim().to_lowercase();
-    let words: Vec<&str> = t.split_whitespace().collect();
-    let version = |w: &str| w.strip_prefix('v').and_then(|n| n.parse::<u32>().ok());
-    match words.as_slice() {
-        ["approve"] | ["approved"] | ["approve", "plan"] => OperatorCommand::ApprovePlan(None),
-        ["approve", v] | ["approve", "plan", v] if version(v).is_some() => OperatorCommand::ApprovePlan(version(v)),
-        ["approve", "comment"] => OperatorCommand::ApproveComment,
-        ["skip", "comment"] => OperatorCommand::SkipComment,
-        ["cancel"] | ["cancel", "item"] => OperatorCommand::Cancel,
-        ["release"] | ["release", "item"] => OperatorCommand::Release(None),
-        ["release", code] if code.len() <= 64 && code.bytes().all(|c| c.is_ascii_hexdigit()) => {
-            OperatorCommand::Release(Some(code.to_string()))
-        }
-        _ => OperatorCommand::Message,
-    }
-}
-
 // ── WhatsApp groups ──────────────────────────────────────────────────────
 
 /// True when one more group may be requested: fewer than `max_per_day`
@@ -397,9 +356,8 @@ mod tests {
         ok(Eval, E::EvalNeedsPlan, Refinement);
         ok(Refinement, E::PlanApproved, Implementation);
         ok(Implementation, E::ImplementationDone, Pr);
-        ok(Pr, E::PrOpened, Review);
-        ok(Review, E::Finished, Closed);
-        for s in [Queued, Eval, Refinement, Implementation, Pr, Review] {
+        ok(Pr, E::Finished, Closed);
+        for s in [Queued, Eval, Refinement, Implementation, Pr] {
             ok(s, E::Failed, Failed);
             ok(s, E::Cancel, Cancelled);
             ok(s, E::SourceClosed, Closed);
@@ -407,9 +365,7 @@ mod tests {
         }
         ok(Failed, E::Stale, Stale);
         ok(Pr, E::Blocked, Blocked);
-        ok(Review, E::Blocked, Blocked);
         ok(Blocked, E::Retry { failed_in: Pr }, Pr);
-        ok(Blocked, E::Retry { failed_in: Review }, Review);
         ok(Queued, E::Blocked, Blocked);
         ok(Implementation, E::Blocked, Blocked);
         ok(Blocked, E::Retry { failed_in: Queued }, Queued);
@@ -422,7 +378,6 @@ mod tests {
         ok(Failed, E::Retry { failed_in: Refinement }, Refinement);
         ok(Failed, E::Retry { failed_in: Implementation }, Implementation);
         ok(Failed, E::Retry { failed_in: Pr }, Pr);
-        ok(Failed, E::Retry { failed_in: Review }, Review);
         for s in [Queued, Eval, Refinement, Implementation] {
             ok(s, E::Hold, Held);
             ok(Held, E::Release { held_in: s }, s);
@@ -446,8 +401,9 @@ mod tests {
         bad(Refinement, E::EvalSimple);
         bad(Refinement, E::ImplementationDone);
         bad(Implementation, E::PlanApproved);
-        bad(Implementation, E::PrOpened);
-        bad(Review, E::PlanApproved);
+        bad(Implementation, E::Finished);
+        bad(Refinement, E::Finished);
+        bad(Pr, E::PlanApproved);
         bad(Failed, E::Failed);
         bad(Refinement, E::Retry { failed_in: Eval });
         bad(Failed, E::Retry { failed_in: Closed });
@@ -456,7 +412,6 @@ mod tests {
         bad(Blocked, E::Retry { failed_in: Closed });
         // Only a stage before an agent step holds; a release returns there.
         bad(Pr, E::Hold);
-        bad(Review, E::Hold);
         bad(Held, E::Hold);
         bad(Refinement, E::Release { held_in: Refinement });
         bad(Held, E::Release { held_in: Pr });
@@ -519,26 +474,6 @@ mod tests {
         assert_eq!((shown.as_str(), plan), ("Two questions first.", None));
         let (_, plan) = split_plan("===PLAN===\n\n===END PLAN===", "plan v1");
         assert_eq!(plan, None, "an empty plan is not a plan");
-    }
-
-    #[test]
-    fn operator_commands_are_whole_messages() {
-        use OperatorCommand::*;
-        assert_eq!(parse_command("approve"), ApprovePlan(None));
-        assert_eq!(parse_command("  Approve!  "), ApprovePlan(None));
-        assert_eq!(parse_command("approve plan"), ApprovePlan(None));
-        assert_eq!(parse_command("approve v3"), ApprovePlan(Some(3)));
-        assert_eq!(parse_command("approve plan v12"), ApprovePlan(Some(12)));
-        assert_eq!(parse_command("approve comment"), ApproveComment);
-        assert_eq!(parse_command("skip comment."), SkipComment);
-        assert_eq!(parse_command("cancel"), Cancel);
-        assert_eq!(parse_command("Release"), Release(None));
-        assert_eq!(parse_command("release A1b2C3"), Release(Some("a1b2c3".into())));
-        assert_eq!(parse_command("release now"), Message);
-        assert_eq!(parse_command("release the item now"), Message);
-        assert_eq!(parse_command("I approve of the idea but change step 2"), Message);
-        assert_eq!(parse_command("approve vX"), Message);
-        assert_eq!(parse_command("please cancel the second step"), Message);
     }
 
     #[test]

@@ -508,8 +508,15 @@ pub async fn add_event(pool: &SqlitePool, task_id: &str, kind: &str, message: &s
     add_event_on(&mut conn, task_id, kind, message).await
 }
 
+/// whatsapp.db in the directory of tasks.db (both live in `memory/`).
+fn sibling_whatsapp_db(pool: &SqlitePool) -> PathBuf {
+    let opts = pool.connect_options();
+    opts.get_filename().with_file_name("whatsapp.db")
+}
+
 /// Validate and canonicalize a new task. Pure except the DM allowlist read
-/// for a `whatsapp-dm` origin_ref.
+/// for a `whatsapp-dm` origin_ref (already checked against the operator's
+/// LIDs by [`create`]).
 fn validate(t: &mut NewTask) -> Result<()> {
     if !ORIGINS.contains(&t.origin.as_str()) {
         bail!("unknown origin {:?} (expected one of: {})", t.origin, ORIGINS.join(", "));
@@ -544,6 +551,7 @@ fn validate(t: &mut NewTask) -> Result<()> {
         t.kind = "general".into();
     }
     t.origin_ref = match (t.origin.as_str(), t.origin_ref.take()) {
+        ("whatsapp-dm", Some(r)) if r.trim().ends_with("@lid") => Some(r),
         ("whatsapp-dm", Some(r)) => Some(crate::whatsapp_queue::canonical_dm_chat(&r)?),
         (_, r) => r.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()),
     };
@@ -560,6 +568,15 @@ fn validate(t: &mut NewTask) -> Result<()> {
 /// among the tasks the caller may see. Does not start a worker; see
 /// [`launch_worker`].
 pub async fn create(pool: &SqlitePool, mut t: NewTask, scope: &Scope) -> Result<Task> {
+    // ADR-036: a task from the operator's DM in LID form is accepted when
+    // the LID is in WHATSAPP_OPERATOR_LIDS or the bot verified it through
+    // the live mapping recently (whatsapp.db next to tasks.db).
+    if t.origin == "whatsapp-dm" {
+        if let Some(r) = t.origin_ref.take() {
+            let lids = crate::whatsapp_queue::accepted_operator_lids(&sibling_whatsapp_db(pool)).await;
+            t.origin_ref = Some(crate::whatsapp_queue::canonical_dm_chat_with(&r, &lids)?);
+        }
+    }
     validate(&mut t)?;
     let parent = match &t.parent_id {
         Some(p) => Some(get(pool, p, scope).await.context("resolving --parent")?.id),
@@ -1723,7 +1740,10 @@ async fn note_given_up_deliveries(workspace_root: &Path, pool: &SqlitePool, cfg:
             match t.origin.as_str() {
                 "whatsapp-dm" => {
                     let chat = match &t.origin_ref {
-                        Some(r) => crate::whatsapp_queue::canonical_dm_chat(r)?,
+                        Some(r) => crate::whatsapp_queue::task_result_chat(
+                            r,
+                            &crate::whatsapp_queue::accepted_operator_lids(&workspace_root.join(crate::whatsapp_queue::WHATSAPP_DB_PATH)).await,
+                        )?,
                         None => crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM.to_string(),
                     };
                     let wa = crate::whatsapp_queue::open(workspace_root).await?;
@@ -1870,10 +1890,15 @@ async fn deliver_inner(
     match t.origin.as_str() {
         "whatsapp-dm" => {
             // The exact chat the task came from, re-validated against the DM
-            // allowlist; without one (a task started from a shell), the bot's
-            // operator-DM resolution, used for both rows.
+            // allowlist and the operator's LIDs (an operator LID whose
+            // verification expired falls back to his phone JID); without
+            // one (a task started from a shell), the bot's operator-DM
+            // resolution, used for both rows.
             let chat = match &t.origin_ref {
-                Some(r) => crate::whatsapp_queue::canonical_dm_chat(r)?,
+                Some(r) => crate::whatsapp_queue::task_result_chat(
+                    r,
+                    &crate::whatsapp_queue::accepted_operator_lids(&workspace_root.join(crate::whatsapp_queue::WHATSAPP_DB_PATH)).await,
+                )?,
                 None => crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM.to_string(),
             };
             let redrives: i64 = sqlx::query_scalar("SELECT delivery_redrives FROM tasks WHERE id = ?1")
@@ -1952,8 +1977,16 @@ mod tests {
         }
     }
 
+    /// Another contact on the DM allowlist (not the operator).
+    const TEST_OTHER_DM: &str = "5511777777777";
+    /// The operator's LID in WHATSAPP_OPERATOR_LIDS.
+    const TEST_OP_LID: &str = "123451234512345";
+
     fn dm_task(title: &str, chat: &str) -> NewTask {
-        std::env::set_var("WHATSAPP_ALLOWED_DM_JIDS", TEST_DM);
+        // The same values in every test (tests share the process
+        // environment).
+        std::env::set_var("WHATSAPP_ALLOWED_DM_JIDS", format!("{TEST_DM},{TEST_OTHER_DM}"));
+        std::env::set_var("WHATSAPP_OPERATOR_LIDS", TEST_OP_LID);
         let mut t = new_task(title);
         t.origin = "whatsapp-dm".into();
         t.origin_ref = Some(chat.into());
@@ -2209,6 +2242,56 @@ mod tests {
         assert_eq!(inbox[0].1, "5511999999999@s.whatsapp.net", "the context goes to the same chat");
         assert!(inbox[0].2.starts_with("task:"));
         assert!(!inbox[0].0.contains("[agent-msg"), "the bot builds the envelope, not the producer");
+    }
+
+    async fn deliver_done(d: &tempfile::TempDir, pool: &SqlitePool, t: &Task) -> String {
+        claim(pool, &t.id, 1, 6).await.unwrap();
+        finish(pool, &t.id, TaskStatus::Done, Some("ok"), None).await.unwrap();
+        let t = get(pool, &t.id, &Scope::Operator).await.unwrap();
+        deliver(d.path(), pool, &cfg(), &t).await;
+        let wa = crate::whatsapp_queue::open(d.path()).await.unwrap();
+        let target: String = sqlx::query_scalar("SELECT target FROM outbound_queue WHERE dedup_key LIKE ?1")
+            .bind(format!("task:{}:%", t.id))
+            .fetch_one(&wa)
+            .await
+            .unwrap();
+        wa.close().await;
+        target
+    }
+
+    #[tokio::test]
+    async fn operator_lid_chats_get_their_task_results() {
+        let (d, pool) = temp_pool().await;
+        // A chat in WHATSAPP_OPERATOR_LIDS: created, delivered to that chat.
+        let lid_chat = format!("{TEST_OP_LID}@lid");
+        let t = create(&pool, dm_task("from the operator LID", &lid_chat), &Scope::Operator).await.unwrap();
+        assert_eq!(t.origin_ref.as_deref(), Some(lid_chat.as_str()));
+        assert_eq!(deliver_done(&d, &pool, &t).await, lid_chat);
+
+        // A LID the bot verified through the live mapping: created while
+        // the verification is fresh; after it expires the result goes to the
+        // operator's phone JID.
+        let mapped = "987659876598765";
+        let mapped_chat = format!("{mapped}@lid");
+        assert!(create(&pool, dm_task("unverified", &mapped_chat), &Scope::Operator).await.is_err(), "not verified yet");
+        let wa = crate::whatsapp_queue::open(d.path()).await.unwrap();
+        sqlx::query("INSERT INTO operator_lid_verified (digits, verified_at) VALUES (?1, ?2)")
+            .bind(mapped)
+            .bind(crate::timestamp::now())
+            .execute(&wa)
+            .await
+            .unwrap();
+        let t = create(&pool, dm_task("from the mapped LID", &mapped_chat), &Scope::Operator).await.unwrap();
+        sqlx::query("UPDATE operator_lid_verified SET verified_at = '2000-01-01T00:00:00.000Z'").execute(&wa).await.unwrap();
+        wa.close().await;
+        assert_eq!(deliver_done(&d, &pool, &t).await, format!("{TEST_DM}@s.whatsapp.net"), "falls back, not dropped");
+
+        // Another allowed contact's task still goes to that contact.
+        let other_chat = format!("{TEST_OTHER_DM}@s.whatsapp.net");
+        let t = create(&pool, dm_task("from another contact", &other_chat), &Scope::Operator).await.unwrap();
+        assert_eq!(deliver_done(&d, &pool, &t).await, other_chat);
+        // An unknown LID is refused.
+        assert!(create(&pool, dm_task("unknown", &format!("{}@lid", "111112222233333")), &Scope::Operator).await.is_err());
     }
 
     #[tokio::test]

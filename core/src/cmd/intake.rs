@@ -8,10 +8,15 @@
 //! Who may do what (`crate::caller`):
 //! - the operator: every command (`release` of a held item only from the
 //!   operator, like `approve-plan`);
-//! - the WhatsApp DM chat session: `list`, `show`, and `cancel` (not in a
-//!   turn that read an agent message). Approvals are the operator's own
-//!   messages in the item's thread, read by code, never a session's
-//!   command;
+//! - the WhatsApp DM chat session: `list`, `show` and `interpret-latest`
+//!   (not in a turn that read an agent message). It changes no item itself:
+//!   a cancel, like an approval or a release, is the operator's own stored
+//!   message, read by the interpreter through `interpret-latest` and
+//!   confirmed. `interpret-latest` takes no text, so the session can
+//!   trigger an interpretation but never supply or change what is
+//!   interpreted. Approvals and releases come from the
+//!   operator's own WhatsApp messages, read by the pipeline's interpreter
+//!   and decided by code, never from a session's command;
 //! - a detached process (launchd, the bot, the dashboard): `tick`;
 //! - workers and every other Nucleus session: nothing.
 
@@ -74,16 +79,12 @@ enum Cmd {
         #[arg(long)]
         version: Option<u32>,
     },
-    /// Approve the proposed issue comment (optionally replacing its text).
-    ApproveComment {
-        item: String,
-        #[arg(long)]
-        text: Option<String>,
-    },
-    /// Close the review without commenting on the issue.
-    SkipComment { item: String },
     /// Stop an item and its running task.
     Cancel { item: String },
+    /// Have the operator's latest WhatsApp DM message (as the bot stored
+    /// it, never text given here) read by the intake interpreter. For the
+    /// DM chat session, when that message looks like a pipeline decision.
+    InterpretLatest,
     /// Resume a failed item at the stage it failed in.
     Retry { item: String },
     /// Release an item held for hidden content (`show <n> --hidden` lists
@@ -111,10 +112,10 @@ fn authorize(caller: &Caller, cmd: &Cmd) -> Result<()> {
     match &caller.role {
         Role::Operator => {}
         Role::Chat { origin, .. } if origin == "whatsapp-dm" => match cmd {
-            Cmd::List { .. } | Cmd::Show { .. } | Cmd::Cancel { .. } => {}
+            Cmd::List { .. } | Cmd::Show { .. } | Cmd::InterpretLatest => {}
             _ => bail!(
-                "a chat session can list, show and cancel items; approvals and replies are the \
-                 operator's own messages in the item's thread (`#<n> approve`), or the dashboard"
+                "a chat session can list and show items and run interpret-latest; cancels, approvals, releases and replies are the \
+                 operator's own WhatsApp messages about the item (the pipeline reads them), or the dashboard"
             ),
         },
         Role::Detached => {
@@ -135,6 +136,61 @@ fn authorize(caller: &Caller, cmd: &Cmd) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// What `interpret-latest` prints: a code-owned line the chat session
+/// follows.
+fn latest_text(r: &pipeline::Latest) -> String {
+    match r {
+        pipeline::Latest::Handled => format!(
+            "HANDLED: the issue pipeline took the operator's latest message as a decision and answered the operator \
+             in this chat itself. End your turn with exactly this line and nothing else: {}",
+            pipeline::INTAKE_HANDLED
+        ),
+        pipeline::Latest::Turn(msgs) => turn_text(msgs),
+        pipeline::Latest::NotADecision => "NOT A DECISION: the interpreter did not read a pipeline decision in the \
+             operator's latest message. Answer the operator normally."
+            .to_string(),
+        pipeline::Latest::NoMessage(why) => format!("NO MESSAGE: {why}. Answer the operator normally."),
+    }
+}
+
+/// `interpret-latest`'s output for the chat session's turn: which of the
+/// operator's messages the pipeline handled and which the session answers.
+fn turn_text(msgs: &[pipeline::TurnMessage]) -> String {
+    use pipeline::TurnOutcome;
+    let list = |o: TurnOutcome| -> Vec<String> {
+        msgs.iter().filter(|m| m.outcome == o).map(|m| format!("{} \"{}\"", m.position, m.preview)).collect()
+    };
+    let handled = list(TurnOutcome::Handled);
+    let earlier = list(TurnOutcome::Earlier);
+    let rest = list(TurnOutcome::ForSession);
+    if handled.is_empty() && rest.is_empty() {
+        return "NO MESSAGE: the operator's messages in this turn were already interpreted. Answer the operator normally."
+            .into();
+    }
+    if handled.is_empty() {
+        return "NOT A DECISION: the interpreter did not read a pipeline decision in the operator's messages of this \
+                turn. Answer the operator normally."
+            .into();
+    }
+    let mut out = format!(
+        "HANDLED: the issue pipeline took these messages of the operator as decisions and answered him in this chat \
+         itself: {}.",
+        handled.join("; ")
+    );
+    if !earlier.is_empty() {
+        out.push_str(&format!(" Already handled before: {}.", earlier.join("; ")));
+    }
+    if rest.is_empty() {
+        out.push_str(&format!(" Nothing is left for you. End your turn with exactly this line and nothing else: {}", pipeline::INTAKE_HANDLED));
+    } else {
+        out.push_str(&format!(
+            " Not handled, answer only these normally and do not repeat or comment on the decisions: {}.",
+            rest.join("; ")
+        ));
+    }
+    out
 }
 
 /// `intake show` output: JSON, or text for the terminal.
@@ -233,7 +289,7 @@ async fn render_show(db: &sqlx::SqlitePool, n: i64, json: bool, label: &str, hid
         writeln!(out, "draft PR: {u}")?;
     }
     if it.comment_state != "none" {
-        writeln!(out, "issue comment: {}", it.comment_state)?;
+        writeln!(out, "pull request link on the issue: {}", it.comment_state)?;
     }
     writeln!(out, "WhatsApp thread: {}", it.surface)?;
     writeln!(out, "\nthread (last 15):")?;
@@ -361,19 +417,17 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
                 .await
                 .map(|i| println!("plan v{} of item #{n} approved", i.approved_version.unwrap_or(0)))
         }
-        Cmd::ApproveComment { item, text } => {
-            let n = item_number(&item)?;
-            pipeline::approve_comment(&ctx, n, text, via)
-                .await
-                .map(|_| println!("comment of item #{n} approved; the next tick posts it"))
-        }
-        Cmd::SkipComment { item } => {
-            let n = item_number(&item)?;
-            pipeline::skip_comment(&ctx, n, via).await.map(|_| println!("item #{n} closes without a comment"))
-        }
         Cmd::Cancel { item } => {
             let n = item_number(&item)?;
             pipeline::cancel(&ctx, n, via).await.map(|_| println!("item #{n} cancelled"))
+        }
+        Cmd::InterpretLatest => {
+            // A chat session only reaches its own chat's messages.
+            let chat = match &caller.role {
+                Role::Chat { chat, .. } => Some(chat.as_str()),
+                _ => None,
+            };
+            pipeline::interpret_latest(&ctx, chat).await.map(|r| println!("{}", latest_text(&r)))
         }
         Cmd::Retry { item } => {
             let n = item_number(&item)?;
@@ -428,6 +482,19 @@ mod tests {
     }
 
     #[test]
+    fn the_turn_output_says_what_the_session_still_answers() {
+        use pipeline::{TurnMessage, TurnOutcome};
+        let m = |position, preview: &str, outcome| TurnMessage { position, preview: preview.into(), outcome };
+        let all = turn_text(&[m(1, "approve the plan", TurnOutcome::Handled), m(2, "cancel it", TurnOutcome::Handled)]);
+        assert!(all.contains("1 \"approve the plan\"; 2 \"cancel it\"") && all.ends_with(pipeline::INTAKE_HANDLED), "{all}");
+        let rest = turn_text(&[m(1, "approve it", TurnOutcome::Handled), m(2, "any update?", TurnOutcome::ForSession)]);
+        assert!(rest.contains("answer only these normally") && rest.contains("2 \"any update?\""), "{rest}");
+        assert!(!rest.contains(pipeline::INTAKE_HANDLED), "{rest}");
+        assert!(turn_text(&[m(1, "hi", TurnOutcome::ForSession)]).starts_with("NOT A DECISION"));
+        assert!(turn_text(&[m(1, "hi", TurnOutcome::Earlier)]).starts_with("NO MESSAGE"));
+    }
+
+    #[test]
     fn authorization_by_caller() {
         let chat = Role::Chat { origin: "whatsapp-dm".into(), chat: "5511999999999@s.whatsapp.net".into() };
         let show = || Cmd::Show { item: "1".into(), json: false, hidden: false };
@@ -437,8 +504,10 @@ mod tests {
         assert!(authorize(&caller(Role::Operator, 0), &approve()).is_ok());
         assert!(authorize(&caller(Role::Operator, 1), &approve()).is_err(), "reacting to an agent message");
         assert!(authorize(&caller(chat.clone(), 0), &show()).is_ok());
-        assert!(authorize(&caller(chat.clone(), 0), &cancel()).is_ok());
-        assert!(authorize(&caller(chat.clone(), 1), &cancel()).is_err());
+        // The chat session changes no item: cancel goes through
+        // interpret-latest and the operator's stored message.
+        assert!(authorize(&caller(chat.clone(), 0), &cancel()).is_err(), "a session never cancels");
+        assert!(authorize(&caller(Role::Operator, 0), &cancel()).is_ok());
         assert!(authorize(&caller(chat.clone(), 0), &approve()).is_err(), "a session never approves");
         assert!(authorize(&caller(chat.clone(), 0), &Cmd::Reply { item: "1".into(), text: "x".into() }).is_err());
         // A release is the operator's, like a plan approval.
@@ -448,6 +517,22 @@ mod tests {
         assert!(authorize(&caller(chat.clone(), 0), &release()).is_err(), "a session never releases");
         assert!(authorize(&caller(Role::Detached, 0), &release()).is_err());
         assert!(authorize(&caller(Role::Worker { task_id: None }, 0), &release()).is_err());
+        // interpret-latest: the DM chat session and the operator only, never
+        // in a turn that read an agent message.
+        assert!(authorize(&caller(chat.clone(), 0), &Cmd::InterpretLatest).is_ok());
+        assert!(authorize(&caller(chat.clone(), 1), &Cmd::InterpretLatest).is_err(), "a turn that read an agent message");
+        assert!(authorize(&caller(Role::Operator, 0), &Cmd::InterpretLatest).is_ok());
+        let group_chat = Role::Chat { origin: "whatsapp-group".into(), chat: "g".into() };
+        for role in [
+            group_chat,
+            Role::Worker { task_id: Some("t".into()) },
+            Role::Session { kind: "discord".into() },
+            Role::UnscopedChat,
+            Role::Detached,
+            Role::Unknown("x".into()),
+        ] {
+            assert!(authorize(&caller(role.clone(), 0), &Cmd::InterpretLatest).is_err(), "{role:?}");
+        }
         let resolve = || Cmd::GroupResolve { item: "1".into(), left: true, absent: false };
         assert!(authorize(&caller(chat, 0), &resolve()).is_err(), "only the operator resolves a group");
         assert!(authorize(&caller(Role::Detached, 0), &resolve()).is_err());

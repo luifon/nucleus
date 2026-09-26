@@ -299,6 +299,12 @@ pub struct SpawnOptions {
     /// issue pipeline's worktrees, ADR-036) sets it to the Nucleus workspace
     /// root, so nothing of Nucleus is written into that repository.
     pub state_root: Option<PathBuf>,
+    /// A session with no tools at all (ADR-036, the intake interpreter):
+    /// `--tools ""` (no built-in tool), `--strict-mcp-config` without a
+    /// config (no MCP server), `--disable-slash-commands` (no skill), no
+    /// `--add-dir` (the operator-private tree included) and no
+    /// `--allowed-tools`, whatever `add_dirs` and `allowed_tools` hold.
+    pub no_tools: bool,
 }
 
 // NOTE (ADR-020): `Default` is deliberately NOT implemented for
@@ -983,6 +989,7 @@ impl SessionPool {
                 agent_label: self.config.agent_label.clone(),
                 env: vec![],
                 state_root: None,
+                no_tools: false,
             })
             .await;
             match spawned {
@@ -1220,6 +1227,7 @@ impl SessionPool {
             agent_label: self.config.agent_label.clone(),
             env: vec![],
             state_root: None,
+            no_tools: false,
         })
         .await
         .context("daily_rotate: spawn new session")?;
@@ -1467,7 +1475,7 @@ fn sanitize_window_name(s: &str) -> String {
 
 // ---- internals ----
 
-fn build_claude_args(
+pub(crate) fn build_claude_args(
     session_id: &str,
     resuming: bool,
     opts: &SpawnOptions,
@@ -1491,6 +1499,16 @@ fn build_claude_args(
     if let Some(ref prompt) = opts.append_system_prompt {
         args.push("--append-system-prompt".into());
         args.push(prompt.clone());
+    }
+    if opts.no_tools {
+        // Nothing that grants a tool, a directory or a skill: the denylist
+        // is kept (it grants nothing), everything else is left out.
+        args.extend(["--tools".into(), String::new(), "--strict-mcp-config".into(), "--disable-slash-commands".into()]);
+        if !opts.disallowed_tools.is_empty() {
+            args.push("--disallowed-tools".into());
+            args.push(opts.disallowed_tools.join(" "));
+        }
+        return args;
     }
     for dir in &opts.add_dirs {
         args.push("--add-dir".into());
@@ -2907,6 +2925,7 @@ mod tests {
             agent_label: None,
             env: vec![],
             state_root: None,
+            no_tools: false,
         }
     }
 

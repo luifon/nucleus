@@ -10,15 +10,25 @@ import path from "node:path";
 import { ChatSessionStore, OutboundQueueStore } from "./db.js";
 import { parseToml } from "./config.js";
 import {
+  ANSWER_WINDOW_MS,
+  CHAT_KEY,
   classifyCreateError,
   closeBackoffMs,
+  DM_KEY,
   newNonce,
   nonceSuffix,
   GroupExecutor,
   groupBudgetAllows,
   intakeConfig,
   IntakeStore,
+  admitDm,
+  dmChatIntake,
   isOperatorId,
+  OperatorLidCache,
+  OPERATOR_LID_TTL_MS,
+  stampBatch,
+  waSeconds,
+  type OperatorIds,
   MAX_CLOSE_ATTEMPTS,
   routeDm,
   routeOperatorDm,
@@ -59,6 +69,14 @@ const WA = ["s", "whatsapp", "net"].join(".");
 const gjid = (n: string) => ["1203630000000000" + n, "g.us"].join("@");
 const OP_LID = ["1234567", "89012345"].join("");
 const STRANGER = ["55119", "77777777"].join("");
+/** The operator's identities with only the phone digits allowlisted. */
+/** The operator's identities: his phone, and `lids` as WHATSAPP_OPERATOR_LIDS. */
+const ops = (op: string | null = OP, ...lids: string[]): OperatorIds => ({
+  operatorId: op,
+  operatorLids: new Set(lids),
+});
+/** Another contact's LID, allowlisted for DMs but not the operator. */
+const OTHER_LID = ["55555", "5555555555"].join("");
 
 /** Executor deps with the operator and the bot as the only known ids. */
 function deps(store: IntakeStore, api: GroupApi, over: Partial<GroupExecutorDeps> = {}) {
@@ -70,7 +88,7 @@ function deps(store: IntakeStore, api: GroupApi, over: Partial<GroupExecutorDeps
     api,
     config: intakeConfig({}),
     operatorJid: () => `${OP}@s.whatsapp.net`,
-    isOperator: (jid) => isOperatorId(jid, OP, async (lid) => (lid === `${OP_LID}@lid` ? `${OP}@s.whatsapp.net` : null)),
+    isOperator: (jid) => isOperatorId(jid, ops(), async (lid) => (lid === `${OP_LID}@lid` ? `${OP}@s.whatsapp.net` : null)),
     selfIds: () => [`${BOT}:3@${WA}`],
     seedMembers: (jid, members, reason) => seeded.push({ jid, members, reason }),
     alertOperator: (text, key) => {
@@ -125,44 +143,247 @@ test("DM messages go to an item by its marker or by a quoted pipeline message", 
   assert.equal(routeDm("#1 priority today is the report", null, has), null, "an ordinary message keeps its #");
   assert.equal(routeDm("hello", null, has), null);
   assert.deepEqual(routeDm("approve", "7", has), { item: "7", text: "approve" });
-  assert.deepEqual(routeDm("#7 approve comment", "7", has), { item: "7", text: "approve comment" });
+  assert.deepEqual(routeDm("#7 looks good", "7", has), { item: "7", text: "looks good" });
+  // A reply to a question or note the pipeline sent in the DM, and the next
+  // message while the pipeline waits for an answer, reach it without an item.
+  assert.deepEqual(routeDm("yes", DM_KEY, has), { item: DM_KEY, text: "yes" });
+  assert.deepEqual(routeDm("  yes ", null, has, true), { item: DM_KEY, text: "yes" });
+  assert.deepEqual(routeDm("#3 no", null, has, true), { item: "3", text: "no" }, "a marker still names the item");
+  assert.equal(routeDm("yes", null, has, false), null, "no question waits: the chat session gets it");
   assert.equal(stripGroupMarker("#5 approve", "5"), "approve");
   assert.equal(stripGroupMarker("#6 approve", "5"), "#6 approve");
 });
 
-test("#n release <code> reaches the item as a command only when the operator typed it", async () => {
+test("only the operator's own DM reaches the pipeline, with how the message was written", async () => {
   const has = (n: string) => n === "3";
   const noLid = async () => null;
-  const base = { operatorId: OP, pnForLid: noLid, quotedItem: null, hasDmThread: has };
+  const base = { operator: ops(), pnForLid: noLid, quotedItem: null, hasDmThread: has };
   const opChat = `${OP}@s.whatsapp.net`;
-  // Typed by the operator: routed as text, which the pipeline acts on.
-  assert.deepEqual(await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release a1b2c3", inputKind: "text" }), {
+  assert.deepEqual(await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release it", inputKind: "text" }), {
     item: "3",
-    text: "release a1b2c3",
+    text: "release it",
     inputKind: "text",
   });
   // A transcribed voice note or a forwarded message keeps its kind; the
-  // pipeline keeps it in the thread and does not act on it.
-  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release a1b2c3", inputKind: "voice" }))?.inputKind, "voice");
-  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release a1b2c3", inputKind: "forwarded" }))?.inputKind, "forwarded");
-  // Another sender's "#3 release a1b2c3" never reaches the item.
+  // pipeline confirms a decision from it before it runs.
+  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release it", inputKind: "voice" }))?.inputKind, "voice");
+  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release it", inputKind: "forwarded" }))?.inputKind, "forwarded");
+  // Another sender's message never reaches the pipeline, not even while it
+  // waits for the operator's answer.
   const other = `${["55119", "88888888"].join("")}@s.whatsapp.net`;
-  assert.equal(await routeOperatorDm({ ...base, chatId: other, text: "#3 release a1b2c3", inputKind: "text" }), null);
+  assert.equal(await routeOperatorDm({ ...base, chatId: other, text: "#3 release it", inputKind: "text" }), null);
+  assert.equal(await routeOperatorDm({ ...base, chatId: other, text: "yes", expectingAnswer: true, inputKind: "text" }), null);
+  assert.deepEqual(await routeOperatorDm({ ...base, chatId: opChat, text: "yes", expectingAnswer: true, inputKind: "voice" }), {
+    item: DM_KEY,
+    text: "yes",
+    inputKind: "voice",
+  });
   // The operator in LID form, resolved through the connection's mapping.
   const lid = ["123456789012345", "lid"].join("@");
-  const viaLid = await routeOperatorDm({ ...base, chatId: lid, pnForLid: async () => opChat, text: "#3 release a1b2c3", inputKind: "text" });
+  const viaLid = await routeOperatorDm({ ...base, chatId: lid, pnForLid: async () => opChat, text: "#3 release it", inputKind: "text" });
   assert.equal(viaLid?.item, "3");
   // An unknown LID is not the operator.
-  assert.equal(await routeOperatorDm({ ...base, chatId: lid, text: "#3 release a1b2c3", inputKind: "text" }), null);
+  assert.equal(await routeOperatorDm({ ...base, chatId: lid, text: "#3 release it", inputKind: "text" }), null);
+});
+
+test("the next DM message answers a question the pipeline asked, for 15 minutes", () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  const out = new OutboundQueueStore(db);
+  const t0 = Date.now();
+  assert.equal(store.expectsDmAnswer(t0), false, "nothing asked");
+  // A note that asks nothing does not open the window.
+  const note = out.enqueue({ target: "dm", body: "Nothing was done for item #1.", source: "intake:note", dedupKey: "n1" });
+  out.markSent(note, "WANOTE");
+  assert.equal(store.expectsDmAnswer(t0), false);
+  // A question not sent yet cannot be answered.
+  const ask = out.enqueue({ target: "dm", body: "Release item #1? Answer yes or no.", source: "intake:ask", dedupKey: "a1" });
+  assert.equal(store.expectsDmAnswer(t0), false);
+  out.markSent(ask, "WAASK");
+  const sentAt = Date.parse(
+    (new DatabaseSync(db).prepare(`SELECT sent_at FROM outbound_queue WHERE id = ?`).get(ask) as { sent_at: string }).sent_at,
+  );
+  assert.equal(store.expectsDmAnswer(sentAt + 1000), true);
+  assert.equal(store.expectsDmAnswer(sentAt + ANSWER_WINDOW_MS + 1), false, "the window closes after 15 minutes");
+  // Replies to either message reach the pipeline without an item.
+  assert.equal(store.itemForSentMessage("WAASK"), DM_KEY);
+  assert.equal(store.itemForSentMessage("WANOTE"), DM_KEY);
+  // The first DM message after the question is the answer; later ones go
+  // to the chat session again. A group message does not count.
+  store.recordInbound({ itemKey: "4", chatId: GROUP, waMsgId: "g1", text: "hi", inputKind: "text", sender: "operator", nowMs: sentAt + 2000 });
+  assert.equal(store.expectsDmAnswer(sentAt + 3000), true);
+  store.recordInbound({ itemKey: DM_KEY, chatId: `${OP}@s.whatsapp.net`, waMsgId: "d1", text: "yes", inputKind: "text", sender: "operator", nowMs: sentAt + 4000 });
+  assert.equal(store.expectsDmAnswer(sentAt + 5000), false);
+});
+
+test("a batch's messages keep the arrival stamped before handling, and WhatsApp's own timestamp", async () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  const out = new OutboundQueueStore(db);
+  const opChat = `${OP}@s.whatsapp.net`;
+  const t0 = Date.now() - 60_000;
+  // "cancel item" and "yes" arrive in one upsert batch.
+  const batch = [
+    { id: "b1", text: "cancel item", ts: 1790000000 },
+    { id: "b2", text: "yes", ts: { low: 1790000000, toNumber: () => 1790000000 } },
+  ];
+  const stamps = stampBatch(batch, (m) => m.ts, t0);
+  // Handling the first message takes time; its question is sent before the
+  // second message is even recorded.
+  store.recordInbound({ itemKey: "chat", chatId: opChat, waMsgId: "b1", text: "cancel item", inputKind: "text", sender: "operator", arrival: stamps.get(batch[0]) });
+  const q = out.enqueue({ target: "dm", body: "Cancel item #1? Answer yes or no.", source: "intake:ask", dedupKey: "intake:answer:b1" });
+  out.markSent(q, "WAQ", 1790000003);
+  // A voice "yes" is recorded after its transcription finished, later still.
+  store.recordInbound({ itemKey: "chat", chatId: opChat, waMsgId: "b2", text: "yes", inputKind: "voice", sender: "operator", arrival: stamps.get(batch[1]) });
+  const d = new DatabaseSync(db);
+  const yes = d.prepare(`SELECT received_at, wa_ts FROM intake_inbound WHERE wa_msg_id = 'b2'`).get() as { received_at: string; wa_ts: number };
+  const sent = d.prepare(`SELECT sent_at, wa_ts FROM outbound_queue WHERE id = ?`).get(q) as { sent_at: string; wa_ts: number };
+  assert.equal(yes.received_at, new Date(t0).toISOString(), "the arrival, not the recording time");
+  assert.ok(yes.received_at < sent.sent_at, "the yes arrived before the question was sent");
+  assert.equal(yes.wa_ts, 1790000000);
+  assert.equal(sent.wa_ts, 1790000003, "the question's WhatsApp timestamp from the send result");
+  assert.equal(waSeconds("1790000001"), 1790000001);
+  assert.equal(waSeconds(undefined), null);
+});
+
+test("an appended line is in the claimed body or refused, never lost", () => {
+  const db = tmpDb();
+  const out = new OutboundQueueStore(db);
+  const d = new DatabaseSync(db);
+  // The Rust append (whatsapp_queue::append_to_pending): only a pending row.
+  const append = (key: string) =>
+    Number(d.prepare(`UPDATE outbound_queue SET body = body || ? WHERE dedup_key = ? AND status = 'pending'`).run("\n\nAlso received: 'x'", key).changes) === 1;
+  // Append first, then the claim: the claimed body has the line.
+  const a = out.enqueue({ target: "dm", body: "Question A?", source: "intake:ask", dedupKey: "qa" });
+  assert.equal(append("qa"), true);
+  const claimedA = out.claimForSend(a, "WA-A");
+  assert.ok(claimedA?.body.endsWith("Also received: 'x'"), claimedA?.body);
+  // Claim first, then the append: refused, so the caller queues the
+  // separate note; the claimed body is what is sent.
+  const b = out.enqueue({ target: "dm", body: "Question B?", source: "intake:ask", dedupKey: "qb" });
+  const claimedB = out.claimForSend(b, "WA-B");
+  assert.equal(claimedB?.body, "Question B?");
+  assert.equal(append("qb"), false, "refused on a claimed row");
+  // A claimed row is not claimed twice while its send is fresh.
+  assert.equal(out.claimForSend(b, "WA-B2"), null);
+});
+
+test("a remapped LID stops being the operator", async () => {
+  let map: Record<string, string> = { [`${OP_LID}@lid`]: `${OP}@s.whatsapp.net` };
+  const pn = async (lid: string) => map[lid] ?? null;
+  const cache = new OperatorLidCache();
+  const t0 = 1_000_000;
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(), pn), true);
+  cache.note(OP_LID, t0);
+  assert.deepEqual([...cache.current(t0 + 1000)], [OP_LID]);
+  // The mapping now resolves the LID to someone else: the live check fails
+  // at once, and the next refresh drops it from the synchronous checks.
+  map = { [`${OP_LID}@lid`]: `${STRANGER}@s.whatsapp.net` };
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(), pn), false);
+  await cache.refresh(OP, pn, t0 + 2000);
+  assert.deepEqual([...cache.current(t0 + 2000)], []);
+  // An entry counts only within the TTL unless a refresh verifies it again.
+  map = { [`${OP_LID}@lid`]: `${OP}@s.whatsapp.net` };
+  cache.note(OP_LID, t0);
+  assert.deepEqual([...cache.current(t0 + OPERATOR_LID_TTL_MS + 1)], []);
+  await cache.refresh(OP, pn, t0 + OPERATOR_LID_TTL_MS + 1);
+  assert.deepEqual([...cache.current(t0 + OPERATOR_LID_TTL_MS + 2)], [OP_LID]);
+  // Every verification and drop is mirrored for the Rust side.
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  const mirrored = new OperatorLidCache(OPERATOR_LID_TTL_MS, {
+    verified: (d, at) => store.markOperatorLidVerified(d, at),
+    dropped: (d) => store.forgetOperatorLid(d),
+  });
+  mirrored.note(OP_LID, t0);
+  const rows = () => new DatabaseSync(db).prepare(`SELECT digits, verified_at FROM operator_lid_verified`).all() as Array<{ digits: string; verified_at: string }>;
+  assert.deepEqual(rows().map((r) => r.digits), [OP_LID]);
+  assert.equal(rows()[0].verified_at, new Date(t0).toISOString());
+  await mirrored.refresh(OP, async () => `${STRANGER}@s.whatsapp.net`, t0 + 1);
+  assert.deepEqual(rows(), [], "a remapped LID is removed for the Rust side too");
+  // A failing mapping drops it too; WHATSAPP_OPERATOR_LIDS does not depend on it.
+  await cache.refresh(OP, async () => { throw new Error("mapping gone"); }, t0 + OPERATOR_LID_TTL_MS + 3);
+  assert.deepEqual([...cache.current(t0 + OPERATOR_LID_TTL_MS + 3)], []);
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(OP, OP_LID), async () => { throw new Error("mapping gone"); }), true);
+});
+
+test("the DM gate admits other allowlisted contacts as normal chat and the operator by the shared check", async () => {
+  const allowedDm = new Set([OP, OTHER_LID]);
+  const noMap = async () => null;
+  const mapped = async (lid: string) => (lid === `${OP_LID}@lid` ? `${OP}@s.whatsapp.net` : null);
+  // A second allowlisted LID: admitted, never the operator.
+  assert.deepEqual(await admitDm({ chatId: `${OTHER_LID}@lid`, allowedDm, operator: ops(), pnForLid: noMap }), { admitted: true, operator: false });
+  // The operator's LID that only the mapping resolves: admitted and the operator.
+  assert.deepEqual(await admitDm({ chatId: `${OP_LID}@lid`, allowedDm, operator: ops(), pnForLid: mapped }), { admitted: true, operator: true });
+  // The operator's LID from WHATSAPP_OPERATOR_LIDS, no mapping.
+  assert.deepEqual(await admitDm({ chatId: `${OP_LID}@lid`, allowedDm, operator: ops(OP, OP_LID), pnForLid: noMap }), { admitted: true, operator: true });
+  // An unknown LID: not admitted.
+  assert.deepEqual(await admitDm({ chatId: `${OP_LID}@lid`, allowedDm, operator: ops(), pnForLid: noMap }), { admitted: false, operator: false });
+  // The operator's phone.
+  assert.deepEqual(await admitDm({ chatId: `${OP}@${WA}`, allowedDm, operator: ops(), pnForLid: noMap }), { admitted: true, operator: true });
+  // The other contact's chat gets no decision block and no stored text.
+  assert.deepEqual(
+    await dmChatIntake({ chatId: `${OTHER_LID}@lid`, operator: ops(), pnForLid: noMap, chatBlock: () => "BLOCK" }),
+    { record: false, block: "" },
+  );
+});
+
+test("the operator's DM in LID form gets the decision block and its text is kept; an unknown LID gets neither", async () => {
+  const block = "[Issue pipeline: decisions waiting for the operator.]\n- item #1: plan v1 is waiting for your approval.";
+  const chatBlock = () => block;
+  const noMap = async () => null;
+  const lidChat = `${OP_LID}@lid`;
+  // A DM chat keyed `<digits>@lid`, those digits in the allowlist.
+  assert.deepEqual(await dmChatIntake({ chatId: lidChat, operator: ops(OP, OP_LID), pnForLid: noMap, chatBlock }), { record: true, block });
+  // The same LID resolved to the operator's phone through the mapping.
+  const mapped = async (lid: string) => (lid === lidChat ? `${OP}@s.whatsapp.net` : null);
+  assert.deepEqual(await dmChatIntake({ chatId: lidChat, operator: ops(), pnForLid: mapped, chatBlock }), { record: true, block });
+  // The phone form.
+  assert.deepEqual(await dmChatIntake({ chatId: `${OP}@${WA}`, operator: ops(), pnForLid: noMap, chatBlock }), { record: true, block });
+  // An unknown LID (not allowlisted, no mapping), and another sender.
+  const unknown = `${["98765", "4321098765"].join("")}@lid`;
+  assert.deepEqual(await dmChatIntake({ chatId: unknown, operator: ops(OP, OP_LID), pnForLid: noMap, chatBlock }), { record: false, block: "" });
+  assert.deepEqual(await dmChatIntake({ chatId: `${STRANGER}@${WA}`, operator: ops(), pnForLid: noMap, chatBlock }), { record: false, block: "" });
+  // The fast paths use the same rule.
+  const route = (chatId: string, operator: OperatorIds, pnForLid: typeof noMap | typeof mapped) =>
+    routeOperatorDm({ chatId, operator, pnForLid, text: "yes", quotedItem: null, hasDmThread: () => false, expectingAnswer: true, inputKind: "text" });
+  assert.equal((await route(lidChat, ops(OP, OP_LID), noMap))?.item, DM_KEY);
+  assert.equal((await route(lidChat, ops(), mapped))?.item, DM_KEY);
+  assert.equal(await route(unknown, ops(OP, OP_LID), noMap), null);
+});
+
+test("the DM session's decision block is read from the table the pipeline writes", () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  assert.equal(store.chatBlock(), "", "nothing written yet");
+  new DatabaseSync(db)
+    .prepare(`INSERT INTO intake_chat_block (id, block, updated_at) VALUES (1, ?, 't')`)
+    .run("[Issue pipeline: decisions waiting for the operator.]\n- item #2: held for hidden content (1 findings).");
+  assert.match(store.chatBlock(), /item #2: held/);
+  // An operator DM message for the chat session is stored under the chat
+  // key, for `interpret-latest`, and marked as the operator's.
+  assert.equal(
+    store.recordInbound({ itemKey: CHAT_KEY, chatId: `${OP}@s.whatsapp.net`, waMsgId: "c1", text: "approve it", inputKind: "text", sender: "operator" }),
+    true,
+  );
+  const row = new DatabaseSync(db).prepare(`SELECT item_key, sender FROM intake_inbound WHERE wa_msg_id = 'c1'`).get() as {
+    item_key: string;
+    sender: string;
+  };
+  assert.deepEqual({ ...row }, { item_key: "chat", sender: "operator" });
 });
 
 test("operator messages are stored once and quoted messages map to their item", () => {
   const db = tmpDb();
   const store = new IntakeStore(db);
-  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi", inputKind: "voice" }), true);
-  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi", inputKind: "text" }), false);
-  const kind = new DatabaseSync(db).prepare(`SELECT input_kind FROM intake_inbound WHERE wa_msg_id = 'm1'`).get() as { input_kind: string };
-  assert.equal(kind.input_kind, "voice", "how the message was written is stored");
+  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi", inputKind: "voice", sender: "operator" }), true);
+  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi", inputKind: "text", sender: "operator" }), false);
+  const row = new DatabaseSync(db).prepare(`SELECT input_kind, sender FROM intake_inbound WHERE wa_msg_id = 'm1'`).get() as {
+    input_kind: string;
+    sender: string;
+  };
+  assert.equal(row.input_kind, "voice", "how the message was written is stored");
+  assert.equal(row.sender, "operator", "the identity check is recorded for the pipeline");
   const out = new OutboundQueueStore(db);
   const id = out.enqueue({ target: "dm", body: "[#2] plan", source: "intake:2", dedupKey: "intake:2:m1" });
   out.markInFlight(id, "WAMSG1");
@@ -241,13 +462,22 @@ test("a group is left only after its last messages went out", async () => {
 
 test("only the operator's own identity counts, in phone or LID form", async () => {
   const pn = async (lid: string) => (lid === `${OP_LID}@lid` ? `${OP}@s.whatsapp.net` : null);
-  assert.equal(await isOperatorId(`${OP}@s.whatsapp.net`, OP, pn), true);
-  assert.equal(await isOperatorId(`${OP}:12@${WA}`, OP, pn), true, "any device");
-  assert.equal(await isOperatorId(`${OP_LID}@lid`, OP, pn), true, "LID mapped to the operator's number");
-  assert.equal(await isOperatorId(`${STRANGER}@s.whatsapp.net`, OP, pn), false);
-  assert.equal(await isOperatorId(`${OP_LID}@lid`, OP, async () => { throw new Error("no mapping"); }), false);
-  assert.equal(await isOperatorId(`${OP}@s.whatsapp.net`, null, pn), false, "no operator configured");
-  const isOp = (j: string) => isOperatorId(j, OP, pn);
+  assert.equal(await isOperatorId(`${OP}@s.whatsapp.net`, ops(), pn), true);
+  assert.equal(await isOperatorId(`${OP}:12@${WA}`, ops(), pn), true, "any device");
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(), pn), true, "LID mapped to the operator's number");
+  assert.equal(await isOperatorId(`${STRANGER}@s.whatsapp.net`, ops(), pn), false);
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(), async () => { throw new Error("no mapping"); }), false);
+  assert.equal(await isOperatorId(`${OP}@s.whatsapp.net`, ops(null), pn), false, "no operator configured");
+  // An operator LID from WHATSAPP_OPERATOR_LIDS counts without a mapping
+  // (the intake-group sender gate uses this check: a message from it is
+  // admitted when the mapping is unavailable).
+  const failing = async () => { throw new Error("no mapping"); };
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(OP, OP_LID), failing), true, "operator LID");
+  // Only in LID form: those digits in a phone JID are not the operator.
+  assert.equal(await isOperatorId(`${OP_LID}@${WA}`, ops(OP, OP_LID), failing), false);
+  // Another contact's LID is never the operator, allowlisted or not.
+  assert.equal(await isOperatorId(`${OTHER_LID}@lid`, ops(OP, OP_LID), failing), false);
+  const isOp = (j: string) => isOperatorId(j, ops(), pn);
   assert.deepEqual(await unexpectedMembers([`${OP_LID}@lid`, `${BOT}@s.whatsapp.net`], [`${BOT}:3@${WA}`], isOp), []);
   assert.deepEqual(await unexpectedMembers([`${OP}@s.whatsapp.net`, `${STRANGER}@s.whatsapp.net`], [BOT], isOp), [`${STRANGER}@s.whatsapp.net`]);
 });

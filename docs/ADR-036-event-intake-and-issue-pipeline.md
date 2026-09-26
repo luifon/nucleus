@@ -2,8 +2,10 @@
 
 **Status:** Accepted (2026-09-24) — Implemented (2026-09-24), amended after an adversarial
 review (2026-09-24, see "Amendment: review findings"), amended with the hidden-content hold
-(2026-09-25, see "Amendment: the hidden-content hold", revised after its review the same day); live verification pending (real `gh`
-against the configured repos, real WhatsApp group creation).
+(2026-09-25, see "Amendment: the hidden-content hold", revised after its review the same day), amended with
+operator decisions in plain words and the pull request link comment without approval (2026-09-26, see
+"Amendment: operator decisions in plain words"); live verification pending (real `gh` against the configured
+repos, real WhatsApp group creation, the interpreter on real messages).
 
 **Builds on / changes:**
 - [[ADR-033]] — every agent step is a task in the task ledger (`origin =
@@ -44,7 +46,9 @@ The operator decided the following, which this ADR implements:
    parent links: intake, eval, refinement (for complex items and feature
    requests), implementation, draft pull request. Nucleus code, not an
    agent, pushes and opens the pull request. Nucleus never merges. The issue
-   gets a comment only after the operator approves the text.
+   gets one code-owned comment with the pull request link (at first a comment
+   the operator approved; changed by "Amendment: operator decisions in plain
+   words").
 5. OS sandboxing is deferred. The design keeps it possible: agents do not
    run network steps; Nucleus code does.
 6. Every WhatsApp send uses the existing target policy and secret filter;
@@ -82,7 +86,7 @@ A push-style source (a script, a future webhook receiver) calls
 `nucleus events emit`. Adding a source changes neither the store, the
 dedup, nor the pipeline. An event from a source without an adapter object
 has no discussion and no reply channel; its item closes after the draft PR
-instead of waiting for a comment decision.
+without the link comment.
 
 `nucleus events emit --source S --id X --title T [--body - | --body B]
 [--project owner/name] [--label L]… [--url U] [--state open|closed]
@@ -136,8 +140,7 @@ repo. Its stage is one of:
 | `eval` | the eval agent runs (read-only) |
 | `refinement` | discussion with the operator until a plan is approved |
 | `implementation` | the implementation agent runs (`code` profile); then Nucleus commits what the agent left uncommitted, checks that the branch has commits, and runs the repo's tests |
-| `pr` | Nucleus pushes the branch and opens a draft PR |
-| `review` | the PR is open; the proposed issue comment waits for the operator |
+| `pr` | Nucleus pushes the branch, opens a draft PR and posts its link on the issue; then the item closes (the `review` stage with an approved comment was removed, see "Amendment: operator decisions in plain words") |
 | `closed`, `cancelled` | terminal; the item's group is left and its clone removed |
 | `stale` | terminal; the source changed after the gate was satisfied (finding 1); re-adding the label starts a new item |
 | `failed` | a step failed; `retry` resumes it |
@@ -154,7 +157,7 @@ transition in `item_transitions`.
 
 Conditions from the source stop an item at any time: the event closed (the
 issue was closed) closes it; the label removed cancels it at every stage,
-including `pr` and `review`; a changed title or body makes it `stale`. A
+including `pr`; a changed title or body makes it `stale`. A
 running stage task is cancelled in every case. An event has at most one
 open item (not closed, cancelled or stale) and at most one item per gate
 event; a new gate event (the label added again, or the issue reopened by a
@@ -285,15 +288,17 @@ by the next one. The turn's final message is the reply. A plan is the text
 between `===PLAN===` and `===END PLAN===`; Nucleus stores it as the next
 plan version and appends the approval hint.
 
-**Approval.** Code decides approval from the operator's own typed message,
-never the model (who counts as the operator: Amendment, finding 5). A message whose whole text is `approve`, `approve plan`,
-`approve vN` (with `#n` in the DM; optional in the item's group) approves
-the latest plan; `approve comment`, `skip comment` and `cancel` are the
-other commands; everything else is a message. The approval is refused, with
-a note in the thread, when there is no plan, when a refinement turn is
-running (its reply may replace the plan the operator read), or when the
-named version is not the latest. The dashboard's approve button sends the
-version shown. The approved plan becomes the implementation brief.
+**Approval.** The operator approves in his own words in the item's group or
+the DM (who counts as the operator: Amendment, finding 5). A model with no
+tools reads the message with a list of pending decisions built by code, and
+code decides and runs the approval bound to the plan version the list
+showed; see "Amendment: operator decisions in plain words" (it replaced the
+whole-message commands `approve`, `approve vN`, `approve comment`, `skip
+comment`, `cancel`). The approval is refused when there is no plan, when a
+refinement turn is running (its reply may replace the plan the operator
+read), or when the plan changed since the version shown. The dashboard's
+approve button sends the version shown. The approved plan becomes the
+implementation brief.
 
 ### 8. Implementation, pull request, comment
 
@@ -317,13 +322,13 @@ Then Nucleus:
    pushes the commit to the item's branch, looks for an existing PR for the
    branch (`gh pr list --head`), and otherwise opens a draft PR (`gh pr
    create --draft`) with the code-owned body of finding 4;
-5. sends the PR link to the item's thread, and proposes an issue comment
-   (`[intake.texts] issue_comment`).
+5. sends the PR link and the agent's summary to the item's thread, and
+   posts one comment with the PR link on the issue (`[intake.texts]
+   pr_comment`), after a secret scan, the idempotency lookup and a fresh live
+   read; then the item closes.
 
-The comment is posted only after the operator approves it, in the thread
-(`#n approve comment`) or on the dashboard, where the text can be edited
-first, and only after a live read of the issue and a secret scan of the
-comment; `skip comment` closes the item without one. Nucleus never merges and
+The comment needs no approval (it was approved by the operator before
+"Amendment: operator decisions in plain words"). Nucleus never merges and
 never marks a PR ready.
 
 ### 9. The driver
@@ -353,20 +358,22 @@ delays the others and no item is advanced by two processes.
 on the operator and the PR link. The detail shows the source event, the eval
 (class, criteria, reasons, escalations), the plan with an approve button,
 the thread with a reply box (refinement only; also sent to WhatsApp), the
-implementation summary, Nucleus's test result, the PR, the proposed comment
-(editable, approve or post nothing), the stage tasks from the ledger and the
-stage log. Retry and cancel are row actions. Every confirmation uses
-`InlineConfirm`. API: `/intake/api/{list,detail,reply,approve-plan,
-approve-comment,skip-comment,cancel,retry,release}`; wire types are generated (Rule
+implementation summary, Nucleus's test result, the PR, whether its link is
+posted on the issue, the stage tasks from the ledger and the stage log.
+Retry and cancel are row actions. Every confirmation uses `InlineConfirm`.
+API: `/intake/api/{list,detail,reply,approve-plan,cancel,retry,release}`;
+wire types are generated (Rule
 12). Writes accept JSON bodies only and refuse requests a browser marks as
 cross-site, as the Tasks cancel does (ADR-033 §7).
 
 ### 11. CLI and the DM session
 
 `nucleus intake tick [--poll] | list [--all] [--json] | show <n> [--json] [--hidden] |
-reply <n> --text T | approve-plan <n> [--version V] | approve-comment <n>
-[--text T] | skip-comment <n> | cancel <n> | retry <n> | release <n> --hold <code> |
-group-resolve <n> --left|--absent`.
+reply <n> --text T | approve-plan <n> [--version V] | cancel <n> | retry <n> |
+release <n> --hold <code> | group-resolve <n> --left|--absent | interpret-latest`.
+The explicit commands stay for the terminal; WhatsApp uses plain words.
+`interpret-latest` has the operator's latest stored DM message interpreted
+("Amendment: operator decisions in plain words").
 
 `list` and `show` print JSON with `--json`. JSON is for programs and is not
 fenced; only when the caller is the WhatsApp DM session is the output (JSON
@@ -377,14 +384,16 @@ WhatsApp group creation whose outcome is unknown (finding 6).
 | Caller (`crate::caller`) | May |
 |---|---|
 | Operator | every command (`group-resolve` and `release` only from the operator) |
-| WhatsApp DM chat session | `list`, `show`, `cancel` (not in a turn that read an agent message) |
+| WhatsApp DM chat session | `list`, `show`, `interpret-latest` (not in a turn that read an agent message); it changes no item itself: a cancel, like an approval or a release, is the operator's stored message read through `interpret-latest` and confirmed |
 | Detached process (launchd, the bot, the dashboard) | `tick` |
 | Workers, other sessions, unscoped chats, unknown | nothing |
 
 The DM persona gets an "Issue pipeline items" section and the pre-approved
-patterns `Bash(./target/release/nucleus intake list|show|cancel:*)`. The
+patterns `Bash(./target/release/nucleus intake list|show|interpret-latest:*)`. The
 session answers questions about items in plain language and tells the
-operator how to approve; it cannot approve, reply in a thread, or retry.
+operator where to decide (the item's group, or a DM message that starts
+with `#n` or replies to an item's message); it cannot approve, release,
+reply in a thread, or retry.
 
 ### 12. Write ownership (ADR-020)
 
@@ -397,11 +406,17 @@ operator how to approve; it cannot approve, reply in a thread, or retry.
   creates no intake.db when intake is disabled or the database is missing,
   and reads an empty or half-created database (no schema version recorded,
   or no item tables) as no items (round 5).
+  Later migrations: 2 adds the hidden-content hold, 3 removes the `review`
+  stage and 4 adds `confirmations` ("Amendment: operator decisions in plain
+  words").
 - **whatsapp.db** — Rust inserts into `outbound_queue` (thread messages) and
   the new queue table `intake_group_requests`; it reads the bot's
   `intake_groups` (group state) and `intake_inbound` (operator messages,
   read past a watermark kept in intake.db, with a processing state per
-  message in intake.db's `inbound_commands`). The bot owns the schema of all
+  message in intake.db's `inbound_commands`; a row is interpreted only when
+  the bot marked it `sender = 'operator'`; rows with `item_key = chat` are
+  read only by `interpret-latest`). Rust also writes the one-row
+  `intake_chat_block` (the DM chat session's list of waiting decisions). The bot owns the schema of all
   three intake tables (`messaging/whatsapp/src/intake.ts`);
   `whatsapp_queue::open` creates the queue table only so a producer works
   before the bot booted.
@@ -444,25 +459,26 @@ through the Nucleus CLIs; they are not isolation) plus:
   process network and filesystem access outside the clone.
 - **What reaches the outside.** Nucleus pushes only the item's branch (one
   commit it collected, to the configured URL, never the default branch),
-  opens only draft PRs with code-owned text, never merges, and posts a
-  comment only after the operator approved its text; the pushed diff, the
-  PR text and the comment pass the repository's secret guard first. WhatsApp
+  opens only draft PRs with code-owned text, never merges, and posts one
+  code-owned comment with the PR link; the pushed diff, the PR text and the
+  comment pass the repository's secret guard first. WhatsApp
   messages go through the outbound queue (target policy, secret filter);
   intake groups are sendable only while active, and only through the drain
   (the TypeScript queue writers `ack.ts` and `enqueue-media.ts` still accept
   only configured groups).
-- **Who approves.** Only an operator message read by code (typed by the
-  operator's own identity, in the operator's DM or in an intake group whose
-  membership still matches the create response), the operator's terminal,
-  or the dashboard (tailnet only). A chat session, a worker, an agent
-  message, a voice-note transcription or a forwarded message cannot
-  approve.
+- **Who approves.** Only a message from the operator's own identity (in
+  the operator's DM or in an intake group whose membership still matches
+  the create response), read by the no-tools interpreter and decided by
+  code, the operator's terminal, or the dashboard (tailnet only). A voice
+  note or a forwarded message decides only after the operator confirms a
+  fixed question. A chat session, a worker or an agent message cannot
+  approve (see "Amendment: operator decisions in plain words").
 
 ## Verification
 
 - Unit (Rust, `cargo test -p nucleus-core intake`): stage transitions
   (allowed and refused), eval parsing and escalation, plan extraction,
-  operator commands, group budget, subjects and branch names; event dedup and
+  group budget, subjects and branch names; event dedup and
   validation, one item per event, guarded stage changes, thread dedup and
   read marks, collaborator cache; GitHub issue conversion and gate, poll
   cursor and state selection, collaborator filtering (404, other failures,
@@ -470,7 +486,7 @@ through the Nucleus CLIs; they are not isolation) plus:
   push cycle, test runs with status and timeout, work dir outside the
   checkout; brief fencing and size; the pipeline against a fake `gh`, a bare
   remote and a launcher that starts nothing: a simple issue to a draft PR and
-  a posted comment, a feature refined in a group with refused and accepted
+  the posted link comment, a feature refined in a group with refused and accepted
   approvals, dashboard replies, the group budget and fallbacks, the source
   stopping items, step retries and failure recovery, unknown items and
   duplicate messages, polling with the interval, item locks. Tasks: working
@@ -487,9 +503,9 @@ through the Nucleus CLIs; they are not isolation) plus:
   runs `nucleus intake tick` against a fake `gh` (shell script) and a local
   bare remote: the eval (read-only) and implementation (code) agents run in
   `nucleus-test-intake`; the item reaches a draft PR with passing tests; the
-  non-collaborator's comment is absent from every brief; the operator's
-  comment approval posts exactly one comment; every thread message is queued
-  for the DM with the `[#1]` marker.
+  non-collaborator's comment is absent from every brief; exactly one link
+  comment is posted after the PR, without approval; every thread message is
+  queued for the DM with the `[#1]` marker.
 - The first end-to-end runs found two defects in shared session code, both
   fixed with this ADR: transcript folder names replaced only `/` (Claude Code
   replaces every character that is not a letter or digit, so a worktree
@@ -758,7 +774,7 @@ item stopped after its push keeps the record of the pushed branch
 (`items.pushed_sha`). Any read failure (network, API error, a timeline
 longer than `max_pages`) is a step error: nothing is written; after three
 errors the item fails and `retry` reads again. The label removed cancels
-the item at every stage, including `pr` and `review`. Events without an
+the item at every stage, including `pr`. Events without an
 adapter (`nucleus events emit --accept`) have no live source; their stored
 event is checked instead.
 
@@ -774,9 +790,10 @@ branch, the changed files as code spans (backticks and control characters
 replaced, at most 100 listed), the test command and Nucleus's result, the
 pipeline footer, `🤖 Generated with [Claude Code](https://claude.com/claude-code)`
 and the item marker. The agent's final message and raw test output are not
-published (the agent's message goes to the operator). The proposed issue
-comment's `{summary}` is at most 600 characters on one line, with
-Markdown and HTML characters escaped, `@` replaced and URLs broken.
+published (the agent's message goes to the operator). The issue comment
+holds only the pull request link (`[intake.texts] pr_comment`; before
+"Amendment: operator decisions in plain words" it held an escaped summary
+the operator approved).
 
 Before the push, the PR title, the body, the commit's author line and
 message, and every line the commit adds relative to its base (with every
@@ -811,15 +828,17 @@ number the connection's LID mapping gives for an `@lid` sender). DM messages
 are routed to an item only from the operator's DM; another allowed DM
 sender's messages go to the chat session. Each routed message stores how it
 was written (`input_kind`: `text`, `voice` for a transcription, `forwarded`);
-the pipeline accepts a command only from `text` and keeps any other
-command-shaped message in the thread with a refusal note. A new group's
+a decision from anything but `text` is confirmed first ("Amendment: operator
+decisions in plain words"; before it, only `text` could be a command). A new group's
 membership baseline is set from the create response. A member in that
 response that is neither the bot nor the operator starts the group disabled
 and alerts the operator in DM; a later change of the member list disables
 the group (no message from it is read) and alerts the operator.
 
 Limit: an `@lid` sender whose phone number the connection does not know is
-not recognized as the operator.
+not recognized as the operator, unless that LID is listed in
+`WHATSAPP_OPERATOR_LIDS` ("Amendment: operator decisions in plain
+words").
 
 ### Finding 6 — group lifecycle
 
@@ -1278,11 +1297,12 @@ decode entities), so only invisible characters are flagged in it.
   the hold the operator reviewed: `nucleus intake release <n> --hold
   <code>` (operator terminal only; `show` prints the code and the
   fingerprint), the dashboard's release button (sends the `hold_hash` the
-  panel rendered), or `#<n> release <code>` typed by the operator (the
-  hold code is the first 6 hex characters of the fingerprint and is in the
-  held message; only the operator's identity and `text` input count). A
-  release without a code, or with the code of another hold, is refused
-  with the current code. The named hold is compared with the current
+  panel rendered), or the operator's WhatsApp message read as a release,
+  which is always confirmed first and bound to the fingerprint the list of
+  pending decisions showed ("Amendment: operator decisions in plain
+  words"; before it, `#<n> release <code>` typed by the operator). The hold
+  code is the first 6 hex characters of the fingerprint. A release without
+  a hold, or with another hold, is refused with the current code. The named hold is compared with the current
   `hold_hash` before the live read, and again in the statement that
   changes the stage (`store::advance_if_hold`), so a release of hold A that
   arrives after the item was held again for hold B changes nothing. Then
@@ -1420,6 +1440,461 @@ newlines inside a tag and attributes on an end tag handled, invisible
 characters inside a bogus comment flagged
 (`every_lt_in_raw_html_is_recognized_or_flagged`).
 
+## Amendment: operator decisions in plain words (2026-09-26)
+
+### Why
+
+The operator's WhatsApp decisions needed exact commands (`#2 approve`,
+`#2 approve comment`, `#2 skip comment`, `#2 release <code>`). The operator
+asked for plain language. When he wrote `#2 approve` for an item whose
+comment waited, the bot kept the message and answered "Item #2 is in the
+review stage; messages reach an agent only during refinement", which did not
+tell him what to do. He writes in his own words now. When the bot does not
+understand a message, it asks, and it lists what each item waits for and what
+each option does, in fixed texts that code writes.
+
+### The issue comment needs no approval
+
+The proposed comment, its approval (`approve-comment`, `skip-comment` in the
+CLI, the dashboard and WhatsApp) and the `review` stage are removed. The `pr`
+stage now pushes the branch, opens the draft pull request, sends the PR link
+and the agent's summary to the item's thread, and posts one comment on the
+issue: `[intake.texts] pr_comment` (default `Draft pull request: {pr_url}`),
+then closes the item. The comment holds no model output and no issue text,
+which is why it needs no approval. The write keeps the protections of
+finding 3 and finding 4: the secret guard scans the text; a random 128-bit
+operation id is stored before the post and its exact marker line, on a
+comment by the authenticated account, is the only proof of an earlier post,
+so a retry never posts twice; the comments lookup comes first, then a fresh
+live read right before `gh issue comment`; `gh` runs from its pinned path.
+An event without a reply channel closes with the draft PR open and
+`comment_state = skipped`.
+
+Migration 3 of intake.db moves stored items: an item in `review` whose
+comment was not posted goes back to `pr` (its `comment_op` is kept, so a
+comment an earlier attempt posted is found by its marker), one whose comment
+was posted or skipped is closed, a failed or blocked item that stopped in
+`review` resumes in `pr`, `proposed` and `approved` become `none`, and
+`comment_draft` is dropped. Each stage change is logged in
+`item_transitions`. The deployed intake.db had no open items; the migration
+is tested on a database with rows in every removed state.
+
+The WhatsApp PR message carried the GitHub-escaped copy of the agent's
+summary, so the operator saw a backslash before every backtick
+(`I changed \`README.m…`). The WhatsApp message now shows the summary as the
+agent wrote it (at most 600 characters); nothing escaped for GitHub reaches
+WhatsApp, and GitHub gets no summary.
+
+### Which messages are read
+
+Only messages from the operator's exact identity count (finding 5). One
+function decides it for every check of the pipeline (`isOperatorId` in
+`messaging/whatsapp/src/intake.ts`): a chat or sender id is the operator
+when its digits are the operator's phone digits (the first
+`WHATSAPP_ALLOWED_DM_JIDS` entry), when it is an `@lid` id whose digits are
+in `WHATSAPP_OPERATOR_LIDS` (the operator's own LIDs, a separate variable),
+or when it is an `@lid` id that the connection's LID mapping resolves to
+the operator's phone. `WHATSAPP_ALLOWED_DM_JIDS` is a general DM allowlist:
+its other entries are contacts the bot chats with, never the operator. The
+same function decides both inbound gates (the DM gate admits the allowlist
+as normal chat and the operator by this check, so a LID only the mapping
+resolves is admitted as the operator; the intake-group sender gate admits
+only this check), approvals, the members of a new group, the DM fast paths,
+the stored `chat` rows and the decision block, so a DM chat keyed
+`<digits>@lid` is the operator's DM everywhere. The asynchronous checks
+call the live mapping every time, so a LID the mapping no longer resolves to
+the operator stops counting at once. The two synchronous checks (the role
+lookup and the target policy) keep a cache of LIDs the mapping resolved to
+the operator (`OperatorLidCache`): an entry counts for 10 minutes, every
+inbound message verifies each entry against the live mapping again, and an
+entry that fails is dropped. `WHATSAPP_OPERATOR_LIDS` entries do not depend
+on the mapping. The bot
+routes to the pipeline: every operator message in an item's group; and, in
+the operator's DM, a message that starts with an item's `#n` marker, a reply
+that quotes a message the pipeline sent (a thread message names its item; a
+question or note the pipeline sent in the DM, source `intake:ask` or
+`intake:note`, names none), and the next DM message after the pipeline asked
+a question in the DM (`intake:ask`), within 15 minutes of it being sent.
+These fast paths go straight to the interpreter. The bot stores each routed
+message with `sender = 'operator'` after its identity check; the pipeline
+refuses to interpret a row without it.
+
+Every other operator DM message goes to the DM chat session, as before, so
+a cold "approve it" hours later also reaches the chat session first. Two
+things make it work there without sending every DM message to a one-shot
+interpreter (that would add a model session to every unrelated chat
+message):
+
+- **The chat session knows what waits.** Every tick writes a code-built
+  block (`pipeline::chat_block`) into whatsapp.db (`intake_chat_block`, one
+  row, Rust writes, the bot reads): a code-owned header, the interpreter's
+  pending lines for the DM (item number, what it waits for, allowed
+  decisions; no issue text), and an instruction (`[intake.texts]
+  chat_block_header`, `chat_block_instruction`). The bot types the block
+  after every operator message in the operator's DM chat session while it
+  is not empty (passed with the message to the turn engine), only in a DM
+  chat that `isOperatorId` accepts, in phone or LID form.
+- **The chat session can only trigger.** The bot also stores each operator
+  DM message that goes to the chat session in `intake_inbound` with
+  `item_key = chat` and `sender = operator`; the tick skips these rows. When
+  the operator's message asks for one of the listed decisions, the chat
+  session runs `nucleus intake interpret-latest`. The command takes no text:
+  code reads the `chat` rows with `sender = operator` that the calling
+  session's current turn covers: the turn engine's running `chat_turns` row
+  for the session's own DM chat (the exact chat id, phone or LID form, that
+  keys both the session's task scope and the stored rows) and the
+  `chat_inbound` rows it marked with that turn, joined by WhatsApp message
+  id. A follow-up that arrived before the command ran therefore cannot take
+  the place of the message that started the turn. The rows are interpreted
+  in order with the same interpreter flow (`pipeline::interpret_latest`).
+  Every one is interpreted: running a decision does not stop the loop, so a
+  second decision in the same turn is not lost. A confirmation question
+  asked by the loop changes what follows: every later message of the turn
+  arrived before that question was sent, so none of them can answer it. A
+  later decision is not run; the line `[intake.texts] also_received`
+  ("Also received: '<preview>' — send it again after answering the question
+  above.") is added to the question while it is still `pending` in the
+  queue (a guarded `UPDATE … WHERE status = 'pending'`), or queued as its
+  own note right after it when the drain already claimed the question, and
+  the message is marked final. The drain claims a row and reads its body in
+  one statement (`claimForSend`: `UPDATE … SET status = 'in_flight' … RETURNING
+  body`), so an appended line is either in the body that is sent or refused
+  and sent separately, never lost. Anything else is
+  left to the session, and the question stays open. From the
+  operator's terminal it reads the newest stored row of the last 15
+  minutes. A row is interpreted at most once: its `inbound_commands` state
+  is final after the first run. On a decision (or an answer to an open
+  question) the full flow runs, confirmations and replies included, and the
+  command prints `HANDLED` with the line the session ends its turn with
+  (`[handled by the issue pipeline]`); the turn engine sends no reply for a
+  turn whose whole final text is that line, because the pipeline already
+  answered. The output lists the turn's messages by position and a short
+  preview: which ones the pipeline handled, and which ones the session must
+  answer normally (without repeating the decisions); only when none is left
+  does it give the silent line. On a discussion
+  or anything unclear, the pipeline sends and keeps nothing, and the
+  command prints `NOT A DECISION`; the session answers normally.
+
+Who may run `interpret-latest` (`crate::caller`, `cmd/intake.rs::authorize`):
+the WhatsApp DM chat session and the operator's terminal, not in a turn
+that read an agent message. A worker, a group chat session, any other
+Nucleus session, a detached process or an unknown caller may not. A session
+that runs it without reason costs one interpreter session and changes
+nothing unless the operator's own latest message is a decision.
+
+### The interpreter
+
+Every routed message is read by an interpreter: a one-shot session through
+`nucleus_core::claude_session` (Rule 4), profile
+`SessionProfile::one_shot_no_tools` (`--tools ""`, `--strict-mcp-config`
+without a config, `--disable-slash-commands`, `--permission-mode dontAsk`,
+no `--add-dir` and no `--allowed-tools`, whatever a caller sets; the argv
+test checks this). It runs in the `nucleus-intake` tmux session, started by
+`nucleus intake tick`.
+
+It receives a `decide::Request` and nothing else:
+
+- the operator's message (for a voice note, its transcription), inside a
+  nonce data fence;
+- where it came from: the DM (naming item #n or not) or the group of item
+  #n;
+- the pending decisions, one code-built line per item: the item number, a
+  `wait_*` text (for example `plan v2 is waiting for your approval`,
+  `held for hidden content (3 findings)`,
+  `in refinement, plan v2 is proposed and the agent is writing a reply`), the
+  allowed decisions, and whether a discussion message reaches the refinement
+  agent;
+- the confirmation question waiting for an answer there, if any.
+
+No issue title, body, comment, plan, thread message or agent output is part
+of the request type, so none can reach it; the item title is issue text and
+is left out too. In an item's group the list holds that item only; in the
+DM it holds every item that waits for the operator (a plan, a reply, a
+release) and the item the message names.
+
+It answers with one JSON object: `{"kind": "decision" | "discussion" |
+"unclear" | "confirm" | "decline", "item": <n or null>, "decision":
+"approve_plan" | "release" | "cancel" | null, "question": <text or null>}`.
+`decide::parse_reading` validates it: exactly these keys, known values,
+fields that fit the kind (`confirm` and `decline` only answer a question).
+Any failure, or text around the object, is `unclear` without a question.
+
+### Code decides
+
+- **decision**: the item must be in the list and the decision must be one
+  that item allows now. It runs through the existing functions, bound to
+  what the list showed: `approve_plan` to the plan version (the approval's
+  `UPDATE` re-checks `plan_version` and that no refinement turn runs,
+  `store::advance_if_plan`), `release` to the hold fingerprint (the release
+  re-checks it before the live read and in its `UPDATE`,
+  `store::advance_if_hold`). The live read, the stale checks and the other
+  refusals of these functions apply unchanged. The operator never types a
+  hold code. A decision the item does not allow is refused with the list.
+- **discussion**: the message goes to the thread of the item it came from
+  or names, of the item the interpreter named from the list, or of the only
+  waiting item; during refinement (or while held during refinement) the
+  refinement agent reads it, as before. Outside refinement the message is
+  kept and the answer says so, with the item's options. With several items
+  waiting and none named, the operator is asked which item.
+- **unclear**: the answer is the interpreter's question, or the fixed
+  `unclear` text, followed by the list: for each item, what it waits for and
+  what each option does (`options_*`, `option_*` texts), ending with
+  "Answer in your own words." His answer is interpreted again.
+
+The old command syntax has no separate parser: `#2 approve` is read like any
+other message.
+
+### Confirmation
+
+A confirmation question naming the item and the action (`confirm_*` texts,
+for example "Release item #4 (held for hidden content, 3 findings)? Answer
+yes or no.") comes before:
+
+- every release;
+- every cancel (a cancel cannot be undone; this goes beyond the operator's
+  request, which named releases and inferred items);
+- every decision from a voice note or a forwarded message;
+- a decision whose item the interpreter inferred in the DM while several
+  items wait.
+
+A message can answer only a question that was sent before the message
+arrived. The bot stamps every message's arrival in its `messages.upsert`
+handler before any await, for the whole batch at once, and stores it as
+the row's `received_at`; a later message of the same batch, or a voice note
+whose transcription finishes later, keeps that stamp. It also stores
+WhatsApp's own `messageTimestamp` (`intake_inbound.wa_ts`, seconds), and the
+drain stores the server timestamp of every sent message from the send
+result (`outbound_queue.wa_ts`). Both must hold: the question's row is
+`sent` with a `sent_at` earlier than the message's arrival stamp, and, when
+both WhatsApp timestamps are known, the question's is earlier than the
+message's (whole seconds; equal is not earlier). For a message that
+arrived earlier, the question is not shown to the interpreter, is not
+answered and is not replaced. When either WhatsApp timestamp is missing for
+a message received over WhatsApp, the order cannot be confirmed and the
+check fails closed: a yes or no is not taken as an answer, the question
+stays open and is sent again with the same fixed text, and the next answer
+is checked against the re-sent question. A path that never carries WhatsApp
+timestamps (none exists today) is judged by the arrival order alone.
+
+A plan approval typed in the item's own group, or in the DM naming the item,
+or in the DM while only that item waits, runs at once.
+
+The question is stored in intake.db (`confirmations`, migration 4) with the
+item, the decision, the bound plan version or hold fingerprint, where it was
+asked (`dm` or `group:<n>`) and an expiry 15 minutes later. Storing it and
+marking the message applied are one transaction. The operator's next
+message from the same place is interpreted with the question shown: `confirm`
+runs the stored decision, bound to what was shown when he was asked (a newer
+plan or hold is refused); `decline` closes it ("Nothing was done for item
+#n."); anything else replaces it and is handled as a new message. The
+answering message is recorded on the question before the decision runs, and
+the decision's own transaction settles it, so a crash never applies one
+answer twice. A question past its expiry is not shown to the interpreter and
+is marked `expired`; a late answer changes nothing and is told so.
+
+### Voice notes and forwarded messages
+
+Before, only typed text could be a command. Now a transcribed voice note is
+interpreted like typed text, and so is a forwarded message, but a decision
+from either always gets the confirmation question; the answer may be typed
+or spoken. This is acceptable because the input still comes only from the
+operator's own identity (the check of finding 5 is unchanged), and the
+confirmation names the item and the action in fixed text, so a
+transcription error or a forwarded third-party text cannot change anything
+without the operator reading that question and answering yes.
+
+### Replies
+
+Every reply is a code-owned text from `[intake.texts]`, sent to the chat the
+message came from through `outbound_queue` (target policy, secret filter).
+
+The target policy keeps operator-only messages with the operator
+(`target_policy.ts`, `resolveQueuedTarget`). The `dm` shorthand resolves to
+the most recently active chat that is the operator's (his phone, a
+`WHATSAPP_OPERATOR_LIDS` entry, or a LID the mapping resolves to him,
+checked live at send time), else his phone JID; never to another allowed
+contact, however recent. A message from the issue pipeline (`intake`,
+`intake:*`), a reminder or a vault check reaches a DM only when that DM is
+the operator by the same live check, whatever target it names. Chat-engine
+replies to another allowed contact stay in that contact's chat. Reminders to
+`whatsapp-dm` name the operator's phone (the first allowlist entry) and pass.
+
+**Task results for the operator's LID chat.** A task started in the
+operator's DM chat session carries that chat as its origin, also in LID
+form. The Rust side cannot ask the live mapping, so the bot mirrors every
+LID it verified as the operator into whatsapp.db (`operator_lid_verified`,
+digits and verified-at time; rows are removed when the mapping no longer
+resolves them to him). A Rust process accepts an `@lid` origin chat that is
+on the allowlist, in `WHATSAPP_OPERATOR_LIDS`, or verified there within the
+last 10 minutes. Task creation refuses any other chat. At delivery, a
+result for an operator LID whose verification expired goes to the
+operator's phone JID; it is not dropped. The drain checks the live mapping
+again at send time and sends a result to an `@lid` chat outside the lists
+only when the live check accepts it. When the live check rejects the `@lid`
+target of an operator-only row or a task result (sender `task:<id>`), the
+bot deletes that LID's `operator_lid_verified` row, drops it from its cache,
+moves the queue row to the operator's phone JID in place and sends it
+there: a result for the operator is never dropped because his LID went
+stale. Tasks and replies for other allowed contacts keep their own chat.
+
+**After a restart.** The bot marks a turn it interrupted `interrupted`. The
+next tick finds operator DM rows of such turns that were stored for
+`interpret-latest` and not interpreted to the end: never read, or left in
+`received` because the restart came while they were being interpreted.
+While items are open, it sends the
+operator one code-owned message (`[intake.texts] interrupted_messages`)
+naming them with short previews and asking him to send any decision again.
+Either way the rows are marked final, so they are never interpreted
+later.
+The interpreter's question is the one piece of model text: it is cut to one
+line of at most 300 characters, the Markdown characters WhatsApp renders
+(`*`, `_`, `~`, backticks, leading `>` and `#`) are removed, and it passes
+the secret guard (a hit replaces it with the fixed text); the drain's secret
+filter applies after that. A decision taken in the DM for an item whose
+thread runs in a group is also answered in the DM with the result note.
+
+### Limits
+
+- The interpreter can misread a message. A misread discussion goes to the
+  wrong read-only refinement agent or thread; a misread decision is either
+  refused (not allowed, not in the list), confirmed first (release, cancel,
+  voice, forward, inferred item), or a plan approval in the item's own
+  context, which is what the operator's group or `#n` message addresses.
+- Each routed message costs one interpreter session (about ten seconds to a
+  minute); a message is not read when nothing waits for a decision and no
+  question is open. An interpreter that cannot start is retried by the
+  inbound mechanism (finding 7) and reported after 5 attempts.
+- A decision written cold in the DM depends on the chat session noticing
+  it against the block and running `interpret-latest`. When the session
+  misses it, the operator gets an ordinary chat answer; the chat session
+  itself still cannot decide anything.
+- A LID listed in `WHATSAPP_OPERATOR_LIDS` counts as the operator without
+  the live mapping, on purpose: the variable exists for the times the
+  mapping is unavailable, so the operator must keep it limited to his own
+  LIDs.
+- A LID that is neither listed in `WHATSAPP_OPERATOR_LIDS` nor resolved
+  to the operator's phone by the connection's mapping is not the operator:
+  its chat gets no block, its messages are not stored for
+  `interpret-latest` and never reach the pipeline (an allowlisted contact's
+  LID still chats normally). Listing the operator's LIDs in
+  `WHATSAPP_OPERATOR_LIDS` removes the dependence on the mapping.
+- The 15-minute window for an unmarked DM answer starts when the question
+  was sent; an unrelated DM message sent in that window goes to the
+  pipeline (and gets the list) instead of the chat session.
+
+### Verification of the amendment
+
+The chat-session trigger: a cold "approve it" in the DM with one plan
+waiting goes to the chat session, the tick does not interpret it, a fake
+chat session that sees the published block runs `interpret-latest`, and the
+plan is approved (`a_cold_approve_in_the_dm_runs_through_the_chat_sessions_trigger`);
+the command interprets the newest stored operator row of its own chat, not
+another sender's, a group's, another chat's or an older one's
+(`interpret_latest_interprets_the_stored_operator_text_only`); a row is
+interpreted once and a discussion sends nothing
+(`a_dm_row_is_interpreted_at_most_once`); an unrelated DM message with items
+waiting starts no interpreter (`an_unrelated_dm_message_starts_no_interpreter`);
+the caller rules (`cmd::intake::tests::authorization_by_caller`); the block
+after the operator's message and the silent handled turn
+(`chat_engine.test.ts`); the block table and the `chat` rows
+(`intake.test.ts`). The operator's DM in LID form: a chat keyed
+`<digits>@lid` with those digits allowlisted, and one the mapping resolves,
+get the block, their text is kept and the fast paths route; an unknown LID
+gets none of it (`intake.test.ts`, "the operator's DM in LID form …"); a
+cold "approve it" stored under a LID-keyed chat runs end to end through
+that chat's session, a phone-keyed session takes nothing from it, and an
+unmarked unknown-LID row is never interpreted
+(`a_cold_approve_in_a_lid_keyed_dm_runs_end_to_end`). Review fixes: a
+second allowlisted LID is admitted as normal chat and never the operator,
+an operator LID from `WHATSAPP_OPERATOR_LIDS` is the operator without a
+mapping, a LID only the mapping resolves is admitted by the DM gate as the
+operator, and the intake-group gate (the same check) admits an operator LID
+with the mapping unavailable (`intake.test.ts`); operator LIDs are sendable
+(`target_policy.test.ts`); the chat session is refused `cancel`,
+`approve-plan` and `release` (`authorization_by_caller`); a cancel from the
+DM goes through `interpret-latest` and a confirmation
+(`a_cancel_from_the_dm_goes_through_interpret_latest_and_a_confirmation`);
+"approve it" followed at once by "any update?" in one turn approves the plan
+and leaves the follow-up to the session, in either order, each row once
+(`a_quick_follow_up_does_not_take_the_place_of_the_decision`). Round 2:
+"approve the plan" and "cancel the old item" in one turn approve the plan
+and ask the cancel's question, and a later message that is not an answer
+stays with the session (`two_decisions_in_one_turn_are_both_taken`,
+`the_turn_output_says_what_the_session_still_answers`); with another allowed
+contact active more recently a `dm` message goes to the operator, an
+operator-only message addressed to another contact's chat is refused, a
+reminder to the operator's phone passes, and a LID the live check rejects
+falls back to the phone (`target_policy.test.ts`, "operator-only messages
+reach only the operator…"); an interrupted turn's uninterpreted row is
+reported once and never interpreted
+(`a_message_of_an_interrupted_turn_is_reported_once_and_never_interpreted`);
+a remapped LID stops being the operator in the live check at once and in
+the cache at the next refresh (`intake.test.ts`, "a remapped LID stops being
+the operator"). Review round 3: a "yes" in the same turn as "cancel item #1"
+confirms nothing and a "yes" after the question was delivered cancels
+(`a_yes_in_the_same_turn_cannot_confirm_a_question_not_yet_sent`); a later
+decision gets the "send it again" line and is not run
+(`two_decisions_in_one_turn_are_both_taken`); a task from a
+`WHATSAPP_OPERATOR_LIDS` chat is created and delivered there, one from a
+mapped LID is created while verified and delivered to the phone JID after
+expiry, and one from another contact stays there
+(`operator_lid_chats_get_their_task_results`); the verification mirror and
+the drain's live check for task LID chats (`intake.test.ts`,
+`target_policy.test.ts`); a row left in `received` is reported too
+(`a_message_of_an_interrupted_turn_is_reported_once_and_never_interpreted`).
+Review round 4: a "yes" of the same batch recorded after the question was
+sent, a voice "yes" transcribed after it, and a "yes" in the question's own
+WhatsApp second do not confirm, and a later "yes" does
+(`a_yes_that_arrived_before_the_question_was_sent_does_not_confirm`); the
+batch arrival stamp and both WhatsApp timestamps are stored
+(`intake.test.ts`, "a batch's messages keep the arrival…"); an append
+racing a claim is in the claimed body or refused, never neither
+(`intake.test.ts`, "an appended line is in the claimed body or refused…";
+`whatsapp_queue::tests::an_append_succeeds_only_on_a_pending_row`); a task
+result or operator-only row for a LID the live check rejects goes to the
+phone and drops the LID, another contact's LID keeps its result
+(`target_policy.test.ts`).
+
+Rust (`cargo test -p nucleus-core intake`, fake interpreter): "looks good,
+go ahead" in item #1's group approves plan v1 at once
+(`looks_good_in_the_items_group_approves_the_plan_it_shows`); a DM approval
+runs at once with one item waiting, after a confirmation with two, and at
+once when it names the item
+(`a_dm_approval_runs_at_once_with_one_item_waiting_and_after_a_confirmation_with_several`);
+a release always asks first (`a_release_always_asks_first`); "no" does
+nothing (`no_to_a_confirmation_does_nothing`); an expired question does
+nothing and says so (`an_expired_confirmation_does_nothing`); an unclear
+message gets the cleaned question and the list, a question the guard stops
+gets the fixed text, a non-JSON answer reads as unclear
+(`an_unclear_message_gets_the_question_and_what_each_option_does`); a
+decision the stage does not allow is refused with the list
+(`a_decision_the_stage_does_not_allow_is_refused_with_the_options`); a voice
+note or forward is always confirmed and the answer may be spoken
+(`a_decision_from_a_voice_note_or_a_forward_is_always_confirmed_first`); a row
+from another sender is never interpreted
+(`a_message_from_another_sender_is_never_interpreted`); an approval binds to
+the listed version, directly and through a confirmation, and the `UPDATE`
+re-checks it (`an_approval_binds_to_the_plan_version_in_the_list`); the
+interpreter's prompt has no issue title, body, comment, plan or agent text
+even when they carry instructions
+(`the_interpreter_receives_only_the_operators_text_and_lines_code_built`);
+the schema, the question cleaning and the fence (`decide::tests`); the
+no-tools argv (`the_no_tools_profile_grants_no_tool_directory_or_skill`).
+The PR link comment is posted after the draft PR without approval, through
+the guard and the fresh read after the lookup
+(`simple_issue_goes_from_intake_to_a_draft_pr_and_the_pr_link_on_the_issue`,
+`the_secret_guard_blocks_a_push_and_a_comment`,
+`the_comment_is_written_only_after_a_fresh_read_that_follows_the_lookup`,
+`removing_the_label_stops_an_item_before_the_pr_link_is_posted`,
+`forged_markers_and_foreign_pull_requests_are_ignored`); the backtick bug
+(`the_implementation_summary_reaches_whatsapp_without_markdown_escapes`);
+migration 3 on a database with rows in every removed state
+(`the_review_stage_is_migrated_away`). TypeScript (`src/intake.test.ts`):
+routing by marker, by quoted pipeline message and by the answer window,
+the window's start, end and use by the first DM message, another sender
+never routed, `sender` stored. Not verified here: the interpreter with a
+real model on real messages, and the answer window on the live account.
+
 ## Rejected alternatives
 
 - **Webhooks.** They need public ingress, which Nucleus does not have
@@ -1429,11 +1904,26 @@ characters inside a bogus comment flagged
   removed ad hoc resume. The thread in intake.db is the durable record, so
   each turn's brief carries it.
 - **Letting the refinement agent decide that a plan is approved.** Approval
-  releases implementation work; a model reading "looks good" is not an
-  authorization. Code reads a whole-message command from the operator, bound
-  to a plan version. (ADR-033 rejected code-parsed commands for tasks
-  because the model maps plain language well enough there; an approval gate
-  is different.)
+  releases implementation work, and the refinement agent reads issue text
+  that anyone can write. The interpreter of the amendment is a different
+  session: it has no tools, reads only the operator's text and lines code
+  built, returns a validated JSON object, and code runs the decision bound
+  to the listed plan version or hold.
+- **Whole-message commands as a second path next to the interpreter.** Two
+  paths would give two behaviors for the same words; the interpreter reads
+  `#2 approve` too.
+- **Sending every DM message to the interpreter while items wait.** It adds
+  a model session to every unrelated chat message and delays every answer
+  of the operator's general assistant for as long as a plan waits. The chat
+  session sees the list and triggers the interpreter on the stored message
+  instead.
+- **Only the fast paths (a `#n` marker, a quote, the answer window).** A
+  cold "approve it" in the DM went to the chat session, which could not
+  decide: the failure the operator reported.
+- **Letting the chat session pass the text to interpret.** The session reads
+  other text (tool output, agent messages); `interpret-latest` reads the
+  operator's stored message instead, so the session can start an
+  interpretation but not choose what is interpreted.
 - **The implementation agent pushes and opens the PR.** It would need
   network access and the operator's `gh` credentials inside the session,
   which rules out a later sandbox.
@@ -1462,8 +1952,8 @@ characters inside a bogus comment flagged
 ## Consequences
 
 - A labeled issue on a configured repo starts an eval within a few minutes
-  (the poll interval) and needs no operator action when it is simple, until
-  the comment decision.
+  (the poll interval) and needs no operator action when it is simple: it
+  closes when the draft PR is open and its link is posted.
 - The operator's WhatsApp gets up to `max_groups_per_day` new groups a day;
   each is left when its item closes. Items past the limit use the DM with
   `[#n]` markers.

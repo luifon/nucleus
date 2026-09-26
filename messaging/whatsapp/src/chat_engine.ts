@@ -164,6 +164,12 @@ export interface EngineDeps {
   apiRetryDelayMs?: number;
 }
 
+/** The final text a DM chat session ends its turn with after `nucleus
+ *  intake interpret-latest` printed HANDLED: the issue pipeline already
+ *  answered the operator, so the turn sends no reply. Mirrors
+ *  `pipeline::INTAKE_HANDLED` in core/src/intake/pipeline.rs. */
+export const INTAKE_HANDLED = "[handled by the issue pipeline]";
+
 export interface InboundMessage {
   chatId: string;
   pool: string;
@@ -172,6 +178,9 @@ export interface InboundMessage {
   waMsgId: string | null;
   /** BufferJSON-encoded {key, message} for quoting the reply. */
   quotedJson: string | null;
+  /** A code-owned block typed after the message (the ADR-036 list of intake
+   *  decisions, for the operator's DM only), or "" / absent for none. */
+  context?: string;
 }
 
 /** An operator marker line, alone on its line. */
@@ -202,13 +211,16 @@ export function neutralizeMarkers(text: string): string {
     .join("\n");
 }
 
-/** The payload typed for an operator message. Pure except the clock. */
-export function operatorPayload(chatId: string, ref: string, text: string, kind: "text" | "voice"): string {
+/** The payload typed for an operator message, with an optional code-owned
+ *  context block after it (the ADR-036 intake decision list). Pure except
+ *  the clock. */
+export function operatorPayload(chatId: string, ref: string, text: string, kind: "text" | "voice", context = ""): string {
   const header =
     kind === "voice"
       ? `[WhatsApp voice memo, transcribed — chat ${chatId} — ref:${ref}]`
       : `[WhatsApp — chat ${chatId} — ref:${ref}]`;
-  return withDatePreamble(`${header}\n\n${neutralizeMarkers(text)}`);
+  const tail = context.trim() ? `\n\n${neutralizeMarkers(context.trim())}` : "";
+  return withDatePreamble(`${header}\n\n${neutralizeMarkers(text)}${tail}`);
 }
 
 /** The code-owned envelope an agent message is typed in: the ADR-021
@@ -341,7 +353,7 @@ class ChatActor {
       text: m.text,
     });
     if (duplicate) return { ref, duplicate };
-    const payload = operatorPayload(this.chatId, ref, m.text, m.inputKind);
+    const payload = operatorPayload(this.chatId, ref, m.text, m.inputKind, m.context ?? "");
     if (this.refuseOversize(ref, payload, m.quotedJson)) return { ref, duplicate: false };
     this.issued.set(ref, "operator");
     this.queue.push({ ref, payload, kind: "operator" });
@@ -722,6 +734,13 @@ class ChatActor {
     const infra = classifyInfraReply(finalText);
     if (infra !== null) {
       this.handleInfra(open, infra, quote);
+      return;
+    }
+
+    // ADR-036: the issue pipeline answered this message itself.
+    if (open.kind === "operator" && finalText.trim() === INTAKE_HANDLED) {
+      this.e.turns.endTurn(open.id, { status: "silent", replyChars: 0, pendingBg });
+      this.answered(open.refs);
       return;
     }
 

@@ -94,7 +94,12 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     add_columns_if_missing(
         &pool,
         "outbound_queue",
-        &[("in_flight_at", "in_flight_at TEXT"), ("dedup_key", "dedup_key TEXT"), ("quoted_json", "quoted_json TEXT")],
+        &[
+            ("in_flight_at", "in_flight_at TEXT"),
+            ("dedup_key", "dedup_key TEXT"),
+            ("quoted_json", "quoted_json TEXT"),
+            ("wa_ts", "wa_ts INTEGER"),
+        ],
     )
     .await?;
     add_columns_if_missing(&pool, "session_inbox", &[("dedup_key", "dedup_key TEXT")]).await?;
@@ -117,6 +122,20 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             calling_at  TEXT
         )
         "#,
+    )
+    .execute(&pool)
+    .await?;
+    // ADR-036: LIDs the bot verified as the operator through the live LID
+    // mapping, with when. The bot writes it; Rust reads it (task chats).
+    // Must match messaging/whatsapp/src/intake.ts.
+    sqlx::query("CREATE TABLE IF NOT EXISTS operator_lid_verified (digits TEXT PRIMARY KEY, verified_at TEXT NOT NULL)")
+        .execute(&pool)
+        .await?;
+    // ADR-036: the DM chat session's list of waiting intake decisions. One
+    // row; Rust writes it, the bot reads it. Must match
+    // messaging/whatsapp/src/intake.ts.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS intake_chat_block (id INTEGER PRIMARY KEY CHECK (id = 1), block TEXT NOT NULL, updated_at TEXT NOT NULL)",
     )
     .execute(&pool)
     .await?;
@@ -431,8 +450,174 @@ pub struct IntakeInbound {
     pub text: String,
     pub received_at: String,
     /// `text` when the operator typed it; `voice` (a transcription) or
-    /// `forwarded` otherwise. Only typed text can be a command.
+    /// `forwarded` otherwise. A decision from anything but typed text is
+    /// always confirmed first.
     pub input_kind: String,
+    /// `operator` when the bot checked that the sender is the operator's
+    /// own identity; any other value (a table from before the column
+    /// existed reads as `unknown`) is never interpreted.
+    pub sender: String,
+    /// WhatsApp's own `messageTimestamp` of the message (seconds), when the
+    /// bot knew it. `received_at` is the arrival at the bot, stamped before
+    /// the message was handled.
+    pub wa_ts: Option<i64>,
+}
+
+/// The `wa_ts` select expression for `intake_inbound` (with a table
+/// `prefix` such as `i.`), or NULL for a table from before the column.
+async fn wa_ts_column(pool: &SqlitePool, prefix: &str) -> Result<String> {
+    let has: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('intake_inbound') WHERE name = 'wa_ts'")
+        .fetch_one(pool)
+        .await?;
+    Ok(if has { format!("{prefix}wa_ts") } else { "NULL AS wa_ts".into() })
+}
+
+/// `item_key` of a DM message that names no item (ADR-036): it answers a
+/// question the pipeline asked in the DM.
+pub const INTAKE_DM_KEY: &str = "dm";
+
+/// `item_key` of an operator DM message that went to the DM chat session
+/// (ADR-036): stored so `nucleus intake interpret-latest` can read the
+/// operator's own text; the tick never interprets it by itself.
+pub const INTAKE_CHAT_KEY: &str = "chat";
+
+/// The newest operator DM message that went to the chat session
+/// (`item_key = chat`, `sender = operator`, not a group), in `chat` when
+/// given.
+pub async fn latest_chat_message(pool: &SqlitePool, chat: Option<&str>) -> Result<Option<IntakeInbound>> {
+    if !table_exists(pool, "intake_inbound").await? {
+        return Ok(None);
+    }
+    let has_sender: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('intake_inbound') WHERE name = 'sender'")
+        .fetch_one(pool)
+        .await?;
+    if !has_sender {
+        return Ok(None);
+    }
+    let wa_ts = wa_ts_column(pool, "").await?;
+    Ok(sqlx::query_as(&format!(
+        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender, {wa_ts} FROM intake_inbound
+          WHERE item_key = ?1 AND sender = 'operator' AND chat_id NOT LIKE ?2 AND (?3 IS NULL OR chat_id = ?3)
+          ORDER BY id DESC LIMIT 1"
+    ))
+    .bind(INTAKE_CHAT_KEY)
+    .bind(format!("%@{}", "g.us"))
+    .bind(chat)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// The operator DM messages (`item_key = chat`, `sender = operator`) that
+/// the running turn of DM chat `chat` covers, oldest first: the turn
+/// engine's `chat_turns` row with `status = 'running'` for the chat, and
+/// the `chat_inbound` rows it marked with that turn, joined to the stored
+/// rows by WhatsApp message id. Empty when the bot tables are missing or no
+/// turn runs.
+pub async fn current_turn_messages(pool: &SqlitePool, chat: &str) -> Result<Vec<IntakeInbound>> {
+    for t in ["intake_inbound", "chat_turns", "chat_inbound"] {
+        if !table_exists(pool, t).await? {
+            return Ok(vec![]);
+        }
+    }
+    let has_sender: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('intake_inbound') WHERE name = 'sender'")
+        .fetch_one(pool)
+        .await?;
+    if !has_sender {
+        return Ok(vec![]);
+    }
+    let wa_ts = wa_ts_column(pool, "i.").await?;
+    Ok(sqlx::query_as(&format!(
+        "SELECT i.id, i.item_key, i.chat_id, i.wa_msg_id, i.text, i.received_at, i.input_kind, i.sender, {wa_ts}
+           FROM intake_inbound i
+           JOIN chat_inbound c ON c.chat_id = i.chat_id AND c.wa_msg_id = i.wa_msg_id
+          WHERE i.chat_id = ?1 AND i.item_key = ?2 AND i.sender = 'operator'
+            AND c.turn_id = (SELECT id FROM chat_turns WHERE chat_id = ?1 AND status = 'running'
+                              ORDER BY started_at DESC LIMIT 1)
+          ORDER BY i.id"
+    ))
+    .bind(chat)
+    .bind(INTAKE_CHAT_KEY)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Operator DM messages (`item_key = chat`, `sender = operator`) of the
+/// last 7 days whose chat turn the bot marked `interrupted` on a restart
+/// (the message itself, or the turn that read it), oldest first. The
+/// caller filters out the ones already interpreted.
+pub async fn interrupted_chat_messages(pool: &SqlitePool) -> Result<Vec<IntakeInbound>> {
+    for t in ["intake_inbound", "chat_turns", "chat_inbound"] {
+        if !table_exists(pool, t).await? {
+            return Ok(vec![]);
+        }
+    }
+    let has_sender: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('intake_inbound') WHERE name = 'sender'")
+        .fetch_one(pool)
+        .await?;
+    if !has_sender {
+        return Ok(vec![]);
+    }
+    let wa_ts = wa_ts_column(pool, "i.").await?;
+    let since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    Ok(sqlx::query_as(&format!(
+        "SELECT DISTINCT i.id, i.item_key, i.chat_id, i.wa_msg_id, i.text, i.received_at, i.input_kind, i.sender, {wa_ts}
+           FROM intake_inbound i
+           JOIN chat_inbound c ON c.chat_id = i.chat_id AND c.wa_msg_id = i.wa_msg_id
+           LEFT JOIN chat_turns t ON t.id = c.turn_id
+          WHERE i.item_key = ?1 AND i.sender = 'operator' AND i.received_at >= ?2
+            AND (c.status = 'interrupted' OR t.status = 'interrupted')
+          ORDER BY i.id"
+    ))
+    .bind(INTAKE_CHAT_KEY)
+    .bind(since)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// When the outbound row with `dedup_key` was sent, if it was: its
+/// `sent_at` (the bot's clock) and WhatsApp's server timestamp of the sent
+/// message in seconds (`wa_ts`, from the send result, when known).
+pub async fn sent_by_dedup(pool: &SqlitePool, dedup_key: &str) -> Result<Option<(String, Option<i64>)>> {
+    Ok(sqlx::query_as(
+        "SELECT sent_at, wa_ts FROM outbound_queue WHERE dedup_key = ?1 AND status = 'sent' AND sent_at IS NOT NULL",
+    )
+    .bind(dedup_key)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Add `line` as a new paragraph to the outbound row with `dedup_key` while
+/// it is still `pending` (not claimed by the drain). False when there is no
+/// such row any more (it was sent or is being sent).
+pub async fn append_to_pending(pool: &SqlitePool, dedup_key: &str, line: &str) -> Result<bool> {
+    let res = sqlx::query("UPDATE outbound_queue SET body = body || ?2 WHERE dedup_key = ?1 AND status = 'pending'")
+        .bind(dedup_key)
+        .bind(format!("\n\n{line}"))
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Replace the block the bot adds to every operator message it types into
+/// the DM chat session (`intake_chat_block`, one row): what waits for an
+/// intake decision. Empty when nothing waits. Rust writes it; the bot only
+/// reads it.
+pub async fn set_intake_chat_block(pool: &SqlitePool, block: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO intake_chat_block (id, block, updated_at) VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET block = excluded.block, updated_at = excluded.updated_at
+         WHERE intake_chat_block.block <> excluded.block",
+    )
+    .bind(block)
+    .bind(crate::timestamp::now())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The block [`set_intake_chat_block`] wrote.
+pub async fn intake_chat_block(pool: &SqlitePool) -> Result<String> {
+    Ok(sqlx::query_scalar("SELECT block FROM intake_chat_block WHERE id = 1").fetch_optional(pool).await?.unwrap_or_default())
 }
 
 /// Rows of `intake_inbound` with an id above `after`, oldest first.
@@ -440,10 +625,15 @@ pub async fn intake_inbound_after(pool: &SqlitePool, after: i64, limit: i64) -> 
     if !table_exists(pool, "intake_inbound").await? {
         return Ok(vec![]);
     }
-    Ok(sqlx::query_as(
-        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, input_kind FROM intake_inbound
-          WHERE id > ?1 ORDER BY id LIMIT ?2",
-    )
+    let has_sender: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('intake_inbound') WHERE name = 'sender'")
+        .fetch_one(pool)
+        .await?;
+    let sender = if has_sender { "sender" } else { "'unknown' AS sender" };
+    let wa_ts = wa_ts_column(pool, "").await?;
+    Ok(sqlx::query_as(&format!(
+        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, input_kind, {sender}, {wa_ts} FROM intake_inbound
+          WHERE id > ?1 ORDER BY id LIMIT ?2"
+    ))
     .bind(after)
     .bind(limit)
     .fetch_all(pool)
@@ -469,15 +659,82 @@ pub fn allowed_dm_digits() -> Vec<String> {
         .collect()
 }
 
+/// The digit sets of `WHATSAPP_OPERATOR_LIDS` (ADR-036): the operator's own
+/// LIDs.
+pub fn operator_lids_env() -> Vec<String> {
+    std::env::var("WHATSAPP_OPERATOR_LIDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| normalize_digits(s.trim().trim_matches('"')))
+        .filter(|d| !d.is_empty())
+        .collect()
+}
+
+/// How long a LID the bot verified as the operator through the live LID
+/// mapping counts (`operator_lid_verified`, ADR-036). Mirrors
+/// `OPERATOR_LID_TTL_MS` in messaging/whatsapp/src/intake.ts.
+pub const OPERATOR_LID_TTL_SECS: i64 = 600;
+
+/// LIDs the bot verified as the operator through the live mapping within
+/// [`OPERATOR_LID_TTL_SECS`] (`operator_lid_verified`, which the bot writes
+/// and Rust only reads). Empty when the table is missing.
+pub async fn verified_operator_lids(pool: &SqlitePool) -> Result<Vec<String>> {
+    if !table_exists(pool, "operator_lid_verified").await? {
+        return Ok(vec![]);
+    }
+    let since = (chrono::Utc::now() - chrono::Duration::seconds(OPERATOR_LID_TTL_SECS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    Ok(sqlx::query_scalar("SELECT digits FROM operator_lid_verified WHERE verified_at > ?1")
+        .bind(since)
+        .fetch_all(pool)
+        .await?)
+}
+
+/// The operator's LIDs a Rust process can accept now: `WHATSAPP_OPERATOR_LIDS`
+/// and the fresh entries of `operator_lid_verified` in `whatsapp_db` (read
+/// only; a missing or unreadable database adds none).
+pub async fn accepted_operator_lids(whatsapp_db: &Path) -> Vec<String> {
+    let mut out = operator_lids_env();
+    if whatsapp_db.exists() {
+        if let Ok(pool) = crate::db::open_read_only(whatsapp_db).await {
+            out.extend(verified_operator_lids(&pool).await.unwrap_or_default());
+            pool.close().await;
+        }
+    }
+    out
+}
+
 /// Validate and canonicalize a DM chat reference for delivery. An `@lid`
 /// chat is kept as is (a reply must go to the exact chat); any other form
 /// becomes `<digits>@s.whatsapp.net`. The digits must be on the DM
-/// allowlist.
+/// allowlist, or the chat is an `@lid` in `WHATSAPP_OPERATOR_LIDS`.
 pub fn canonical_dm_chat(chat: &str) -> Result<String> {
-    canonical_dm_chat_in(chat, &allowed_dm_digits())
+    canonical_dm_chat_in(chat, &allowed_dm_digits(), &operator_lids_env())
 }
 
-fn canonical_dm_chat_in(chat: &str, allowed: &[String]) -> Result<String> {
+/// [`canonical_dm_chat`] that also accepts an `@lid` chat in `operator_lids`
+/// (see [`accepted_operator_lids`]).
+pub fn canonical_dm_chat_with(chat: &str, operator_lids: &[String]) -> Result<String> {
+    canonical_dm_chat_in(chat, &allowed_dm_digits(), operator_lids)
+}
+
+/// The chat a task's result goes to (ADR-036): its origin chat when that is
+/// still accepted ([`canonical_dm_chat_with`]); an operator LID that is no
+/// longer accepted (its mapping verification expired) falls back to the
+/// operator's phone JID (the first `WHATSAPP_ALLOWED_DM_JIDS` entry), so
+/// the result is not lost. Any other chat that is not accepted is an error.
+pub fn task_result_chat(chat: &str, operator_lids: &[String]) -> Result<String> {
+    match canonical_dm_chat_with(chat, operator_lids) {
+        Ok(c) => Ok(c),
+        Err(e) if chat.trim().ends_with("@lid") => match allowed_dm_digits().first() {
+            Some(phone) => Ok(format!("{phone}@s.whatsapp.net")),
+            None => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+fn canonical_dm_chat_in(chat: &str, allowed: &[String], operator_lids: &[String]) -> Result<String> {
     if chat.contains("@g.us") {
         anyhow::bail!("{chat:?} is a group, not a WhatsApp DM chat");
     }
@@ -485,14 +742,11 @@ fn canonical_dm_chat_in(chat: &str, allowed: &[String]) -> Result<String> {
     if digits.len() < 8 {
         anyhow::bail!("{chat:?} is not a WhatsApp DM chat");
     }
-    if !allowed.contains(&digits) {
-        anyhow::bail!("{chat:?} is not on WHATSAPP_ALLOWED_DM_JIDS");
+    let lid = chat.trim().ends_with("@lid");
+    if !allowed.contains(&digits) && !(lid && operator_lids.contains(&digits)) {
+        anyhow::bail!("{chat:?} is not on WHATSAPP_ALLOWED_DM_JIDS and not a verified operator LID");
     }
-    Ok(if chat.trim().ends_with("@lid") {
-        format!("{digits}@lid")
-    } else {
-        format!("{digits}@s.whatsapp.net")
-    })
+    Ok(if lid { format!("{digits}@lid") } else { format!("{digits}@s.whatsapp.net") })
 }
 
 #[cfg(test)]
@@ -585,12 +839,52 @@ mod tests {
         assert!(intake_inbound_after(&pool, 0, 10).await.unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn an_append_succeeds_only_on_a_pending_row() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let pool = open(dir.path()).await.unwrap();
+        enqueue_text_once(&pool, "dm", "Question?", "intake:ask", "k1").await.unwrap();
+        assert!(append_to_pending(&pool, "k1", "Also received: 'x'").await.unwrap());
+        let body: String = sqlx::query_scalar("SELECT body FROM outbound_queue WHERE dedup_key = 'k1'").fetch_one(&pool).await.unwrap();
+        assert_eq!(body, "Question?\n\nAlso received: 'x'");
+        // Claimed by the drain: the append is refused (the caller queues the
+        // separate note) and the body is unchanged.
+        sqlx::query("UPDATE outbound_queue SET status = 'in_flight' WHERE dedup_key = 'k1'").execute(&pool).await.unwrap();
+        assert!(!append_to_pending(&pool, "k1", "Also received: 'y'").await.unwrap());
+        let body: String = sqlx::query_scalar("SELECT body FROM outbound_queue WHERE dedup_key = 'k1'").fetch_one(&pool).await.unwrap();
+        assert!(!body.contains("'y'"));
+        assert!(!append_to_pending(&pool, "missing", "z").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_inbound_table_without_the_sender_column_reads_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let pool = open(dir.path()).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE intake_inbound (id INTEGER PRIMARY KEY AUTOINCREMENT, item_key TEXT NOT NULL, chat_id TEXT NOT NULL,
+             wa_msg_id TEXT NOT NULL, text TEXT NOT NULL, received_at TEXT NOT NULL, input_kind TEXT NOT NULL DEFAULT 'text')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at) VALUES ('1', 'c', 'm', 'hi', 't')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(intake_inbound_after(&pool, 0, 10).await.unwrap()[0].sender, "unknown");
+        sqlx::query("ALTER TABLE intake_inbound ADD COLUMN sender TEXT NOT NULL DEFAULT 'unknown'").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE intake_inbound SET sender = 'operator'").execute(&pool).await.unwrap();
+        assert_eq!(intake_inbound_after(&pool, 0, 10).await.unwrap()[0].sender, "operator");
+    }
+
     #[test]
     fn dm_chat_canonicalization() {
         assert_eq!(normalize_digits("+55 11 99999-9999"), "5511999999999");
         assert_eq!(normalize_digits("5511999999999:12@s.whatsapp.net"), "5511999999999");
         let allowed = vec!["5511999999999".to_string(), "123456789012".to_string()];
-        let c = |s: &str| canonical_dm_chat_in(s, &allowed);
+        let c = |s: &str| canonical_dm_chat_in(s, &allowed, &[]);
         assert_eq!(c("+55 11 99999-9999").unwrap(), "5511999999999@s.whatsapp.net");
         // Synthetic ids built at runtime (the committed-secrets scanner reads
         // a literal `<digits>@<domain>` as a real JID).

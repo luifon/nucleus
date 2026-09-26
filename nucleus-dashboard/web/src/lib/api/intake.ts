@@ -8,7 +8,6 @@ import type { IntakeMessage as IntakeMessageWire } from "./generated/IntakeMessa
 import type { IntakeDetail as IntakeDetailWire } from "./generated/IntakeDetail";
 import type { IntakeReplyReq } from "./generated/IntakeReplyReq";
 import type { IntakeApprovePlanReq } from "./generated/IntakeApprovePlanReq";
-import type { IntakeApproveCommentReq } from "./generated/IntakeApproveCommentReq";
 import type { IntakeItemReq } from "./generated/IntakeItemReq";
 import type { IntakeReleaseReq } from "./generated/IntakeReleaseReq";
 import type { Task } from "./tasks";
@@ -26,7 +25,6 @@ export type IntakeStage =
   | "refinement"
   | "implementation"
   | "pr"
-  | "review"
   | "closed"
   | "failed"
   | "cancelled"
@@ -34,8 +32,9 @@ export type IntakeStage =
   | "blocked"
   | "held";
 
-/** UI-layer refinement of IntakeItem.comment_state. */
-export type CommentState = "none" | "proposed" | "approved" | "posted" | "skipped";
+/** UI-layer refinement of IntakeItem.comment_state: the pull request link
+ *  on the issue (`skipped`: the event's source has no reply channel). */
+export type CommentState = "none" | "posted" | "skipped";
 
 /** UI-layer refinement of IntakeItem.surface. */
 export type ThreadSurface = "none" | "pending" | "group" | "dm";
@@ -75,11 +74,6 @@ export const replyToItem = (id: number, text: string) =>
 
 export const approvePlan = (id: number, version: number) =>
   jsonPost<IntakeItem, IntakeApprovePlanReq>("/intake/api/approve-plan", { id, version });
-
-export const approveComment = (id: number, text?: string) =>
-  jsonPost<IntakeItem, IntakeApproveCommentReq>("/intake/api/approve-comment", text === undefined ? { id } : { id, text });
-
-export const skipComment = (id: number) => jsonPost<IntakeItem, IntakeItemReq>("/intake/api/skip-comment", { id });
 
 export const cancelItem = (id: number) => jsonPost<IntakeItem, IntakeItemReq>("/intake/api/cancel", { id });
 

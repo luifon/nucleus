@@ -527,7 +527,6 @@ pub(crate) mod tests {
             tests_status: None,
             tests_output: None,
             pr_url: None,
-            comment_draft: None,
             comment_state: "none".into(),
             comment_url: None,
             comment_op: None,

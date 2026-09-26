@@ -10,8 +10,9 @@
 //!
 //! **Pipeline.** An accepted event on a configured repo becomes an *item*
 //! (`#<n>`). The item moves through stages ([`stage::Stage`]):
-//! `queued` → `eval` → (`refinement` →) `implementation` → `pr` →
-//! `review` → `closed`, or `failed` / `cancelled`. Every agent step is a
+//! `queued` → `eval` → (`refinement` →) `implementation` → `pr` → `closed`,
+//! or `failed` / `cancelled` (and `stale`, `blocked`, `held`). The operator's
+//! WhatsApp decisions are read in [`decide`]. Every agent step is a
 //! task in the ADR-033 ledger (`origin = pipeline`, parent links between the
 //! steps of one item): the eval agent and each refinement turn run
 //! read-only in a checkout of the repo, the implementation agent runs in a
@@ -33,6 +34,7 @@
 //! `intake_groups` and `intake_inbound`.
 
 pub mod briefs;
+pub mod decide;
 pub mod event;
 pub mod git;
 pub mod github;

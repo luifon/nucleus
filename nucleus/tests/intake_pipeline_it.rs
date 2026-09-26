@@ -10,10 +10,10 @@
 //! comments, every call logged) and whose remote URL is a bare repository in
 //! a temporary directory. The workspace's `tools/check-secrets.sh` is a
 //! stand-in that finds nothing. The test
-//! drives `nucleus intake tick` until the item has a draft PR, approves the
-//! issue comment as the operator, and checks the ledger, the pushed branch,
-//! the gh calls, and that a non-collaborator's comment never reached an
-//! agent. Workers run in the `nucleus-test-intake` tmux session, which the
+//! drives `nucleus intake tick` until the item is closed (draft PR open, its
+//! link posted on the issue without approval), and checks the ledger, the
+//! pushed branch, the gh calls, and that a non-collaborator's comment never
+//! reached an agent. Workers run in the `nucleus-test-intake` tmux session, which the
 //! test removes.
 
 use std::path::{Path, PathBuf};
@@ -176,11 +176,11 @@ async fn issue_to_draft_pr_with_real_agents() {
     let item = loop {
         tick(ws);
         if let Ok(it) = nucleus_core::intake::store::item(&db, 1).await {
-            if matches!(it.stage.as_str(), "review" | "failed" | "closed" | "cancelled" | "refinement") {
+            if matches!(it.stage.as_str(), "failed" | "blocked" | "closed" | "cancelled" | "stale" | "refinement") {
                 break it;
             }
         }
-        assert!(started.elapsed() < Duration::from_secs(1500), "the pipeline did not reach review in time");
+        assert!(started.elapsed() < Duration::from_secs(1500), "the pipeline did not close the item in time");
         tokio::time::sleep(Duration::from_secs(5)).await;
     };
     let tasks_db = nucleus_core::tasks::open(ws).await.unwrap();
@@ -199,7 +199,7 @@ async fn issue_to_draft_pr_with_real_agents() {
     for m in nucleus_core::intake::store::messages(&db, 1).await.unwrap() {
         println!("[{} {}] {}", m.author, m.via, m.body.replace('\n', " "));
     }
-    assert_eq!(item.stage, "review", "item: {item:?}");
+    assert_eq!((item.stage.as_str(), item.comment_state.as_str()), ("closed", "posted"), "item: {item:?}");
     assert_eq!(item.classification.as_deref(), Some("simple"));
     assert_eq!(item.tests_status.as_deref(), Some("passed"));
     assert_eq!(item.pr_url.as_deref(), Some("https://example.invalid/acme/widget/pull/1"));
@@ -251,24 +251,18 @@ async fn issue_to_draft_pr_with_real_agents() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&files.stdout).trim(), "LICENSE\nREADME.md", "files on the branch");
-    let wt = PathBuf::from(item.worktree.clone().unwrap());
-    assert!(!wt.join("memory").exists(), "no Nucleus state in the item's clone");
+    assert!(item.worktree.is_none(), "the clone is removed when the item closes");
     assert!(ws.join("memory/logs/tasks/runs.jsonl").exists(), "the run-log stays in the workspace");
 
     let log = std::fs::read_to_string(&env.gh_log).unwrap();
     let create = log.lines().find(|l| l.starts_with("pr create")).expect("a PR was created");
     assert!(create.contains("--draft") && create.contains("--head nucleus/item-1 "), "{create}");
     assert!(!log.contains("pr merge") && !log.contains("pr ready"), "never merged, never marked ready");
-    assert!(!log.contains("issue comment"), "no comment before the operator approves it");
-
-    // The operator approves the proposed comment; the next tick posts it.
-    let out = nucleus(ws, &["intake", "approve-comment", "1"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    tick(ws);
-    let item = nucleus_core::intake::store::item(&db, 1).await.unwrap();
-    assert_eq!((item.stage.as_str(), item.comment_state.as_str()), ("closed", "posted"));
-    let log = std::fs::read_to_string(&env.gh_log).unwrap();
+    // One comment with the PR link, posted after the PR, without approval.
     assert_eq!(log.lines().filter(|l| l.starts_with("issue comment 1")).count(), 1);
+    let created = log.lines().position(|l| l.starts_with("pr create")).unwrap();
+    let commented = log.lines().position(|l| l.starts_with("issue comment 1")).unwrap();
+    assert!(created < commented, "{log}");
 
     // Every thread message was queued for the operator's DM, marked #1.
     let wa = nucleus_core::whatsapp_queue::open(ws).await.unwrap();

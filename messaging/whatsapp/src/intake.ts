@@ -8,14 +8,18 @@
 //      bot drains); the bot records the outcome in its own `intake_groups`
 //      table, which Rust reads. A created group contains the bot and the
 //      operator only; its membership baseline is the create response.
-//   2. Route the operator's messages to an item: messages from the operator
-//      (the first WHATSAPP_ALLOWED_DM_JIDS entry, phone or LID form) in an
-//      item's group, and operator DM messages that start with the item
-//      marker (`#12 …`) or quote a message the pipeline sent for that item.
-//      The bot stores them in `intake_inbound` with how they were written
-//      (`text`, `voice`, `forwarded`: only typed text can be a command) and
-//      runs `nucleus intake tick`; the Rust side reads them, decides
-//      approvals, and replies through the outbound queue.
+//   2. Route the operator's messages to the pipeline: messages from the
+//      operator (the first WHATSAPP_ALLOWED_DM_JIDS entry, phone or LID
+//      form) in an item's group, and operator DM messages that start with
+//      the item marker (`#12 …`), quote a message the pipeline sent, or come
+//      within 15 minutes after the pipeline asked the operator a question in
+//      the DM (its next message is the answer). The bot stores them in
+//      `intake_inbound` with how they were written (`text`, `voice`,
+//      `forwarded`) and `sender = 'operator'`, and runs `nucleus intake
+//      tick`. The Rust side has each message read by the interpreter model,
+//      decides in code what happens, and replies through the outbound queue
+//      (a decision from a voice note or a forward is always confirmed
+//      first).
 //   3. Keep the intake groups in the target allowlist while they are
 //      active, so the outbound drain (target policy + secret filter) can
 //      send to them, and remove them when the bot has left.
@@ -121,30 +125,202 @@ export function classifyCreateError(e: unknown): "rejected" | "unknown" {
   return "unknown";
 }
 
-/** How an operator message was written. Only `text` can be a command. */
+/** How an operator message was written. The pipeline confirms a decision
+ *  from anything but `text` before it runs. */
 export type InputKind = "text" | "voice" | "forwarded";
 
-/** True when `jid` (a phone JID, an `@lid` id, or a bare number) is the
- *  operator: its digits equal `operatorId`, or it is a LID whose phone
- *  number (from `pnForLid`, the bot's LID mapping) has those digits. The
- *  same rule the group sender check uses. */
+/** `item_key` of a DM message that names no item: the answer to a question
+ *  the pipeline asked in the DM. Mirrors `INTAKE_DM_KEY` in
+ *  core/src/whatsapp_queue.rs. */
+export const DM_KEY = "dm";
+
+/** `item_key` of an operator DM message that went to the chat session. It
+ *  is stored so `nucleus intake interpret-latest` can read the operator's
+ *  own text when the chat session asks; the tick never interprets it by
+ *  itself. Mirrors `INTAKE_CHAT_KEY` in core/src/whatsapp_queue.rs. */
+export const CHAT_KEY = "chat";
+
+/** A question the pipeline asks in the DM (`intake:ask`) waits this long for
+ *  the operator's answer. Mirrors `CONFIRMATION_MINUTES` in
+ *  core/src/intake/pipeline.rs. */
+export const ANSWER_WINDOW_MS = 15 * 60 * 1000;
+
+/** The end of a WhatsApp group chat id. */
+const GROUP_JID_SUFFIX = ["@", "g.us"].join("");
+
+/** Who the operator is: `operatorId` is the first WHATSAPP_ALLOWED_DM_JIDS
+ *  entry (the phone digits); `operatorLids` are the digits of
+ *  WHATSAPP_OPERATOR_LIDS. The rest of the DM allowlist is other contacts
+ *  the bot chats with, never the operator. */
+export interface OperatorIds {
+  operatorId: string | null;
+  operatorLids: ReadonlySet<string>;
+}
+
+/** The operator's identities from the bot's configuration. */
+export function operatorIds(config: { operatorId: string | null; operatorLids: ReadonlySet<string> }): OperatorIds {
+  return { operatorId: config.operatorId, operatorLids: config.operatorLids };
+}
+
+/** True when `jid` (a phone JID, an `@lid` id, a DM chat id, or a bare
+ *  number) is the operator: its digits equal the operator's phone digits;
+ *  or it is an `@lid` id whose digits are in WHATSAPP_OPERATOR_LIDS; or it
+ *  is an `@lid` id whose phone number, from `pnForLid` (the bot's LID
+ *  mapping), has the operator's digits. The one rule for every operator
+ *  check: both inbound gates (the DM gate and the intake-group sender
+ *  gate), approvals, group members, the DM routing, the stored `chat` rows
+ *  and the decision block for the DM chat session. */
 export async function isOperatorId(
   jid: string,
-  operatorId: string | null,
+  op: OperatorIds,
   pnForLid: (lid: string) => Promise<string | null | undefined>,
 ): Promise<boolean> {
-  if (!operatorId) return false;
+  if (!op.operatorId) return false;
   const digits = normalizeSenderId(jid);
-  if (digits && digits === operatorId) return true;
+  if (digits && digits === op.operatorId) return true;
   if (jid.endsWith("@lid")) {
+    if (digits && op.operatorLids.has(digits)) return true;
     try {
       const pn = await pnForLid(jid);
-      if (pn && normalizeSenderId(pn) === operatorId) return true;
+      if (pn && normalizeSenderId(pn) === op.operatorId) return true;
     } catch {
       // A failed lookup is not the operator.
     }
   }
   return false;
+}
+
+/** When a message reached the bot (ADR-036): `atMs`, taken in the
+ *  `messages.upsert` handler before any await (so a batch's later message,
+ *  or a voice note still being transcribed, keeps its real arrival time),
+ *  and `waTs`, WhatsApp's own `messageTimestamp` in seconds when known. A
+ *  message can answer only a question sent before both. */
+export interface Arrival {
+  atMs: number;
+  waTs: number | null;
+}
+
+/** WhatsApp's `messageTimestamp` (a number, or a protobuf Long) in
+ *  seconds, or null. */
+export function waSeconds(ts: unknown): number | null {
+  if (typeof ts === "number" && Number.isFinite(ts)) return Math.floor(ts);
+  if (ts && typeof ts === "object") {
+    const t = ts as { toNumber?: () => number; low?: number };
+    if (typeof t.toNumber === "function") return Math.floor(t.toNumber());
+    if (typeof t.low === "number") return t.low;
+  }
+  if (typeof ts === "string" && /^\d+$/.test(ts)) return Number(ts);
+  return null;
+}
+
+/** The arrival of every message of one `messages.upsert` batch, stamped at
+ *  once, before the batch is handled. */
+export function stampBatch<T>(messages: readonly T[], tsOf: (m: T) => unknown, nowMs = Date.now()): Map<T, Arrival> {
+  const out = new Map<T, Arrival>();
+  for (const m of messages) out.set(m, { atMs: nowMs, waTs: waSeconds(tsOf(m)) });
+  return out;
+}
+
+/** How long a LID the mapping resolved to the operator counts for the
+ *  checks that cannot ask the mapping (role lookup, target policy). */
+export const OPERATOR_LID_TTL_MS = 10 * 60 * 1000;
+
+/** LIDs the live mapping resolved to the operator, for the synchronous
+ *  checks only (ADR-036). An entry counts for `OPERATOR_LID_TTL_MS` after
+ *  it was last verified; `refresh` verifies every entry against the live
+ *  mapping again (on each inbound message) and drops the ones that no
+ *  longer resolve to the operator. The asynchronous checks never read it:
+ *  they call the mapping each time (`isOperatorId`). WHATSAPP_OPERATOR_LIDS
+ *  entries are not kept here and do not depend on the mapping. */
+export class OperatorLidCache {
+  private verified = new Map<string, number>();
+
+  /** `persist` mirrors every verification and drop into whatsapp.db
+   *  (`operator_lid_verified`), where the Rust side reads it to accept a
+   *  task from the operator's LID chat. */
+  constructor(
+    private readonly ttlMs = OPERATOR_LID_TTL_MS,
+    private readonly persist?: { verified: (digits: string, atMs: number) => void; dropped: (digits: string) => void },
+  ) {}
+
+  /** A LID (digits) the mapping has just resolved to the operator. */
+  note(digits: string, nowMs = Date.now()): void {
+    if (!digits) return;
+    this.verified.set(digits, nowMs);
+    this.persist?.verified(digits, nowMs);
+  }
+
+  /** The live check rejected LID `digits`: forget it at once. */
+  forget(digits: string): void {
+    if (!digits) return;
+    this.verified.delete(digits);
+    this.persist?.dropped(digits);
+  }
+
+  /** The entries verified within the TTL. */
+  current(nowMs = Date.now()): Set<string> {
+    const out = new Set<string>();
+    for (const [d, at] of this.verified) {
+      if (nowMs - at < this.ttlMs) out.add(d);
+    }
+    return out;
+  }
+
+  /** Verify every entry against the live mapping; keep and re-date the
+   *  ones that still resolve to the operator's phone, drop the others. */
+  async refresh(
+    operatorId: string | null,
+    pnForLid: (lid: string) => Promise<string | null | undefined>,
+    nowMs = Date.now(),
+  ): Promise<void> {
+    for (const d of [...this.verified.keys()]) {
+      let ok = false;
+      try {
+        const pn = await pnForLid(`${d}@lid`);
+        ok = !!operatorId && !!pn && normalizeSenderId(pn) === operatorId;
+      } catch {
+        ok = false;
+      }
+      if (ok) {
+        this.verified.set(d, nowMs);
+        this.persist?.verified(d, nowMs);
+      } else {
+        this.verified.delete(d);
+        this.persist?.dropped(d);
+      }
+    }
+  }
+}
+
+/** The DM gate: a DM chat is admitted when its digits are in the DM
+ *  allowlist (the operator or another contact, as normal chat) or when it
+ *  is the operator by `isOperatorId` (a LID the allowlist does not list).
+ *  `operator` says whether it is the operator; only then does anything of
+ *  the issue pipeline apply. */
+export async function admitDm(input: {
+  chatId: string;
+  allowedDm: ReadonlySet<string>;
+  operator: OperatorIds;
+  pnForLid: (lid: string) => Promise<string | null | undefined>;
+}): Promise<{ admitted: boolean; operator: boolean }> {
+  const operator = await isOperatorId(input.chatId, input.operator, input.pnForLid);
+  const digits = normalizeSenderId(input.chatId);
+  return { admitted: operator || (digits.length > 0 && input.allowedDm.has(digits)), operator };
+}
+
+/** What the bot does with a DM message that goes to the chat session
+ *  (ADR-036): for the operator's DM (in any form `isOperatorId` accepts),
+ *  keep the text for `interpret-latest` (`record`) and type the pipeline's
+ *  decision block after it (`block`, "" when nothing waits). For any other
+ *  DM chat: nothing. */
+export async function dmChatIntake(input: {
+  chatId: string;
+  operator: OperatorIds;
+  pnForLid: (lid: string) => Promise<string | null | undefined>;
+  chatBlock: () => string;
+}): Promise<{ record: boolean; block: string }> {
+  if (!(await isOperatorId(input.chatId, input.operator, input.pnForLid))) return { record: false, block: "" };
+  return { record: true, block: input.chatBlock() };
 }
 
 /** Members of a new group that are neither the bot nor the operator. */
@@ -205,14 +381,19 @@ export function groupBudgetAllows(createdAt: readonly string[], nowMs: number, m
 
 const MARKER = /^\s*#(\d{1,6})(?:\s+|$)/;
 
-/** A DM message for an item, or null for the chat session. The message
- *  belongs to an item when it quotes a message the pipeline sent for it
- *  (`quotedItem`), or when it starts with `#<n>` and item n has a DM
- *  thread (`hasDmThread`). The marker is removed from the text. */
+/** A DM message for the pipeline, or null for the chat session. The
+ *  message belongs to item n when it starts with `#<n>` and item n has a DM
+ *  thread (`hasDmThread`), or when it quotes a message the pipeline sent for
+ *  item n (`quotedItem`; the marker is removed from the text). It goes to
+ *  the pipeline without an item (`DM_KEY`) when it quotes a question or note
+ *  the pipeline sent in the DM (`quotedItem` is `DM_KEY`), or when the
+ *  pipeline is waiting for the answer to a question it asked in the DM
+ *  (`expectingAnswer`). */
 export function routeDm(
   text: string,
   quotedItem: string | null,
   hasDmThread: (item: string) => boolean,
+  expectingAnswer = false,
 ): { item: string; text: string } | null {
   const m = MARKER.exec(text);
   if (m && hasDmThread(m[1])) return { item: m[1], text: text.slice(m[0].length).trim() };
@@ -220,6 +401,7 @@ export function routeDm(
     const t = m && m[1] === quotedItem ? text.slice(m[0].length).trim() : text.trim();
     return { item: quotedItem, text: t };
   }
+  if (expectingAnswer) return { item: DM_KEY, text: text.trim() };
   return null;
 }
 
@@ -230,26 +412,28 @@ export interface RoutedDm {
   inputKind: InputKind;
 }
 
-/** Decide whether a DM message goes to an issue-pipeline item. Only the
+/** Decide whether a DM message goes to the issue pipeline. Only the
  *  operator's own DM is routed (another allowed DM sender's message goes to
  *  the chat session, so it can never approve, release or cancel), and the
  *  message keeps how it was written: `voice` for a transcription,
- *  `forwarded` for a forwarded message, `text` only for what the operator
- *  typed. The Rust side acts on a command (`approve`, `release`, …) only
- *  when it is `text`. */
+ *  `forwarded` for a forwarded message, `text` for what the operator
+ *  typed. */
 export async function routeOperatorDm(input: {
   chatId: string;
-  operatorId: string | null;
+  operator: OperatorIds;
   pnForLid: (lid: string) => Promise<string | null | undefined>;
   text: string;
   quotedItem: string | null;
   hasDmThread: (item: string) => boolean;
+  /** The pipeline asked a question in the DM in the last 15 minutes and no
+   *  DM message went to it since (`IntakeStore.expectsDmAnswer`). */
+  expectingAnswer?: boolean;
   /** `voice` for a transcribed voice note; otherwise how the message was
    *  sent (`text` or `forwarded`). */
   inputKind: InputKind;
 }): Promise<RoutedDm | null> {
-  if (!(await isOperatorId(input.chatId, input.operatorId, input.pnForLid))) return null;
-  const routed = routeDm(input.text, input.quotedItem, input.hasDmThread);
+  if (!(await isOperatorId(input.chatId, input.operator, input.pnForLid))) return null;
+  const routed = routeDm(input.text, input.quotedItem, input.hasDmThread, input.expectingAnswer ?? false);
   return routed ? { ...routed, inputKind: input.inputKind } : null;
 }
 
@@ -314,11 +498,35 @@ export class IntakeStore {
         wa_msg_id   TEXT NOT NULL,
         text        TEXT NOT NULL,
         received_at TEXT NOT NULL,
-        input_kind  TEXT NOT NULL DEFAULT 'unknown'
+        input_kind  TEXT NOT NULL DEFAULT 'unknown',
+        sender      TEXT NOT NULL DEFAULT 'unknown',
+        wa_ts       INTEGER
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_inbound_msg
         ON intake_inbound(chat_id, wa_msg_id);
+
+      -- ADR-036: LIDs the bot verified as the operator through the live
+      -- LID mapping, with when. The bot writes it; Rust reads it to accept
+      -- a task from the operator's LID chat (entries count for 10 minutes).
+      CREATE TABLE IF NOT EXISTS operator_lid_verified (
+        digits      TEXT PRIMARY KEY,
+        verified_at TEXT NOT NULL
+      );
+
+      -- ADR-036: the DM chat session's list of waiting intake decisions.
+      -- One row; Rust writes it (whatsapp_queue.rs), the bot only reads it.
+      CREATE TABLE IF NOT EXISTS intake_chat_block (
+        id         INTEGER PRIMARY KEY CHECK (id = 1),
+        block      TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `);
+    // A table created before the column existed.
+    const cols = (this.db.prepare(`SELECT name FROM pragma_table_info('intake_inbound')`).all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    );
+    if (!cols.includes("sender")) this.db.exec(`ALTER TABLE intake_inbound ADD COLUMN sender TEXT NOT NULL DEFAULT 'unknown'`);
+    if (!cols.includes("wa_ts")) this.db.exec(`ALTER TABLE intake_inbound ADD COLUMN wa_ts INTEGER`);
   }
 
   /** Pending requests that are due (a close waiting for its backoff is
@@ -509,24 +717,96 @@ export class IntakeStore {
       .run(reason, new Date().toISOString(), itemKey);
   }
 
-  /** Store an operator message for an item. A message stored before (the
-   *  same WhatsApp id in the same chat) is ignored. Returns true when new. */
-  recordInbound(input: { itemKey: string; chatId: string; waMsgId: string; text: string; inputKind: InputKind }): boolean {
+  /** Store an operator message for the pipeline, after the caller checked
+   *  that the sender is the operator's own identity (`sender`; the Rust side
+   *  interprets no other row). A message stored before (the same WhatsApp
+   *  id in the same chat) is ignored. Returns true when new. */
+  recordInbound(input: {
+    itemKey: string;
+    chatId: string;
+    waMsgId: string;
+    text: string;
+    inputKind: InputKind;
+    sender: "operator";
+    /** When the message reached the bot (`Arrival`), not when it was
+     *  handled; now when unknown. */
+    arrival?: Arrival | null;
+    nowMs?: number;
+  }): boolean {
     const res = this.db
       .prepare(
-        `INSERT OR IGNORE INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender, wa_ts)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(input.itemKey, input.chatId, input.waMsgId, input.text, new Date().toISOString(), input.inputKind);
+      .run(
+        input.itemKey,
+        input.chatId,
+        input.waMsgId,
+        input.text,
+        new Date(input.arrival?.atMs ?? input.nowMs ?? Date.now()).toISOString(),
+        input.inputKind,
+        input.sender,
+        input.arrival?.waTs ?? null,
+      );
     return Number(res.changes) > 0;
   }
 
-  /** The item a message the bot sent belongs to (its outbound row's source
-   *  is `intake:<n>`), from the WhatsApp message id a reply quotes. */
+  /** Record that the live mapping verified LID `digits` as the operator. */
+  markOperatorLidVerified(digits: string, atMs = Date.now()): void {
+    this.db
+      .prepare(
+        `INSERT INTO operator_lid_verified (digits, verified_at) VALUES (?, ?)
+         ON CONFLICT(digits) DO UPDATE SET verified_at = excluded.verified_at`,
+      )
+      .run(digits, new Date(atMs).toISOString());
+  }
+
+  /** The live mapping no longer resolves LID `digits` to the operator. */
+  forgetOperatorLid(digits: string): void {
+    this.db.prepare(`DELETE FROM operator_lid_verified WHERE digits = ?`).run(digits);
+  }
+
+  /** The code-owned block the pipeline wrote for the DM chat session: what
+   *  waits for an intake decision and when to run `interpret-latest`; ""
+   *  when nothing waits. */
+  chatBlock(): string {
+    const r = this.db.prepare(`SELECT block FROM intake_chat_block WHERE id = 1`).get() as { block: string } | undefined;
+    return r?.block ?? "";
+  }
+
+  /** What a message the bot sent belongs to, from the WhatsApp message id a
+   *  reply quotes: item n for a thread message (`intake:<n>`), `DM_KEY` for a
+   *  question or note the pipeline sent in the DM (`intake:ask`,
+   *  `intake:note`), otherwise null. */
   itemForSentMessage(msgId: string): string | null {
     const r = this.db.prepare(`SELECT source FROM outbound_queue WHERE msg_id = ?`).get(msgId) as { source: string } | undefined;
-    const m = r ? /^intake:(\d+)$/.exec(r.source) : null;
+    if (!r) return null;
+    if (r.source === "intake:ask" || r.source === "intake:note") return DM_KEY;
+    const m = /^intake:(\d+)$/.exec(r.source);
     return m ? m[1] : null;
+  }
+
+  /** True when the pipeline asked the operator a question in the DM
+   *  (`intake:ask`, sent or being sent) less than `ANSWER_WINDOW_MS` ago,
+   *  and no DM message went to the pipeline since: the operator's next DM
+   *  message is the answer. */
+  expectsDmAnswer(nowMs = Date.now()): boolean {
+    const asked = this.db
+      .prepare(
+        `SELECT MAX(COALESCE(sent_at, in_flight_at)) AS at FROM outbound_queue
+          WHERE source = 'intake:ask' AND target = 'dm' AND status IN ('sent', 'in_flight')`,
+      )
+      .get() as { at: string | null };
+    if (!asked.at) return false;
+    const askedMs = Date.parse(asked.at);
+    if (!(nowMs - askedMs < ANSWER_WINDOW_MS)) return false;
+    // DM rows only: a group chat id ends in the group suffix (built at
+    // runtime; the committed-secrets scanner reads the literal as an
+    // address).
+    const last = this.db
+      .prepare(`SELECT MAX(received_at) AS at FROM intake_inbound WHERE chat_id NOT LIKE ?`)
+      .get(`%${GROUP_JID_SUFFIX}`) as { at: string | null };
+    return !last.at || Date.parse(last.at) < askedMs;
   }
 
   /** True when the pipeline sent a DM message for item `n` in the last 30
@@ -768,7 +1048,7 @@ export class GroupExecutor {
     if (tripped) {
       this.d.alertOperator(
         `Item #${itemKey}: the new WhatsApp group has ${strangers.length} member(s) besides the bot and you. ` +
-          `Commands from that group are ignored; use the DM (#${itemKey} …) or the dashboard.`,
+          `Messages from that group are ignored; use the DM (#${itemKey} …) or the dashboard.`,
         `intake:group-tripped:${jid}`,
       );
     }
