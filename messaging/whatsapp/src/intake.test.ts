@@ -21,6 +21,7 @@ import {
   groupBudgetAllows,
   intakeConfig,
   IntakeStore,
+  admitDm,
   dmChatIntake,
   isOperatorId,
   type OperatorIds,
@@ -65,10 +66,13 @@ const gjid = (n: string) => ["1203630000000000" + n, "g.us"].join("@");
 const OP_LID = ["1234567", "89012345"].join("");
 const STRANGER = ["55119", "77777777"].join("");
 /** The operator's identities with only the phone digits allowlisted. */
-const ops = (op: string | null = OP, ...more: string[]): OperatorIds => ({
+/** The operator's identities: his phone, and `lids` as WHATSAPP_OPERATOR_LIDS. */
+const ops = (op: string | null = OP, ...lids: string[]): OperatorIds => ({
   operatorId: op,
-  allowedDm: new Set([...(op ? [op] : []), ...more]),
+  operatorLids: new Set(lids),
 });
+/** Another contact's LID, allowlisted for DMs but not the operator. */
+const OTHER_LID = ["55555", "5555555555"].join("");
 
 /** Executor deps with the operator and the bot as the only known ids. */
 function deps(store: IntakeStore, api: GroupApi, over: Partial<GroupExecutorDeps> = {}) {
@@ -206,6 +210,27 @@ test("the next DM message answers a question the pipeline asked, for 15 minutes"
   assert.equal(store.expectsDmAnswer(sentAt + 3000), true);
   store.recordInbound({ itemKey: DM_KEY, chatId: `${OP}@s.whatsapp.net`, waMsgId: "d1", text: "yes", inputKind: "text", sender: "operator", nowMs: sentAt + 4000 });
   assert.equal(store.expectsDmAnswer(sentAt + 5000), false);
+});
+
+test("the DM gate admits other allowlisted contacts as normal chat and the operator by the shared check", async () => {
+  const allowedDm = new Set([OP, OTHER_LID]);
+  const noMap = async () => null;
+  const mapped = async (lid: string) => (lid === `${OP_LID}@lid` ? `${OP}@s.whatsapp.net` : null);
+  // A second allowlisted LID: admitted, never the operator.
+  assert.deepEqual(await admitDm({ chatId: `${OTHER_LID}@lid`, allowedDm, operator: ops(), pnForLid: noMap }), { admitted: true, operator: false });
+  // The operator's LID that only the mapping resolves: admitted and the operator.
+  assert.deepEqual(await admitDm({ chatId: `${OP_LID}@lid`, allowedDm, operator: ops(), pnForLid: mapped }), { admitted: true, operator: true });
+  // The operator's LID from WHATSAPP_OPERATOR_LIDS, no mapping.
+  assert.deepEqual(await admitDm({ chatId: `${OP_LID}@lid`, allowedDm, operator: ops(OP, OP_LID), pnForLid: noMap }), { admitted: true, operator: true });
+  // An unknown LID: not admitted.
+  assert.deepEqual(await admitDm({ chatId: `${OP_LID}@lid`, allowedDm, operator: ops(), pnForLid: noMap }), { admitted: false, operator: false });
+  // The operator's phone.
+  assert.deepEqual(await admitDm({ chatId: `${OP}@${WA}`, allowedDm, operator: ops(), pnForLid: noMap }), { admitted: true, operator: true });
+  // The other contact's chat gets no decision block and no stored text.
+  assert.deepEqual(
+    await dmChatIntake({ chatId: `${OTHER_LID}@lid`, operator: ops(), pnForLid: noMap, chatBlock: () => "BLOCK" }),
+    { record: false, block: "" },
+  );
 });
 
 test("the operator's DM in LID form gets the decision block and its text is kept; an unknown LID gets neither", async () => {
@@ -348,11 +373,15 @@ test("only the operator's own identity counts, in phone or LID form", async () =
   assert.equal(await isOperatorId(`${STRANGER}@s.whatsapp.net`, ops(), pn), false);
   assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(), async () => { throw new Error("no mapping"); }), false);
   assert.equal(await isOperatorId(`${OP}@s.whatsapp.net`, ops(null), pn), false, "no operator configured");
-  // The operator's LID listed in the DM allowlist counts without a mapping.
+  // An operator LID from WHATSAPP_OPERATOR_LIDS counts without a mapping
+  // (the intake-group sender gate uses this check: a message from it is
+  // admitted when the mapping is unavailable).
   const failing = async () => { throw new Error("no mapping"); };
-  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(OP, OP_LID), failing), true, "allowlisted LID");
-  // Only in LID form: allowlisted digits in a phone JID are not the operator.
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(OP, OP_LID), failing), true, "operator LID");
+  // Only in LID form: those digits in a phone JID are not the operator.
   assert.equal(await isOperatorId(`${OP_LID}@${WA}`, ops(OP, OP_LID), failing), false);
+  // Another contact's LID is never the operator, allowlisted or not.
+  assert.equal(await isOperatorId(`${OTHER_LID}@lid`, ops(OP, OP_LID), failing), false);
   const isOp = (j: string) => isOperatorId(j, ops(), pn);
   assert.deepEqual(await unexpectedMembers([`${OP_LID}@lid`, `${BOT}@s.whatsapp.net`], [`${BOT}:3@${WA}`], isOp), []);
   assert.deepEqual(await unexpectedMembers([`${OP}@s.whatsapp.net`, `${STRANGER}@s.whatsapp.net`], [BOT], isOp), [`${STRANGER}@s.whatsapp.net`]);

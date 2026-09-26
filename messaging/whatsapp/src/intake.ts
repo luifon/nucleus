@@ -149,26 +149,27 @@ export const ANSWER_WINDOW_MS = 15 * 60 * 1000;
 const GROUP_JID_SUFFIX = ["@", "g.us"].join("");
 
 /** Who the operator is: `operatorId` is the first WHATSAPP_ALLOWED_DM_JIDS
- *  entry (the phone digits); `allowedDm` is the whole DM allowlist, digits
- *  only, which may also hold the operator's LID. */
+ *  entry (the phone digits); `operatorLids` are the digits of
+ *  WHATSAPP_OPERATOR_LIDS. The rest of the DM allowlist is other contacts
+ *  the bot chats with, never the operator. */
 export interface OperatorIds {
   operatorId: string | null;
-  allowedDm: ReadonlySet<string>;
+  operatorLids: ReadonlySet<string>;
 }
 
 /** The operator's identities from the bot's configuration. */
-export function operatorIds(config: { operatorId: string | null; allowedDmSenders: ReadonlySet<string> }): OperatorIds {
-  return { operatorId: config.operatorId, allowedDm: config.allowedDmSenders };
+export function operatorIds(config: { operatorId: string | null; operatorLids: ReadonlySet<string> }): OperatorIds {
+  return { operatorId: config.operatorId, operatorLids: config.operatorLids };
 }
 
 /** True when `jid` (a phone JID, an `@lid` id, a DM chat id, or a bare
  *  number) is the operator: its digits equal the operator's phone digits;
- *  or it is an `@lid` id whose digits are in the DM allowlist (the
- *  operator's LID listed there); or it is an `@lid` id whose phone number,
- *  from `pnForLid` (the bot's LID mapping), has the operator's digits. The
- *  one rule for every operator check of the issue pipeline: approvals,
- *  group members, the DM routing, the stored `chat` rows and the decision
- *  block for the DM chat session. */
+ *  or it is an `@lid` id whose digits are in WHATSAPP_OPERATOR_LIDS; or it
+ *  is an `@lid` id whose phone number, from `pnForLid` (the bot's LID
+ *  mapping), has the operator's digits. The one rule for every operator
+ *  check: both inbound gates (the DM gate and the intake-group sender
+ *  gate), approvals, group members, the DM routing, the stored `chat` rows
+ *  and the decision block for the DM chat session. */
 export async function isOperatorId(
   jid: string,
   op: OperatorIds,
@@ -178,7 +179,7 @@ export async function isOperatorId(
   const digits = normalizeSenderId(jid);
   if (digits && digits === op.operatorId) return true;
   if (jid.endsWith("@lid")) {
-    if (digits && op.allowedDm.has(digits)) return true;
+    if (digits && op.operatorLids.has(digits)) return true;
     try {
       const pn = await pnForLid(jid);
       if (pn && normalizeSenderId(pn) === op.operatorId) return true;
@@ -187,6 +188,22 @@ export async function isOperatorId(
     }
   }
   return false;
+}
+
+/** The DM gate: a DM chat is admitted when its digits are in the DM
+ *  allowlist (the operator or another contact, as normal chat) or when it
+ *  is the operator by `isOperatorId` (a LID the allowlist does not list).
+ *  `operator` says whether it is the operator; only then does anything of
+ *  the issue pipeline apply. */
+export async function admitDm(input: {
+  chatId: string;
+  allowedDm: ReadonlySet<string>;
+  operator: OperatorIds;
+  pnForLid: (lid: string) => Promise<string | null | undefined>;
+}): Promise<{ admitted: boolean; operator: boolean }> {
+  const operator = await isOperatorId(input.chatId, input.operator, input.pnForLid);
+  const digits = normalizeSenderId(input.chatId);
+  return { admitted: operator || (digits.length > 0 && input.allowedDm.has(digits)), operator };
 }
 
 /** What the bot does with a DM message that goes to the chat session

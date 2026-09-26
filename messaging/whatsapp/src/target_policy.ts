@@ -18,6 +18,9 @@ import { normalizeSenderId } from "./config.js";
 /** The configuration the policy reads (a subset of Config). */
 export interface TargetConfig {
   allowedDmSenders: ReadonlySet<string>;
+  /** The operator's LIDs (WHATSAPP_OPERATOR_LIDS, and in the bot also the
+   *  LIDs its mapping resolved to the operator): sendable `@lid` DMs. */
+  operatorLids?: ReadonlySet<string>;
   allowedChatIds: readonly string[];
   brainDumpChatIds: readonly string[];
   allowedGroupNames: readonly string[];
@@ -80,6 +83,7 @@ export function isOperatorDm(target: string, config: TargetConfig): boolean {
   if (target.endsWith("@g.us")) return false;
   if (!(target.endsWith("@lid") || target.includes("@s.whatsapp.net") || /^\d{8,15}$/.test(target))) return false;
   const digits = normalizeSenderId(target);
+  if (digits.length > 0 && target.endsWith("@lid") && config.operatorLids?.has(digits)) return true;
   return digits.length > 0 && config.allowedDmSenders.has(digits);
 }
 

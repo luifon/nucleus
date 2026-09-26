@@ -25,6 +25,15 @@ const config: TargetConfig = {
   brainDumpGroupNames: ["Capture Group"],
 };
 
+test("an operator LID is a sendable DM; another LID is not", () => {
+  const groups = new GroupAllowlist(config);
+  const lid = ["12345", "6789012345"].join("");
+  assert.equal(resolveTarget(`${lid}@lid`, config, groups), null);
+  const withLid: TargetConfig = { ...config, operatorLids: new Set([lid]) };
+  assert.equal(resolveTarget(`${lid}@lid`, withLid, groups), `${lid}@lid`);
+  assert.equal(resolveTarget(`${lid}@s.whatsapp.net`, withLid, groups), null, "only in LID form");
+});
+
 test("the drain and send.ts resolve only the operator's DM and configured groups", () => {
   const groups = new GroupAllowlist(config, [
     { jid: NAMED_GROUP, subject: "Capture Group" },

@@ -174,6 +174,11 @@ export interface Config {
    *  digits (ADR-005b). The only identity whose issue-pipeline commands
    *  count (ADR-036); null when the list is empty. */
   operatorId: string | null;
+  /** The operator's LIDs (WHATSAPP_OPERATOR_LIDS, digits): an `@lid` chat
+   *  or sender with these digits is the operator even when the connection
+   *  has no LID-to-phone mapping for it (ADR-036). Separate from the DM
+   *  allowlist, which may hold other contacts. */
+  operatorLids: Set<string>;
   /** Per-sender authorization: only messages whose participant matches
    *  one of these IDs are processed, even inside an allowlisted group.
    *  Holds normalized digit-only user parts; comparison is against the
@@ -267,6 +272,11 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
         .filter((s) => s.length > 0),
     ),
     operatorId: splitCsv(process.env.WHATSAPP_ALLOWED_DM_JIDS).map(normalizeSenderId).find((s) => s.length > 0) ?? null,
+    operatorLids: new Set(
+      splitCsv(process.env.WHATSAPP_OPERATOR_LIDS)
+        .map(normalizeSenderId)
+        .filter((s) => s.length > 0),
+    ),
     allowedSenders: new Set(
       splitCsv(process.env.WHATSAPP_ALLOWED_SENDERS)
         .map(normalizeSenderId)
