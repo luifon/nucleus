@@ -18,7 +18,7 @@ brain is your existing Claude subscription — no separate API billing.
 | **nucleus-dashboard** | Single operator app subsuming dashboard widgets, chat against your PARA vault, the public news API, and every admin surface (agents, skills, diary, reminders, vault writes, usage) at `nucleus.<your-domain>`. See ADR-015/016/034. |
 | **Distiller** | Single daily 4am pass (consolidated per ADR-016; absorbed the old preference learner) that promotes diary observations to long-term memory (PROMOTE / MERGE / ARCHIVE / DROP, Mem0-style ops). |
 | **Reminders** | Ask either bot "remind me at 16:45 about dentist" → Claude schedules via the `reminders` CLI. Once-per-minute polling delivers to one or more channels (`discord-home`, `whatsapp-dm` via the bot-drained outbound queue, `calendar`). Supports `--at` (one-shot) and `--cron` (recurring) with pause/resume + per-channel retry. |
-| **Issue pipeline** | Issues labeled for Nucleus on the configured repos become items: a read-only eval agent classifies them; complex ones are discussed with you in a WhatsApp group (or the DM) and on the dashboard until you approve a plan; an implementation agent works in a git worktree; Nucleus pushes and opens a draft PR and comments on the issue only with your approval. It never merges. See ADR-036. |
+| **Issue pipeline** | Issues labeled for Nucleus on the configured repos become items: a read-only eval agent classifies them; complex ones are discussed with you in a WhatsApp group (or the DM) and on the dashboard until you approve a plan; an implementation agent works in a separate clone per item; Nucleus pushes and opens a draft PR and comments on the issue only with your approval. It never merges. See ADR-036. |
 
 ## Architecture at a glance
 
