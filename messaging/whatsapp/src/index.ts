@@ -92,6 +92,7 @@ import {
   admitDm,
   isOperatorId,
   OperatorLidCache,
+  OPERATOR_LID_TTL_MS,
   routeOperatorDm,
   stripGroupMarker,
   type InputKind,
@@ -169,7 +170,7 @@ let groupAllowlist: GroupAllowlist | null = null;
  *  mapping. Each entry counts for 10 minutes and is verified against the
  *  mapping again on every inbound message; the asynchronous checks never
  *  read it. */
-const operatorLidCache = new OperatorLidCache();
+let operatorLidCache = new OperatorLidCache();
 
 /** The operator's LIDs for the synchronous checks: WHATSAPP_OPERATOR_LIDS,
  *  and the LIDs the mapping resolved to him recently. */
@@ -375,6 +376,12 @@ async function main() {
   // ADR-036: issue-pipeline groups and operator replies to items (after
   // ChatSessionStore, which creates outbound_queue).
   const intakeStore = new IntakeStore(config.dbPath);
+  // ADR-036: every verification is mirrored into whatsapp.db for the Rust
+  // side (task chats), with the same 10-minute expiry.
+  operatorLidCache = new OperatorLidCache(OPERATOR_LID_TTL_MS, {
+    verified: (digits, atMs) => intakeStore.markOperatorLidVerified(digits, atMs),
+    dropped: (digits) => intakeStore.forgetOperatorLid(digits),
+  });
   // Note: pending_classifications schema still lives in ChatSessionStore's
   // CREATE block (kept for forward-compat); the multi-op braindump pipeline
   // doesn't use it — corrections happen via follow-up captures + move ops

@@ -204,11 +204,19 @@ export const OPERATOR_LID_TTL_MS = 10 * 60 * 1000;
 export class OperatorLidCache {
   private verified = new Map<string, number>();
 
-  constructor(private readonly ttlMs = OPERATOR_LID_TTL_MS) {}
+  /** `persist` mirrors every verification and drop into whatsapp.db
+   *  (`operator_lid_verified`), where the Rust side reads it to accept a
+   *  task from the operator's LID chat. */
+  constructor(
+    private readonly ttlMs = OPERATOR_LID_TTL_MS,
+    private readonly persist?: { verified: (digits: string, atMs: number) => void; dropped: (digits: string) => void },
+  ) {}
 
   /** A LID (digits) the mapping has just resolved to the operator. */
   note(digits: string, nowMs = Date.now()): void {
-    if (digits) this.verified.set(digits, nowMs);
+    if (!digits) return;
+    this.verified.set(digits, nowMs);
+    this.persist?.verified(digits, nowMs);
   }
 
   /** The entries verified within the TTL. */
@@ -235,8 +243,13 @@ export class OperatorLidCache {
       } catch {
         ok = false;
       }
-      if (ok) this.verified.set(d, nowMs);
-      else this.verified.delete(d);
+      if (ok) {
+        this.verified.set(d, nowMs);
+        this.persist?.verified(d, nowMs);
+      } else {
+        this.verified.delete(d);
+        this.persist?.dropped(d);
+      }
     }
   }
 }
@@ -452,6 +465,14 @@ export class IntakeStore {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_inbound_msg
         ON intake_inbound(chat_id, wa_msg_id);
+
+      -- ADR-036: LIDs the bot verified as the operator through the live
+      -- LID mapping, with when. The bot writes it; Rust reads it to accept
+      -- a task from the operator's LID chat (entries count for 10 minutes).
+      CREATE TABLE IF NOT EXISTS operator_lid_verified (
+        digits      TEXT PRIMARY KEY,
+        verified_at TEXT NOT NULL
+      );
 
       -- ADR-036: the DM chat session's list of waiting intake decisions.
       -- One row; Rust writes it (whatsapp_queue.rs), the bot only reads it.
@@ -684,6 +705,21 @@ export class IntakeStore {
         input.sender,
       );
     return Number(res.changes) > 0;
+  }
+
+  /** Record that the live mapping verified LID `digits` as the operator. */
+  markOperatorLidVerified(digits: string, atMs = Date.now()): void {
+    this.db
+      .prepare(
+        `INSERT INTO operator_lid_verified (digits, verified_at) VALUES (?, ?)
+         ON CONFLICT(digits) DO UPDATE SET verified_at = excluded.verified_at`,
+      )
+      .run(digits, new Date(atMs).toISOString());
+  }
+
+  /** The live mapping no longer resolves LID `digits` to the operator. */
+  forgetOperatorLid(digits: string): void {
+    this.db.prepare(`DELETE FROM operator_lid_verified WHERE digits = ?`).run(digits);
   }
 
   /** The code-owned block the pipeline wrote for the DM chat session: what

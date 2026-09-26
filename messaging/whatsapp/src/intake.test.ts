@@ -234,6 +234,19 @@ test("a remapped LID stops being the operator", async () => {
   assert.deepEqual([...cache.current(t0 + OPERATOR_LID_TTL_MS + 1)], []);
   await cache.refresh(OP, pn, t0 + OPERATOR_LID_TTL_MS + 1);
   assert.deepEqual([...cache.current(t0 + OPERATOR_LID_TTL_MS + 2)], [OP_LID]);
+  // Every verification and drop is mirrored for the Rust side.
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  const mirrored = new OperatorLidCache(OPERATOR_LID_TTL_MS, {
+    verified: (d, at) => store.markOperatorLidVerified(d, at),
+    dropped: (d) => store.forgetOperatorLid(d),
+  });
+  mirrored.note(OP_LID, t0);
+  const rows = () => new DatabaseSync(db).prepare(`SELECT digits, verified_at FROM operator_lid_verified`).all() as Array<{ digits: string; verified_at: string }>;
+  assert.deepEqual(rows().map((r) => r.digits), [OP_LID]);
+  assert.equal(rows()[0].verified_at, new Date(t0).toISOString());
+  await mirrored.refresh(OP, async () => `${STRANGER}@s.whatsapp.net`, t0 + 1);
+  assert.deepEqual(rows(), [], "a remapped LID is removed for the Rust side too");
   // A failing mapping drops it too; WHATSAPP_OPERATOR_LIDS does not depend on it.
   await cache.refresh(OP, async () => { throw new Error("mapping gone"); }, t0 + OPERATOR_LID_TTL_MS + 3);
   assert.deepEqual([...cache.current(t0 + OPERATOR_LID_TTL_MS + 3)], []);

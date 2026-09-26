@@ -134,6 +134,10 @@ export async function resolveQueuedTarget(input: {
     return input.operatorPhone ? resolveTarget(input.operatorPhone, config, groups) : null;
   }
   const jid = resolveTarget(target, config, groups);
+  // An `@lid` DM that is not on the lists may still be the operator by the
+  // live check (a task result for his LID chat after the cached
+  // verification expired).
+  if (!jid && target.endsWith("@lid") && (await input.isOperator(target))) return target;
   if (!jid || jid.endsWith("@g.us") || !isOperatorOnly(target, input.source)) return jid;
   return (await input.isOperator(jid)) ? jid : null;
 }

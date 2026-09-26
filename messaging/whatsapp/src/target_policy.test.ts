@@ -58,6 +58,11 @@ test("operator-only messages reach only the operator; replies stay in the writer
   assert.equal(await q(OP, "reminders"), `${OP}@s.whatsapp.net`);
   // A LID the live check no longer accepts: `dm` falls back to the phone.
   assert.equal(await q("dm", "intake:ask", () => opChat, async (j) => j.startsWith(`${OP}@`)), `${OP}@s.whatsapp.net`);
+  // A task result for an operator LID chat not in the lists: delivered when
+  // the live check accepts it, refused otherwise.
+  const mappedChat = `${["22222", "3333344444"].join("")}@lid`;
+  assert.equal(await q(mappedChat, "task:ab12cd34", undefined, async (j) => j === mappedChat), mappedChat);
+  assert.equal(await q(mappedChat, "task:ab12cd34", undefined, async () => false), null);
   assert.equal(isOperatorOnly("dm", "chat-reply"), true);
   assert.equal(isOperatorOnly(otherChat, "chat-reply"), false);
 });
