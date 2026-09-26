@@ -553,8 +553,10 @@ JSON-parsed numbers.
   directory and a profile (`read-only` for eval and refinement, `code` for
   implementation). Network steps — fetch, push, `gh pr create`,
   `gh issue comment` — are Nucleus code in `core/src/intake/`, never an
-  agent. Nucleus opens draft PRs only, never merges, and comments on an
-  issue only after the operator approved the text.
+  agent. Nucleus opens draft PRs only and never merges. After the draft PR
+  is open it posts one code-owned comment on the issue with the PR link
+  (`[intake.texts] pr_comment`), without approval, then closes the item.
+  That comment must never carry model output or issue text.
 - Issue text and comments go into briefs only between the nonce data
   markers of `briefs::Fence`; only collaborator comments are included.
 - Before the clone and before every agent task (eval, each refinement turn,
@@ -574,15 +576,27 @@ JSON-parsed numbers.
   sources stored; no agent runs until the operator releases it or cancels
   it. Every release names the hold the operator reviewed (`nucleus intake
   release <n> --hold <code>` from the terminal, the dashboard's rendered
-  fingerprint, or `#<n> release <code>` typed by the operator); a release
+  fingerprint, or the fingerprint a WhatsApp release was confirmed for); a release
   of an earlier hold is refused, checked again in the transaction that
   changes the stage, and a changed issue or used comment refuses it and
   makes the item stale. The hidden content is never stripped; released
   briefs carry `briefs::RELEASED_NOTE` outside the fence.
-- Plan and comment approvals and releases of held items are decided by code from the operator's own
-  message (`#n approve`, `#n approve comment`), the operator's terminal, or
-  the dashboard. A chat session may list, show and cancel items; it never
-  approves or releases.
+- The operator decides in plain words on WhatsApp (approve the plan,
+  release a held item, cancel). Each of his messages that reaches the
+  pipeline is read by an interpreter: a one-shot `Session` with
+  `SessionProfile::one_shot_no_tools`, which receives only his text, where
+  it came from, and a code-built list of pending decisions (never issue
+  text, titles, plans, thread messages or agent output) and returns JSON
+  that `decide::parse_reading` validates. Code decides: a decision runs only
+  for an item and decision the list allows, bound to the plan version or
+  hold fingerprint the list showed. Releases, cancels, decisions from voice
+  notes or forwards, and items inferred in the DM while several wait are
+  confirmed first (stored in `confirmations`, 15 minutes). Replies are
+  `[intake.texts]` texts; the interpreter's question is cut, stripped of
+  Markdown and passed through the secret guard. Only the operator's exact
+  identity counts. The terminal and the dashboard keep explicit commands.
+  A chat session may list, show and cancel items; it never approves or
+  releases.
 - Thread messages reach WhatsApp only through `outbound_queue` (target
   policy, secret filter). Intake groups are created and left only by the
   bot (`messaging/whatsapp/src/intake.ts`), within `[intake.whatsapp]
