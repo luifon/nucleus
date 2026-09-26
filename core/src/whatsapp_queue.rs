@@ -482,6 +482,39 @@ pub async fn latest_chat_message(pool: &SqlitePool, chat: Option<&str>) -> Resul
     .await?)
 }
 
+/// The operator DM messages (`item_key = chat`, `sender = operator`) that
+/// the running turn of DM chat `chat` covers, oldest first: the turn
+/// engine's `chat_turns` row with `status = 'running'` for the chat, and
+/// the `chat_inbound` rows it marked with that turn, joined to the stored
+/// rows by WhatsApp message id. Empty when the bot tables are missing or no
+/// turn runs.
+pub async fn current_turn_messages(pool: &SqlitePool, chat: &str) -> Result<Vec<IntakeInbound>> {
+    for t in ["intake_inbound", "chat_turns", "chat_inbound"] {
+        if !table_exists(pool, t).await? {
+            return Ok(vec![]);
+        }
+    }
+    let has_sender: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('intake_inbound') WHERE name = 'sender'")
+        .fetch_one(pool)
+        .await?;
+    if !has_sender {
+        return Ok(vec![]);
+    }
+    Ok(sqlx::query_as(
+        "SELECT i.id, i.item_key, i.chat_id, i.wa_msg_id, i.text, i.received_at, i.input_kind, i.sender
+           FROM intake_inbound i
+           JOIN chat_inbound c ON c.chat_id = i.chat_id AND c.wa_msg_id = i.wa_msg_id
+          WHERE i.chat_id = ?1 AND i.item_key = ?2 AND i.sender = 'operator'
+            AND c.turn_id = (SELECT id FROM chat_turns WHERE chat_id = ?1 AND status = 'running'
+                              ORDER BY started_at DESC LIMIT 1)
+          ORDER BY i.id",
+    )
+    .bind(chat)
+    .bind(INTAKE_CHAT_KEY)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Replace the block the bot adds to every operator message it types into
 /// the DM chat session (`intake_chat_block`, one row): what waits for an
 /// intake decision. Empty when nothing waits. Rust writes it; the bot only

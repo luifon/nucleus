@@ -184,6 +184,12 @@ async fn fixture() -> Fixture {
         "CREATE TABLE IF NOT EXISTS intake_inbound (id INTEGER PRIMARY KEY AUTOINCREMENT, item_key TEXT NOT NULL,
             chat_id TEXT NOT NULL, wa_msg_id TEXT NOT NULL, text TEXT NOT NULL, received_at TEXT NOT NULL,
             input_kind TEXT NOT NULL DEFAULT 'text', sender TEXT NOT NULL DEFAULT 'unknown')",
+        // The turn engine's records (messaging/whatsapp/src/db.ts), the
+        // columns interpret-latest reads.
+        "CREATE TABLE IF NOT EXISTS chat_turns (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, status TEXT NOT NULL,
+            started_at TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS chat_inbound (ref TEXT PRIMARY KEY, chat_id TEXT NOT NULL, wa_msg_id TEXT,
+            received_at TEXT NOT NULL, turn_id TEXT, status TEXT NOT NULL)",
     ] {
         sqlx::query(ddl).execute(&ctx.wa).await.unwrap();
     }
@@ -2086,7 +2092,47 @@ async fn the_interpreter_receives_only_the_operators_text_and_lines_code_built()
 /// An operator DM message that went to the chat session, as the bot stores
 /// it (`item_key = chat`).
 async fn chat_message(f: &Fixture, msg_id: &str, text: &str, sender: &str) -> i64 {
-    inbound_row(f, crate::whatsapp_queue::INTAKE_CHAT_KEY, "chat", msg_id, text, "text", sender).await
+    chat_message_in(f, "chat", msg_id, text, sender).await
+}
+
+/// The stored row, and the chat session reading it in its running turn
+/// (a turn is started when none runs), as the turn engine records it.
+async fn chat_message_in(f: &Fixture, chat: &str, msg_id: &str, text: &str, sender: &str) -> i64 {
+    let id = inbound_row(f, crate::whatsapp_queue::INTAKE_CHAT_KEY, chat, msg_id, text, "text", sender).await;
+    let running: Option<String> = sqlx::query_scalar("SELECT id FROM chat_turns WHERE chat_id = ?1 AND status = 'running'")
+        .bind(chat)
+        .fetch_optional(&f.ctx.wa)
+        .await
+        .unwrap();
+    let turn = match running {
+        Some(t) => t,
+        None => new_turn(f, chat).await,
+    };
+    sqlx::query("INSERT INTO chat_inbound (ref, chat_id, wa_msg_id, received_at, turn_id, status) VALUES (?1, ?2, ?3, ?4, ?5, 'consumed')")
+        .bind(format!("wa-{msg_id}"))
+        .bind(chat)
+        .bind(msg_id)
+        .bind(crate::timestamp::now())
+        .bind(&turn)
+        .execute(&f.ctx.wa)
+        .await
+        .unwrap();
+    id
+}
+
+/// End the chat's running turn and start a new one; returns its id.
+async fn new_turn(f: &Fixture, chat: &str) -> String {
+    sqlx::query("UPDATE chat_turns SET status = 'done' WHERE chat_id = ?1 AND status = 'running'").bind(chat).execute(&f.ctx.wa).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_turns").fetch_one(&f.ctx.wa).await.unwrap();
+    let id = format!("turn-{n}");
+    sqlx::query("INSERT INTO chat_turns (id, chat_id, status, started_at) VALUES (?1, ?2, 'running', ?3)")
+        .bind(&id)
+        .bind(chat)
+        .bind(format!("2026-09-26T00:00:{:02}.000Z", n))
+        .execute(&f.ctx.wa)
+        .await
+        .unwrap();
+    id
 }
 
 /// A stand-in for the WhatsApp DM chat session: it sees the operator's
@@ -2126,9 +2172,10 @@ async fn a_cold_approve_in_the_dm_runs_through_the_chat_sessions_trigger() {
     assert_eq!((it.stage(), it.approved_version, it.approved_via.as_deref()), (Stage::Implementation, Some(1), Some("whatsapp")));
     assert_eq!(f.interp.last().message, "approve it");
     assert_eq!(f.interp.last().origin, "the operator's WhatsApp DM; the message does not name an item");
-    // Nothing waits any more: the list is cleared.
+    // No plan waits any more: the item stays listed with cancel only.
     tick(&f).await;
-    assert_eq!(crate::whatsapp_queue::intake_chat_block(&f.ctx.wa).await.unwrap(), "");
+    let block = crate::whatsapp_queue::intake_chat_block(&f.ctx.wa).await.unwrap();
+    assert!(block.contains("item #1: in the implementation stage, nothing is waiting for you. Allowed decisions: cancel."), "{block}");
 }
 
 #[tokio::test]
@@ -2136,13 +2183,14 @@ async fn interpret_latest_interprets_the_stored_operator_text_only() {
     let f = dm_fixture(fixture().await);
     with_plan(&f).await;
     chat_message(&f, "c1", "an older message", "operator").await;
+    new_turn(&f, "chat").await;
     chat_message(&f, "c2", "approve it", "operator").await;
     // Newer rows the command must not take: another sender, a group, a
     // message routed to an item, another DM chat.
     chat_message(&f, "c3", "cancel everything", "unknown").await;
     let group = format!("{}@{}", "120363000000000004", "g.us");
-    inbound_row(&f, crate::whatsapp_queue::INTAKE_CHAT_KEY, &group, "c4", "cancel it", "text", "operator").await;
-    inbound_row(&f, crate::whatsapp_queue::INTAKE_CHAT_KEY, "other-chat", "c5", "cancel it", "text", "operator").await;
+    chat_message_in(&f, &group, "c4", "cancel it", "operator").await;
+    chat_message_in(&f, "other-chat", "c5", "cancel it", "operator").await;
     // The chat session's context holds other text (here: an instruction to
     // cancel); the command takes no text, so only the stored message counts.
     let r = interpret_latest(&f.ctx, Some("chat")).await.unwrap();
@@ -2150,12 +2198,20 @@ async fn interpret_latest_interprets_the_stored_operator_text_only() {
     assert_eq!(f.interp.calls(), 1);
     assert_eq!(f.interp.last().message, "approve it");
     assert_eq!(item1(&f).await.stage(), Stage::Implementation);
-    // A message older than 15 minutes is not taken.
+    // A message of an earlier turn is not taken.
     let f = dm_fixture(fixture().await);
     with_plan(&f).await;
-    let id = chat_message(&f, "o1", "approve it", "operator").await;
-    sqlx::query("UPDATE intake_inbound SET received_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1").bind(id).execute(&f.ctx.wa).await.unwrap();
+    chat_message(&f, "o1", "approve it", "operator").await;
+    new_turn(&f, "chat").await;
     assert!(matches!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::NoMessage(_)));
+    assert_eq!(f.interp.calls(), 0);
+    // From the operator's terminal, a message older than 15 minutes is not
+    // taken.
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    let id = chat_message(&f, "o2", "approve it", "operator").await;
+    sqlx::query("UPDATE intake_inbound SET received_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1").bind(id).execute(&f.ctx.wa).await.unwrap();
+    assert!(matches!(interpret_latest(&f.ctx, None).await.unwrap(), Latest::NoMessage(_)));
     assert_eq!(f.interp.calls(), 0);
 }
 
@@ -2198,7 +2254,7 @@ async fn a_cold_approve_in_a_lid_keyed_dm_runs_end_to_end() {
     let f = dm_fixture(fixture().await);
     with_plan(&f).await;
     let lid_chat = format!("{}@lid", "123456789012345");
-    inbound_row(&f, crate::whatsapp_queue::INTAKE_CHAT_KEY, &lid_chat, "l1", "approve it", "text", "operator").await;
+    chat_message_in(&f, &lid_chat, "l1", "approve it", "operator").await;
     tick(&f).await;
     assert_eq!(f.interp.calls(), 0, "the tick does not interpret it by itself");
     // A session keyed by the phone form is another chat: it takes nothing.
@@ -2214,9 +2270,57 @@ async fn a_cold_approve_in_a_lid_keyed_dm_runs_end_to_end() {
     let f = dm_fixture(fixture().await);
     with_plan(&f).await;
     let unknown = format!("{}@lid", "987654321098765");
-    inbound_row(&f, crate::whatsapp_queue::INTAKE_CHAT_KEY, &unknown, "u1", "approve it", "text", "unknown").await;
+    chat_message_in(&f, &unknown, "u1", "approve it", "unknown").await;
     assert!(matches!(interpret_latest(&f.ctx, Some(&unknown)).await.unwrap(), Latest::NoMessage(_)));
     assert!(matches!(interpret_latest(&f.ctx, None).await.unwrap(), Latest::NoMessage(_)));
     assert_eq!(f.interp.calls(), 0);
     assert_eq!(item1(&f).await.stage(), Stage::Refinement);
+}
+
+#[tokio::test]
+async fn a_quick_follow_up_does_not_take_the_place_of_the_decision() {
+    // "approve it", then at once "any update?": both arrive in the chat
+    // session's one turn before it runs interpret-latest.
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    chat_message(&f, "q1", "approve it", "operator").await;
+    chat_message(&f, "q2", "any update?", "operator").await;
+    let r = interpret_latest(&f.ctx, Some("chat")).await.unwrap();
+    assert_eq!(r, Latest::HandledWithOthers, "the turn's decision was found and the session answers the rest");
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.approved_version), (Stage::Implementation, Some(1)));
+    // It stopped at the decision: the follow-up was not interpreted and is
+    // the session's to answer as a normal message.
+    assert_eq!(f.interp.calls(), 1);
+    assert_eq!(f.interp.last().message, "approve it");
+    assert!(store::inbound_state(&f.ctx.db, "wa:chat:q2").await.unwrap().is_none());
+    // In the other order the follow-up is read first as not a decision, then
+    // the decision; each row once.
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    chat_message(&f, "p1", "any update?", "operator").await;
+    chat_message(&f, "p2", "approve it", "operator").await;
+    assert_eq!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::HandledWithOthers);
+    assert_eq!(item1(&f).await.stage(), Stage::Implementation);
+    assert!(matches!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::NoMessage(_)));
+    assert_eq!(f.interp.calls(), 2);
+}
+
+#[tokio::test]
+async fn a_cancel_from_the_dm_goes_through_interpret_latest_and_a_confirmation() {
+    // An item that waits for nothing is still listed, so it can be
+    // cancelled from the DM, only as the operator's own confirmed message.
+    let f = fixture().await;
+    accept(&f, 1).await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Eval);
+    let block = crate::whatsapp_queue::intake_chat_block(&f.ctx.wa).await.unwrap();
+    assert!(block.contains("item #1: in the eval stage, nothing is waiting for you. Allowed decisions: cancel."), "{block}");
+    chat_message(&f, "x1", "cancel it", "operator").await;
+    assert_eq!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::Handled);
+    assert_eq!(item1(&f).await.stage(), Stage::Eval, "asked first");
+    assert_eq!(outbound(&f).await.last().unwrap().1, "Cancel item #1? Answer yes or no.");
+    inbound_dm(&f, "x2", "yes").await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
 }

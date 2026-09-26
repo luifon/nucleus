@@ -568,6 +568,9 @@ pub enum Latest {
     /// The pipeline took the message as a decision (or an answer to its
     /// question) and replied to the operator itself.
     Handled,
+    /// As `Handled`, and the session's turn covers other operator messages
+    /// that are not decisions: the session answers those normally.
+    HandledWithOthers,
     /// The interpreter did not read a decision; the chat session answers.
     NotADecision,
     /// No operator DM message from the last 15 minutes waits for an
@@ -585,13 +588,60 @@ pub const INTAKE_HANDLED: &str = "[handled by the issue pipeline]";
 /// session's request.
 const LATEST_MAX_AGE_MINUTES: i64 = 15;
 
-/// `nucleus intake interpret-latest`: interpret the operator's latest DM
-/// message, as the bot stored it (`intake_inbound`, `item_key = chat`,
-/// `sender = operator`), never text the caller supplies. `chat` limits it
-/// to one DM chat (the calling chat session's). A row is interpreted at
-/// most once: a row with a final state is not taken again.
+/// `nucleus intake interpret-latest`: interpret operator DM messages as the
+/// bot stored them (`intake_inbound`, `item_key = chat`, `sender =
+/// operator`), never text the caller supplies. A row is interpreted at most
+/// once: a row with a final state is not taken again.
+///
+/// From the DM chat session (`chat` = its chat id), the messages are the
+/// ones the session's current turn covers (the running `chat_turns` row
+/// and its `chat_inbound` rows, which the turn engine records), so a
+/// follow-up that arrived before the command ran does not take the place
+/// of the message that started the turn. They are interpreted in order,
+/// and the first decision (or answer to a question) stops it. From the
+/// operator's terminal (`chat` = None), the newest stored message of the
+/// last 15 minutes.
 pub async fn interpret_latest(ctx: &Ctx, chat: Option<&str>) -> Result<Latest> {
-    let Some(row) = crate::whatsapp_queue::latest_chat_message(&ctx.wa, chat).await? else {
+    let Some(chat) = chat else { return interpret_newest(ctx).await };
+    let rows = crate::whatsapp_queue::current_turn_messages(&ctx.wa, chat).await?;
+    if rows.is_empty() {
+        return Ok(Latest::NoMessage("the session's current turn covers no stored operator message".into()));
+    }
+    let mut seen = false;
+    for row in &rows {
+        match interpret_row(ctx, row).await? {
+            Latest::Handled | Latest::HandledWithOthers => {
+                return Ok(if rows.len() > 1 { Latest::HandledWithOthers } else { Latest::Handled });
+            }
+            Latest::NotADecision => seen = true,
+            Latest::NoMessage(_) => {}
+        }
+    }
+    Ok(if seen {
+        Latest::NotADecision
+    } else {
+        Latest::NoMessage("the operator messages of the current turn were already interpreted".into())
+    })
+}
+
+/// Interpret one stored row once, on the chat session's request.
+async fn interpret_row(ctx: &Ctx, row: &crate::whatsapp_queue::IntakeInbound) -> Result<Latest> {
+    let msg_ref = format!("wa:{}:{}", row.chat_id, row.wa_msg_id);
+    let state = store::inbound_receive(&ctx.db, &msg_ref, row.id, &row.item_key).await?;
+    if state.is_final() {
+        return Ok(Latest::NoMessage("already interpreted".into()));
+    }
+    let r = handle_message(ctx, &Origin::Dm { item: None }, &row.text, &msg_ref, &row.input_kind, Trigger::ChatSession).await;
+    if let Err(e) = &r {
+        let _ = store::inbound_attempt_failed(&ctx.db, &msg_ref, &clip(&format!("{e:#}"), 1_000)).await;
+    }
+    r
+}
+
+/// The operator's terminal: the newest stored DM message, at most 15
+/// minutes old.
+async fn interpret_newest(ctx: &Ctx) -> Result<Latest> {
+    let Some(row) = crate::whatsapp_queue::latest_chat_message(&ctx.wa, None).await? else {
         return Ok(Latest::NoMessage("no operator DM message is stored".into()));
     };
     let age = chrono::DateTime::parse_from_rfc3339(&row.received_at)
@@ -600,16 +650,10 @@ pub async fn interpret_latest(ctx: &Ctx, chat: Option<&str>) -> Result<Latest> {
     if age > LATEST_MAX_AGE_MINUTES {
         return Ok(Latest::NoMessage(format!("the operator's latest DM message is older than {LATEST_MAX_AGE_MINUTES} minutes")));
     }
-    let msg_ref = format!("wa:{}:{}", row.chat_id, row.wa_msg_id);
-    let state = store::inbound_receive(&ctx.db, &msg_ref, row.id, &row.item_key).await?;
-    if state.is_final() {
-        return Ok(Latest::NoMessage("the operator's latest DM message was already interpreted".into()));
+    match interpret_row(ctx, &row).await? {
+        Latest::NoMessage(_) => Ok(Latest::NoMessage("the operator's latest DM message was already interpreted".into())),
+        other => Ok(other),
     }
-    let r = handle_message(ctx, &Origin::Dm { item: None }, &row.text, &msg_ref, &row.input_kind, Trigger::ChatSession).await;
-    if let Err(e) = &r {
-        let _ = store::inbound_attempt_failed(&ctx.db, &msg_ref, &clip(&format!("{e:#}"), 1_000)).await;
-    }
-    r
 }
 
 async fn handle_message(
@@ -767,7 +811,8 @@ async fn answer(ctx: &Ctx, origin: &Origin, body: &str, msg_ref: &str, question:
 
 /// The list of pending decisions for a message from `origin`, built by code
 /// from each item's stage: in an item's group, that item; in the DM, every
-/// item that waits for the operator, and the item the message names.
+/// open item (the ones that wait for the operator are marked `waiting`; any
+/// open item can be cancelled from the DM).
 async fn pending_decisions(ctx: &Ctx, origin: &Origin) -> Result<Vec<decide::Pending>> {
     let ids = match origin {
         Origin::Group { item, .. } => vec![*item],
@@ -777,9 +822,7 @@ async fn pending_decisions(ctx: &Ctx, origin: &Origin) -> Result<Vec<decide::Pen
     for id in ids {
         let Ok(item) = store::item(&ctx.db, id).await else { continue };
         if let Some(p) = pending_for(ctx, &item) {
-            if p.waiting || origin.item() == Some(id) || matches!(origin, Origin::Group { .. }) {
-                out.push(p);
-            }
+            out.push(p);
         }
     }
     Ok(out)

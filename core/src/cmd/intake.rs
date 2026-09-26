@@ -8,11 +8,13 @@
 //! Who may do what (`crate::caller`):
 //! - the operator: every command (`release` of a held item only from the
 //!   operator, like `approve-plan`);
-//! - the WhatsApp DM chat session: `list`, `show`, `cancel` and
-//!   `interpret-latest` (not in a turn that read an agent message).
-//!   `interpret-latest` takes no text: it has the operator's latest stored
-//!   DM message interpreted, so the session can trigger an interpretation
-//!   but never supply or change what is interpreted. Approvals and releases come from the
+//! - the WhatsApp DM chat session: `list`, `show` and `interpret-latest`
+//!   (not in a turn that read an agent message). It changes no item itself:
+//!   a cancel, like an approval or a release, is the operator's own stored
+//!   message, read by the interpreter through `interpret-latest` and
+//!   confirmed. `interpret-latest` takes no text, so the session can
+//!   trigger an interpretation but never supply or change what is
+//!   interpreted. Approvals and releases come from the
 //!   operator's own WhatsApp messages, read by the pipeline's interpreter
 //!   and decided by code, never from a session's command;
 //! - a detached process (launchd, the bot, the dashboard): `tick`;
@@ -110,9 +112,9 @@ fn authorize(caller: &Caller, cmd: &Cmd) -> Result<()> {
     match &caller.role {
         Role::Operator => {}
         Role::Chat { origin, .. } if origin == "whatsapp-dm" => match cmd {
-            Cmd::List { .. } | Cmd::Show { .. } | Cmd::Cancel { .. } | Cmd::InterpretLatest => {}
+            Cmd::List { .. } | Cmd::Show { .. } | Cmd::InterpretLatest => {}
             _ => bail!(
-                "a chat session can list, show and cancel items and run interpret-latest; approvals, releases and replies are the \
+                "a chat session can list and show items and run interpret-latest; cancels, approvals, releases and replies are the \
                  operator's own WhatsApp messages about the item (the pipeline reads them), or the dashboard"
             ),
         },
@@ -145,6 +147,10 @@ fn latest_text(r: &pipeline::Latest) -> String {
              in this chat itself. End your turn with exactly this line and nothing else: {}",
             pipeline::INTAKE_HANDLED
         ),
+        pipeline::Latest::HandledWithOthers => "HANDLED: the issue pipeline took one of the operator's messages in this \
+             turn as a decision and answered it in this chat itself. His other messages in this turn are not \
+             decisions: answer those normally, and do not repeat or comment on the decision."
+            .to_string(),
         pipeline::Latest::NotADecision => "NOT A DECISION: the interpreter did not read a pipeline decision in the \
              operator's latest message. Answer the operator normally."
             .to_string(),
@@ -450,8 +456,10 @@ mod tests {
         assert!(authorize(&caller(Role::Operator, 0), &approve()).is_ok());
         assert!(authorize(&caller(Role::Operator, 1), &approve()).is_err(), "reacting to an agent message");
         assert!(authorize(&caller(chat.clone(), 0), &show()).is_ok());
-        assert!(authorize(&caller(chat.clone(), 0), &cancel()).is_ok());
-        assert!(authorize(&caller(chat.clone(), 1), &cancel()).is_err());
+        // The chat session changes no item: cancel goes through
+        // interpret-latest and the operator's stored message.
+        assert!(authorize(&caller(chat.clone(), 0), &cancel()).is_err(), "a session never cancels");
+        assert!(authorize(&caller(Role::Operator, 0), &cancel()).is_ok());
         assert!(authorize(&caller(chat.clone(), 0), &approve()).is_err(), "a session never approves");
         assert!(authorize(&caller(chat.clone(), 0), &Cmd::Reply { item: "1".into(), text: "x".into() }).is_err());
         // A release is the operator's, like a plan approval.

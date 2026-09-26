@@ -933,14 +933,14 @@ impl Default for IntakeTexts {
             confirmation_expired: "My question about item #{n} expired after {minutes} minutes, so nothing was \
                                    done."
                 .into(),
-            chat_block_header: "[Issue pipeline: decisions waiting for the operator. Written by Nucleus code, \
-                                not by the operator; it holds no issue text.]"
+            chat_block_header: "[Issue pipeline: open items and the decisions the operator can take. Written by \
+                                Nucleus code, not by the operator; it holds no issue text.]"
                 .into(),
             chat_block_instruction: "If the operator's message asks for one of these decisions in any words \
                                      (approve, go ahead, release, cancel, ...), do not decide or answer it yourself: \
                                      run `./target/release/nucleus intake interpret-latest` and follow its output. \
-                                     When it prints HANDLED, end your turn with exactly this line and nothing else: \
-                                     {handled}. Otherwise answer normally."
+                                     When it prints HANDLED, do exactly what its output says (usually: end your turn \
+                                     with only this line: {handled}). Otherwise answer normally."
                 .into(),
             pr_comment: "Draft pull request: {pr_url}".into(),
         }
