@@ -1501,9 +1501,14 @@ as normal chat and the operator by this check, so a LID only the mapping
 resolves is admitted as the operator; the intake-group sender gate admits
 only this check), approvals, the members of a new group, the DM fast paths,
 the stored `chat` rows and the decision block, so a DM chat keyed
-`<digits>@lid` is the operator's DM everywhere. A LID the mapping resolved
-is remembered for the synchronous checks (role lookup and the target
-policy, which then sends replies to that chat). The bot
+`<digits>@lid` is the operator's DM everywhere. The asynchronous checks
+call the live mapping every time, so a LID the mapping no longer resolves to
+the operator stops counting at once. The two synchronous checks (the role
+lookup and the target policy) keep a cache of LIDs the mapping resolved to
+the operator (`OperatorLidCache`): an entry counts for 10 minutes, every
+inbound message verifies each entry against the live mapping again, and an
+entry that fails is dropped. `WHATSAPP_OPERATOR_LIDS` entries do not depend
+on the mapping. The bot
 routes to the pipeline: every operator message in an item's group; and, in
 the operator's DM, a message that starts with an item's `#n` marker, a reply
 that quotes a message the pipeline sent (a thread message names its item; a
@@ -1541,8 +1546,12 @@ message):
   `chat_inbound` rows it marked with that turn, joined by WhatsApp message
   id. A follow-up that arrived before the command ran therefore cannot take
   the place of the message that started the turn. The rows are interpreted
-  in order with the same interpreter flow (`pipeline::interpret_latest`),
-  and the first decision or answer to a question stops it. From the
+  in order with the same interpreter flow (`pipeline::interpret_latest`).
+  Every one is interpreted: running a decision does not stop the loop, so a
+  second decision in the same turn is not lost. A confirmation question
+  does: once the loop has asked one, a later message of the turn is handled
+  only when it answers that question, and is left to the session otherwise
+  (the question stays open). From the
   operator's terminal it reads the newest stored row of the last 15
   minutes. A row is interpreted at most once: its `inbound_commands` state
   is final after the first run. On a decision (or an answer to an open
@@ -1550,9 +1559,10 @@ message):
   command prints `HANDLED` with the line the session ends its turn with
   (`[handled by the issue pipeline]`); the turn engine sends no reply for a
   turn whose whole final text is that line, because the pipeline already
-  answered. When the turn also covers other operator messages, `HANDLED`
-  tells the session to answer those normally instead, without repeating the
-  decision. On a discussion
+  answered. The output lists the turn's messages by position and a short
+  preview: which ones the pipeline handled, and which ones the session must
+  answer normally (without repeating the decisions); only when none is left
+  does it give the silent line. On a discussion
   or anything unclear, the pipeline sends and keeps nothing, and the
   command prints `NOT A DECISION`; the session answers normally.
 
@@ -1669,6 +1679,25 @@ without the operator reading that question and answering yes.
 
 Every reply is a code-owned text from `[intake.texts]`, sent to the chat the
 message came from through `outbound_queue` (target policy, secret filter).
+
+The target policy keeps operator-only messages with the operator
+(`target_policy.ts`, `resolveQueuedTarget`). The `dm` shorthand resolves to
+the most recently active chat that is the operator's (his phone, a
+`WHATSAPP_OPERATOR_LIDS` entry, or a LID the mapping resolves to him,
+checked live at send time), else his phone JID; never to another allowed
+contact, however recent. A message from the issue pipeline (`intake`,
+`intake:*`), a reminder or a vault check reaches a DM only when that DM is
+the operator by the same live check, whatever target it names. Chat-engine
+replies to another allowed contact stay in that contact's chat. Reminders to
+`whatsapp-dm` name the operator's phone (the first allowlist entry) and pass.
+
+**After a restart.** The bot marks a turn it interrupted `interrupted`. The
+next tick finds operator DM rows of such turns that were stored for
+`interpret-latest` but not interpreted. While items are open, it sends the
+operator one code-owned message (`[intake.texts] interrupted_messages`)
+naming them with short previews and asking him to send any decision again.
+Either way the rows are marked final, so they are never interpreted
+later.
 The interpreter's question is the one piece of model text: it is cut to one
 line of at most 300 characters, the Markdown characters WhatsApp renders
 (`*`, `_`, `~`, backticks, leading `>` and `#`) are removed, and it passes
@@ -1735,7 +1764,21 @@ DM goes through `interpret-latest` and a confirmation
 (`a_cancel_from_the_dm_goes_through_interpret_latest_and_a_confirmation`);
 "approve it" followed at once by "any update?" in one turn approves the plan
 and leaves the follow-up to the session, in either order, each row once
-(`a_quick_follow_up_does_not_take_the_place_of_the_decision`).
+(`a_quick_follow_up_does_not_take_the_place_of_the_decision`). Round 2:
+"approve the plan" and "cancel the old item" in one turn approve the plan
+and ask the cancel's question, and a later message that is not an answer
+stays with the session (`two_decisions_in_one_turn_are_both_taken`,
+`the_turn_output_says_what_the_session_still_answers`); with another allowed
+contact active more recently a `dm` message goes to the operator, an
+operator-only message addressed to another contact's chat is refused, a
+reminder to the operator's phone passes, and a LID the live check rejects
+falls back to the phone (`target_policy.test.ts`, "operator-only messages
+reach only the operator…"); an interrupted turn's uninterpreted row is
+reported once and never interpreted
+(`a_message_of_an_interrupted_turn_is_reported_once_and_never_interpreted`);
+a remapped LID stops being the operator in the live check at once and in
+the cache at the next refresh (`intake.test.ts`, "a remapped LID stops being
+the operator").
 
 Rust (`cargo test -p nucleus-core intake`, fake interpreter): "looks good,
 go ahead" in item #1's group approves plan v1 at once

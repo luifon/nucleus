@@ -607,10 +607,14 @@ JSON-parsed numbers.
   the waiting decisions (no issue text) with each operator message and runs
   `nucleus intake interpret-latest` when he asks for one. That command takes
   no text: it interprets the stored DM rows (`item_key = chat`, `sender =
-  operator`) that the session's current turn covers, in order, stopping at
-  the first decision, each row once; only the DM chat session and the
-  operator's terminal may run it. A chat session may list and show items
-  and trigger that interpretation; it never cancels, approves or releases.
+  operator`) that the session's current turn covers, in order, every one
+  (a confirmation question asked in the loop leaves later non-answers to
+  the session), each row once, and prints which ones it handled; only the
+  DM chat session and the operator's terminal may run it. Operator-only
+  outbound (the pipeline, reminders, `dm`) reaches only the operator's
+  identities, checked live at send time (`resolveQueuedTarget`). A chat
+  session may list and show items and trigger that interpretation; it
+  never cancels, approves or releases.
 - Thread messages reach WhatsApp only through `outbound_queue` (target
   policy, secret filter). Intake groups are created and left only by the
   bot (`messaging/whatsapp/src/intake.ts`), within `[intake.whatsapp]
