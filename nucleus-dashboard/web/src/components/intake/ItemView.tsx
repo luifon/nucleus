@@ -135,7 +135,7 @@ export function ItemScreen({
 
       <div className="flex min-h-0 flex-1 xl:grid xl:grid-cols-2">
         <section aria-label="conversation" className={`${pane === "thread" ? "flex" : "hidden"} min-h-0 min-w-0 flex-1 flex-col xl:flex xl:border-r xl:border-[var(--color-nucleus-border)]`}>
-          <ItemThread item={item} messages={messages} visible={pane === "thread"} onSent={onChange} />
+          <ItemThread item={item} messages={messages} visible={pane === "thread"} onSent={onChange} question={detail.question} findings={detail.hidden} />
         </section>
         <section aria-label={side} className={`${pane === "thread" ? "hidden" : "flex"} min-h-0 min-w-0 flex-1 flex-col xl:flex`}>
           <div className="hidden shrink-0 px-2 xl:block">

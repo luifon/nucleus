@@ -1,7 +1,19 @@
 import { describe, expect, test } from "vitest";
 import { ApiError } from "@/lib/api/client";
-import { fixtureItem, fixtureReplyResult } from "./intake.fixtures";
+import type { IntakeItem } from "@/lib/api";
+import { parseResponses } from "@/lib/canvas";
+import { fixtureItem, fixtureMessage, fixtureReplyResult } from "./intake.fixtures";
 import {
+  boardFor,
+  boardKey,
+  cancelStep,
+  canvasAnswerText,
+  composerHint,
+  moveHighlight,
+  questionStep,
+  replyNotice,
+  threadAnsweredIds,
+  threadBlocks,
   authorLabel,
   canApprovePlan,
   canApproveShown,
@@ -199,7 +211,7 @@ describe("item page", () => {
       return fixtureReplyResult();
     });
     expect(calls).toEqual([[4, "looks good"]]);
-    expect(ok).toEqual({ kind: "sent", item: item(), note: null });
+    expect(ok).toEqual({ kind: "sent", item: item(), outcome: "discussion", note: null });
   });
 
   test("a reply saved outside refinement carries the server's note", async () => {
@@ -207,9 +219,20 @@ describe("item page", () => {
     const saved = await sendReply(4, "x", async () =>
       fixtureReplyResult({ item: item({ stage: "implementation" }), reaches_agent: false, note }),
     );
-    expect(saved).toEqual({ kind: "sent", item: item({ stage: "implementation" }), note });
+    expect(saved).toEqual({ kind: "sent", item: item({ stage: "implementation" }), outcome: "discussion", note });
     const noNote = await sendReply(4, "x", async () => fixtureReplyResult({ reaches_agent: false, note: null }));
     expect(noNote.kind === "sent" && noNote.note).toBe("Saved in the thread. No agent reads it now.");
+  });
+
+  test("the composer reports what Nucleus did with a message", () => {
+    const r = (over: Parameters<typeof fixtureReplyResult>[0]) => replyNotice(fixtureReplyResult(over));
+    expect(r({ outcome: "decision", decision: "approve_plan", reaches_agent: false })).toBe("Plan approved. Implementation starts.");
+    expect(r({ outcome: "decision", decision: "cancel", reaches_agent: false })).toBe("Item cancelled.");
+    expect(r({ outcome: "question", reaches_agent: false, note: "Cancel item #4? Answer yes or no." })).toMatch(/Yes or No on the board/);
+    const options = "I did not understand which decision you mean.\n\nWhat each item is waiting for:";
+    expect(r({ outcome: "unclear", reaches_agent: false, note: options })).toBe(options);
+    expect(r({ outcome: "refused", reaches_agent: false, note: "Plan v1 is not the latest plan." })).toBe("Plan v1 is not the latest plan.");
+    expect(r({ outcome: "declined", reaches_agent: false, note: null })).toBe("Nothing was done.");
   });
 
   test("non-2xx answers are errors", async () => {
@@ -225,5 +248,110 @@ describe("item page", () => {
 
   test("the surface is the DM or nothing yet", () => {
     expect(surfaceLabel(item({ surface: "none" }))).toBe("not on WhatsApp yet");
+  });
+});
+
+describe("decision board", () => {
+  const keys = (b: ReturnType<typeof boardFor>) => (b.kind === "board" ? b.options.map((o) => o.key) : b.kind);
+
+  test("refinement with a proposed plan: approve that version, continue discussing, cancel", () => {
+    const b = boardFor(item({ plan_version: 2, plan_draft: "# Plan" }));
+    expect(keys(b)).toEqual(["approve", "discuss", "cancel"]);
+    expect(b.kind === "board" && b.options[0].label).toBe("Approve plan v2");
+    expect(b.kind === "board" && b.options[1].label).toBe("Continue discussing");
+    expect(b.kind === "board" && b.options[2].label).toBe("Cancel item");
+  });
+
+  test("refinement with no plan while the agent waits: the composer, no board", () => {
+    expect(boardFor(item())).toEqual({ kind: "composer" });
+  });
+
+  test("held: release bound to the hold, continue discussing, cancel", () => {
+    const b = boardFor(item({ stage: "held", hold_hash: "a1b2c3d4e5f6" }));
+    expect(keys(b)).toEqual(["release", "discuss", "cancel"]);
+    expect(b.kind === "board" && b.options[0].label).toBe("Release (hold a1b2c3)");
+  });
+
+  test("failed or blocked: retry, cancel", () => {
+    for (const stage of ["failed", "blocked"] as const) {
+      const b = boardFor(item({ stage, failed_stage: "pr" }));
+      expect(keys(b)).toEqual(["retry", "cancel"]);
+      expect(b.kind === "board" && b.title).toContain("in pr");
+    }
+  });
+
+  test("while an agent works: the status line and Write a message", () => {
+    const cases: [Partial<IntakeItem>, string][] = [
+      [{ stage: "eval" }, "evaluating"],
+      [{ stage: "refinement", current_task_id: "t", plan_version: 2, plan_draft: "x" }, "writing a reply (plan v2"],
+      [{ stage: "implementation" }, "implementing"],
+      [{ stage: "pr" }, "draft pull request"],
+      [{ stage: "queued" }, "preparing"],
+    ];
+    for (const [over, status] of cases) {
+      const b = boardFor(item(over));
+      expect(keys(b)).toEqual(["write"]);
+      expect(b.kind === "board" && b.title).toContain(status);
+    }
+  });
+
+  test("finished items show neither the board nor the composer", () => {
+    for (const stage of ["closed", "cancelled", "stale"] as const) expect(boardFor(item({ stage }))).toEqual({ kind: "closed" });
+  });
+
+  test("the board comes back when what it offers changes", () => {
+    const a = boardKey(item({ plan_version: 1 }));
+    expect(boardKey(item({ plan_version: 1 }))).toBe(a);
+    expect(boardKey(item({ plan_version: 2 }))).not.toBe(a);
+    expect(boardKey(item({ plan_version: 1, current_task_id: "t" }))).not.toBe(a);
+    expect(boardKey(item({ stage: "implementation", plan_version: 1 }))).not.toBe(a);
+  });
+
+  test("steps: cancel asks once more; a server question binds what it names", () => {
+    expect(cancelStep(4).title).toMatch(/^Cancel item #4\?/);
+    expect(cancelStep(4).options.map((o) => o.key)).toEqual(["yes", "no"]);
+    expect(questionStep(4, { decision: "approve_plan", plan_version: 3, hold_hash: null }).title).toMatch(/^Approve plan v3 of item #4\?/);
+    expect(questionStep(4, { decision: "release", plan_version: null, hold_hash: "ffeedd001122" }).title).toContain("hold ffeedd");
+    expect(questionStep(4, { decision: "cancel", plan_version: null, hold_hash: null }).options.map((o) => o.label)).toEqual(["Yes", "No"]);
+  });
+
+  test("arrow keys move the highlight and wrap; Home and End jump; other keys do nothing", () => {
+    expect(moveHighlight(0, "ArrowDown", 3)).toBe(1);
+    expect(moveHighlight(2, "ArrowDown", 3)).toBe(0);
+    expect(moveHighlight(0, "ArrowUp", 3)).toBe(2);
+    expect(moveHighlight(1, "ArrowLeft", 3)).toBe(0);
+    expect(moveHighlight(1, "ArrowRight", 3)).toBe(2);
+    expect(moveHighlight(1, "Home", 3)).toBe(0);
+    expect(moveHighlight(0, "End", 3)).toBe(2);
+    expect(moveHighlight(0, "Enter", 3)).toBeNull();
+    expect(moveHighlight(0, "a", 3)).toBeNull();
+    expect(moveHighlight(0, "ArrowDown", 0)).toBeNull();
+  });
+
+  test("the composer hint says what happens to a message in each stage", () => {
+    expect(composerHint("refinement")).toBeNull();
+    expect(composerHint("held")).toMatch(/decision in your own words/);
+    expect(composerHint("implementation")).toContain("the agent reads replies only during refinement");
+  });
+});
+
+describe("canvas questions in the thread", () => {
+  const block = `<canvas v="1" type="decision" id="fmt" title="Output format">{"options":[{"key":"j","label":"JSON"},{"key":"y","label":"YAML"}]}</canvas>`;
+  const agent = fixtureMessage(1, { author: "agent", body: `Which format?\n${block}` });
+  const answer = fixtureMessage(2, { author: "operator", via: "dashboard", body: `<canvas-response v="1" id="fmt" type="decision">\n{"choice":"y"}\n</canvas-response>` });
+
+  test("a block is answered once a later operator message carries its response", () => {
+    expect(threadAnsweredIds([agent]).has("fmt")).toBe(false);
+    expect(threadAnsweredIds([agent, answer]).has("fmt")).toBe(true);
+    // An agent quoting the response does not answer it.
+    expect(threadAnsweredIds([agent, { ...answer, author: "agent" }]).has("fmt")).toBe(false);
+  });
+
+  test("the operator's answer names the option label", () => {
+    const blocks = threadBlocks([agent, answer]);
+    expect([...blocks.keys()]).toEqual(["fmt"]);
+    const [r] = parseResponses(answer.body);
+    expect(canvasAnswerText(r, blocks.get("fmt"))).toBe("Output format: YAML");
+    expect(canvasAnswerText(r, undefined)).toBe("fmt: y");
   });
 });

@@ -4,7 +4,18 @@
 // be refused.
 
 import type { StatusKind } from "@/components/StatusPill";
-import type { IntakeHiddenFinding, IntakeItem, IntakeMessage, IntakePlanVersion, IntakeReplyResult, IntakeStage } from "@/lib/api/intake";
+import type {
+  IntakeDecision,
+  IntakeHiddenFinding,
+  IntakeItem,
+  IntakeMessage,
+  IntakePlanVersion,
+  IntakeQuestion,
+  IntakeReplyOutcome,
+  IntakeReplyResult,
+  IntakeStage,
+} from "@/lib/api/intake";
+import { answeredIds, describeResponse, parseMessage, type CanvasBlockData, type ParsedResponse } from "@/lib/canvas";
 
 /** The stages in pipeline order, for the stage track. */
 export const STAGE_TRACK: readonly IntakeStage[] = ["queued", "eval", "refinement", "implementation", "pr", "closed"];
@@ -238,11 +249,23 @@ export function composerPlaceholder(coarsePointer: boolean): string {
   return coarsePointer ? "reply…" : "reply…  (Enter sends · Shift+Enter new line)";
 }
 
-/** What a reply attempt ended in. `sent` carries the server's `note` when
- *  the message was saved but no agent reads it now, and null when the agent
- *  does. `error` is any non-2xx answer (an empty message is a 409). */
+/** The line above the composer: what happens to a message in this stage;
+ *  null during refinement (the agent reads it, or Nucleus takes a decision
+ *  written in words). */
+export function composerHint(stage: IntakeStage): string | null {
+  if (stage === "refinement") return null;
+  if (stage === "held") {
+    return "Nucleus reads your message: a decision in your own words (release, cancel) is taken as on the board, with a confirmation first; anything else is saved in the thread.";
+  }
+  return `saved in the thread; the agent reads replies only during refinement, and this item is in ${stage}`;
+}
+
+/** What a reply attempt ended in. `sent` carries what the server did
+ *  (`outcome`) and the text the composer shows (`note`, null when nothing
+ *  needs saying: a message the refinement agent reads). `error` is any
+ *  non-2xx answer (an empty message is a 409). */
 export type ReplyOutcome =
-  | { kind: "sent"; item: IntakeItem; note: string | null }
+  | { kind: "sent"; item: IntakeItem; outcome: IntakeReplyOutcome; note: string | null }
   | { kind: "error"; message: string };
 
 export async function sendReply(
@@ -252,9 +275,228 @@ export async function sendReply(
 ): Promise<ReplyOutcome> {
   try {
     const r = await post(id, text);
-    const note = r.reaches_agent ? null : (r.note ?? "Saved in the thread. No agent reads it now.");
-    return { kind: "sent", item: r.item, note };
+    return { kind: "sent", item: r.item, outcome: r.outcome, note: replyNotice(r) };
   } catch (e) {
     return { kind: "error", message: e instanceof Error ? e.message : String(e) };
   }
+}
+
+/** What the composer shows after the server took a message. */
+export function replyNotice(r: Pick<IntakeReplyResult, "outcome" | "decision" | "reaches_agent" | "note">): string | null {
+  switch (r.outcome) {
+    case "discussion":
+      return r.reaches_agent ? null : (r.note ?? "Saved in the thread. No agent reads it now.");
+    case "decision":
+      return decisionDone(r.decision);
+    case "question":
+      return "Nucleus asks you to confirm first: answer Yes or No on the board.";
+    default:
+      return r.note ?? "Nothing was done.";
+  }
+}
+
+/** One line for a decision that ran. */
+export function decisionDone(d: IntakeDecision | null): string {
+  switch (d) {
+    case "approve_plan":
+      return "Plan approved. Implementation starts.";
+    case "release":
+      return "Released. The item continues where it was held.";
+    case "cancel":
+      return "Item cancelled.";
+    default:
+      return "Done.";
+  }
+}
+
+// ── the decision board ──────────────────────────────────────────────────
+//
+// When the item waits for the operator, the bottom of the conversation
+// shows the options code derives from the item's stage and data (never
+// from model text), in place of the composer. The server stays the
+// authority: every option calls an explicit route that refuses what the
+// item cannot take.
+
+export type BoardOptionKey = "approve" | "release" | "retry" | "discuss" | "cancel" | "write" | "yes" | "no";
+
+export interface BoardOption {
+  key: BoardOptionKey;
+  label: string;
+  /** One line under the label: what choosing it does. */
+  hint?: string;
+  /** `down` for a destructive choice. */
+  tone?: "accent" | "down";
+}
+
+/** What the bottom of the conversation shows for an item:
+ *  - `closed`: neither the board nor the composer (a finished item);
+ *  - `composer`: the composer only (nothing to decide; the agent waits for
+ *    a reply);
+ *  - `board`: a title (what the item waits for, or what runs now) and the
+ *    options. */
+export type Board =
+  | { kind: "closed" }
+  | { kind: "composer" }
+  | { kind: "board"; title: string; options: BoardOption[] };
+
+const DISCUSS: BoardOption = { key: "discuss", label: "Continue discussing", hint: "write a message instead" };
+const CANCEL: BoardOption = { key: "cancel", label: "Cancel item", hint: "the item stops; asks once more", tone: "down" };
+const WRITE: BoardOption = { key: "write", label: "Write a message", hint: "saved in the thread" };
+
+/** What runs while an agent or Nucleus works on the item. */
+export function workingStatus(item: Pick<IntakeItem, "stage" | "plan_version">): string {
+  switch (item.stage) {
+    case "queued":
+      return "Nucleus is preparing the item.";
+    case "eval":
+      return "The agent is evaluating the issue.";
+    case "refinement":
+      return item.plan_version > 0
+        ? `The agent is writing a reply (plan v${item.plan_version} is proposed).`
+        : "The agent is writing a reply.";
+    case "implementation":
+      return "The agent is implementing the approved plan.";
+    case "pr":
+      return "Nucleus is running the tests and opening the draft pull request.";
+    default:
+      return `The item is in ${item.stage}.`;
+  }
+}
+
+/** The board for an item, from its stage and data. */
+export function boardFor(
+  item: Pick<IntakeItem, "id" | "stage" | "plan_version" | "plan_draft" | "current_task_id" | "hold_hash" | "failed_stage">,
+): Board {
+  switch (item.stage) {
+    case "closed":
+    case "cancelled":
+    case "stale":
+      return { kind: "closed" };
+    case "refinement":
+      if (item.current_task_id) return { kind: "board", title: workingStatus(item), options: [WRITE] };
+      if (item.plan_version > 0 && item.plan_draft !== null) {
+        return {
+          kind: "board",
+          title: `Plan v${item.plan_version} waits for your decision.`,
+          options: [
+            { key: "approve", label: `Approve plan v${item.plan_version}`, hint: "implementation starts from this version", tone: "accent" },
+            DISCUSS,
+            CANCEL,
+          ],
+        };
+      }
+      return { kind: "composer" };
+    case "held":
+      return {
+        kind: "board",
+        title: "Held: the issue has content GitHub's page does not show. Read the findings above, then decide.",
+        options: [
+          { key: "release", label: `Release (hold ${holdCode(item.hold_hash)})`, hint: "the agent reads the hidden content as data", tone: "accent" },
+          DISCUSS,
+          CANCEL,
+        ],
+      };
+    case "failed":
+    case "blocked":
+      return {
+        kind: "board",
+        title: `${item.stage === "failed" ? "Failed" : "Blocked"} in ${item.failed_stage ?? "?"}. Retry once the cause is fixed, or cancel.`,
+        options: [{ key: "retry", label: "Retry", hint: `resume in ${item.failed_stage ?? "the stage it stopped in"}`, tone: "accent" }, CANCEL],
+      };
+    default:
+      return { kind: "board", title: workingStatus(item), options: [WRITE] };
+  }
+}
+
+/** Changes whenever what the board offers changes; the thread shows the
+ *  board again (instead of the composer) when it does. */
+export function boardKey(item: Pick<IntakeItem, "stage" | "plan_version" | "current_task_id" | "hold_hash">): string {
+  return [item.stage, item.plan_version, item.current_task_id ?? "", item.hold_hash ?? ""].join("|");
+}
+
+/** The second step of "Cancel item". */
+export function cancelStep(id: number): { title: string; options: BoardOption[] } {
+  return {
+    title: `Cancel item #${id}? Its running task stops. A cancelled item cannot be resumed.`,
+    options: [
+      { key: "yes", label: "Yes, cancel it", tone: "down" },
+      { key: "no", label: "No, keep it" },
+    ],
+  };
+}
+
+/** The Yes / No step for a confirmation question the server asked after
+ *  text typed on the page. The title is built from the decision and what it
+ *  binds to, never from model text. */
+export function questionStep(id: number, q: Pick<IntakeQuestion, "decision" | "plan_version" | "hold_hash">): { title: string; options: BoardOption[] } {
+  const title =
+    q.decision === "approve_plan"
+      ? `Approve plan v${q.plan_version ?? "?"} of item #${id}? Implementation starts from that version.`
+      : q.decision === "release"
+        ? `Release item #${id} (hold ${holdCode(q.hold_hash)})? The agent reads the hidden content as data.`
+        : `Cancel item #${id}? Its running task stops. A cancelled item cannot be resumed.`;
+  return {
+    title,
+    options: [
+      { key: "yes", label: "Yes", tone: q.decision === "cancel" ? "down" : "accent" },
+      { key: "no", label: "No", hint: "nothing is done" },
+    ],
+  };
+}
+
+/** Keyboard selection on the board, as in Claude Code's option prompts:
+ *  ArrowUp / ArrowLeft move up, ArrowDown / ArrowRight move down (both wrap
+ *  around), Home and End jump to the ends. Returns the new highlighted
+ *  index, or null when the key does not move the highlight. */
+export function moveHighlight(current: number, key: string, count: number): number | null {
+  if (count <= 0) return null;
+  switch (key) {
+    case "ArrowUp":
+    case "ArrowLeft":
+      return (current - 1 + count) % count;
+    case "ArrowDown":
+    case "ArrowRight":
+      return (current + 1) % count;
+    case "Home":
+      return 0;
+    case "End":
+      return count - 1;
+    default:
+      return null;
+  }
+}
+
+// ── canvas questions in agent replies (ADR-012) ─────────────────────────
+
+/** The ids of the canvas blocks the operator answered: a later operator
+ *  message carries a canvas response for the id (the chat's derivation). */
+export function threadAnsweredIds(messages: readonly Pick<IntakeMessage, "author" | "body">[]): Set<string> {
+  return answeredIds(messages.map((m) => ({ role: m.author === "operator" ? "user" : "assistant", content: m.body })));
+}
+
+/** One line for an operator's canvas response: the option labels of the
+ *  block it answers when that block is known, the raw keys otherwise. */
+export function canvasAnswerText(r: ParsedResponse, block: CanvasBlockData | undefined): string {
+  const v = r.value as Record<string, unknown> | null;
+  const label = (key: unknown) => block?.options?.find((o) => o.key === key)?.label ?? String(key);
+  const title = block?.title ?? block?.prompt ?? r.id;
+  if (v && typeof v === "object") {
+    if (typeof v["choice"] === "string") return `${title}: ${label(v["choice"])}`;
+    if (Array.isArray(v["selected"])) {
+      const picked = (v["selected"] as unknown[]).map(label);
+      return `${title}: ${picked.length > 0 ? picked.join(", ") : "(none)"}`;
+    }
+    if (typeof v["confirmed"] === "boolean") return `${title}: ${v["confirmed"] ? "yes" : "no"}`;
+  }
+  return describeResponse(r);
+}
+
+/** Every canvas block in the agent's replies, by id. */
+export function threadBlocks(messages: readonly Pick<IntakeMessage, "author" | "body">[]): Map<string, CanvasBlockData> {
+  const out = new Map<string, CanvasBlockData>();
+  for (const m of messages) {
+    if (m.author !== "agent" || !m.body.includes("<canvas")) continue;
+    for (const s of parseMessage(m.body)) if (s.kind === "canvas") out.set(s.block.id, s.block);
+  }
+  return out;
 }

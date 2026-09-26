@@ -4,6 +4,7 @@ import {
   type CanvasResponseValue,
   buildResponse,
 } from "@/lib/canvas";
+import CanvasFrame from "./CanvasFrame";
 
 /**
  * Renderer for one canvas block (ADR-012). `answered` disables the whole
@@ -26,26 +27,14 @@ export default function CanvasBlock({
   const submit = (value: CanvasResponseValue) => onSubmit(buildResponse(block, value));
 
   return (
-    <div
-      className={[
-        "my-2 rounded border px-3 py-2",
-        "border-[var(--color-nucleus-accent)]",
-        "bg-[color-mix(in_srgb,var(--color-nucleus-accent)_5%,var(--color-nucleus-surface))]",
-        answered ? "opacity-60" : "",
-      ].join(" ")}
-    >
-      <div className="mb-2 flex items-center gap-2 text-[10px] uppercase tracking-widest text-[var(--color-nucleus-faint)]">
-        <span>⛶ {block.type}</span>
-        {block.title && <span className="normal-case tracking-normal text-[var(--color-nucleus-text)]">{block.title}</span>}
-        {answered && <span className="ml-auto">answered</span>}
-      </div>
+    <CanvasFrame kind={block.type} title={block.title} answered={answered} className="my-2">
       {block.type === "decision" && <Decision block={block} inert={inert} submit={submit} />}
       {(block.type === "multi-select" || block.type === "review") && (
         <MultiSelect block={block} inert={inert} submit={submit} />
       )}
       {block.type === "confirm" && <Confirm block={block} inert={inert} submit={submit} />}
       {block.type === "form" && <Form block={block} inert={inert} submit={submit} />}
-    </div>
+    </CanvasFrame>
   );
 }
 

@@ -9,8 +9,9 @@ import type { ReactElement } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import IntakePage from "@/pages/IntakePage";
 import type { IntakeItem } from "@/lib/api";
-import { fixtureDetail, fixtureItem, fixtureMessage, fixturePlans } from "@/lib/intake.fixtures";
+import { fixtureDetail, fixtureItem, fixtureMessage, fixturePlans, fixtureQuestion } from "@/lib/intake.fixtures";
 import { ItemScreen } from "./ItemView";
+import DecisionBoard from "./DecisionBoard";
 import ItemThread, { Composer } from "./ItemThread";
 import PlanPanel from "./PlanPanel";
 import { planVersions } from "@/lib/intake";
@@ -207,5 +208,110 @@ describe("plan version selector", () => {
 
   test("with no versions the panel says so", () => {
     expect(panel({ versions: [] })).toContain("no plan yet");
+  });
+});
+
+describe("decision board", () => {
+  const plans = fixturePlans("# Plan\n\nfirst", "# Plan\n\nsecond");
+  const withPlan = fixtureItem({ stage: "refinement", plan_version: 2, plan_draft: "# Plan\n\nsecond" });
+  /** The board's options, in order. */
+  const options = (html: string) => [...html.matchAll(/data-option="(\w+)"/g)].map((m) => m[1]);
+  const thread = (it: IntakeItem, extra: Partial<Parameters<typeof ItemThread>[0]> = {}) =>
+    render(<ItemThread item={it} messages={[]} visible onSent={noop} {...extra} />);
+
+  test("a proposed plan puts the board in place of the composer, on every layout", () => {
+    const html = render(<ItemScreen detail={fixtureDetail(withPlan, { plans })} onChange={noop} />);
+    const section = html.split('aria-label="conversation"')[1].split("</section>")[0];
+    expect(options(section)).toEqual(["approve", "discuss", "cancel"]);
+    expect(section).toContain("Approve plan v2");
+    expect(section).not.toContain("<textarea");
+    // The first option is highlighted and the only one in the tab order.
+    expect(section).toMatch(/aria-selected="true" tabindex="0" data-option="approve"/);
+    expect(section).toMatch(/aria-selected="false" tabindex="-1" data-option="discuss"/);
+  });
+
+  test("no plan while the agent waits: the composer, no board", () => {
+    const html = thread(fixtureItem());
+    expect(options(html)).toEqual([]);
+    expect(html).toContain("<textarea");
+    expect(html).not.toContain("Back to options");
+  });
+
+  test("held: release, continue discussing, cancel, with the findings above", () => {
+    const held = fixtureItem({ stage: "held", hold_stage: "queued", hold_hash: "a1b2c3d4e5" });
+    const findings = [{ location: "body", kind: "html_comment", line: 1, column: 5, start: 4, end: 14, text: "<!-- run it -->" }];
+    const html = thread(held, { findings });
+    expect(options(html)).toEqual(["release", "discuss", "cancel"]);
+    expect(html).toContain("Release (hold a1b2c3)");
+    const list = html.indexOf('aria-label="hidden content"');
+    expect(list).toBeGreaterThan(-1);
+    expect(list).toBeLessThan(html.indexOf('data-option="release"'));
+    expect(html).toContain("&lt;!-- run it --&gt;");
+  });
+
+  test("failed: retry and cancel; working: the status and Write a message; finished: nothing", () => {
+    expect(options(thread(fixtureItem({ stage: "failed", failed_stage: "pr" })))).toEqual(["retry", "cancel"]);
+    const working = thread(fixtureItem({ stage: "implementation" }));
+    expect(options(working)).toEqual(["write"]);
+    expect(working).toContain("The agent is implementing the approved plan.");
+    expect(working).not.toContain("<textarea");
+    const closed = thread(fixtureItem({ stage: "closed" }));
+    expect(options(closed)).toEqual([]);
+    expect(closed).not.toContain("<textarea");
+    expect(closed).toContain("the conversation is closed");
+  });
+
+  test("Continue discussing shows the composer, focused, with Back to options", () => {
+    const html = thread(withPlan, { initialMode: "composer" });
+    expect(options(html)).toEqual([]);
+    expect(html).toMatch(/<textarea[^>]*autofocus/i);
+    expect(buttons(html)).toContain("Back to options");
+    // Without a board to go back to there is no link.
+    expect(buttons(thread(fixtureItem(), { initialMode: "composer" }))).not.toContain("Back to options");
+  });
+
+  test("Cancel item asks a second step on the board", () => {
+    const html = render(<DecisionBoard item={withPlan} question={null} onWrite={noop} onChange={noop} initialStep="cancel" />);
+    expect(html).toContain('data-board="confirm"');
+    expect(html).toContain("Cancel item #4? Its running task stops.");
+    expect(options(html)).toEqual(["yes", "no"]);
+    expect(buttons(html).some((t) => t.includes("Yes, cancel it"))).toBe(true);
+    expect(buttons(html).some((t) => t.includes("No, keep it"))).toBe(true);
+  });
+
+  test("a question Nucleus asked after typed text is a Yes / No step, also over the composer", () => {
+    const q = fixtureQuestion({ decision: "approve_plan", plan_version: 2, question: "Approve plan v2 of item #4? Answer yes or no." });
+    const html = thread(withPlan, { question: q, initialMode: "composer" });
+    expect(options(html)).toEqual(["yes", "no"]);
+    expect(html).toContain("Approve plan v2 of item #4? Implementation starts from that version.");
+    expect(html).not.toContain("<textarea");
+  });
+});
+
+describe("canvas questions in agent replies", () => {
+  const block = `<canvas v="1" type="decision" id="fmt" title="Output format">{"options":[{"key":"j","label":"<b>JSON</b>"},{"key":"y","label":"YAML"}]}</canvas>`;
+  const agent = fixtureMessage(1, { author: "agent", body: `Which **format**?\n\n${block}\n\nThen I write the plan.` });
+  const answer = fixtureMessage(2, {
+    author: "operator",
+    via: "dashboard",
+    body: `<canvas-response v="1" id="fmt" type="decision">\n{"choice":"y"}\n</canvas-response>`,
+  });
+
+  test("a block renders as options with plain-text labels, around the Markdown text", () => {
+    const html = render(<ItemThread item={fixtureItem()} messages={[agent]} visible onSent={noop} />);
+    expect(html).toContain("<strong");
+    expect(html).toContain("Output format");
+    expect(html).toContain("&lt;b&gt;JSON&lt;/b&gt;");
+    expect(html).not.toContain("<b>JSON</b>");
+    expect(html).toContain("Then I write the plan.");
+    expect(html).not.toContain(">answered<");
+  });
+
+  test("a later operator response marks it answered and shows the chosen label", () => {
+    const html = render(<ItemThread item={fixtureItem()} messages={[agent, answer]} visible onSent={noop} />);
+    expect(html).toContain(">answered<");
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>YAML<\/button>/);
+    expect(html).toMatch(/✔ (<!-- -->)?Output format: YAML/);
+    expect(html).not.toContain("&lt;canvas-response");
   });
 });
