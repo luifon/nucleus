@@ -287,6 +287,14 @@ async fn inbound_kind(f: &Fixture, item: i64, msg_id: &str, text: &str, kind: &s
 /// names none), `chat` the chat id (a group's ends in `@g.us`), `sender`
 /// what the bot's identity check found.
 async fn inbound_row(f: &Fixture, key: &str, chat: &str, msg_id: &str, text: &str, kind: &str, sender: &str) -> i64 {
+    // The operator writes after he received what was queued before: the bot
+    // delivered those messages (a question can only be answered once sent).
+    let before = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    sqlx::query("UPDATE outbound_queue SET status = 'sent', sent_at = ?1 WHERE status = 'pending'")
+        .bind(before)
+        .execute(&f.ctx.wa)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender)
          VALUES (?1, ?2, ?3, ?4, ?7, ?5, ?6)",
@@ -635,7 +643,7 @@ async fn unknown_items_and_duplicate_messages() {
     // The same WhatsApp message again is ignored.
     let before = store::messages(&f.ctx.db, 1).await.unwrap().len();
     let calls = f.interp.calls();
-    operator_message(&f.ctx, &Origin::Dm { item: Some(1) }, "a note", "wa:chat:x2", "text").await.unwrap();
+    operator_message(&f.ctx, &Origin::Dm { item: Some(1) }, "a note", "wa:chat:x2", "text", &crate::timestamp::now()).await.unwrap();
     assert_eq!(store::messages(&f.ctx.db, 1).await.unwrap().len(), before);
     assert_eq!(f.interp.calls(), calls, "not interpreted again");
 }
@@ -2343,15 +2351,21 @@ async fn two_decisions_in_one_turn_are_both_taken() {
     chat_message(&f, "d3", "and any update on the build?", "operator").await;
     f.interp.answer(reading("decision", Some(1), Some("approve_plan"), None));
     f.interp.answer(reading("decision", Some(2), Some("cancel"), None));
-    // After the cancel's question, a message that is not an answer stays
-    // with the session and leaves the question open.
+    // A decision after the cancel's question in the same turn is not run:
+    // it is reported under the question, to be sent again.
     f.interp.answer(reading("decision", Some(2), Some("cancel"), None));
     let r = interpret_latest(&f.ctx, Some("chat")).await.unwrap();
-    assert_eq!(outcomes(&r), [TurnOutcome::Handled, TurnOutcome::Handled, TurnOutcome::ForSession]);
+    assert_eq!(outcomes(&r), [TurnOutcome::Handled, TurnOutcome::Handled, TurnOutcome::Handled]);
     assert_eq!(item1(&f).await.stage(), Stage::Implementation, "the plan is approved");
     assert_eq!(store::item(&f.ctx.db, 2).await.unwrap().stage(), Stage::Eval, "the cancel waits for its answer");
-    assert!(outbound(&f).await.iter().any(|(_, b)| b == "Cancel item #2? Answer yes or no."));
+    assert!(
+        outbound(&f).await.iter().any(|(_, b)| b
+            == "Cancel item #2? Answer yes or no.\n\nAlso received: 'and any update on the build?' — send it again after answering the question above."),
+        "{:?}",
+        outbound(&f).await
+    );
     assert_eq!(confirmation_states(&f).await, ["pending"], "the question is still open");
+    assert_eq!(store::inbound_state(&f.ctx.db, "wa:chat:d3").await.unwrap().unwrap().state, "failed", "marked final");
     let Latest::Turn(msgs) = r else { unreachable!() };
     assert_eq!(msgs[0].preview, "approve the plan");
     assert_eq!(msgs[2].position, 3);
@@ -2367,6 +2381,9 @@ async fn a_message_of_an_interrupted_turn_is_reported_once_and_never_interpreted
     let f = dm_fixture(fixture().await);
     with_plan(&f).await;
     chat_message(&f, "r1", "approve it", "operator").await;
+    // A second message whose interpretation had started (state `received`).
+    let r2 = chat_message(&f, "r2", "release it too", "operator").await;
+    store::inbound_receive(&f.ctx.db, "wa:chat:r2", r2, "chat").await.unwrap();
     // The bot restarted during the turn: its restart sweep marks the turn.
     sqlx::query("UPDATE chat_turns SET status = 'interrupted'").execute(&f.ctx.wa).await.unwrap();
     tick(&f).await;
@@ -2374,11 +2391,33 @@ async fn a_message_of_an_interrupted_turn_is_reported_once_and_never_interpreted
     let notes: Vec<String> =
         outbound(&f).await.into_iter().map(|(_, b)| b).filter(|b| b.contains("restarted before it could check")).collect();
     assert_eq!(notes.len(), 1, "told once: {notes:?}");
-    assert!(notes[0].contains("\"approve it\"") && notes[0].contains("send it again"), "{}", notes[0]);
-    assert_eq!(store::inbound_state(&f.ctx.db, "wa:chat:r1").await.unwrap().unwrap().state, "failed");
+    assert!(notes[0].contains("\"approve it\"; \"release it too\"") && notes[0].contains("send it again"), "{}", notes[0]);
+    for m in ["wa:chat:r1", "wa:chat:r2"] {
+        assert_eq!(store::inbound_state(&f.ctx.db, m).await.unwrap().unwrap().state, "failed");
+    }
     // A new turn that somehow covered it would not take it again.
     sqlx::query("UPDATE chat_turns SET status = 'running'").execute(&f.ctx.wa).await.unwrap();
-    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Earlier]);
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Earlier, TurnOutcome::Earlier]);
     assert_eq!(f.interp.calls(), 0);
     assert_eq!(item1(&f).await.stage(), Stage::Refinement);
+}
+
+#[tokio::test]
+async fn a_yes_in_the_same_turn_cannot_confirm_a_question_not_yet_sent() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    tick(&f).await;
+    // "cancel item #1" and "yes" arrive in one turn.
+    chat_message(&f, "y1", "cancel item #1", "operator").await;
+    chat_message(&f, "y2", "yes", "operator").await;
+    let r = interpret_latest(&f.ctx, Some("chat")).await.unwrap();
+    assert_eq!(outcomes(&r), [TurnOutcome::Handled, TurnOutcome::ForSession]);
+    assert_eq!(item1(&f).await.stage(), Stage::Eval, "nothing is cancelled");
+    assert_eq!(confirmation_states(&f).await, ["pending"]);
+    assert!(f.interp.last().confirmation.is_none(), "the yes was not shown the unsent question");
+    // A yes sent after the question was delivered cancels.
+    new_turn(&f, "chat").await;
+    chat_message(&f, "y3", "yes", "operator").await;
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Handled]);
+    assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
 }

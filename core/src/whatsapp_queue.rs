@@ -120,6 +120,12 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     )
     .execute(&pool)
     .await?;
+    // ADR-036: LIDs the bot verified as the operator through the live LID
+    // mapping, with when. The bot writes it; Rust reads it (task chats).
+    // Must match messaging/whatsapp/src/intake.ts.
+    sqlx::query("CREATE TABLE IF NOT EXISTS operator_lid_verified (digits TEXT PRIMARY KEY, verified_at TEXT NOT NULL)")
+        .execute(&pool)
+        .await?;
     // ADR-036: the DM chat session's list of waiting intake decisions. One
     // row; Rust writes it, the bot reads it. Must match
     // messaging/whatsapp/src/intake.ts.
@@ -547,6 +553,27 @@ pub async fn interrupted_chat_messages(pool: &SqlitePool) -> Result<Vec<IntakeIn
     .await?)
 }
 
+/// When the outbound row with `dedup_key` was sent (`sent_at` of a `sent`
+/// row), if it was.
+pub async fn sent_at_by_dedup(pool: &SqlitePool, dedup_key: &str) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar("SELECT sent_at FROM outbound_queue WHERE dedup_key = ?1 AND status = 'sent' AND sent_at IS NOT NULL")
+        .bind(dedup_key)
+        .fetch_optional(pool)
+        .await?)
+}
+
+/// Add `line` as a new paragraph to the outbound row with `dedup_key` while
+/// it is still `pending` (not claimed by the drain). False when there is no
+/// such row any more (it was sent or is being sent).
+pub async fn append_to_pending(pool: &SqlitePool, dedup_key: &str, line: &str) -> Result<bool> {
+    let res = sqlx::query("UPDATE outbound_queue SET body = body || ?2 WHERE dedup_key = ?1 AND status = 'pending'")
+        .bind(dedup_key)
+        .bind(format!("\n\n{line}"))
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// Replace the block the bot adds to every operator message it types into
 /// the DM chat session (`intake_chat_block`, one row): what waits for an
 /// intake decision. Empty when nothing waits. Rust writes it; the bot only
@@ -607,15 +634,82 @@ pub fn allowed_dm_digits() -> Vec<String> {
         .collect()
 }
 
+/// The digit sets of `WHATSAPP_OPERATOR_LIDS` (ADR-036): the operator's own
+/// LIDs.
+pub fn operator_lids_env() -> Vec<String> {
+    std::env::var("WHATSAPP_OPERATOR_LIDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| normalize_digits(s.trim().trim_matches('"')))
+        .filter(|d| !d.is_empty())
+        .collect()
+}
+
+/// How long a LID the bot verified as the operator through the live LID
+/// mapping counts (`operator_lid_verified`, ADR-036). Mirrors
+/// `OPERATOR_LID_TTL_MS` in messaging/whatsapp/src/intake.ts.
+pub const OPERATOR_LID_TTL_SECS: i64 = 600;
+
+/// LIDs the bot verified as the operator through the live mapping within
+/// [`OPERATOR_LID_TTL_SECS`] (`operator_lid_verified`, which the bot writes
+/// and Rust only reads). Empty when the table is missing.
+pub async fn verified_operator_lids(pool: &SqlitePool) -> Result<Vec<String>> {
+    if !table_exists(pool, "operator_lid_verified").await? {
+        return Ok(vec![]);
+    }
+    let since = (chrono::Utc::now() - chrono::Duration::seconds(OPERATOR_LID_TTL_SECS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    Ok(sqlx::query_scalar("SELECT digits FROM operator_lid_verified WHERE verified_at > ?1")
+        .bind(since)
+        .fetch_all(pool)
+        .await?)
+}
+
+/// The operator's LIDs a Rust process can accept now: `WHATSAPP_OPERATOR_LIDS`
+/// and the fresh entries of `operator_lid_verified` in `whatsapp_db` (read
+/// only; a missing or unreadable database adds none).
+pub async fn accepted_operator_lids(whatsapp_db: &Path) -> Vec<String> {
+    let mut out = operator_lids_env();
+    if whatsapp_db.exists() {
+        if let Ok(pool) = crate::db::open_read_only(whatsapp_db).await {
+            out.extend(verified_operator_lids(&pool).await.unwrap_or_default());
+            pool.close().await;
+        }
+    }
+    out
+}
+
 /// Validate and canonicalize a DM chat reference for delivery. An `@lid`
 /// chat is kept as is (a reply must go to the exact chat); any other form
 /// becomes `<digits>@s.whatsapp.net`. The digits must be on the DM
-/// allowlist.
+/// allowlist, or the chat is an `@lid` in `WHATSAPP_OPERATOR_LIDS`.
 pub fn canonical_dm_chat(chat: &str) -> Result<String> {
-    canonical_dm_chat_in(chat, &allowed_dm_digits())
+    canonical_dm_chat_in(chat, &allowed_dm_digits(), &operator_lids_env())
 }
 
-fn canonical_dm_chat_in(chat: &str, allowed: &[String]) -> Result<String> {
+/// [`canonical_dm_chat`] that also accepts an `@lid` chat in `operator_lids`
+/// (see [`accepted_operator_lids`]).
+pub fn canonical_dm_chat_with(chat: &str, operator_lids: &[String]) -> Result<String> {
+    canonical_dm_chat_in(chat, &allowed_dm_digits(), operator_lids)
+}
+
+/// The chat a task's result goes to (ADR-036): its origin chat when that is
+/// still accepted ([`canonical_dm_chat_with`]); an operator LID that is no
+/// longer accepted (its mapping verification expired) falls back to the
+/// operator's phone JID (the first `WHATSAPP_ALLOWED_DM_JIDS` entry), so
+/// the result is not lost. Any other chat that is not accepted is an error.
+pub fn task_result_chat(chat: &str, operator_lids: &[String]) -> Result<String> {
+    match canonical_dm_chat_with(chat, operator_lids) {
+        Ok(c) => Ok(c),
+        Err(e) if chat.trim().ends_with("@lid") => match allowed_dm_digits().first() {
+            Some(phone) => Ok(format!("{phone}@s.whatsapp.net")),
+            None => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+fn canonical_dm_chat_in(chat: &str, allowed: &[String], operator_lids: &[String]) -> Result<String> {
     if chat.contains("@g.us") {
         anyhow::bail!("{chat:?} is a group, not a WhatsApp DM chat");
     }
@@ -623,14 +717,11 @@ fn canonical_dm_chat_in(chat: &str, allowed: &[String]) -> Result<String> {
     if digits.len() < 8 {
         anyhow::bail!("{chat:?} is not a WhatsApp DM chat");
     }
-    if !allowed.contains(&digits) {
-        anyhow::bail!("{chat:?} is not on WHATSAPP_ALLOWED_DM_JIDS");
+    let lid = chat.trim().ends_with("@lid");
+    if !allowed.contains(&digits) && !(lid && operator_lids.contains(&digits)) {
+        anyhow::bail!("{chat:?} is not on WHATSAPP_ALLOWED_DM_JIDS and not a verified operator LID");
     }
-    Ok(if chat.trim().ends_with("@lid") {
-        format!("{digits}@lid")
-    } else {
-        format!("{digits}@s.whatsapp.net")
-    })
+    Ok(if lid { format!("{digits}@lid") } else { format!("{digits}@s.whatsapp.net") })
 }
 
 #[cfg(test)]
@@ -750,7 +841,7 @@ mod tests {
         assert_eq!(normalize_digits("+55 11 99999-9999"), "5511999999999");
         assert_eq!(normalize_digits("5511999999999:12@s.whatsapp.net"), "5511999999999");
         let allowed = vec!["5511999999999".to_string(), "123456789012".to_string()];
-        let c = |s: &str| canonical_dm_chat_in(s, &allowed);
+        let c = |s: &str| canonical_dm_chat_in(s, &allowed, &[]);
         assert_eq!(c("+55 11 99999-9999").unwrap(), "5511999999999@s.whatsapp.net");
         // Synthetic ids built at runtime (the committed-secrets scanner reads
         // a literal `<digits>@<domain>` as a real JID).

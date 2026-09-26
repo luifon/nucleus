@@ -858,6 +858,10 @@ pub struct IntakeTexts {
     /// interrupted before they could be checked for a decision
     /// (`{messages}`: short previews, quoted, separated by `; `).
     pub interrupted_messages: String,
+    /// Added under a confirmation question when a decision arrived in the
+    /// same chat turn after the question was asked (`{preview}`: the first
+    /// words of that message).
+    pub also_received: String,
     /// The comment Nucleus posts on the issue once the draft PR is open
     /// (`{pr_url}` only). Code-owned and posted without approval, so it
     /// must not take model output or issue text.
@@ -950,6 +954,7 @@ impl Default for IntakeTexts {
                                    pipeline decision, so nothing was done for them: {messages}. If one of them was a \
                                    decision, send it again."
                 .into(),
+            also_received: "Also received: '{preview}' — send it again after answering the question above.".into(),
             pr_comment: "Draft pull request: {pr_url}".into(),
         }
     }
