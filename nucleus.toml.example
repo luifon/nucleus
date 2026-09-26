@@ -260,19 +260,14 @@ max_runtime_hours = 12
 # # edit ~/.gitconfig), so the only credential helper is gh at gh_bin.
 # remote_url = "https://github.com/{repo}.git"
 #
-# Items that need a plan get a WhatsApp group with the bot and the operator.
-# The operator decides there in his own words (approve the plan, release a
-# held item, cancel); a model with no tools reads each message and code
-# decides what happens (ADR-036, "Operator decisions"). In the DM, a message
-# without an item marker reaches the chat session, which sees the waiting
-# decisions and has the pipeline interpret the message (interpret-latest).
-# Creating groups automatically from a personal account can trigger WhatsApp's
-# anti-spam checks: keep max_groups_per_day low. Past the limit, or with
-# refinement_groups = false, the item's thread runs in the DM, marked #<n>.
-# [intake.whatsapp]
-# refinement_groups = true
-# max_groups_per_day = 3
-# group_wait_minutes = 15
+# Every item's WhatsApp thread is the operator's DM, marked #<n> (per-item
+# groups were removed: ADR-036, "No WhatsApp groups"). The
+# operator decides there in his own words (approve the plan, release a held
+# item, cancel); a model with no tools reads each message and code decides
+# what happens (ADR-036, "Operator decisions"). A DM message without an item
+# marker reaches the chat session, which sees the waiting decisions and has
+# the pipeline interpret the message (interpret-latest). There is no
+# [intake.whatsapp] section.
 #
 # Operator-facing texts; placeholders are listed in core/src/config.rs
 # (IntakeTexts).

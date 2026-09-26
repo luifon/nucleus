@@ -61,10 +61,10 @@ comment_state: string, comment_url: string | null,
  */
 comment_op: string | null,
 /**
- * Where the item's thread runs on WhatsApp: `none` (not yet),
- * `pending` (group requested), `group`, `dm`.
+ * Whether the item has a WhatsApp thread: `none` (nothing sent yet) or
+ * `dm` (its notices go to the operator's DM, marked `#<n>`).
  */
-surface: string, group_requested_at: string | null, group_jid: string | null, group_closed_at: string | null,
+surface: string,
 /**
  * The stage task running now.
  */

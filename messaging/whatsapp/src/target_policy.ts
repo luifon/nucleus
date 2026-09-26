@@ -9,8 +9,7 @@
 // digits are in WHATSAPP_ALLOWED_DM_JIDS) or a configured group: a group JID
 // in WHATSAPP_ALLOWED_CHAT_IDS / WHATSAPP_BRAINDUMP_CHAT_IDS, or a group
 // whose name is in WHATSAPP_ALLOWED_GROUP_NAMES /
-// WHATSAPP_BRAINDUMP_GROUP_NAMES, or an issue-pipeline group the bot created
-// and has not left (ADR-036; the drain only, see `addIntake`). Nothing else is sendable, so a caller that
+// WHATSAPP_BRAINDUMP_GROUP_NAMES. Nothing else is sendable, so a caller that
 // evades caller detection (caller_guard.ts) still cannot reach another chat.
 
 import { normalizeSenderId } from "./config.js";
@@ -33,9 +32,7 @@ export interface GroupInfo {
   subject: string;
 }
 
-/** `intake`: a group the bot created for one issue-pipeline item (ADR-036);
- *  added while the item is open, removed when the bot leaves it. */
-export type GroupRole = "whatsapp-group" | "braindump" | "intake";
+export type GroupRole = "whatsapp-group" | "braindump";
 
 /** The allowed groups: configured JIDs, plus participating groups whose
  *  name is configured (case-insensitive). A JID in both lists is a
@@ -61,20 +58,6 @@ export class GroupAllowlist {
         this.byName.set(lower, g.jid);
       }
     }
-  }
-
-  /** Add the active intake groups (ADR-036). A configured group keeps its
-   *  configured role. */
-  addIntake(jids: readonly string[]): this {
-    for (const jid of jids) {
-      if (jid.endsWith("@g.us") && !this.roles.has(jid)) this.roles.set(jid, "intake");
-    }
-    return this;
-  }
-
-  /** Remove an intake group the bot left. Configured groups stay. */
-  removeIntake(jid: string): void {
-    if (this.roles.get(jid) === "intake") this.roles.delete(jid);
   }
 }
 

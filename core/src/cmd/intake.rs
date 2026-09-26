@@ -66,7 +66,8 @@ enum Cmd {
         #[arg(long)]
         hidden: bool,
     },
-    /// Write in an item's thread (refinement only). `--text -` reads stdin.
+    /// Write in an item's thread (any stage; the refinement agent reads it
+    /// during refinement). `--text -` reads stdin.
     Reply {
         item: String,
         #[arg(long)]
@@ -95,15 +96,6 @@ enum Cmd {
         /// it. Refused when the item was held again since.
         #[arg(long)]
         hold: String,
-    },
-    /// End an unresolved WhatsApp group creation of an item by hand: you
-    /// left the group (`--left`) or checked that none exists (`--absent`).
-    GroupResolve {
-        item: String,
-        #[arg(long, conflicts_with = "absent", required_unless_present = "absent")]
-        left: bool,
-        #[arg(long)]
-        absent: bool,
     },
 }
 
@@ -409,7 +401,10 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
                 text
             };
             let n = item_number(&item)?;
-            pipeline::reply(&ctx, n, &text, via).await.map(|_| println!("message added to item #{n}"))
+            pipeline::reply(&ctx, n, &text, via).await.map(|r| match r.note {
+                Some(note) => println!("{note}"),
+                None => println!("message added to item #{n}; the refinement agent reads it at its next turn"),
+            })
         }
         Cmd::ApprovePlan { item, version } => {
             let n = item_number(&item)?;
@@ -436,13 +431,6 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
         Cmd::Release { item, hold } => {
             let n = item_number(&item)?;
             pipeline::release(&ctx, n, Some(&hold), via).await.map(|i| println!("item #{n} released; it continues at {}", i.stage))
-        }
-        Cmd::GroupResolve { item, left, absent } => {
-            let n = item_number(&item)?;
-            let how = if left { "left" } else if absent { "absent" } else { unreachable!("clap requires one") };
-            pipeline::group_resolve(&ctx, n, how)
-                .await
-                .map(|_| println!("item #{n}: group marked {how}; the WhatsApp bot applies it"))
         }
     };
     match result {
@@ -533,10 +521,6 @@ mod tests {
         ] {
             assert!(authorize(&caller(role.clone(), 0), &Cmd::InterpretLatest).is_err(), "{role:?}");
         }
-        let resolve = || Cmd::GroupResolve { item: "1".into(), left: true, absent: false };
-        assert!(authorize(&caller(chat, 0), &resolve()).is_err(), "only the operator resolves a group");
-        assert!(authorize(&caller(Role::Detached, 0), &resolve()).is_err());
-        assert!(authorize(&caller(Role::Operator, 0), &resolve()).is_ok());
         assert!(authorize(&caller(Role::Detached, 0), &tick()).is_ok());
         assert!(authorize(&caller(Role::Detached, 0), &show()).is_err());
         for role in [

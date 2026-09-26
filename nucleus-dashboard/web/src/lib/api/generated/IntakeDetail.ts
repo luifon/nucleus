@@ -5,6 +5,7 @@ import type { IntakeHiddenFinding } from "./IntakeHiddenFinding";
 import type { IntakeHiddenSource } from "./IntakeHiddenSource";
 import type { IntakeItem } from "./IntakeItem";
 import type { IntakeMessage } from "./IntakeMessage";
+import type { IntakePlanVersion } from "./IntakePlanVersion";
 import type { IntakeTransition } from "./IntakeTransition";
 import type { Task } from "./Task";
 
@@ -18,7 +19,13 @@ hidden: Array<IntakeHiddenFinding>,
  * The raw text of each location that has findings (title, body,
  * `comment <id>`), complete, for review with the ranges marked.
  */
-hidden_sources: Array<IntakeHiddenSource>, messages: Array<IntakeMessage>,
+hidden_sources: Array<IntakeHiddenSource>,
+/**
+ * Every accepted plan version, whole, oldest first. An approval names
+ * one of these versions (`approve-plan`); only the latest can be
+ * approved.
+ */
+plans: Array<IntakePlanVersion>, messages: Array<IntakeMessage>,
 /**
  * Every stage task of the item, oldest first (from the task ledger).
  */

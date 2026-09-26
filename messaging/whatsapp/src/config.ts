@@ -3,7 +3,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { resolvePersona } from "./persona.js";
 import { textsFrom } from "./texts.js";
-import { intakeConfig, type IntakeWhatsAppConfig } from "./intake.js";
 
 /** Minimal TOML reader — supports tables (dotted names nest), arrays of
  * tables (`[[a.b]]`), scalars, single-line AND multi-line string arrays.
@@ -226,8 +225,6 @@ export interface Config {
   link: LinkConfig;
   /** ADR-033: the `nucleus` binary (tasks CLI, skill review). */
   nucleusBin: string | null;
-  /** ADR-036: issue-pipeline groups ([intake.whatsapp] in nucleus.toml). */
-  intake: IntakeWhatsAppConfig;
 }
 
 export type { Config as default };
@@ -305,7 +302,6 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
     turns: turnsConfig(parsed.whatsapp?.turns ?? {}, parsed.whatsapp?.texts ?? {}),
     link: linkConfig(parsed.whatsapp?.link ?? {}),
     nucleusBin: findNucleusBin(workspaceRoot),
-    intake: intakeConfig(parsed.intake?.whatsapp ?? {}),
   };
 }
 

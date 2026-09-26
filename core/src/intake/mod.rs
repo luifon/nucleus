@@ -30,8 +30,8 @@
 //! **Write ownership (ADR-020).** intake.db is written only through this
 //! module, inside the `nucleus` binary (the CLI, the tick, the dashboard's
 //! write routes). whatsapp.db is the bot's: Rust inserts into its queue
-//! tables (`outbound_queue`, `intake_group_requests`) and reads
-//! `intake_groups` and `intake_inbound`.
+//! table `outbound_queue`, writes the one-row `intake_chat_block`, and reads
+//! `intake_inbound`.
 
 pub mod briefs;
 pub mod decide;
@@ -48,7 +48,7 @@ pub mod tools;
 
 pub use event::{Event, NewEvent};
 pub use stage::Stage;
-pub use store::{Item, ItemMessage, ItemTransition};
+pub use store::{Item, ItemMessage, ItemTransition, PlanVersion};
 
 /// Relative to the workspace root.
 pub const INTAKE_DB_PATH: &str = "memory/intake.db";
@@ -60,6 +60,38 @@ pub fn fill(template: &str, vars: &[(&str, &str)]) -> String {
         out = out.replace(&format!("{{{k}}}"), v);
     }
     out
+}
+
+/// `template` with each `{key}` of `vars` replaced in one pass: text a value
+/// brings in is not filled again, so an issue title that contains `{link}`
+/// stays as written. An unknown `{key}` is kept.
+pub fn fill_once(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let known = after.find('}').and_then(|close| vars.iter().find(|(k, _)| *k == &after[..close]).map(|(_, v)| (close, *v)));
+        match known {
+            Some((close, v)) => {
+                out.push_str(v);
+                rest = &after[close + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `s` on one line: every run of whitespace (line breaks included) becomes
+/// one space, and the ends are trimmed. A notice whose `{link}` is empty
+/// keeps no trailing space.
+pub fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Cut `s` to at most `max` characters, marking the cut.

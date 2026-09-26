@@ -17,7 +17,7 @@ via: string, body: string,
  */
 pending_agent: number, read_by_task: string | null,
 /**
- * `null` (to be sent to WhatsApp), `queued`, or `none` (not sent: it
- * came from WhatsApp).
+ * `null` (its notice is still to be sent), `queued` (the notice is in
+ * the outbound queue), or `none` (nothing is sent for it).
  */
 wa_state: string | null, };
