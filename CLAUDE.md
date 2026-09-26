@@ -609,7 +609,8 @@ JSON-parsed numbers.
   no text: it interprets the stored DM rows (`item_key = chat`, `sender =
   operator`) that the session's current turn covers, in order, every one,
   each row once, and prints which ones it handled. A message answers only
-  a question sent before it arrived; a decision after a question asked in
+  a question sent before it arrived (the arrival is stamped before the
+  message is handled, and WhatsApp's timestamps must agree); a decision after a question asked in
   the same turn is not run but reported under the question; only the
   DM chat session and the operator's terminal may run it. Operator-only
   outbound (the pipeline, reminders, `dm`) reaches only the operator's

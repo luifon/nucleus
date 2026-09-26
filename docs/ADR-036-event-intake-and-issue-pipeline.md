@@ -1553,8 +1553,13 @@ message):
   arrived before that question was sent, so none of them can answer it. A
   later decision is not run; the line `[intake.texts] also_received`
   ("Also received: '<preview>' — send it again after answering the question
-  above.") is added to the question while it is still in the queue (or
-  sent right after it), and the message is marked final. Anything else is
+  above.") is added to the question while it is still `pending` in the
+  queue (a guarded `UPDATE … WHERE status = 'pending'`), or queued as its
+  own note right after it when the drain already claimed the question, and
+  the message is marked final. The drain claims a row and reads its body in
+  one statement (`claimForSend`: `UPDATE … SET status = 'in_flight' … RETURNING
+  body`), so an appended line is either in the body that is sent or refused
+  and sent separately, never lost. Anything else is
   left to the session, and the question stays open. From the
   operator's terminal it reads the newest stored row of the last 15
   minutes. A row is interpreted at most once: its `inbound_commands` state
@@ -1653,11 +1658,18 @@ yes or no.") comes before:
   items wait.
 
 A message can answer only a question that was sent before the message
-arrived: the question's `outbound_queue` row must be `sent`, with a
-`sent_at` earlier than the message's `received_at`. For a message that
-arrived earlier (a "yes" typed in the same turn as the decision, before the
-question reached WhatsApp), the question is not shown to the interpreter,
-is not answered and is not replaced.
+arrived. The bot stamps every message's arrival in its `messages.upsert`
+handler before any await, for the whole batch at once, and stores it as
+the row's `received_at`; a later message of the same batch, or a voice note
+whose transcription finishes later, keeps that stamp. It also stores
+WhatsApp's own `messageTimestamp` (`intake_inbound.wa_ts`, seconds), and the
+drain stores the server timestamp of every sent message from the send
+result (`outbound_queue.wa_ts`). Both must hold: the question's row is
+`sent` with a `sent_at` earlier than the message's arrival stamp, and, when
+both WhatsApp timestamps are known, the question's is earlier than the
+message's (whole seconds; equal is not earlier). For a message that
+arrived earlier, the question is not shown to the interpreter, is not
+answered and is not replaced.
 
 A plan approval typed in the item's own group, or in the DM naming the item,
 or in the DM while only that item waits, runs at once.
@@ -1713,8 +1725,12 @@ last 10 minutes. Task creation refuses any other chat. At delivery, a
 result for an operator LID whose verification expired goes to the
 operator's phone JID; it is not dropped. The drain checks the live mapping
 again at send time and sends a result to an `@lid` chat outside the lists
-only when the live check accepts it. Tasks from other allowed contacts keep
-their own chat.
+only when the live check accepts it. When the live check rejects the `@lid`
+target of an operator-only row or a task result (sender `task:<id>`), the
+bot deletes that LID's `operator_lid_verified` row, drops it from its cache,
+moves the queue row to the operator's phone JID in place and sends it
+there: a result for the operator is never dropped because his LID went
+stale. Tasks and replies for other allowed contacts keep their own chat.
 
 **After a restart.** The bot marks a turn it interrupted `interrupted`. The
 next tick finds operator DM rows of such turns that were stored for
@@ -1817,6 +1833,18 @@ expiry, and one from another contact stays there
 the drain's live check for task LID chats (`intake.test.ts`,
 `target_policy.test.ts`); a row left in `received` is reported too
 (`a_message_of_an_interrupted_turn_is_reported_once_and_never_interpreted`).
+Review round 4: a "yes" of the same batch recorded after the question was
+sent, a voice "yes" transcribed after it, and a "yes" in the question's own
+WhatsApp second do not confirm, and a later "yes" does
+(`a_yes_that_arrived_before_the_question_was_sent_does_not_confirm`); the
+batch arrival stamp and both WhatsApp timestamps are stored
+(`intake.test.ts`, "a batch's messages keep the arrival…"); an append
+racing a claim is in the claimed body or refused, never neither
+(`intake.test.ts`, "an appended line is in the claimed body or refused…";
+`whatsapp_queue::tests::an_append_succeeds_only_on_a_pending_row`); a task
+result or operator-only row for a LID the live check rejects goes to the
+phone and drops the LID, another contact's LID keeps its result
+(`target_policy.test.ts`).
 
 Rust (`cargo test -p nucleus-core intake`, fake interpreter): "looks good,
 go ahead" in item #1's group approves plan v1 at once
