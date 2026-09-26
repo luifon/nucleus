@@ -464,6 +464,7 @@ pub const CONFIRMATION_MINUTES: i64 = 15;
 async fn ingest_whatsapp(ctx: &Ctx) -> Result<()> {
     let after: i64 = store::meta(&ctx.db, WA_INBOUND_WATERMARK).await?.and_then(|v| v.parse().ok()).unwrap_or(0);
     let rows = crate::whatsapp_queue::intake_inbound_after(&ctx.wa, after, 200).await?;
+    report_group_rows(ctx, &rows).await?;
     for row in rows {
         // An operator DM message that went to the chat session: it is
         // interpreted only when the session asks (`interpret-latest`).
@@ -497,6 +498,41 @@ async fn ingest_whatsapp(ctx: &Ctx) -> Result<()> {
             }
         }
         store::set_meta(&ctx.db, WA_INBOUND_WATERMARK, &row.id.to_string()).await?;
+    }
+    Ok(())
+}
+
+/// Operator messages the bot stored from an item's WhatsApp group while
+/// groups existed and that were never interpreted: the pipeline reads only
+/// the DM now, so they are not applied. They are reported in one DM message
+/// with short previews ("send it again"), then marked final, like the
+/// messages of an interrupted chat turn ([`report_interrupted`]). The report
+/// is queued before the rows are marked, under a key of the first row, so a
+/// crash in between queues it once.
+async fn report_group_rows(ctx: &Ctx, rows: &[crate::whatsapp_queue::IntakeInbound]) -> Result<()> {
+    let mut lost = Vec::new();
+    for row in rows.iter().filter(|r| r.chat_id.ends_with("@g.us") && r.sender == "operator") {
+        let msg_ref = format!("wa:{}:{}", row.chat_id, row.wa_msg_id);
+        if !store::inbound_state(&ctx.db, &msg_ref).await?.is_some_and(|s| s.is_final()) {
+            lost.push((row, msg_ref));
+        }
+    }
+    let Some((first, _)) = lost.first() else { return Ok(()) };
+    let previews: Vec<String> =
+        lost.iter().map(|(r, _)| format!("\"{}\"", clip(&publish::plain_line(&r.text, 500), TURN_PREVIEW_CHARS))).collect();
+    let body = fill(&ctx.cfg.texts.group_messages_dropped, &[("messages", &previews.join("; "))]);
+    crate::whatsapp_queue::enqueue_text_once(
+        &ctx.wa,
+        crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM,
+        &body,
+        "intake:note",
+        &format!("intake:group-dropped:{}", first.id),
+    )
+    .await?;
+    for (row, msg_ref) in &lost {
+        store::inbound_receive(&ctx.db, msg_ref, row.id, &row.item_key).await?;
+        store::inbound_finish(&ctx.db, msg_ref, "failed", Some("a message from an item's old WhatsApp group; reported to the operator"))
+            .await?;
     }
     Ok(())
 }
@@ -1294,7 +1330,7 @@ async fn approve_plan_caused(ctx: &Ctx, n: i64, version: Option<u32>, via: &str,
         return refuse(format!("Item #{n} changed while approving (a new plan, or the agent started a reply); look at it again."));
     }
     let item = store::item(&ctx.db, n).await?;
-    let notice = notice_text(ctx, &ctx.cfg.texts.notice_implementation_started, &item, &[]);
+    let notice = notice(ctx, &ctx.cfg.texts.notice_implementation_started, &item, &[]).await;
     note(ctx, n, &fill_vars(&ctx.cfg.texts.plan_approved, &item_vars(ctx, &item)), Some(notice)).await?;
     Ok(item)
 }
@@ -1366,7 +1402,7 @@ async fn cancel_caused(ctx: &Ctx, n: i64, via: &str, cause: Option<&str>) -> Res
         return refuse(format!("Item #{n} changed while cancelling; look at it again."));
     }
     let item = store::item(&ctx.db, n).await?;
-    let notice = notice_text(ctx, &ctx.cfg.texts.notice_cancelled, &item, &[]);
+    let notice = notice(ctx, &ctx.cfg.texts.notice_cancelled, &item, &[]).await;
     note(ctx, n, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &item)), Some(notice)).await?;
     Ok(item)
 }
@@ -1462,7 +1498,7 @@ async fn release_caused(ctx: &Ctx, n: i64, hold: Option<&str>, via: &str, cause:
         return refuse(format!("Item #{n} changed while releasing (held again or stopped); look at it again."));
     }
     let item = store::item(&ctx.db, n).await?;
-    let notice = notice_text(ctx, &ctx.cfg.texts.notice_released, &item, &[("stage", &item.stage)]);
+    let notice = notice(ctx, &ctx.cfg.texts.notice_released, &item, &[("stage", &item.stage)]).await;
     note(ctx, n, &fill_item(&ctx.cfg.texts.item_released, &item_vars(ctx, &item), &[("via", via), ("code", &code)]), Some(notice))
         .await?;
     tracing::info!(item = n, via, "intake: held item released");
@@ -1613,7 +1649,7 @@ async fn fail(ctx: &Ctx, item: &Item, error: &str) -> Result<()> {
         let it = store::item(&ctx.db, item.id).await?;
         let reason = notice_reason(ctx, error).await;
         let failed_in = it.failed_stage.clone().unwrap_or_default();
-        let notice = notice_text(ctx, &ctx.cfg.texts.notice_failed, &it, &[("failed_in", &failed_in), ("reason", &reason)]);
+        let notice = notice(ctx, &ctx.cfg.texts.notice_failed, &it, &[("failed_in", &failed_in), ("reason", &reason)]).await;
         note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_failed, &item_vars(ctx, &it)), Some(notice)).await?;
     }
     Ok(())
@@ -1632,7 +1668,7 @@ async fn close_by_source(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
     .await?
     {
         let it = store::item(&ctx.db, item.id).await?;
-        let notice = notice_text(ctx, &ctx.cfg.texts.notice_stopped, &it, &[("reason", &notice_reason(ctx, why).await)]);
+        let notice = notice(ctx, &ctx.cfg.texts.notice_stopped, &it, &[("reason", &notice_reason(ctx, why).await)]).await;
         note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_closed, &item_vars(ctx, &it)), Some(notice)).await?;
     }
     Ok(())
@@ -1652,7 +1688,7 @@ async fn cancel_by_source(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
     .await?
     {
         let it = store::item(&ctx.db, item.id).await?;
-        let notice = notice_text(ctx, &ctx.cfg.texts.notice_cancelled, &it, &[]);
+        let notice = notice(ctx, &ctx.cfg.texts.notice_cancelled, &it, &[]).await;
         note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &it)), Some(notice)).await?;
     }
     Ok(())
@@ -1674,7 +1710,7 @@ async fn mark_stale(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
     {
         tracing::warn!(item = item.id, why, "intake: item is stale");
         let it = store::item(&ctx.db, item.id).await?;
-        let notice = notice_text(ctx, &ctx.cfg.texts.notice_stopped, &it, &[("reason", &notice_reason(ctx, why).await)]);
+        let notice = notice(ctx, &ctx.cfg.texts.notice_stopped, &it, &[("reason", &notice_reason(ctx, why).await)]).await;
         note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_stale, &item_vars(ctx, &it)), Some(notice)).await?;
     }
     Ok(())
@@ -1748,7 +1784,7 @@ async fn hold(ctx: &Ctx, item: &Item, found: &hidden::Hold, fp: &str) -> Result<
             &item_vars(ctx, &it),
             &[("count", &findings.len().to_string()), ("kinds", &kinds), ("findings", &lines.join("\n")), ("code", code)],
         );
-        let notice = notice_text(ctx, &ctx.cfg.texts.notice_held, &it, &[("count", &findings.len().to_string())]);
+        let notice = notice(ctx, &ctx.cfg.texts.notice_held, &it, &[("count", &findings.len().to_string())]).await;
         note_once(ctx, item.id, &text, &format!("held:{}:{fp}", item.id), Some(notice)).await?;
     }
     Ok(())
@@ -2064,7 +2100,7 @@ async fn step_eval(ctx: &Ctx, item: &Item) -> Result<()> {
                         &item_vars(ctx, &it),
                         &[("ref", &event_ref(&ev)), ("url", ev.url.as_deref().unwrap_or(""))],
                     );
-                    let notice = notice_text(ctx, &ctx.cfg.texts.notice_implementation_started, &it, &[]);
+                    let notice = notice(ctx, &ctx.cfg.texts.notice_implementation_started, &it, &[]).await;
                     note_once(ctx, item.id, &text, &format!("eval:{id}"), Some(notice)).await?;
                 }
                 return Ok(());
@@ -2078,7 +2114,7 @@ async fn step_eval(ctx: &Ctx, item: &Item) -> Result<()> {
                     &item_vars(ctx, &it),
                     &[("ref", &event_ref(&ev)), ("url", ev.url.as_deref().unwrap_or(""))],
                 );
-                let notice = notice_text(ctx, &ctx.cfg.texts.notice_needs_plan, &it, &[]);
+                let notice = notice(ctx, &ctx.cfg.texts.notice_needs_plan, &it, &[]).await;
                 note_once(ctx, item.id, &text, &format!("eval:{id}"), Some(notice)).await?;
             }
             Ok(())
@@ -2187,7 +2223,7 @@ async fn finish_refinement_turn(ctx: &Ctx, item: &Item, task: &str, result: &str
             vars.retain(|(k, _)| *k != "version");
             vars.push(("version", next.to_string()));
             let body = format!("{shown}\n\n{}", fill_vars(&t.approve_hint, &vars));
-            let notice = notice_text(ctx, &t.notice_plan_ready, item, &[("version", &next.to_string())]);
+            let notice = notice(ctx, &t.notice_plan_ready, item, &[("version", &next.to_string())]).await;
             accepted = Some((next, p));
             (body, Some(next), Some(notice), None)
         }
@@ -2396,7 +2432,7 @@ async fn block_because(ctx: &Ctx, item: &Item, why: String) -> Result<()> {
     .await?
     {
         let it = store::item(&ctx.db, item.id).await?;
-        let notice = notice_text(ctx, &ctx.cfg.texts.notice_blocked, &it, &[("reason", &notice_reason(ctx, &why).await)]);
+        let notice = notice(ctx, &ctx.cfg.texts.notice_blocked, &it, &[("reason", &notice_reason(ctx, &why).await)]).await;
         note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_blocked, &item_vars(ctx, &it)), Some(notice)).await?;
     }
     Ok(())
@@ -2469,7 +2505,11 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
         .await;
     };
     let header = header_for_guard(&git::commit_header(&mirror, &sha).await?, &configured_author_email(ctx));
-    if let Verdict::Hit(cats) = ctx.guard.scan(&format!("{title}\n{body}\n{header}\n{added}")).await {
+    // The raw issue title and source name as well: the title and the body
+    // normalize them (an `@` becomes `＠`), which would hide an address from
+    // the guard's patterns.
+    let raw = format!("{}\n{} {}", item.rev_title.as_deref().unwrap_or(&item.title), ev.source, ev.external_id);
+    if let Verdict::Hit(cats) = ctx.guard.scan(&format!("{raw}\n{title}\n{body}\n{header}\n{added}")).await {
         return block(ctx, item, "the commit or the pull request text", &cats).await;
     }
     // Each write gets its own fresh read right before it (GitHub has no
@@ -2504,7 +2544,7 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     // The agent's own words, as it wrote them: this goes to the item's
     // thread on the dashboard, never to GitHub or WhatsApp.
     let summary = clip(it.impl_summary.as_deref().unwrap_or(""), 600);
-    let notice = notice_text(ctx, &ctx.cfg.texts.notice_pr_opened, &it, &[("pr_url", &url), ("tests", &tests)]);
+    let notice = notice(ctx, &ctx.cfg.texts.notice_pr_opened, &it, &[("pr_url", &url), ("tests", &tests)]).await;
     note_once(
         ctx,
         item.id,
@@ -2611,12 +2651,24 @@ pub fn item_link(public_url: Option<&str>, n: i64) -> String {
 
 /// A WhatsApp notice for `item`: `template` with `{n}`, `{title}` (the
 /// issue title on one line, at most 80 characters), `{link}` and `extra`
-/// filled in one pass, on one line.
-fn notice_text(ctx: &Ctx, template: &str, item: &Item, extra: &[(&str, &str)]) -> String {
-    build_notice(ctx.public_url.as_deref(), template, item.id, &item.title, extra)
+/// filled in one pass, on one line. The secret guard reads the raw title
+/// (when the template uses it) before any normalization, and then the
+/// finished notice; a hit on either sends the fixed `notice_withheld` text
+/// instead. `extra` values must already be safe: each comes from a function
+/// that scanned its raw source first ([`agent_replied_notice`],
+/// [`notice_reason`]) or from code.
+async fn notice(ctx: &Ctx, template: &str, item: &Item, extra: &[(&str, &str)]) -> String {
+    let raw_title_hit = template.contains("{title}") && matches!(ctx.guard.scan(&item.title).await, Verdict::Hit(_));
+    let text = build_notice(ctx.public_url.as_deref(), template, item.id, &item.title, extra);
+    if raw_title_hit || matches!(ctx.guard.scan(&text).await, Verdict::Hit(_)) {
+        tracing::warn!(item = item.id, "intake: a notice was replaced by the fixed text after the secret guard");
+        return build_notice(ctx.public_url.as_deref(), &ctx.cfg.texts.notice_withheld, item.id, "", &[]);
+    }
+    text
 }
 
-/// [`notice_text`] without a context (and for the notice tests).
+/// A notice filled without a context and without the guard (the notice
+/// tests; [`notice`] adds the guard).
 pub fn build_notice(public_url: Option<&str>, template: &str, n: i64, title: &str, extra: &[(&str, &str)]) -> String {
     let n_s = n.to_string();
     let title = publish::plain_line(title, NOTICE_TITLE_CHARS);
@@ -2651,25 +2703,30 @@ pub fn reply_preview(text: &str) -> Option<String> {
     Some(format!("{}…", cut.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '-'))))
 }
 
-/// The notice for a refinement reply without a plan: its preview, when the
-/// secret guard passes it; otherwise the notice without a preview.
+/// The notice for a refinement reply without a plan. The secret guard reads
+/// the raw reply first, before any normalization (the preview replaces `@`
+/// and removes formatting, which would hide an address or a key from the
+/// guard's patterns): a hit anywhere in it sends the notice without a
+/// preview. [`notice`] then scans the finished notice.
 async fn agent_replied_notice(ctx: &Ctx, item: &Item, reply: &str) -> String {
     let t = &ctx.cfg.texts;
+    if let Verdict::Hit(cats) = ctx.guard.scan(reply).await {
+        tracing::warn!(item = item.id, ?cats, "intake: the reply preview was withheld by the secret guard");
+        return notice(ctx, &t.notice_agent_replied_plain, item, &[]).await;
+    }
     match reply_preview(reply) {
-        Some(p) => match ctx.guard.scan(&p).await {
-            Verdict::Clean => notice_text(ctx, &t.notice_agent_replied, item, &[("preview", &p)]),
-            Verdict::Hit(cats) => {
-                tracing::warn!(item = item.id, ?cats, "intake: the reply preview was withheld by the secret guard");
-                notice_text(ctx, &t.notice_agent_replied_plain, item, &[])
-            }
-        },
-        None => notice_text(ctx, &t.notice_agent_replied_plain, item, &[]),
+        Some(p) => notice(ctx, &t.notice_agent_replied, item, &[("preview", &p)]).await,
+        None => notice(ctx, &t.notice_agent_replied_plain, item, &[]).await,
     }
 }
 
 /// A one-line reason for a notice (an error, why an item stopped): at most
-/// 160 characters, and only when the secret guard passes it.
+/// 160 characters. The secret guard reads the raw text first, then the
+/// shortened line; a hit on either gives the fixed text.
 async fn notice_reason(ctx: &Ctx, text: &str) -> String {
+    if matches!(ctx.guard.scan(text).await, Verdict::Hit(_)) {
+        return ctx.cfg.texts.notice_reason_withheld.clone();
+    }
     let r = publish::plain_line(text, NOTICE_REASON_CHARS);
     match ctx.guard.scan(&r).await {
         Verdict::Clean if !r.is_empty() => r,

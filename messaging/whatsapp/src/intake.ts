@@ -25,6 +25,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { normalizeSenderId } from "./config.js";
+import { DEFAULT_TEXTS, fill, type BotTexts } from "./texts.js";
 
 /** How an operator message was written. The pipeline confirms a decision
  *  from anything but `text` before it runs. */
@@ -489,20 +490,129 @@ export class IntakeStore {
     return Number(r?.n ?? 0);
   }
 
-  /** Drop the group tables once no group is left open: the one-time
-   *  migration of the groups' removal. True when the tables are gone. */
-  dropLegacyGroupTablesIfDone(): boolean {
-    if (this.tableExists("intake_groups") && this.legacyGroups().length > 0) return false;
+  /** Old group creations whose outcome is still unknown: a `create` request
+   *  that was claimed and may have called WhatsApp (`creating`, with
+   *  `calling_at` set when that column exists) while `intake_groups` has no
+   *  closed or refused (`fallback`) row for its item. Any other request
+   *  cannot mean a group exists that `intake_groups` does not record: a
+   *  pending create was never sent, and a close or resolve concerns a group
+   *  the group rows already cover. Empty when the table is gone. */
+  unfinishedGroupRequests(): LegacyRequest[] {
+    if (!this.tableExists("intake_group_requests")) return [];
+    const cols = (this.db.prepare(`SELECT name FROM pragma_table_info('intake_group_requests')`).all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    );
+    if (!cols.includes("cleanup_attempts")) {
+      this.db.exec(`ALTER TABLE intake_group_requests ADD COLUMN cleanup_attempts INTEGER NOT NULL DEFAULT 0`);
+    }
+    const nonce = cols.includes("nonce") ? "r.nonce" : "NULL";
+    const called = cols.includes("calling_at") ? "AND r.calling_at IS NOT NULL" : "";
+    const resolved = this.tableExists("intake_groups")
+      ? `AND NOT EXISTS (SELECT 1 FROM intake_groups g WHERE g.item_key = r.item_key AND g.status IN ('closed', 'fallback'))`
+      : "";
+    return (
+      this.db
+        .prepare(
+          `SELECT r.id, r.item_key, ${nonce} AS nonce, r.cleanup_attempts FROM intake_group_requests r
+            WHERE r.action = 'create' AND r.status = 'creating' ${called} ${resolved} ORDER BY r.id`,
+        )
+        .all() as any[]
+    ).map((r) => ({ id: Number(r.id), itemKey: String(r.item_key), nonce: r.nonce ?? null, attempts: Number(r.cleanup_attempts ?? 0) }));
+  }
+
+  /** The old creation `id` is settled: no group, or the bot left it. */
+  finishGroupRequest(id: number, result: string, nowMs = Date.now()): void {
+    this.db
+      .prepare(`UPDATE intake_group_requests SET status = 'done', result = ?, handled_at = ? WHERE id = ?`)
+      .run(result, new Date(nowMs).toISOString(), id);
+  }
+
+  /** Count one start at which old creation `id` stayed unknown. */
+  groupRequestStillUnknown(id: number): number {
+    this.db.prepare(`UPDATE intake_group_requests SET cleanup_attempts = cleanup_attempts + 1 WHERE id = ?`).run(id);
+    const r = this.db.prepare(`SELECT cleanup_attempts AS n FROM intake_group_requests WHERE id = ?`).get(id) as { n: number } | undefined;
+    return Number(r?.n ?? 0);
+  }
+
+  /** Drop each group table once nothing in it is left open: `intake_groups`
+   *  when no group is open, `intake_group_requests` when no creation is
+   *  unknown. Returns the tables still there. */
+  dropLegacyGroupTablesIfDone(): string[] {
+    const drop = (name: string) => {
+      this.db.exec(`BEGIN IMMEDIATE`);
+      try {
+        this.db.exec(`DROP TABLE IF EXISTS ${name}`);
+        this.db.exec(`COMMIT`);
+      } catch (e) {
+        this.db.exec(`ROLLBACK`);
+        throw e;
+      }
+    };
+    // The requests first: whether one is settled reads the group rows.
+    if (this.tableExists("intake_group_requests") && this.unfinishedGroupRequests().length === 0) drop("intake_group_requests");
+    if (this.tableExists("intake_groups") && this.legacyGroups().length === 0) drop("intake_groups");
+    return ["intake_group_requests", "intake_groups"].filter((t) => this.tableExists(t));
+  }
+
+  /** Full thread messages an earlier version queued for WhatsApp and did
+   *  not send (`pending`, or `in_flight` from a process that stopped): an
+   *  item thread message (`intake:<n>`, body marked `[#n] `) or any intake
+   *  row addressed to a group. Called at start, before the drain runs: each
+   *  row is marked `failed` (nothing is deleted), and each item gets one
+   *  short notice with its dashboard link instead (`intakeWithdrawn`, one per
+   *  item, keyed so a second start queues none). Returns the items. */
+  withdrawLegacyThreadMessages(withdrawn: string, publicUrl: string | null, nowMs = Date.now()): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, target, source, body FROM outbound_queue
+          WHERE status IN ('pending', 'in_flight') AND (source = 'intake' OR source LIKE 'intake:%')`,
+      )
+      .all() as Array<{ id: number; target: string; source: string; body: string }>;
+    const items = new Set<string>();
+    const at = new Date(nowMs).toISOString();
     this.db.exec(`BEGIN IMMEDIATE`);
     try {
-      this.db.exec(`DROP TABLE IF EXISTS intake_groups; DROP TABLE IF EXISTS intake_group_requests;`);
+      for (const r of rows) {
+        const item = /^intake:(\d+)$/.exec(r.source)?.[1] ?? null;
+        const toGroup = r.target.endsWith(GROUP_JID_SUFFIX);
+        const fullMessage = item !== null && r.body.startsWith("[#");
+        if (!toGroup && !fullMessage) continue;
+        this.db
+          .prepare(
+            `UPDATE outbound_queue SET status = 'failed', last_error = ?, in_flight_at = NULL
+              WHERE id = ? AND status IN ('pending', 'in_flight')`,
+          )
+          .run(`withdrawn at ${at}: full issue-pipeline messages and group messages are not sent any more`, r.id);
+        const n = item ?? /^\[#(\d+)\]/.exec(r.body)?.[1] ?? null;
+        if (n) items.add(n);
+      }
+      for (const n of items) {
+        const link = publicUrl ? `${publicUrl.replace(/\/+$/, "")}/intake?item=${n}` : "";
+        const body = withdrawn.replace(/\{n\}/g, n).replace(/\{link\}/g, link).replace(/\s+/g, " ").trim();
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO outbound_queue (target, body, source, enqueued_at, status, attempts, kind, dedup_key)
+             VALUES ('dm', ?, ?, ?, 'pending', 0, 'text', ?)`,
+          )
+          .run(body, `intake:${n}`, at, `intake:withdrawn:${n}`);
+      }
       this.db.exec(`COMMIT`);
     } catch (e) {
       this.db.exec(`ROLLBACK`);
       throw e;
     }
-    return true;
+    return [...items];
   }
+}
+
+/** An old group creation whose outcome is unknown. */
+export interface LegacyRequest {
+  id: number;
+  itemKey: string;
+  /** The recovery nonce at the end of the subject it was created with. */
+  nonce: string | null;
+  /** Starts at which it stayed unknown. */
+  attempts: number;
 }
 
 /** A group an earlier version created for an item (ADR-036, "No
@@ -529,8 +639,9 @@ export interface LegacyGroupApi {
   listParticipating?(): Promise<Array<{ jid: string; subject: string }>>;
 }
 
-/** A group whose leave failed this many times (over several starts) is
- *  reported to the operator in the DM, once. */
+/** A group whose leave failed this many times (over several starts), or an
+ *  old creation still unknown after this many starts, is reported to the
+ *  operator in the DM, once. */
 export const LEGACY_LEAVE_ALERT_AFTER = 3;
 
 /** The one-time cleanup of the removed per-item groups, run when the bot
@@ -539,13 +650,19 @@ export const LEGACY_LEAVE_ALERT_AFTER = 3;
  *  one match is left, none means there is no group, several are counted as
  *  a failure. A failed leave keeps its row for the next start and is
  *  reported to the operator in the DM after `LEGACY_LEAVE_ALERT_AFTER`
- *  failures. When no open group is left, the group tables are dropped. */
+ *  failures. An old creation whose outcome is unknown (`creating`, with no
+ *  group row) is looked for the same way; while one stays unknown,
+ *  `intake_group_requests` is kept, and after `LEGACY_LEAVE_ALERT_AFTER`
+ *  starts the operator is asked to check by hand. Each table is dropped
+ *  when nothing in it is left open. */
 export async function cleanupLegacyGroups(input: {
   store: IntakeStore;
   api: LegacyGroupApi;
   alertOperator: (text: string, dedupKey: string) => void;
   log: { info: (o: object, m: string) => void; warn: (o: object, m: string) => void };
-}): Promise<{ left: string[]; failed: string[]; dropped: boolean }> {
+  texts?: Pick<BotTexts, "intakeGroupLeaveFailed" | "intakeGroupRequestUnresolved">;
+}): Promise<{ left: string[]; failed: string[]; dropped: boolean; kept: string[] }> {
+  const texts = input.texts ?? DEFAULT_TEXTS;
   const { store, api, log } = input;
   const left: string[] = [];
   const failed: string[] = [];
@@ -556,12 +673,19 @@ export async function cleanupLegacyGroups(input: {
     const n = store.legacyLeaveFailed(g.itemKey, error);
     log.warn({ item: g.itemKey, attempts: n, err: error }, "whatsapp: leaving an old intake group failed — tried again at the next start");
     if (n >= LEGACY_LEAVE_ALERT_AFTER) {
-      input.alertOperator(
-        `Item #${g.itemKey}: leaving its old WhatsApp group failed ${n} times (${error}). Issue-pipeline items no ` +
-          `longer use groups; leave the group by hand. The bot tries again at its next start.`,
-        `intake:group-cleanup:${g.itemKey}`,
-      );
+      input.alertOperator(fill(texts.intakeGroupLeaveFailed, { n: g.itemKey, count: n, error }), `intake:group-cleanup:${g.itemKey}`);
     }
+  };
+  const listGroups = async (): Promise<Array<{ jid: string; subject: string }> | null> => {
+    if (participating === undefined) {
+      try {
+        participating = api.listParticipating ? await api.listParticipating() : null;
+      } catch (e) {
+        participating = null;
+        log.warn({ err: (e as Error).message }, "whatsapp: listing groups for the intake cleanup failed");
+      }
+    }
+    return participating;
   };
   for (const g of groups) {
     let jid = g.jid;
@@ -570,19 +694,12 @@ export async function cleanupLegacyGroups(input: {
         store.closeLegacyGroup(g.itemKey, null, "cleanup: no group was recorded and none can be looked for");
         continue;
       }
-      if (participating === undefined) {
-        try {
-          participating = await api.listParticipating();
-        } catch (e) {
-          participating = null;
-          log.warn({ err: (e as Error).message }, "whatsapp: listing groups for the intake cleanup failed");
-        }
-      }
-      if (participating === null) {
+      const all = await listGroups();
+      if (all === null) {
         fail(g, "the bot's groups could not be listed");
         continue;
       }
-      const matches = participating.filter((x) => x.subject.endsWith(` ~${g.token}`));
+      const matches = all.filter((x) => x.subject.endsWith(` ~${g.token}`));
       if (matches.length === 0) {
         store.closeLegacyGroup(g.itemKey, null, "cleanup: no group carries its nonce");
         continue;
@@ -613,8 +730,42 @@ export async function cleanupLegacyGroups(input: {
       fail(g, error || "leave failed");
     }
   }
-  const dropped = store.dropLegacyGroupTablesIfDone();
+  // Old creations whose outcome is unknown, looked for by their nonce.
+  for (const r of store.unfinishedGroupRequests()) {
+    const all = r.nonce ? await listGroups() : null;
+    const matches = all && r.nonce ? all.filter((x) => x.subject.endsWith(` ~${r.nonce}`)) : null;
+    if (matches && matches.length === 0) {
+      store.finishGroupRequest(r.id, "cleanup: no group carries its nonce");
+      continue;
+    }
+    if (matches && matches.length === 1) {
+      const jid = matches[0].jid;
+      let ok = false;
+      try {
+        await api.leave(jid);
+        ok = true;
+      } catch {
+        ok = (await api.isMember?.(jid).catch(() => null)) === false;
+      }
+      if (ok) {
+        store.finishGroupRequest(r.id, "cleanup: found by its nonce and left");
+        left.push(r.itemKey);
+        continue;
+      }
+    }
+    const n = store.groupRequestStillUnknown(r.id);
+    log.warn({ item: r.itemKey, request: r.id, starts: n }, "whatsapp: an old intake group creation is still unknown — the request table is kept");
+    if (n >= LEGACY_LEAVE_ALERT_AFTER) {
+      input.alertOperator(
+        fill(texts.intakeGroupRequestUnresolved, { n: r.itemKey, nonce: r.nonce ?? "?", count: n }),
+        `intake:group-request:${r.id}`,
+      );
+    }
+  }
+  const kept = store.dropLegacyGroupTablesIfDone();
+  const dropped = kept.length === 0;
   if (dropped && groups.length > 0) log.info({ left: left.length }, "whatsapp: old intake group tables dropped");
-  return { left, failed, dropped };
+  if (!dropped) log.warn({ kept }, "whatsapp: old intake group tables kept until their open rows are settled");
+  return { left, failed, dropped, kept };
 }
 

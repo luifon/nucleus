@@ -225,6 +225,9 @@ export interface Config {
   link: LinkConfig;
   /** ADR-033: the `nucleus` binary (tasks CLI, skill review). */
   nucleusBin: string | null;
+  /** ADR-036: NUCLEUS_PUBLIC_URL, the dashboard's public address, for item
+   *  links in issue-pipeline notices; null when unset. */
+  publicUrl: string | null;
 }
 
 export type { Config as default };
@@ -302,6 +305,7 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
     turns: turnsConfig(parsed.whatsapp?.turns ?? {}, parsed.whatsapp?.texts ?? {}),
     link: linkConfig(parsed.whatsapp?.link ?? {}),
     nucleusBin: findNucleusBin(workspaceRoot),
+    publicUrl: process.env.NUCLEUS_PUBLIC_URL?.trim() || null,
   };
 }
 

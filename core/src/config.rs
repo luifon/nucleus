@@ -896,6 +896,13 @@ pub struct IntakeTexts {
     /// The `{reason}` of a notice when the secret guard found something in
     /// the real reason (the dashboard shows it).
     pub notice_reason_withheld: String,
+    /// The whole notice when the secret guard found something in the raw
+    /// issue title or in the finished notice (`{n}`, `{link}`).
+    pub notice_withheld: String,
+    /// One DM message for operator messages stored from an item's old
+    /// WhatsApp group that were never interpreted (`{messages}`: short
+    /// previews, quoted, separated by `; `).
+    pub group_messages_dropped: String,
 }
 
 impl Default for IntakeTexts {
@@ -1012,6 +1019,11 @@ impl Default for IntakeTexts {
             notice_stopped: "⛔ Item #{n} stopped: {reason} {link}".into(),
             notice_cancelled: "⏹ Item #{n} cancelled. {link}".into(),
             notice_reason_withheld: "the reason is on the dashboard.".into(),
+            notice_withheld: "Item #{n} has an update on the dashboard. {link}".into(),
+            group_messages_dropped: "Issue-pipeline items no longer use WhatsApp groups, so these messages of yours from \
+                                     an item's group were not handled: {messages}. If one of them was a decision or a \
+                                     message for the agent, send it again here, starting with the item's #n."
+                .into(),
         }
     }
 }

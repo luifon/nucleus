@@ -84,9 +84,24 @@ export interface BotTexts {
   interpretFailed: string;
   /** {error} */
   applyFailed: string;
+
+  // ── issue pipeline (ADR-036) ──
+  /** Sent once per item in place of full thread messages still in the queue
+   *  when the bot started: {n} {link} (the item's dashboard page, or ""). */
+  intakeWithdrawn: string;
+  /** {n} {count} {error} */
+  intakeGroupLeaveFailed: string;
+  /** An old group creation whose outcome is unknown: {n} {nonce} {count} */
+  intakeGroupRequestUnresolved: string;
 }
 
 export const DEFAULT_TEXTS: BotTexts = {
+  intakeWithdrawn: "Item #{n} has messages on the dashboard. {link}",
+  intakeGroupLeaveFailed:
+    "Item #{n}: leaving its old WhatsApp group failed {count} times ({error}). Issue-pipeline items no longer use groups; leave the group by hand. The bot tries again at its next start.",
+  intakeGroupRequestUnresolved:
+    "Item #{n}: an old WhatsApp group may have been created for it and could not be found after {count} starts. If a group whose name ends in \"~{nonce}\" exists, leave it by hand; the bot looks again at its next start.",
+
   ack: "⏳ Working on it…",
   progressPrefix: "↻ Progress: ",
   interrupted: "⚠️ Interrupted: the bot restarted before the reply. Not resumed — send it again if you still want it.",
