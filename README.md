@@ -162,8 +162,12 @@ identity — so build through `tools/build.sh`, never bare `cargo build
 
 ```bash
 ./tools/codesign/create-identity.sh   # once per machine: self-signed identity
-./tools/build.sh                      # build + sign + verify
+./tools/build.sh                      # build + sign + verify + install + launchd job check
+./tools/build.sh --no-job-check       # same, without the launchd job check
 # The first build shows a keychain dialog. Click "Always Allow", not "Allow".
+# build.sh builds into target/install-build/, signs a copy and moves it over
+# target/release/nucleus; target/release/ then holds only that binary. After
+# the install it runs tools/launchd/check.sh (see tools/launchd/README.md).
 # Then grant Full Disk Access to target/release/nucleus in
 # System Settings → Privacy & Security → Full Disk Access.
 (cd messaging/whatsapp && npm install)
