@@ -2659,12 +2659,15 @@ pub fn item_link(public_url: Option<&str>, n: i64) -> String {
 /// [`notice_reason`]) or from code.
 async fn notice(ctx: &Ctx, template: &str, item: &Item, extra: &[(&str, &str)]) -> String {
     let raw_title_hit = template.contains("{title}") && matches!(ctx.guard.scan(&item.title).await, Verdict::Hit(_));
-    let text = build_notice(ctx.public_url.as_deref(), template, item.id, &item.title, extra);
-    if raw_title_hit || matches!(ctx.guard.scan(&text).await, Verdict::Hit(_)) {
+    // The link comes from the operator's own `NUCLEUS_PUBLIC_URL`, an `.env`
+    // value the guard always flags, so the notice is scanned without it and
+    // the link is added after the scan.
+    let scanned = build_notice(None, template, item.id, &item.title, extra);
+    if raw_title_hit || matches!(ctx.guard.scan(&scanned).await, Verdict::Hit(_)) {
         tracing::warn!(item = item.id, "intake: a notice was replaced by the fixed text after the secret guard");
         return build_notice(ctx.public_url.as_deref(), &ctx.cfg.texts.notice_withheld, item.id, "", &[]);
     }
-    text
+    build_notice(ctx.public_url.as_deref(), template, item.id, &item.title, extra)
 }
 
 /// A notice filled without a context and without the guard (the notice

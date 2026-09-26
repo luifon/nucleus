@@ -2728,3 +2728,18 @@ async fn a_title_with_an_email_address_blocks_the_pull_request() {
     assert!(it.error.unwrap().contains("pii-email"));
     assert!(!remote_has(&f, "nucleus/item-1") && f.gh.calls_with("pr create") == 0);
 }
+
+#[tokio::test]
+async fn a_public_url_the_guard_flags_does_not_replace_the_notice() {
+    // The operator's NUCLEUS_PUBLIC_URL is an .env value, so the real guard
+    // flags it; the notice is scanned without the link and keeps its text.
+    let f = fixture().await;
+    let f = Fixture { ctx: Ctx { public_url: Some("https://FAKE-SECRET-VALUE.example.invalid".into()), ..f.ctx }, ..f };
+    accept(&f, 1).await;
+    tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
+    tick(&f).await;
+    let n = outbound(&f).await.last().unwrap().1.clone();
+    assert!(n.starts_with("🧭 Item #1 needs a plan: Issue 1."), "{n}");
+    assert!(n.ends_with("https://FAKE-SECRET-VALUE.example.invalid/intake?item=1"), "{n}");
+}
