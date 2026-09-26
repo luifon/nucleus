@@ -93,7 +93,7 @@ const CFG: TurnsConfig = {
   texts: { ...DEFAULT_TEXTS, ack: "ACK" },
 };
 
-function setup(script: Script, cfg: TurnsConfig = CFG, operatorContext?: (chatId: string, pool: string) => string) {
+function setup(script: Script, cfg: TurnsConfig = CFG) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nucleus-engine-"));
   const dbPath = path.join(dir, "whatsapp.db");
   const store = new ChatSessionStore(dbPath);
@@ -117,7 +117,6 @@ function setup(script: Script, cfg: TurnsConfig = CFG, operatorContext?: (chatId
         return s;
       },
       apiRetryDelayMs: 50,
-      operatorContext,
     },
     {
       dm: { name: "dm", workspaceRoot: dir, tmuxSession: "nucleus-test-dm", idleTimeoutMs: 60_000, taskScope: true },
@@ -160,10 +159,8 @@ test("the intake decision block follows the operator's message; a turn the pipel
       s.say(INTAKE_HANDLED, "end_turn");
       s.end();
     },
-    CFG,
-    (chatId, pool) => (pool === "dm" && chatId === CHAT ? block : ""),
   );
-  t.engine.receive(msg("approve it", "H1"));
+  t.engine.receive({ ...msg("approve it", "H1"), context: block });
   await t.until(() => t.turns.unanswered(CHAT).length === 0);
   await sleep(100);
   await t.engine.tick();

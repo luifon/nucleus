@@ -2189,3 +2189,34 @@ async fn an_unrelated_dm_message_starts_no_interpreter() {
     assert_eq!(outbound(&f).await.len(), before, "the pipeline sent nothing");
     assert_eq!(item1(&f).await.stage(), Stage::Refinement);
 }
+
+#[tokio::test]
+async fn a_cold_approve_in_a_lid_keyed_dm_runs_end_to_end() {
+    // The operator's DM chat session is keyed `<digits>@lid`; the bot
+    // accepted that chat as the operator's (the LID is allowlisted or maps
+    // to his phone) and stored his message under that chat id.
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    let lid_chat = format!("{}@lid", "123456789012345");
+    inbound_row(&f, crate::whatsapp_queue::INTAKE_CHAT_KEY, &lid_chat, "l1", "approve it", "text", "operator").await;
+    tick(&f).await;
+    assert_eq!(f.interp.calls(), 0, "the tick does not interpret it by itself");
+    // A session keyed by the phone form is another chat: it takes nothing.
+    let phone_chat = format!("{}@{}", "5511999999999", "s.whatsapp.net");
+    assert!(matches!(interpret_latest(&f.ctx, Some(&phone_chat)).await.unwrap(), Latest::NoMessage(_)));
+    // The LID-keyed session's command interprets his stored message.
+    assert_eq!(interpret_latest(&f.ctx, Some(&lid_chat)).await.unwrap(), Latest::Handled);
+    assert_eq!(f.interp.last().message, "approve it");
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.approved_version), (Stage::Implementation, Some(1)));
+    // An unknown LID's message carries no operator mark (the bot's check
+    // failed) and is never interpreted.
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    let unknown = format!("{}@lid", "987654321098765");
+    inbound_row(&f, crate::whatsapp_queue::INTAKE_CHAT_KEY, &unknown, "u1", "approve it", "text", "unknown").await;
+    assert!(matches!(interpret_latest(&f.ctx, Some(&unknown)).await.unwrap(), Latest::NoMessage(_)));
+    assert!(matches!(interpret_latest(&f.ctx, None).await.unwrap(), Latest::NoMessage(_)));
+    assert_eq!(f.interp.calls(), 0);
+    assert_eq!(item1(&f).await.stage(), Stage::Refinement);
+}

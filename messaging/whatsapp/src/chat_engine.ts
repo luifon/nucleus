@@ -162,10 +162,6 @@ export interface EngineDeps {
   now?: () => number;
   /** Delay before an API-error retry (tests shorten it). */
   apiRetryDelayMs?: number;
-  /** A code-owned block typed after an operator message in `chatId` (the
-   *  ADR-036 list of intake decisions for the operator's DM), or "" for
-   *  none. */
-  operatorContext?: (chatId: string, pool: string) => string;
 }
 
 /** The final text a DM chat session ends its turn with after `nucleus
@@ -182,6 +178,9 @@ export interface InboundMessage {
   waMsgId: string | null;
   /** BufferJSON-encoded {key, message} for quoting the reply. */
   quotedJson: string | null;
+  /** A code-owned block typed after the message (the ADR-036 list of intake
+   *  decisions, for the operator's DM only), or "" / absent for none. */
+  context?: string;
 }
 
 /** An operator marker line, alone on its line. */
@@ -354,7 +353,7 @@ class ChatActor {
       text: m.text,
     });
     if (duplicate) return { ref, duplicate };
-    const payload = operatorPayload(this.chatId, ref, m.text, m.inputKind, this.e.operatorContext?.(this.chatId, this.pool.name) ?? "");
+    const payload = operatorPayload(this.chatId, ref, m.text, m.inputKind, m.context ?? "");
     if (this.refuseOversize(ref, payload, m.quotedJson)) return { ref, duplicate: false };
     this.issued.set(ref, "operator");
     this.queue.push({ ref, payload, kind: "operator" });

@@ -21,7 +21,9 @@ import {
   groupBudgetAllows,
   intakeConfig,
   IntakeStore,
+  dmChatIntake,
   isOperatorId,
+  type OperatorIds,
   MAX_CLOSE_ATTEMPTS,
   routeDm,
   routeOperatorDm,
@@ -62,6 +64,11 @@ const WA = ["s", "whatsapp", "net"].join(".");
 const gjid = (n: string) => ["1203630000000000" + n, "g.us"].join("@");
 const OP_LID = ["1234567", "89012345"].join("");
 const STRANGER = ["55119", "77777777"].join("");
+/** The operator's identities with only the phone digits allowlisted. */
+const ops = (op: string | null = OP, ...more: string[]): OperatorIds => ({
+  operatorId: op,
+  allowedDm: new Set([...(op ? [op] : []), ...more]),
+});
 
 /** Executor deps with the operator and the bot as the only known ids. */
 function deps(store: IntakeStore, api: GroupApi, over: Partial<GroupExecutorDeps> = {}) {
@@ -73,7 +80,7 @@ function deps(store: IntakeStore, api: GroupApi, over: Partial<GroupExecutorDeps
     api,
     config: intakeConfig({}),
     operatorJid: () => `${OP}@s.whatsapp.net`,
-    isOperator: (jid) => isOperatorId(jid, OP, async (lid) => (lid === `${OP_LID}@lid` ? `${OP}@s.whatsapp.net` : null)),
+    isOperator: (jid) => isOperatorId(jid, ops(), async (lid) => (lid === `${OP_LID}@lid` ? `${OP}@s.whatsapp.net` : null)),
     selfIds: () => [`${BOT}:3@${WA}`],
     seedMembers: (jid, members, reason) => seeded.push({ jid, members, reason }),
     alertOperator: (text, key) => {
@@ -142,7 +149,7 @@ test("DM messages go to an item by its marker or by a quoted pipeline message", 
 test("only the operator's own DM reaches the pipeline, with how the message was written", async () => {
   const has = (n: string) => n === "3";
   const noLid = async () => null;
-  const base = { operatorId: OP, pnForLid: noLid, quotedItem: null, hasDmThread: has };
+  const base = { operator: ops(), pnForLid: noLid, quotedItem: null, hasDmThread: has };
   const opChat = `${OP}@s.whatsapp.net`;
   assert.deepEqual(await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release it", inputKind: "text" }), {
     item: "3",
@@ -199,6 +206,30 @@ test("the next DM message answers a question the pipeline asked, for 15 minutes"
   assert.equal(store.expectsDmAnswer(sentAt + 3000), true);
   store.recordInbound({ itemKey: DM_KEY, chatId: `${OP}@s.whatsapp.net`, waMsgId: "d1", text: "yes", inputKind: "text", sender: "operator", nowMs: sentAt + 4000 });
   assert.equal(store.expectsDmAnswer(sentAt + 5000), false);
+});
+
+test("the operator's DM in LID form gets the decision block and its text is kept; an unknown LID gets neither", async () => {
+  const block = "[Issue pipeline: decisions waiting for the operator.]\n- item #1: plan v1 is waiting for your approval.";
+  const chatBlock = () => block;
+  const noMap = async () => null;
+  const lidChat = `${OP_LID}@lid`;
+  // A DM chat keyed `<digits>@lid`, those digits in the allowlist.
+  assert.deepEqual(await dmChatIntake({ chatId: lidChat, operator: ops(OP, OP_LID), pnForLid: noMap, chatBlock }), { record: true, block });
+  // The same LID resolved to the operator's phone through the mapping.
+  const mapped = async (lid: string) => (lid === lidChat ? `${OP}@s.whatsapp.net` : null);
+  assert.deepEqual(await dmChatIntake({ chatId: lidChat, operator: ops(), pnForLid: mapped, chatBlock }), { record: true, block });
+  // The phone form.
+  assert.deepEqual(await dmChatIntake({ chatId: `${OP}@${WA}`, operator: ops(), pnForLid: noMap, chatBlock }), { record: true, block });
+  // An unknown LID (not allowlisted, no mapping), and another sender.
+  const unknown = `${["98765", "4321098765"].join("")}@lid`;
+  assert.deepEqual(await dmChatIntake({ chatId: unknown, operator: ops(OP, OP_LID), pnForLid: noMap, chatBlock }), { record: false, block: "" });
+  assert.deepEqual(await dmChatIntake({ chatId: `${STRANGER}@${WA}`, operator: ops(), pnForLid: noMap, chatBlock }), { record: false, block: "" });
+  // The fast paths use the same rule.
+  const route = (chatId: string, operator: OperatorIds, pnForLid: typeof noMap | typeof mapped) =>
+    routeOperatorDm({ chatId, operator, pnForLid, text: "yes", quotedItem: null, hasDmThread: () => false, expectingAnswer: true, inputKind: "text" });
+  assert.equal((await route(lidChat, ops(OP, OP_LID), noMap))?.item, DM_KEY);
+  assert.equal((await route(lidChat, ops(), mapped))?.item, DM_KEY);
+  assert.equal(await route(unknown, ops(OP, OP_LID), noMap), null);
 });
 
 test("the DM session's decision block is read from the table the pipeline writes", () => {
@@ -311,13 +342,18 @@ test("a group is left only after its last messages went out", async () => {
 
 test("only the operator's own identity counts, in phone or LID form", async () => {
   const pn = async (lid: string) => (lid === `${OP_LID}@lid` ? `${OP}@s.whatsapp.net` : null);
-  assert.equal(await isOperatorId(`${OP}@s.whatsapp.net`, OP, pn), true);
-  assert.equal(await isOperatorId(`${OP}:12@${WA}`, OP, pn), true, "any device");
-  assert.equal(await isOperatorId(`${OP_LID}@lid`, OP, pn), true, "LID mapped to the operator's number");
-  assert.equal(await isOperatorId(`${STRANGER}@s.whatsapp.net`, OP, pn), false);
-  assert.equal(await isOperatorId(`${OP_LID}@lid`, OP, async () => { throw new Error("no mapping"); }), false);
-  assert.equal(await isOperatorId(`${OP}@s.whatsapp.net`, null, pn), false, "no operator configured");
-  const isOp = (j: string) => isOperatorId(j, OP, pn);
+  assert.equal(await isOperatorId(`${OP}@s.whatsapp.net`, ops(), pn), true);
+  assert.equal(await isOperatorId(`${OP}:12@${WA}`, ops(), pn), true, "any device");
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(), pn), true, "LID mapped to the operator's number");
+  assert.equal(await isOperatorId(`${STRANGER}@s.whatsapp.net`, ops(), pn), false);
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(), async () => { throw new Error("no mapping"); }), false);
+  assert.equal(await isOperatorId(`${OP}@s.whatsapp.net`, ops(null), pn), false, "no operator configured");
+  // The operator's LID listed in the DM allowlist counts without a mapping.
+  const failing = async () => { throw new Error("no mapping"); };
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(OP, OP_LID), failing), true, "allowlisted LID");
+  // Only in LID form: allowlisted digits in a phone JID are not the operator.
+  assert.equal(await isOperatorId(`${OP_LID}@${WA}`, ops(OP, OP_LID), failing), false);
+  const isOp = (j: string) => isOperatorId(j, ops(), pn);
   assert.deepEqual(await unexpectedMembers([`${OP_LID}@lid`, `${BOT}@s.whatsapp.net`], [`${BOT}:3@${WA}`], isOp), []);
   assert.deepEqual(await unexpectedMembers([`${OP}@s.whatsapp.net`, `${STRANGER}@s.whatsapp.net`], [BOT], isOp), [`${STRANGER}@s.whatsapp.net`]);
 });

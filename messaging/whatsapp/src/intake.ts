@@ -148,27 +148,60 @@ export const ANSWER_WINDOW_MS = 15 * 60 * 1000;
 /** The end of a WhatsApp group chat id. */
 const GROUP_JID_SUFFIX = ["@", "g.us"].join("");
 
-/** True when `jid` (a phone JID, an `@lid` id, or a bare number) is the
- *  operator: its digits equal `operatorId`, or it is a LID whose phone
- *  number (from `pnForLid`, the bot's LID mapping) has those digits. The
- *  same rule the group sender check uses. */
+/** Who the operator is: `operatorId` is the first WHATSAPP_ALLOWED_DM_JIDS
+ *  entry (the phone digits); `allowedDm` is the whole DM allowlist, digits
+ *  only, which may also hold the operator's LID. */
+export interface OperatorIds {
+  operatorId: string | null;
+  allowedDm: ReadonlySet<string>;
+}
+
+/** The operator's identities from the bot's configuration. */
+export function operatorIds(config: { operatorId: string | null; allowedDmSenders: ReadonlySet<string> }): OperatorIds {
+  return { operatorId: config.operatorId, allowedDm: config.allowedDmSenders };
+}
+
+/** True when `jid` (a phone JID, an `@lid` id, a DM chat id, or a bare
+ *  number) is the operator: its digits equal the operator's phone digits;
+ *  or it is an `@lid` id whose digits are in the DM allowlist (the
+ *  operator's LID listed there); or it is an `@lid` id whose phone number,
+ *  from `pnForLid` (the bot's LID mapping), has the operator's digits. The
+ *  one rule for every operator check of the issue pipeline: approvals,
+ *  group members, the DM routing, the stored `chat` rows and the decision
+ *  block for the DM chat session. */
 export async function isOperatorId(
   jid: string,
-  operatorId: string | null,
+  op: OperatorIds,
   pnForLid: (lid: string) => Promise<string | null | undefined>,
 ): Promise<boolean> {
-  if (!operatorId) return false;
+  if (!op.operatorId) return false;
   const digits = normalizeSenderId(jid);
-  if (digits && digits === operatorId) return true;
+  if (digits && digits === op.operatorId) return true;
   if (jid.endsWith("@lid")) {
+    if (digits && op.allowedDm.has(digits)) return true;
     try {
       const pn = await pnForLid(jid);
-      if (pn && normalizeSenderId(pn) === operatorId) return true;
+      if (pn && normalizeSenderId(pn) === op.operatorId) return true;
     } catch {
       // A failed lookup is not the operator.
     }
   }
   return false;
+}
+
+/** What the bot does with a DM message that goes to the chat session
+ *  (ADR-036): for the operator's DM (in any form `isOperatorId` accepts),
+ *  keep the text for `interpret-latest` (`record`) and type the pipeline's
+ *  decision block after it (`block`, "" when nothing waits). For any other
+ *  DM chat: nothing. */
+export async function dmChatIntake(input: {
+  chatId: string;
+  operator: OperatorIds;
+  pnForLid: (lid: string) => Promise<string | null | undefined>;
+  chatBlock: () => string;
+}): Promise<{ record: boolean; block: string }> {
+  if (!(await isOperatorId(input.chatId, input.operator, input.pnForLid))) return { record: false, block: "" };
+  return { record: true, block: input.chatBlock() };
 }
 
 /** Members of a new group that are neither the bot nor the operator. */
@@ -268,7 +301,7 @@ export interface RoutedDm {
  *  typed. */
 export async function routeOperatorDm(input: {
   chatId: string;
-  operatorId: string | null;
+  operator: OperatorIds;
   pnForLid: (lid: string) => Promise<string | null | undefined>;
   text: string;
   quotedItem: string | null;
@@ -280,7 +313,7 @@ export async function routeOperatorDm(input: {
    *  sent (`text` or `forwarded`). */
   inputKind: InputKind;
 }): Promise<RoutedDm | null> {
-  if (!(await isOperatorId(input.chatId, input.operatorId, input.pnForLid))) return null;
+  if (!(await isOperatorId(input.chatId, input.operator, input.pnForLid))) return null;
   const routed = routeDm(input.text, input.quotedItem, input.hasDmThread, input.expectingAnswer ?? false);
   return routed ? { ...routed, inputKind: input.inputKind } : null;
 }

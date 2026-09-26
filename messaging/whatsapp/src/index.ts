@@ -84,7 +84,17 @@ import { makeVaultManifestHook } from "./docstore_vault.js";
 import { transcribe } from "./transcribe.js";
 import { GroupAllowlist, resolveTarget } from "./target_policy.js";
 import { handleBrainDump, sweepExpiredPlans, type BraindumpDeps } from "./braindump_flow.js";
-import { CHAT_KEY, GroupExecutor, IntakeStore, isOperatorId, routeOperatorDm, stripGroupMarker, type InputKind } from "./intake.js";
+import {
+  CHAT_KEY,
+  dmChatIntake,
+  GroupExecutor,
+  IntakeStore,
+  isOperatorId,
+  operatorIds,
+  routeOperatorDm,
+  stripGroupMarker,
+  type InputKind,
+} from "./intake.js";
 import { planCapture, applyPlan, interpretResponse, BRAINDUMP_TMUX_SESSION } from "./braindump.js";
 
 // Every tmux session this process spawns claude windows into. Defined once
@@ -437,9 +447,6 @@ async function main() {
       cfg: config.turns,
       format: formatReply,
       outboundTarget: (chatId) => chatId,
-      // ADR-036: the operator's DM session sees which intake decisions wait.
-      operatorContext: (chatId, pool) =>
-        pool === "dm" && config.operatorId !== null && normalizeSenderId(chatId) === config.operatorId ? intakeStore.chatBlock() : "",
       presence: (chatId, state) => {
         liveSock?.sendPresenceUpdate(state, chatId).catch(() => {});
       },
@@ -617,7 +624,7 @@ async function main() {
       },
     },
     operatorJid: () => (config.operatorId ? `${config.operatorId}@s.whatsapp.net` : null),
-    isOperator: (jid) => isOperatorId(jid, config.operatorId, pnForLid),
+    isOperator: (jid) => isOperatorId(jid, operatorIds(config), pnForLid),
     selfIds,
     seedMembers: (jid, members, reason) => store.seedMembers(jid, members, reason),
     alertOperator: (text, dedupKey) => {
@@ -1228,11 +1235,12 @@ async function dispatchInbound(
   // the pipeline, not to the chat session. Only the operator's own DM is
   // routed; another allowed DM sender's message goes to the chat session as
   // before.
+  let intakeBlock = "";
   if (role === "dm") {
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? null;
     const routed = await routeOperatorDm({
       chatId,
-      operatorId: config.operatorId,
+      operator: operatorIds(config),
       pnForLid,
       text,
       quotedItem: quoted ? bot.intakeStore.itemForSentMessage(quoted) : null,
@@ -1244,10 +1252,18 @@ async function dispatchInbound(
       routeToItem(bot, routed.item, chatId, msg, routed.text, routed.inputKind);
       return;
     }
-    // ADR-036: keep the operator's own DM text for `nucleus intake
-    // interpret-latest`, which the chat session may run on it. No tick: the
-    // pipeline reads it only when the session asks.
-    if (await isOperatorId(chatId, config.operatorId, pnForLid)) {
+    // ADR-036: in the operator's DM (phone or LID form), keep his text for
+    // `nucleus intake interpret-latest`, which the chat session may run on
+    // it, and give the session the list of waiting decisions. No tick: the
+    // pipeline reads the text only when the session asks.
+    const intake = await dmChatIntake({
+      chatId,
+      operator: operatorIds(config),
+      pnForLid,
+      chatBlock: () => bot.intakeStore.chatBlock(),
+    });
+    intakeBlock = intake.block;
+    if (intake.record) {
       bot.intakeStore.recordInbound({
         itemKey: CHAT_KEY,
         chatId,
@@ -1276,6 +1292,7 @@ async function dispatchInbound(
     inputKind,
     waMsgId: msg.key.id ?? null,
     quotedJson,
+    context: intakeBlock,
   });
   log.info({ chatId, ref, duplicate }, "whatsapp: message handed to the turn engine");
 }
