@@ -62,6 +62,38 @@ pub fn fill(template: &str, vars: &[(&str, &str)]) -> String {
     out
 }
 
+/// `template` with each `{key}` of `vars` replaced in one pass: text a value
+/// brings in is not filled again, so an issue title that contains `{link}`
+/// stays as written. An unknown `{key}` is kept.
+pub fn fill_once(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let known = after.find('}').and_then(|close| vars.iter().find(|(k, _)| *k == &after[..close]).map(|(_, v)| (close, *v)));
+        match known {
+            Some((close, v)) => {
+                out.push_str(v);
+                rest = &after[close + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `s` on one line: every run of whitespace (line breaks included) becomes
+/// one space, and the ends are trimmed. A notice whose `{link}` is empty
+/// keeps no trailing space.
+pub fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Cut `s` to at most `max` characters, marking the cut.
 pub(crate) fn clip(s: &str, max: usize) -> String {
     let s = s.trim();

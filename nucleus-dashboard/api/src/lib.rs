@@ -223,6 +223,7 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
         workspace_root: workspace_root.clone(),
         intake: settings.intake.clone(),
         tasks: settings.tasks.clone(),
+        public_url: settings.public_urls.nucleus.clone(),
     });
     app = app.nest("/intake/api", handlers::intake::router(intake_state));
 

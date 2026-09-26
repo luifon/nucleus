@@ -422,6 +422,7 @@ pub(crate) mod tests {
                 pending_agent: 0,
                 read_by_task: None,
                 wa_state: None,
+                notice: None,
             },
             ItemMessage {
                 id: 2,
@@ -433,6 +434,7 @@ pub(crate) mod tests {
                 pending_agent: 1,
                 read_by_task: None,
                 wa_state: None,
+                notice: None,
             },
         ];
         let r = refinement_brief(&item, &ev, &d, &thread, 2);
@@ -469,6 +471,7 @@ pub(crate) mod tests {
                 pending_agent: if i == 199 { 1 } else { 0 },
                 read_by_task: None,
                 wa_state: None,
+                notice: None,
             })
             .collect();
         let r = refinement_brief(&item, &ev, &d, &thread, 199);

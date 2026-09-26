@@ -727,7 +727,9 @@ pub struct IntakeGithubConfig {
 }
 
 /// Operator-facing texts of the pipeline (`[intake.texts]`), all written by
-/// code, never by a model. Placeholders: `{n}` item number, `{title}`,
+/// code, never by a model. The thread texts (`refinement_opened` …
+/// `comment_posted`, `item_*`) are Nucleus's messages in the item's thread on
+/// the dashboard; WhatsApp gets only the short `notice_*` texts. Placeholders: `{n}` item number, `{title}`,
 /// `{ref}` (`owner/name#12`), `{url}`, `{stage}`, `{version}` (a plan
 /// version), `{error}`, `{pr_url}`, `{tests}`, `{classification}`,
 /// `{failed_in}` (the stage a failed item failed in), `{label}` (the gate
@@ -846,6 +848,54 @@ pub struct IntakeTexts {
     /// (`{pr_url}` only). Code-owned and posted without approval, so it
     /// must not take model output or issue text.
     pub pr_comment: String,
+    /// A refinement reply proposed a plan over the length limit; it did not
+    /// become a plan version and the agent is asked to shorten it
+    /// (`{chars}`, `{limit}`). A thread note, sent to the next refinement turn.
+    pub plan_too_long: String,
+    /// The same, after `{count}` refusals in a row: the agent is not asked
+    /// again until the operator writes (`{chars}`, `{limit}`, `{count}`).
+    pub plan_too_long_stopped: String,
+    /// A dashboard message outside refinement: saved, no agent reads it
+    /// (`{stage}`).
+    pub reply_saved_not_in_refinement: String,
+
+    // ── WhatsApp notices (ADR-036, "Amendment: short notices") ──────────
+    //
+    // Every WhatsApp message the pipeline sends about an item is one of these:
+    // one line, code-owned, never a plan, an agent reply or a finding list.
+    // `{link}` is the item's dashboard page (`NUCLEUS_PUBLIC_URL` +
+    // `/intake?item=<n>`), empty when NUCLEUS_PUBLIC_URL is unset; `{title}`
+    // is the issue title on one line, at most 80 characters.
+    /// A new item needs a plan (refinement starts).
+    pub notice_needs_plan: String,
+    /// The refinement agent replied without a plan (`{preview}`: the first
+    /// ~200 characters of the reply, cut at a word boundary, formatting
+    /// removed, passed through the secret guard).
+    pub notice_agent_replied: String,
+    /// The same when the preview was withheld (the secret guard found
+    /// something in it, or it is empty).
+    pub notice_agent_replied_plain: String,
+    /// Plan `{version}` is ready to approve.
+    pub notice_plan_ready: String,
+    /// Held for hidden content (`{count}` findings; never the findings).
+    pub notice_held: String,
+    /// A held item was released (`{stage}`: where it continues).
+    pub notice_released: String,
+    /// Implementation started (a simple eval, or an approved plan).
+    pub notice_implementation_started: String,
+    /// The draft PR is open (`{pr_url}`, `{tests}`).
+    pub notice_pr_opened: String,
+    /// Blocked (`{reason}`: one line, at most 160 characters).
+    pub notice_blocked: String,
+    /// Failed (`{failed_in}`, `{reason}`).
+    pub notice_failed: String,
+    /// Stopped for good: stale, or closed at its source (`{reason}`).
+    pub notice_stopped: String,
+    /// Cancelled.
+    pub notice_cancelled: String,
+    /// The `{reason}` of a notice when the secret guard found something in
+    /// the real reason (the dashboard shows it).
+    pub notice_reason_withheld: String,
 }
 
 impl Default for IntakeTexts {
@@ -914,9 +964,9 @@ impl Default for IntakeTexts {
             unclear: "I did not understand which decision you mean.".into(),
             which_item: "Several items are waiting. Which item is your message about?".into(),
             decision_refused: "Item #{n} cannot take that decision now.".into(),
-            confirm_approve_plan: "Approve plan v{version} of item #{n}? Answer yes or no.".into(),
-            confirm_release: "Release item #{n} (held for hidden content, {count} findings)? Answer yes or no.".into(),
-            confirm_cancel: "Cancel item #{n}? Answer yes or no.".into(),
+            confirm_approve_plan: "Approve plan v{version} of item #{n}? Answer yes or no. {link}".into(),
+            confirm_release: "Release item #{n} (held for hidden content, {count} findings)? Answer yes or no. {link}".into(),
+            confirm_cancel: "Cancel item #{n}? Answer yes or no. {link}".into(),
             declined: "Nothing was done for item #{n}.".into(),
             confirmation_expired: "My question about item #{n} expired after {minutes} minutes, so nothing was \
                                    done."
@@ -936,6 +986,32 @@ impl Default for IntakeTexts {
                 .into(),
             also_received: "Also received: '{preview}' — send it again after answering the question above.".into(),
             pr_comment: "Draft pull request: {pr_url}".into(),
+            plan_too_long: "The proposed plan has {chars} characters; the limit is {limit}. The agent was asked to \
+                            shorten it."
+                .into(),
+            plan_too_long_stopped: "The proposed plan has {chars} characters; the limit is {limit}. It was refused \
+                                    {count} times in a row, so the agent waits for your message before it tries again."
+                .into(),
+            reply_saved_not_in_refinement: "Your message is saved in item #{n}'s thread. The item is in the {stage} \
+                                            stage, not in refinement, so no agent reads it."
+                .into(),
+            notice_needs_plan: "🧭 Item #{n} needs a plan: {title}. The agent is reading the issue. {link}".into(),
+            notice_agent_replied: "💬 Item #{n}: the agent replied: \"{preview}\" Full reply on the dashboard. {link}".into(),
+            notice_agent_replied_plain: "💬 Item #{n}: the agent replied. Full reply on the dashboard. {link}".into(),
+            notice_plan_ready: "📋 Item #{n}: plan v{version} is ready to approve. Read it on the dashboard, then approve \
+                                it there or tell me here. {link}"
+                .into(),
+            notice_held: "🔍 Item #{n} is held: its issue text has {count} piece(s) of content that GitHub's page does \
+                          not show. No agent runs until you release or cancel it. {link}"
+                .into(),
+            notice_released: "▶️ Item #{n} released; it continues in the {stage} stage. {link}".into(),
+            notice_implementation_started: "🛠 Item #{n}: implementation started. {link}".into(),
+            notice_pr_opened: "📬 Item #{n}: draft PR opened: {pr_url} (tests: {tests}). {link}".into(),
+            notice_blocked: "🛑 Item #{n} is blocked: {reason} {link}".into(),
+            notice_failed: "⚠️ Item #{n} failed during {failed_in}: {reason} {link}".into(),
+            notice_stopped: "⛔ Item #{n} stopped: {reason} {link}".into(),
+            notice_cancelled: "⏹ Item #{n} cancelled. {link}".into(),
+            notice_reason_withheld: "the reason is on the dashboard.".into(),
         }
     }
 }

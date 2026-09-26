@@ -279,17 +279,19 @@ pub fn options_text(t: &IntakeTexts, pending: &[Pending]) -> String {
     out.join("\n")
 }
 
-/// The confirmation question for `decision` on `p`.
-pub fn confirm_text(t: &IntakeTexts, p: &Pending, decision: Decision) -> String {
+/// The confirmation question for `decision` on `p`, with `link` (the item's
+/// dashboard page, or empty) in place of `{link}`, on one line.
+pub fn confirm_text(t: &IntakeTexts, p: &Pending, decision: Decision, link: &str) -> String {
     let n = p.item.to_string();
-    match decision {
+    let text = match decision {
         Decision::ApprovePlan => {
             let v = p.plan_version.unwrap_or(0).to_string();
-            super::fill(&t.confirm_approve_plan, &[("n", &n), ("version", &v)])
+            super::fill(&t.confirm_approve_plan, &[("n", &n), ("version", &v), ("link", link)])
         }
-        Decision::Release => super::fill(&t.confirm_release, &[("n", &n), ("count", &p.findings.to_string())]),
-        Decision::Cancel => super::fill(&t.confirm_cancel, &[("n", &n)]),
-    }
+        Decision::Release => super::fill(&t.confirm_release, &[("n", &n), ("count", &p.findings.to_string()), ("link", link)]),
+        Decision::Cancel => super::fill(&t.confirm_cancel, &[("n", &n), ("link", link)]),
+    };
+    super::one_line(&text)
 }
 
 /// Reads an operator message.

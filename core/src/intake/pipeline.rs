@@ -20,7 +20,7 @@ use super::hidden;
 use super::publish::{self, SecretGuard, Verdict};
 use super::stage::{self, Stage, StageEvent};
 use super::store::{self, Item, NewMessage, Val};
-use super::{clip, fill};
+use super::{clip, fill, fill_once, one_line};
 use crate::config::{IntakeConfig, IntakeRepo, Settings, TasksConfig};
 use crate::tasks::{self, NewTask, Scope, TaskStatus, WorkerProfile};
 use anyhow::{anyhow, bail, Context, Result};
@@ -31,8 +31,6 @@ use std::time::Duration;
 
 /// Steps of one item that fail this many times in a row fail the item.
 const MAX_STEP_ERRORS: i64 = 3;
-/// Largest message copied into WhatsApp; the thread keeps the full text.
-const WA_MAX_CHARS: usize = 12_000;
 
 /// Starts the worker of a created task. The real launcher detaches a
 /// `nucleus tasks run` process; tests use one that starts nothing.
@@ -71,6 +69,9 @@ pub struct Ctx {
     pub viewer: tokio::sync::OnceCell<String>,
     /// Reads the operator's WhatsApp messages ([`decide::SessionInterpreter`]).
     pub interpreter: Arc<dyn decide::Interpreter>,
+    /// `NUCLEUS_PUBLIC_URL`: the dashboard's public address, for the item
+    /// link in every WhatsApp notice. `None`: notices carry no link.
+    pub public_url: Option<String>,
 }
 
 impl Ctx {
@@ -103,6 +104,7 @@ impl Ctx {
             tools: Arc::new(tools),
             viewer: tokio::sync::OnceCell::new(),
             interpreter: Arc::new(decide::SessionInterpreter { workspace_root: ws.to_path_buf(), claude: settings.claude.clone() }),
+            public_url: settings.public_urls.nucleus.clone(),
         })
     }
 }
@@ -907,7 +909,7 @@ async fn handle_message(
                 unclear(ctx, origin, &pending, None, late, text, msg_ref).await
             } else {
                 let Some(decision) = Decision::parse(&c.decision) else { bail!("confirmation {} has an unknown decision", c.id) };
-                run_decision(ctx, origin, c.item_id, decision, c.plan_version, c.hold_hash.as_deref(), msg_ref).await
+                run_decision(ctx, c.item_id, decision, c.plan_version, c.hold_hash.as_deref(), msg_ref).await
             }
         }
         (Reading::Decline, Some(c)) => {
@@ -969,7 +971,7 @@ async fn keep_message(ctx: &Ctx, n: i64, text: &str, msg_ref: &str) -> Result<()
     store::add_message(
         &ctx.db,
         n,
-        NewMessage { author: "operator", via: "whatsapp", body: text, external_ref: Some(msg_ref), pending_agent: false, to_whatsapp: false },
+        NewMessage { author: "operator", via: "whatsapp", body: text, external_ref: Some(msg_ref), pending_agent: false, notice: None },
     )
     .await?;
     Ok(())
@@ -1100,9 +1102,9 @@ async fn decided(
     let waiting = pending.iter().filter(|p| p.waiting).count();
     let confirm = decision != Decision::ApprovePlan || !typed || (!named && waiting > 1);
     if !confirm {
-        return run_decision(ctx, origin, item, decision, p.plan_version, p.hold_hash.as_deref(), msg_ref).await;
+        return run_decision(ctx, item, decision, p.plan_version, p.hold_hash.as_deref(), msg_ref).await;
     }
-    let question = decide::confirm_text(t, p, decision);
+    let question = decide::confirm_text(t, p, decision, &item_link(ctx.public_url.as_deref(), item));
     answer(ctx, &question, msg_ref, true).await?;
     let expires = (chrono::Utc::now() + chrono::Duration::minutes(CONFIRMATION_MINUTES))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -1128,7 +1130,6 @@ async fn decided(
 /// A refusal is answered with the reason and the current list.
 async fn run_decision(
     ctx: &Ctx,
-    origin: &Origin,
     item: i64,
     decision: Decision,
     plan_version: Option<i64>,
@@ -1148,17 +1149,10 @@ async fn run_decision(
         Decision::Cancel => cancel_caused(ctx, item, "whatsapp", cause).await,
     };
     match outcome {
-        Ok(it) => {
-            store::inbound_finish(&ctx.db, msg_ref, "applied", None).await?;
-            // The result note goes to the item's thread. A decision taken in
-            // the DM for an item whose thread runs elsewhere is also
-            // answered in the DM.
-            if matches!(origin, Origin::Dm { .. }) && it.surface != "dm" {
-                if let Some(m) = store::messages(&ctx.db, item).await?.into_iter().rev().find(|m| m.author == "nucleus") {
-                    answer(ctx, &m.body, msg_ref, false).await?;
-                }
-            }
-            Ok(())
+        Ok(_) => {
+            // The result note goes to the item's thread; its notice reaches
+            // the operator's DM.
+            store::inbound_finish(&ctx.db, msg_ref, "applied", None).await
         }
         Err(e) if e.downcast_ref::<Refusal>().is_some() => {
             let pending = pending_decisions(ctx).await?;
@@ -1212,7 +1206,7 @@ async fn discussed(
             body: text,
             external_ref: Some(msg_ref),
             pending_agent: to_agent,
-            to_whatsapp: false,
+            notice: None,
         },
         Some(msg_ref),
     )
@@ -1300,7 +1294,8 @@ async fn approve_plan_caused(ctx: &Ctx, n: i64, version: Option<u32>, via: &str,
         return refuse(format!("Item #{n} changed while approving (a new plan, or the agent started a reply); look at it again."));
     }
     let item = store::item(&ctx.db, n).await?;
-    note(ctx, n, &fill_vars(&ctx.cfg.texts.plan_approved, &item_vars(ctx, &item))).await?;
+    let notice = notice_text(ctx, &ctx.cfg.texts.notice_implementation_started, &item, &[]);
+    note(ctx, n, &fill_vars(&ctx.cfg.texts.plan_approved, &item_vars(ctx, &item)), Some(notice)).await?;
     Ok(item)
 }
 
@@ -1322,7 +1317,7 @@ pub async fn reply(ctx: &Ctx, n: i64, text: &str, via: &str) -> Result<Item> {
     store::add_message(
         &ctx.db,
         n,
-        NewMessage { author: "operator", via, body: text, external_ref: None, pending_agent: true, to_whatsapp: true },
+        NewMessage { author: "operator", via, body: text, external_ref: None, pending_agent: true, notice: None },
     )
     .await?;
     Ok(item)
@@ -1353,7 +1348,8 @@ async fn cancel_caused(ctx: &Ctx, n: i64, via: &str, cause: Option<&str>) -> Res
         return refuse(format!("Item #{n} changed while cancelling; look at it again."));
     }
     let item = store::item(&ctx.db, n).await?;
-    note(ctx, n, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &item))).await?;
+    let notice = notice_text(ctx, &ctx.cfg.texts.notice_cancelled, &item, &[]);
+    note(ctx, n, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &item)), Some(notice)).await?;
     Ok(item)
 }
 
@@ -1448,7 +1444,9 @@ async fn release_caused(ctx: &Ctx, n: i64, hold: Option<&str>, via: &str, cause:
         return refuse(format!("Item #{n} changed while releasing (held again or stopped); look at it again."));
     }
     let item = store::item(&ctx.db, n).await?;
-    note(ctx, n, &fill_item(&ctx.cfg.texts.item_released, &item_vars(ctx, &item), &[("via", via), ("code", &code)])).await?;
+    let notice = notice_text(ctx, &ctx.cfg.texts.notice_released, &item, &[("stage", &item.stage)]);
+    note(ctx, n, &fill_item(&ctx.cfg.texts.item_released, &item_vars(ctx, &item), &[("via", via), ("code", &code)]), Some(notice))
+        .await?;
     tracing::info!(item = n, via, "intake: held item released");
     Ok(item)
 }
@@ -1491,30 +1489,24 @@ fn fill_vars(template: &str, vars: &[(&'static str, String)]) -> String {
     fill_item(template, vars, &[])
 }
 
-/// A message from Nucleus in the item's thread (also sent to WhatsApp).
-async fn note(ctx: &Ctx, n: i64, text: &str) -> Result<()> {
+/// A message from Nucleus in the item's thread (the dashboard), with the
+/// short `notice` it sends to the operator's WhatsApp DM (`None`: nothing).
+async fn note(ctx: &Ctx, n: i64, text: &str, notice: Option<String>) -> Result<()> {
     store::add_message(
         &ctx.db,
         n,
-        NewMessage { author: "nucleus", via: "pipeline", body: text, external_ref: None, pending_agent: false, to_whatsapp: true },
+        NewMessage { author: "nucleus", via: "pipeline", body: text, external_ref: None, pending_agent: false, notice },
     )
     .await?;
     Ok(())
 }
 
 /// `note` with a dedup reference, for notes a crashed step could repeat.
-async fn note_once(ctx: &Ctx, n: i64, text: &str, external_ref: &str) -> Result<()> {
+async fn note_once(ctx: &Ctx, n: i64, text: &str, external_ref: &str, notice: Option<String>) -> Result<()> {
     store::add_message(
         &ctx.db,
         n,
-        NewMessage {
-            author: "nucleus",
-            via: "pipeline",
-            body: text,
-            external_ref: Some(external_ref),
-            pending_agent: false,
-            to_whatsapp: true,
-        },
+        NewMessage { author: "nucleus", via: "pipeline", body: text, external_ref: Some(external_ref), pending_agent: false, notice },
     )
     .await?;
     Ok(())
@@ -1601,7 +1593,10 @@ async fn fail(ctx: &Ctx, item: &Item, error: &str) -> Result<()> {
     }
     if store::advance(&ctx.db, item.id, item.stage(), StageEvent::Failed, error, set).await? {
         let it = store::item(&ctx.db, item.id).await?;
-        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_failed, &item_vars(ctx, &it))).await?;
+        let reason = notice_reason(ctx, error).await;
+        let failed_in = it.failed_stage.clone().unwrap_or_default();
+        let notice = notice_text(ctx, &ctx.cfg.texts.notice_failed, &it, &[("failed_in", &failed_in), ("reason", &reason)]);
+        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_failed, &item_vars(ctx, &it)), Some(notice)).await?;
     }
     Ok(())
 }
@@ -1619,7 +1614,8 @@ async fn close_by_source(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
     .await?
     {
         let it = store::item(&ctx.db, item.id).await?;
-        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_closed, &item_vars(ctx, &it))).await?;
+        let notice = notice_text(ctx, &ctx.cfg.texts.notice_stopped, &it, &[("reason", &notice_reason(ctx, why).await)]);
+        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_closed, &item_vars(ctx, &it)), Some(notice)).await?;
     }
     Ok(())
 }
@@ -1638,7 +1634,8 @@ async fn cancel_by_source(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
     .await?
     {
         let it = store::item(&ctx.db, item.id).await?;
-        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &it))).await?;
+        let notice = notice_text(ctx, &ctx.cfg.texts.notice_cancelled, &it, &[]);
+        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &it)), Some(notice)).await?;
     }
     Ok(())
 }
@@ -1659,7 +1656,8 @@ async fn mark_stale(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
     {
         tracing::warn!(item = item.id, why, "intake: item is stale");
         let it = store::item(&ctx.db, item.id).await?;
-        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_stale, &item_vars(ctx, &it))).await?;
+        let notice = notice_text(ctx, &ctx.cfg.texts.notice_stopped, &it, &[("reason", &notice_reason(ctx, why).await)]);
+        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_stale, &item_vars(ctx, &it)), Some(notice)).await?;
     }
     Ok(())
 }
@@ -1710,19 +1708,13 @@ const HELD_MESSAGE_FINDINGS: usize = 3;
 async fn hold(ctx: &Ctx, item: &Item, found: &hidden::Hold, fp: &str) -> Result<()> {
     let findings = &found.findings;
     let kinds = hidden::summary(findings);
-    let mut set = vec![
+    let set = vec![
         ("hold_json", Val::from(serde_json::to_string(found)?)),
         ("hold_hash", fp.into()),
         ("held_at", crate::timestamp::now().into()),
         ("hold_stage", item.stage.clone().into()),
         ("current_task_id", Val::Text(None)),
     ];
-    // The operator is told in the DM, where a message marked `#<n>` (or a
-    // reply to this one) reaches the item, when it has no WhatsApp thread
-    // yet.
-    if item.surface == "none" {
-        set.push(("surface", "dm".into()));
-    }
     let code = hidden::hold_code(fp);
     let reason = format!("held (hold {code}): {} piece(s) of content GitHub's page does not show ({kinds})", findings.len());
     if store::advance(&ctx.db, item.id, item.stage(), StageEvent::Hold, &reason, set).await? {
@@ -1738,7 +1730,8 @@ async fn hold(ctx: &Ctx, item: &Item, found: &hidden::Hold, fp: &str) -> Result<
             &item_vars(ctx, &it),
             &[("count", &findings.len().to_string()), ("kinds", &kinds), ("findings", &lines.join("\n")), ("code", code)],
         );
-        note_once(ctx, item.id, &text, &format!("held:{}:{fp}", item.id)).await?;
+        let notice = notice_text(ctx, &ctx.cfg.texts.notice_held, &it, &[("count", &findings.len().to_string())]);
+        note_once(ctx, item.id, &text, &format!("held:{}:{fp}", item.id), Some(notice)).await?;
     }
     Ok(())
 }
@@ -2046,31 +2039,29 @@ async fn step_eval(ctx: &Ctx, item: &Item) -> Result<()> {
                 ("last_task_id", id.clone().into()),
             ];
             if e.effective == "simple" {
-                let mut set = common;
-                set.push(("surface", "dm".into()));
-                if store::advance(&ctx.db, item.id, Stage::Eval, StageEvent::EvalSimple, "eval: simple", set).await? {
+                if store::advance(&ctx.db, item.id, Stage::Eval, StageEvent::EvalSimple, "eval: simple", common).await? {
                     let it = store::item(&ctx.db, item.id).await?;
                     let text = fill_item(
                         &ctx.cfg.texts.simple_started,
                         &item_vars(ctx, &it),
                         &[("ref", &event_ref(&ev)), ("url", ev.url.as_deref().unwrap_or(""))],
                     );
-                    note_once(ctx, item.id, &text, &format!("eval:{id}")).await?;
+                    let notice = notice_text(ctx, &ctx.cfg.texts.notice_implementation_started, &it, &[]);
+                    note_once(ctx, item.id, &text, &format!("eval:{id}"), Some(notice)).await?;
                 }
                 return Ok(());
             }
-            // Needs a plan: the thread runs in the operator's DM.
-            let mut set = common;
-            set.push(("surface", "dm".into()));
+            // Needs a plan: refinement starts; the operator is told in the DM.
             let reason = format!("eval: {}", e.effective);
-            if store::advance(&ctx.db, item.id, Stage::Eval, StageEvent::EvalNeedsPlan, &reason, set).await? {
+            if store::advance(&ctx.db, item.id, Stage::Eval, StageEvent::EvalNeedsPlan, &reason, common).await? {
                 let it = store::item(&ctx.db, item.id).await?;
                 let text = fill_item(
                     &ctx.cfg.texts.refinement_opened,
                     &item_vars(ctx, &it),
                     &[("ref", &event_ref(&ev)), ("url", ev.url.as_deref().unwrap_or(""))],
                 );
-                note_once(ctx, item.id, &text, &format!("eval:{id}")).await?;
+                let notice = notice_text(ctx, &ctx.cfg.texts.notice_needs_plan, &it, &[]);
+                note_once(ctx, item.id, &text, &format!("eval:{id}"), Some(notice)).await?;
             }
             Ok(())
         }
@@ -2083,9 +2074,9 @@ async fn step_refinement(ctx: &Ctx, item: &Item) -> Result<()> {
         TaskState::Done { id, result } => {
             let next = item.plan_version + 1;
             let (shown, plan) = stage::split_plan(&result, &format!("plan v{next}"));
-            let mut body = shown;
+            let mut body = shown.clone();
             let mut set = vec![("current_task_id", Val::Text(None)), ("last_task_id", id.clone().into())];
-            if let Some(p) = plan {
+            let notice = if let Some(p) = plan {
                 set.push(("plan_draft", p.into()));
                 set.push(("plan_version", next.into()));
                 let mut vars = item_vars(ctx, item);
@@ -2093,7 +2084,10 @@ async fn step_refinement(ctx: &Ctx, item: &Item) -> Result<()> {
                 vars.push(("version", next.to_string()));
                 body.push_str("\n\n");
                 body.push_str(&fill_vars(&ctx.cfg.texts.approve_hint, &vars));
-            }
+                notice_text(ctx, &ctx.cfg.texts.notice_plan_ready, item, &[("version", &next.to_string())])
+            } else {
+                agent_replied_notice(ctx, item, &shown).await
+            };
             // Keyed by the task: a crash before the update below does not
             // add the reply twice.
             store::add_message(
@@ -2105,7 +2099,7 @@ async fn step_refinement(ctx: &Ctx, item: &Item) -> Result<()> {
                     body: &body,
                     external_ref: Some(&format!("task:{id}")),
                     pending_agent: false,
-                    to_whatsapp: true,
+                    notice: Some(notice),
                 },
             )
             .await?;
@@ -2329,7 +2323,8 @@ async fn block_because(ctx: &Ctx, item: &Item, why: String) -> Result<()> {
     .await?
     {
         let it = store::item(&ctx.db, item.id).await?;
-        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_blocked, &item_vars(ctx, &it))).await?;
+        let notice = notice_text(ctx, &ctx.cfg.texts.notice_blocked, &it, &[("reason", &notice_reason(ctx, &why).await)]);
+        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_blocked, &item_vars(ctx, &it)), Some(notice)).await?;
     }
     Ok(())
 }
@@ -2433,14 +2428,16 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     }
     let it = store::item(&ctx.db, item.id).await?;
     let tests = it.tests_status.clone().unwrap_or_else(|| "not_run".into());
-    // The agent's own words, as it wrote them: this goes to the operator on
-    // WhatsApp, never to GitHub.
+    // The agent's own words, as it wrote them: this goes to the item's
+    // thread on the dashboard, never to GitHub or WhatsApp.
     let summary = clip(it.impl_summary.as_deref().unwrap_or(""), 600);
+    let notice = notice_text(ctx, &ctx.cfg.texts.notice_pr_opened, &it, &[("pr_url", &url), ("tests", &tests)]);
     note_once(
         ctx,
         item.id,
         &fill_item(&ctx.cfg.texts.pr_opened, &item_vars(ctx, &it), &[("tests", &tests), ("summary", &summary)]),
         &format!("pr:{url}"),
+        Some(notice),
     )
     .await?;
     post_pr_link(ctx, &it, &ev, &url, &first).await
@@ -2470,7 +2467,7 @@ async fn post_pr_link(ctx: &Ctx, item: &Item, ev: &Event, url: &str, first: &Rev
             let mut v = vars.clone();
             v.retain(|(k, _)| *k != "error");
             let why = "the draft PR is open; the event's source has no reply channel";
-            note(ctx, item.id, &fill_item(&ctx.cfg.texts.item_closed, &v, &[("error", why)])).await?;
+            note(ctx, item.id, &fill_item(&ctx.cfg.texts.item_closed, &v, &[("error", why)]), None).await?;
         }
         return Ok(());
     };
@@ -2515,39 +2512,126 @@ async fn post_pr_link(ctx: &Ctx, item: &Item, ev: &Event, url: &str, first: &Rev
     )
     .await?
     {
-        note(ctx, item.id, &fill_item(&ctx.cfg.texts.comment_posted, &vars, &[("ref", &event_ref(ev))])).await?;
+        note(ctx, item.id, &fill_item(&ctx.cfg.texts.comment_posted, &vars, &[("ref", &event_ref(ev))]), None).await?;
     }
     Ok(())
 }
 
 // ── WhatsApp surface ─────────────────────────────────────────────────────
 
-/// Send the thread messages not yet on WhatsApp to the operator's DM, with
-/// the item's marker. Every row goes through the outbound queue, so the
-/// bot's target policy and secret filter apply.
-async fn flush_whatsapp(ctx: &Ctx, item: &Item) -> Result<()> {
-    if item.surface != "dm" {
-        return Ok(());
+/// Longest issue title in a notice.
+const NOTICE_TITLE_CHARS: usize = 80;
+/// The agent-reply preview in a notice: about this many characters, cut at
+/// a word boundary.
+pub const NOTICE_PREVIEW_CHARS: usize = 200;
+/// Longest reason (an error, a stale cause) in a notice.
+const NOTICE_REASON_CHARS: usize = 160;
+
+/// The item's dashboard page, `<NUCLEUS_PUBLIC_URL>/intake?item=<n>`; empty
+/// when `NUCLEUS_PUBLIC_URL` is unset.
+pub fn item_link(public_url: Option<&str>, n: i64) -> String {
+    match public_url.map(|u| u.trim().trim_end_matches('/')).filter(|u| !u.is_empty()) {
+        Some(base) => format!("{base}/intake?item={n}"),
+        None => String::new(),
     }
-    let prefix = format!("[#{}] ", item.id);
+}
+
+/// A WhatsApp notice for `item`: `template` with `{n}`, `{title}` (the
+/// issue title on one line, at most 80 characters), `{link}` and `extra`
+/// filled in one pass, on one line.
+fn notice_text(ctx: &Ctx, template: &str, item: &Item, extra: &[(&str, &str)]) -> String {
+    build_notice(ctx.public_url.as_deref(), template, item.id, &item.title, extra)
+}
+
+/// [`notice_text`] without a context (and for the notice tests).
+pub fn build_notice(public_url: Option<&str>, template: &str, n: i64, title: &str, extra: &[(&str, &str)]) -> String {
+    let n_s = n.to_string();
+    let title = publish::plain_line(title, NOTICE_TITLE_CHARS);
+    let link = item_link(public_url, n);
+    let mut vars: Vec<(&str, &str)> = vec![("n", &n_s), ("title", &title), ("link", &link)];
+    vars.extend_from_slice(extra);
+    one_line(&fill_once(template, &vars))
+}
+
+/// The start of an agent reply for a notice: WhatsApp's formatting
+/// characters (`*`, `_`, `~`, backticks) and line-start quote and heading
+/// marks removed, on one line, at most about [`NOTICE_PREVIEW_CHARS`]
+/// characters, cut at a word boundary and marked with `…`. `None` when
+/// nothing is left.
+pub fn reply_preview(text: &str) -> Option<String> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim_start().trim_start_matches(['>', '#']).chars().filter(|c| !matches!(c, '*' | '_' | '~' | '`')).collect())
+        .collect();
+    let line = publish::plain_line(&lines.join(" "), usize::MAX);
+    if line.is_empty() {
+        return None;
+    }
+    if line.chars().count() <= NOTICE_PREVIEW_CHARS {
+        return Some(line);
+    }
+    let head: String = line.chars().take(NOTICE_PREVIEW_CHARS).collect();
+    let cut = match head.rfind(char::is_whitespace) {
+        Some(i) if i > NOTICE_PREVIEW_CHARS / 2 => &head[..i],
+        _ => head.as_str(),
+    };
+    Some(format!("{}…", cut.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '-'))))
+}
+
+/// The notice for a refinement reply without a plan: its preview, when the
+/// secret guard passes it; otherwise the notice without a preview.
+async fn agent_replied_notice(ctx: &Ctx, item: &Item, reply: &str) -> String {
+    let t = &ctx.cfg.texts;
+    match reply_preview(reply) {
+        Some(p) => match ctx.guard.scan(&p).await {
+            Verdict::Clean => notice_text(ctx, &t.notice_agent_replied, item, &[("preview", &p)]),
+            Verdict::Hit(cats) => {
+                tracing::warn!(item = item.id, ?cats, "intake: the reply preview was withheld by the secret guard");
+                notice_text(ctx, &t.notice_agent_replied_plain, item, &[])
+            }
+        },
+        None => notice_text(ctx, &t.notice_agent_replied_plain, item, &[]),
+    }
+}
+
+/// A one-line reason for a notice (an error, why an item stopped): at most
+/// 160 characters, and only when the secret guard passes it.
+async fn notice_reason(ctx: &Ctx, text: &str) -> String {
+    let r = publish::plain_line(text, NOTICE_REASON_CHARS);
+    match ctx.guard.scan(&r).await {
+        Verdict::Clean if !r.is_empty() => r,
+        _ => ctx.cfg.texts.notice_reason_withheld.clone(),
+    }
+}
+
+/// Send the notices not yet on WhatsApp to the operator's DM. A thread
+/// message without a notice sends nothing. Every notice goes through the
+/// outbound queue (source `intake:<n>`, so a reply to it reaches the item),
+/// where the bot's target policy and secret filter apply. The first notice
+/// marks the item's surface `dm`.
+async fn flush_whatsapp(ctx: &Ctx, item: &Item) -> Result<()> {
+    let mut sent = false;
     for m in store::messages(&ctx.db, item.id).await? {
         if m.wa_state.is_some() {
             continue;
         }
-        let head = match (m.author.as_str(), m.via.as_str()) {
-            ("operator", via) => format!("(operator, via {via}) "),
-            _ => String::new(),
+        let Some(notice) = m.notice.as_deref().filter(|n| !n.trim().is_empty()) else {
+            store::set_wa_none(&ctx.db, m.id).await?;
+            continue;
         };
-        let body = format!("{prefix}{head}{}", clip(&m.body, WA_MAX_CHARS));
         let id = crate::whatsapp_queue::enqueue_text_once(
             &ctx.wa,
             crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM,
-            &body,
+            notice,
             &format!("intake:{}", item.id),
             &format!("intake:{}:m{}", item.id, m.id),
         )
         .await?;
         store::set_wa_queued(&ctx.db, m.id, id).await?;
+        sent = true;
+    }
+    if sent && item.surface != "dm" {
+        store::update(&ctx.db, item.id, item.stage(), vec![("surface", "dm".into())]).await?;
     }
     Ok(())
 }

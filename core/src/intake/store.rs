@@ -261,6 +261,15 @@ ALTER TABLE items DROP COLUMN group_requested_at;
 ALTER TABLE items DROP COLUMN group_jid;
 ALTER TABLE items DROP COLUMN group_closed_at";
 
+/// WhatsApp gets short notices, not thread messages (ADR-036, "Amendment:
+/// short notices"). `item_messages.notice` is the code-owned notice a thread
+/// message sends to the operator's DM (NULL: nothing is sent). Thread
+/// messages still waiting to be copied to WhatsApp in full are not sent any
+/// more: the long bodies stay on the dashboard.
+const SCHEMA_V6: &str = "
+ALTER TABLE item_messages ADD COLUMN notice TEXT;
+UPDATE item_messages SET wa_state = 'none' WHERE wa_state IS NULL";
+
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(super::INTAKE_DB_PATH)).await?;
@@ -272,6 +281,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             crate::migrate::Migration { version: 3, name: "no comment approval", step: crate::migrate::Step::Sql(SCHEMA_V3) },
             crate::migrate::Migration { version: 4, name: "operator confirmations", step: crate::migrate::Step::Sql(SCHEMA_V4) },
             crate::migrate::Migration { version: 5, name: "no whatsapp groups", step: crate::migrate::Step::Sql(SCHEMA_V5) },
+            crate::migrate::Migration { version: 6, name: "whatsapp notices", step: crate::migrate::Step::Sql(SCHEMA_V6) },
         ],
     )
     .await
@@ -280,7 +290,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// True when `pool` (a read-only intake.db) has the full schema: the
 /// migration ledger records [`SCHEMA_VERSION`] and the item tables exist.
@@ -658,9 +668,13 @@ pub struct ItemMessage {
     #[ts(type = "number")]
     pub pending_agent: i64,
     pub read_by_task: Option<String>,
-    /// `null` (to be sent to WhatsApp), `queued`, or `none` (not sent: it
-    /// came from WhatsApp).
+    /// `null` (its notice is still to be sent), `queued` (the notice is in
+    /// the outbound queue), or `none` (nothing is sent for it).
     pub wa_state: Option<String>,
+    /// The short, code-owned notice this message sends to the operator's
+    /// WhatsApp DM (never the body). Not part of the dashboard's wire type.
+    #[serde(skip)]
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow, ts_rs::TS)]
@@ -1110,8 +1124,9 @@ pub struct NewMessage<'a> {
     pub external_ref: Option<&'a str>,
     /// An operator message that the next refinement turn must read.
     pub pending_agent: bool,
-    /// Send it to the item's WhatsApp thread (`false`: it came from there).
-    pub to_whatsapp: bool,
+    /// The short notice sent to the operator's WhatsApp DM for this message;
+    /// `None` sends nothing. The body itself never goes to WhatsApp.
+    pub notice: Option<String>,
 }
 
 /// Append a message to item `id`'s thread. Returns its id, or `None` when
@@ -1125,8 +1140,8 @@ pub async fn add_message(pool: &SqlitePool, id: i64, m: NewMessage<'_>) -> Resul
 pub async fn add_message_caused(pool: &SqlitePool, id: i64, m: NewMessage<'_>, cause: Option<&str>) -> Result<Option<i64>> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let res = sqlx::query(
-        "INSERT OR IGNORE INTO item_messages (item_id, at, author, via, body, external_ref, pending_agent, wa_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT OR IGNORE INTO item_messages (item_id, at, author, via, body, external_ref, pending_agent, wa_state, notice)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
     .bind(id)
     .bind(crate::timestamp::now())
@@ -1135,7 +1150,8 @@ pub async fn add_message_caused(pool: &SqlitePool, id: i64, m: NewMessage<'_>, c
     .bind(m.body)
     .bind(m.external_ref)
     .bind(m.pending_agent as i64)
-    .bind(if m.to_whatsapp { None } else { Some("none") })
+    .bind(if m.notice.is_some() { None } else { Some("none") })
+    .bind(&m.notice)
     .execute(&mut *tx)
     .await?;
     mark_applied(&mut tx, cause).await?;
@@ -1145,7 +1161,7 @@ pub async fn add_message_caused(pool: &SqlitePool, id: i64, m: NewMessage<'_>, c
 
 pub async fn messages(pool: &SqlitePool, id: i64) -> Result<Vec<ItemMessage>> {
     Ok(sqlx::query_as(
-        "SELECT id, item_id, at, author, via, body, pending_agent, read_by_task, wa_state
+        "SELECT id, item_id, at, author, via, body, pending_agent, read_by_task, wa_state, notice
            FROM item_messages WHERE item_id = ?1 ORDER BY id",
     )
     .bind(id)
@@ -1172,6 +1188,15 @@ pub async fn unread(pool: &SqlitePool, id: i64, task_id: &str) -> Result<()> {
     sqlx::query("UPDATE item_messages SET pending_agent = 1, read_by_task = NULL WHERE item_id = ?1 AND read_by_task = ?2")
         .bind(id)
         .bind(task_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Record that nothing is sent for thread message `message_id`.
+pub async fn set_wa_none(pool: &SqlitePool, message_id: i64) -> Result<()> {
+    sqlx::query("UPDATE item_messages SET wa_state = 'none' WHERE id = ?1 AND wa_state IS NULL")
+        .bind(message_id)
         .execute(pool)
         .await?;
     Ok(())
@@ -1655,7 +1680,7 @@ pub(crate) mod tests {
             body: "hi",
             external_ref: r,
             pending_agent: true,
-            to_whatsapp: false,
+            notice: None,
         };
         let a = add_message(&pool, it.id, m(Some("wa:1"))).await.unwrap();
         assert!(a.is_some());

@@ -264,12 +264,12 @@ async fn issue_to_draft_pr_with_real_agents() {
     let commented = log.lines().position(|l| l.starts_with("issue comment 1")).unwrap();
     assert!(created < commented, "{log}");
 
-    // Every thread message was queued for the operator's DM, marked #1.
+    // Short notices were queued for the operator's DM, each naming item #1.
     let wa = nucleus_core::whatsapp_queue::open(ws).await.unwrap();
     let rows: Vec<(String, String)> =
         sqlx::query_as("SELECT target, body FROM outbound_queue ORDER BY id").fetch_all(&wa).await.unwrap();
     assert!(!rows.is_empty());
-    assert!(rows.iter().all(|(t, b)| t == "dm" && b.starts_with("[#1] ")), "{rows:?}");
+    assert!(rows.iter().all(|(t, b)| t == "dm" && b.contains("Item #1") && b.chars().count() <= 600), "{rows:?}");
     assert!(rows.iter().any(|(_, b)| b.contains("pull/1")));
 
     let _ = Command::new("tmux").args(["kill-session", "-t", TMUX]).output();

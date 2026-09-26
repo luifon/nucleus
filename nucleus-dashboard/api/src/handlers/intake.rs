@@ -42,6 +42,8 @@ pub struct IntakeState {
     pub workspace_root: PathBuf,
     pub intake: nucleus_core::config::IntakeConfig,
     pub tasks: nucleus_core::config::TasksConfig,
+    /// `NUCLEUS_PUBLIC_URL`, for the item link in WhatsApp notices.
+    pub public_url: Option<String>,
 }
 
 pub fn router(state: Arc<IntakeState>) -> Router {
@@ -194,6 +196,7 @@ async fn ctx(s: &IntakeState) -> Result<Ctx, IntakeError> {
         // The dashboard takes explicit decisions; it never reads WhatsApp
         // messages.
         interpreter: Arc::new(nucleus_core::intake::decide::NoInterpreter),
+        public_url: s.public_url.clone(),
     })
 }
 
@@ -311,6 +314,7 @@ mod tests {
             workspace_root: dir.to_path_buf(),
             intake: Default::default(),
             tasks: Default::default(),
+            public_url: None,
         })
     }
 
@@ -370,7 +374,7 @@ mod tests {
     fn enabled_state(dir: &std::path::Path) -> Arc<IntakeState> {
         let mut intake = nucleus_core::config::IntakeConfig { enabled: true, ..Default::default() };
         intake.github.gh_bin = "sh".into();
-        Arc::new(IntakeState { workspace_root: dir.to_path_buf(), intake, tasks: Default::default() })
+        Arc::new(IntakeState { workspace_root: dir.to_path_buf(), intake, tasks: Default::default(), public_url: None })
     }
 
     /// An operator-accepted event (`nucleus events emit --accept`, no
