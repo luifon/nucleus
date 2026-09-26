@@ -607,9 +607,10 @@ JSON-parsed numbers.
   the waiting decisions (no issue text) with each operator message and runs
   `nucleus intake interpret-latest` when he asks for one. That command takes
   no text: it interprets the stored DM rows (`item_key = chat`, `sender =
-  operator`) that the session's current turn covers, in order, every one
-  (a confirmation question asked in the loop leaves later non-answers to
-  the session), each row once, and prints which ones it handled; only the
+  operator`) that the session's current turn covers, in order, every one,
+  each row once, and prints which ones it handled. A message answers only
+  a question sent before it arrived; a decision after a question asked in
+  the same turn is not run but reported under the question; only the
   DM chat session and the operator's terminal may run it. Operator-only
   outbound (the pipeline, reminders, `dm`) reaches only the operator's
   identities, checked live at send time (`resolveQueuedTarget`). A chat

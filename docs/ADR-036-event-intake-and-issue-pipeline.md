@@ -1549,9 +1549,13 @@ message):
   in order with the same interpreter flow (`pipeline::interpret_latest`).
   Every one is interpreted: running a decision does not stop the loop, so a
   second decision in the same turn is not lost. A confirmation question
-  does: once the loop has asked one, a later message of the turn is handled
-  only when it answers that question, and is left to the session otherwise
-  (the question stays open). From the
+  asked by the loop changes what follows: every later message of the turn
+  arrived before that question was sent, so none of them can answer it. A
+  later decision is not run; the line `[intake.texts] also_received`
+  ("Also received: '<preview>' — send it again after answering the question
+  above.") is added to the question while it is still in the queue (or
+  sent right after it), and the message is marked final. Anything else is
+  left to the session, and the question stays open. From the
   operator's terminal it reads the newest stored row of the last 15
   minutes. A row is interpreted at most once: its `inbound_commands` state
   is final after the first run. On a decision (or an answer to an open
@@ -1648,6 +1652,13 @@ yes or no.") comes before:
 - a decision whose item the interpreter inferred in the DM while several
   items wait.
 
+A message can answer only a question that was sent before the message
+arrived: the question's `outbound_queue` row must be `sent`, with a
+`sent_at` earlier than the message's `received_at`. For a message that
+arrived earlier (a "yes" typed in the same turn as the decision, before the
+question reached WhatsApp), the question is not shown to the interpreter,
+is not answered and is not replaced.
+
 A plan approval typed in the item's own group, or in the DM naming the item,
 or in the DM while only that item waits, runs at once.
 
@@ -1691,9 +1702,25 @@ the operator by the same live check, whatever target it names. Chat-engine
 replies to another allowed contact stay in that contact's chat. Reminders to
 `whatsapp-dm` name the operator's phone (the first allowlist entry) and pass.
 
+**Task results for the operator's LID chat.** A task started in the
+operator's DM chat session carries that chat as its origin, also in LID
+form. The Rust side cannot ask the live mapping, so the bot mirrors every
+LID it verified as the operator into whatsapp.db (`operator_lid_verified`,
+digits and verified-at time; rows are removed when the mapping no longer
+resolves them to him). A Rust process accepts an `@lid` origin chat that is
+on the allowlist, in `WHATSAPP_OPERATOR_LIDS`, or verified there within the
+last 10 minutes. Task creation refuses any other chat. At delivery, a
+result for an operator LID whose verification expired goes to the
+operator's phone JID; it is not dropped. The drain checks the live mapping
+again at send time and sends a result to an `@lid` chat outside the lists
+only when the live check accepts it. Tasks from other allowed contacts keep
+their own chat.
+
 **After a restart.** The bot marks a turn it interrupted `interrupted`. The
 next tick finds operator DM rows of such turns that were stored for
-`interpret-latest` but not interpreted. While items are open, it sends the
+`interpret-latest` and not interpreted to the end: never read, or left in
+`received` because the restart came while they were being interpreted.
+While items are open, it sends the
 operator one code-owned message (`[intake.texts] interrupted_messages`)
 naming them with short previews and asking him to send any decision again.
 Either way the rows are marked final, so they are never interpreted
@@ -1778,7 +1805,18 @@ reported once and never interpreted
 (`a_message_of_an_interrupted_turn_is_reported_once_and_never_interpreted`);
 a remapped LID stops being the operator in the live check at once and in
 the cache at the next refresh (`intake.test.ts`, "a remapped LID stops being
-the operator").
+the operator"). Review round 3: a "yes" in the same turn as "cancel item #1"
+confirms nothing and a "yes" after the question was delivered cancels
+(`a_yes_in_the_same_turn_cannot_confirm_a_question_not_yet_sent`); a later
+decision gets the "send it again" line and is not run
+(`two_decisions_in_one_turn_are_both_taken`); a task from a
+`WHATSAPP_OPERATOR_LIDS` chat is created and delivered there, one from a
+mapped LID is created while verified and delivered to the phone JID after
+expiry, and one from another contact stays there
+(`operator_lid_chats_get_their_task_results`); the verification mirror and
+the drain's live check for task LID chats (`intake.test.ts`,
+`target_policy.test.ts`); a row left in `received` is reported too
+(`a_message_of_an_interrupted_turn_is_reported_once_and_never_interpreted`).
 
 Rust (`cargo test -p nucleus-core intake`, fake interpreter): "looks good,
 go ahead" in item #1's group approves plan v1 at once
