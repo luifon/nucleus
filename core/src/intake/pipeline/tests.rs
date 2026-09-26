@@ -183,7 +183,7 @@ async fn fixture() -> Fixture {
             status TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL, closed_at TEXT)",
         "CREATE TABLE IF NOT EXISTS intake_inbound (id INTEGER PRIMARY KEY AUTOINCREMENT, item_key TEXT NOT NULL,
             chat_id TEXT NOT NULL, wa_msg_id TEXT NOT NULL, text TEXT NOT NULL, received_at TEXT NOT NULL,
-            input_kind TEXT NOT NULL DEFAULT 'text', sender TEXT NOT NULL DEFAULT 'unknown')",
+            input_kind TEXT NOT NULL DEFAULT 'text', sender TEXT NOT NULL DEFAULT 'unknown', wa_ts INTEGER)",
         // The turn engine's records (messaging/whatsapp/src/db.ts), the
         // columns interpret-latest reads.
         "CREATE TABLE IF NOT EXISTS chat_turns (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, status TEXT NOT NULL,
@@ -643,7 +643,7 @@ async fn unknown_items_and_duplicate_messages() {
     // The same WhatsApp message again is ignored.
     let before = store::messages(&f.ctx.db, 1).await.unwrap().len();
     let calls = f.interp.calls();
-    operator_message(&f.ctx, &Origin::Dm { item: Some(1) }, "a note", "wa:chat:x2", "text", &crate::timestamp::now()).await.unwrap();
+    operator_message(&f.ctx, &Origin::Dm { item: Some(1) }, "a note", "wa:chat:x2", "text", &crate::timestamp::now(), None).await.unwrap();
     assert_eq!(store::messages(&f.ctx.db, 1).await.unwrap().len(), before);
     assert_eq!(f.interp.calls(), calls, "not interpreted again");
 }
@@ -2418,6 +2418,78 @@ async fn a_yes_in_the_same_turn_cannot_confirm_a_question_not_yet_sent() {
     // A yes sent after the question was delivered cancels.
     new_turn(&f, "chat").await;
     chat_message(&f, "y3", "yes", "operator").await;
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Handled]);
+    assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
+}
+
+#[tokio::test]
+async fn a_yes_that_arrived_before_the_question_was_sent_does_not_confirm() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    tick(&f).await;
+    // "cancel item #1" is handled first; its question is queued.
+    chat_message(&f, "a1", "cancel item #1", "operator").await;
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Handled]);
+    // The question is sent now, with a WhatsApp timestamp.
+    let sent = crate::timestamp::now();
+    sqlx::query("UPDATE outbound_queue SET status = 'sent', sent_at = ?1, wa_ts = 1790000005 WHERE status = 'pending'")
+        .bind(&sent)
+        .execute(&f.ctx.wa)
+        .await
+        .unwrap();
+    // A "yes" of the same upsert batch, recorded after that (or a voice
+    // "yes" whose transcription finished after it): its arrival stamp is
+    // earlier than the send.
+    let early = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    for (id, kind) in [("a2", "text"), ("a3", "voice")] {
+        new_turn(&f, "chat").await;
+        sqlx::query(
+            "INSERT INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender, wa_ts)
+             VALUES ('chat', 'chat', ?1, 'yes', ?2, ?3, 'operator', 1790000000)",
+        )
+        .bind(id)
+        .bind(&early)
+        .bind(kind)
+        .execute(&f.ctx.wa)
+        .await
+        .unwrap();
+        let turn: String = sqlx::query_scalar("SELECT id FROM chat_turns WHERE status = 'running'").fetch_one(&f.ctx.wa).await.unwrap();
+        sqlx::query("INSERT INTO chat_inbound (ref, chat_id, wa_msg_id, received_at, turn_id, status) VALUES (?1, 'chat', ?2, ?3, ?4, 'consumed')")
+            .bind(format!("wa-{id}"))
+            .bind(id)
+            .bind(&early)
+            .bind(&turn)
+            .execute(&f.ctx.wa)
+            .await
+            .unwrap();
+        assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::ForSession], "{kind}");
+        assert_eq!(item1(&f).await.stage(), Stage::Eval, "{kind}: nothing is cancelled");
+    }
+    // Arrival after the send, but WhatsApp's own timestamp is the same
+    // second as the question's: not earlier, so still no answer.
+    new_turn(&f, "chat").await;
+    let later = (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    sqlx::query(
+        "INSERT INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender, wa_ts)
+         VALUES ('chat', 'chat', 'a4', 'yes', ?1, 'text', 'operator', 1790000005)",
+    )
+    .bind(&later)
+    .execute(&f.ctx.wa)
+    .await
+    .unwrap();
+    let turn: String = sqlx::query_scalar("SELECT id FROM chat_turns WHERE status = 'running'").fetch_one(&f.ctx.wa).await.unwrap();
+    sqlx::query("INSERT INTO chat_inbound (ref, chat_id, wa_msg_id, received_at, turn_id, status) VALUES ('wa-a4', 'chat', 'a4', ?1, ?2, 'consumed')")
+        .bind(&later)
+        .bind(&turn)
+        .execute(&f.ctx.wa)
+        .await
+        .unwrap();
+    assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::ForSession]);
+    assert_eq!(item1(&f).await.stage(), Stage::Eval);
+    // A yes after both: it cancels.
+    new_turn(&f, "chat").await;
+    let t = chat_message(&f, "a5", "yes", "operator").await;
+    sqlx::query("UPDATE intake_inbound SET wa_ts = 1790000006 WHERE id = ?1").bind(t).execute(&f.ctx.wa).await.unwrap();
     assert_eq!(outcomes(&interpret_latest(&f.ctx, Some("chat")).await.unwrap()), [TurnOutcome::Handled]);
     assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
 }

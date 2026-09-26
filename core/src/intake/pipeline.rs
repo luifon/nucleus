@@ -527,7 +527,7 @@ async fn apply_inbound(ctx: &Ctx, row: &crate::whatsapp_queue::IntakeInbound, ms
             Err(_) => return store::inbound_finish(&ctx.db, msg_ref, "failed", Some("no item")).await,
         }
     };
-    operator_message(ctx, &origin, &row.text, msg_ref, &row.input_kind, &row.received_at).await
+    operator_message(ctx, &origin, &row.text, msg_ref, &row.input_kind, &row.received_at, row.wa_ts).await
 }
 
 /// One operator message (ADR-036, "Operator decisions"). The interpreter
@@ -556,8 +556,10 @@ pub async fn operator_message(
     msg_ref: &str,
     input_kind: &str,
     received_at: &str,
+    wa_ts: Option<i64>,
 ) -> Result<()> {
-    handle_message(ctx, origin, text, msg_ref, input_kind, received_at, Trigger::Routed).await.map(|_| ())
+    let arrived = Arrived { at: received_at, wa_ts };
+    handle_message(ctx, origin, text, msg_ref, input_kind, arrived, Trigger::Routed).await.map(|_| ())
 }
 
 /// How an operator message reached the interpreter.
@@ -724,8 +726,16 @@ async fn interpret_row(ctx: &Ctx, row: &crate::whatsapp_queue::IntakeInbound, as
         return Ok(Latest::NoMessage("already interpreted".into()));
     }
     let r =
-        handle_message(ctx, &Origin::Dm { item: None }, &row.text, &msg_ref, &row.input_kind, &row.received_at, Trigger::ChatSession { asked })
-            .await;
+        handle_message(
+            ctx,
+            &Origin::Dm { item: None },
+            &row.text,
+            &msg_ref,
+            &row.input_kind,
+            Arrived { at: &row.received_at, wa_ts: row.wa_ts },
+            Trigger::ChatSession { asked },
+        )
+        .await;
     if let Err(e) = &r {
         let _ = store::inbound_attempt_failed(&ctx.db, &msg_ref, &clip(&format!("{e:#}"), 1_000)).await;
     }
@@ -750,12 +760,31 @@ async fn interpret_newest(ctx: &Ctx) -> Result<Latest> {
     }
 }
 
-/// True when the confirmation question `c` was sent to WhatsApp before
-/// `received_at` (the message's arrival): only then can the message answer
-/// it. A question still in the queue, or sent later, was not seen.
-async fn question_seen(ctx: &Ctx, c: &store::Confirmation, received_at: &str) -> Result<bool> {
-    let sent = crate::whatsapp_queue::sent_at_by_dedup(&ctx.wa, &format!("intake:answer:{}", c.asked_by)).await?;
-    Ok(sent.is_some_and(|s| crate::timestamp::to_sortable(&s) < crate::timestamp::to_sortable(received_at)))
+/// When an operator message reached WhatsApp and the bot.
+#[derive(Debug, Clone, Copy)]
+struct Arrived<'a> {
+    /// The bot's arrival stamp, taken before the message was handled.
+    at: &'a str,
+    /// WhatsApp's `messageTimestamp` in seconds, when known.
+    wa_ts: Option<i64>,
+}
+
+/// True when the confirmation question `c` was sent before the message
+/// arrived: its `sent_at` is earlier than the message's arrival stamp, and,
+/// when both WhatsApp timestamps are known, the question's server timestamp
+/// is earlier than the message's (whole seconds: equal is not earlier).
+/// Only then can the message answer it.
+async fn question_seen(ctx: &Ctx, c: &store::Confirmation, arrived: Arrived<'_>) -> Result<bool> {
+    let Some((sent_at, q_ts)) = crate::whatsapp_queue::sent_by_dedup(&ctx.wa, &format!("intake:answer:{}", c.asked_by)).await? else {
+        return Ok(false);
+    };
+    if crate::timestamp::to_sortable(&sent_at) >= crate::timestamp::to_sortable(arrived.at) {
+        return Ok(false);
+    }
+    Ok(match (q_ts, arrived.wa_ts) {
+        (Some(q), Some(m)) => q < m,
+        _ => true,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -765,7 +794,7 @@ async fn handle_message(
     text: &str,
     msg_ref: &str,
     input_kind: &str,
-    received_at: &str,
+    arrived: Arrived<'_>,
     trigger: Trigger<'_>,
 ) -> Result<Latest> {
     if store::inbound_state(&ctx.db, msg_ref).await?.map(|s| s.is_final()).unwrap_or(false) {
@@ -788,7 +817,7 @@ async fn handle_message(
     // A question counts for this message only when it was sent before the
     // message arrived; otherwise it is neither shown nor replaced.
     let open = match store::open_confirmation(&ctx.db, &scope, msg_ref, &now).await? {
-        Some(c) if question_seen(ctx, &c, received_at).await? => Some(c),
+        Some(c) if question_seen(ctx, &c, arrived).await? => Some(c),
         _ => None,
     };
     let pending = pending_decisions(ctx, origin).await?;

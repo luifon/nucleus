@@ -94,7 +94,12 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     add_columns_if_missing(
         &pool,
         "outbound_queue",
-        &[("in_flight_at", "in_flight_at TEXT"), ("dedup_key", "dedup_key TEXT"), ("quoted_json", "quoted_json TEXT")],
+        &[
+            ("in_flight_at", "in_flight_at TEXT"),
+            ("dedup_key", "dedup_key TEXT"),
+            ("quoted_json", "quoted_json TEXT"),
+            ("wa_ts", "wa_ts INTEGER"),
+        ],
     )
     .await?;
     add_columns_if_missing(&pool, "session_inbox", &[("dedup_key", "dedup_key TEXT")]).await?;
@@ -452,6 +457,19 @@ pub struct IntakeInbound {
     /// own identity; any other value (a table from before the column
     /// existed reads as `unknown`) is never interpreted.
     pub sender: String,
+    /// WhatsApp's own `messageTimestamp` of the message (seconds), when the
+    /// bot knew it. `received_at` is the arrival at the bot, stamped before
+    /// the message was handled.
+    pub wa_ts: Option<i64>,
+}
+
+/// The `wa_ts` select expression for `intake_inbound` (with a table
+/// `prefix` such as `i.`), or NULL for a table from before the column.
+async fn wa_ts_column(pool: &SqlitePool, prefix: &str) -> Result<String> {
+    let has: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('intake_inbound') WHERE name = 'wa_ts'")
+        .fetch_one(pool)
+        .await?;
+    Ok(if has { format!("{prefix}wa_ts") } else { "NULL AS wa_ts".into() })
 }
 
 /// `item_key` of a DM message that names no item (ADR-036): it answers a
@@ -476,11 +494,12 @@ pub async fn latest_chat_message(pool: &SqlitePool, chat: Option<&str>) -> Resul
     if !has_sender {
         return Ok(None);
     }
-    Ok(sqlx::query_as(
-        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender FROM intake_inbound
+    let wa_ts = wa_ts_column(pool, "").await?;
+    Ok(sqlx::query_as(&format!(
+        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender, {wa_ts} FROM intake_inbound
           WHERE item_key = ?1 AND sender = 'operator' AND chat_id NOT LIKE ?2 AND (?3 IS NULL OR chat_id = ?3)
-          ORDER BY id DESC LIMIT 1",
-    )
+          ORDER BY id DESC LIMIT 1"
+    ))
     .bind(INTAKE_CHAT_KEY)
     .bind(format!("%@{}", "g.us"))
     .bind(chat)
@@ -506,15 +525,16 @@ pub async fn current_turn_messages(pool: &SqlitePool, chat: &str) -> Result<Vec<
     if !has_sender {
         return Ok(vec![]);
     }
-    Ok(sqlx::query_as(
-        "SELECT i.id, i.item_key, i.chat_id, i.wa_msg_id, i.text, i.received_at, i.input_kind, i.sender
+    let wa_ts = wa_ts_column(pool, "i.").await?;
+    Ok(sqlx::query_as(&format!(
+        "SELECT i.id, i.item_key, i.chat_id, i.wa_msg_id, i.text, i.received_at, i.input_kind, i.sender, {wa_ts}
            FROM intake_inbound i
            JOIN chat_inbound c ON c.chat_id = i.chat_id AND c.wa_msg_id = i.wa_msg_id
           WHERE i.chat_id = ?1 AND i.item_key = ?2 AND i.sender = 'operator'
             AND c.turn_id = (SELECT id FROM chat_turns WHERE chat_id = ?1 AND status = 'running'
                               ORDER BY started_at DESC LIMIT 1)
-          ORDER BY i.id",
-    )
+          ORDER BY i.id"
+    ))
     .bind(chat)
     .bind(INTAKE_CHAT_KEY)
     .fetch_all(pool)
@@ -537,29 +557,33 @@ pub async fn interrupted_chat_messages(pool: &SqlitePool) -> Result<Vec<IntakeIn
     if !has_sender {
         return Ok(vec![]);
     }
+    let wa_ts = wa_ts_column(pool, "i.").await?;
     let since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    Ok(sqlx::query_as(
-        "SELECT DISTINCT i.id, i.item_key, i.chat_id, i.wa_msg_id, i.text, i.received_at, i.input_kind, i.sender
+    Ok(sqlx::query_as(&format!(
+        "SELECT DISTINCT i.id, i.item_key, i.chat_id, i.wa_msg_id, i.text, i.received_at, i.input_kind, i.sender, {wa_ts}
            FROM intake_inbound i
            JOIN chat_inbound c ON c.chat_id = i.chat_id AND c.wa_msg_id = i.wa_msg_id
            LEFT JOIN chat_turns t ON t.id = c.turn_id
           WHERE i.item_key = ?1 AND i.sender = 'operator' AND i.received_at >= ?2
             AND (c.status = 'interrupted' OR t.status = 'interrupted')
-          ORDER BY i.id",
-    )
+          ORDER BY i.id"
+    ))
     .bind(INTAKE_CHAT_KEY)
     .bind(since)
     .fetch_all(pool)
     .await?)
 }
 
-/// When the outbound row with `dedup_key` was sent (`sent_at` of a `sent`
-/// row), if it was.
-pub async fn sent_at_by_dedup(pool: &SqlitePool, dedup_key: &str) -> Result<Option<String>> {
-    Ok(sqlx::query_scalar("SELECT sent_at FROM outbound_queue WHERE dedup_key = ?1 AND status = 'sent' AND sent_at IS NOT NULL")
-        .bind(dedup_key)
-        .fetch_optional(pool)
-        .await?)
+/// When the outbound row with `dedup_key` was sent, if it was: its
+/// `sent_at` (the bot's clock) and WhatsApp's server timestamp of the sent
+/// message in seconds (`wa_ts`, from the send result, when known).
+pub async fn sent_by_dedup(pool: &SqlitePool, dedup_key: &str) -> Result<Option<(String, Option<i64>)>> {
+    Ok(sqlx::query_as(
+        "SELECT sent_at, wa_ts FROM outbound_queue WHERE dedup_key = ?1 AND status = 'sent' AND sent_at IS NOT NULL",
+    )
+    .bind(dedup_key)
+    .fetch_optional(pool)
+    .await?)
 }
 
 /// Add `line` as a new paragraph to the outbound row with `dedup_key` while
@@ -605,8 +629,9 @@ pub async fn intake_inbound_after(pool: &SqlitePool, after: i64, limit: i64) -> 
         .fetch_one(pool)
         .await?;
     let sender = if has_sender { "sender" } else { "'unknown' AS sender" };
+    let wa_ts = wa_ts_column(pool, "").await?;
     Ok(sqlx::query_as(&format!(
-        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, input_kind, {sender} FROM intake_inbound
+        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, input_kind, {sender}, {wa_ts} FROM intake_inbound
           WHERE id > ?1 ORDER BY id LIMIT ?2"
     ))
     .bind(after)
@@ -812,6 +837,24 @@ mod tests {
         // Before the bot created its tables, nothing is there to read.
         assert!(intake_group(&pool, "3").await.unwrap().is_none());
         assert!(intake_inbound_after(&pool, 0, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_append_succeeds_only_on_a_pending_row() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let pool = open(dir.path()).await.unwrap();
+        enqueue_text_once(&pool, "dm", "Question?", "intake:ask", "k1").await.unwrap();
+        assert!(append_to_pending(&pool, "k1", "Also received: 'x'").await.unwrap());
+        let body: String = sqlx::query_scalar("SELECT body FROM outbound_queue WHERE dedup_key = 'k1'").fetch_one(&pool).await.unwrap();
+        assert_eq!(body, "Question?\n\nAlso received: 'x'");
+        // Claimed by the drain: the append is refused (the caller queues the
+        // separate note) and the body is unchanged.
+        sqlx::query("UPDATE outbound_queue SET status = 'in_flight' WHERE dedup_key = 'k1'").execute(&pool).await.unwrap();
+        assert!(!append_to_pending(&pool, "k1", "Also received: 'y'").await.unwrap());
+        let body: String = sqlx::query_scalar("SELECT body FROM outbound_queue WHERE dedup_key = 'k1'").fetch_one(&pool).await.unwrap();
+        assert!(!body.contains("'y'"));
+        assert!(!append_to_pending(&pool, "missing", "z").await.unwrap());
     }
 
     #[tokio::test]
