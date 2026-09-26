@@ -30,8 +30,8 @@
 //! **Write ownership (ADR-020).** intake.db is written only through this
 //! module, inside the `nucleus` binary (the CLI, the tick, the dashboard's
 //! write routes). whatsapp.db is the bot's: Rust inserts into its queue
-//! tables (`outbound_queue`, `intake_group_requests`) and reads
-//! `intake_groups` and `intake_inbound`.
+//! table `outbound_queue`, writes the one-row `intake_chat_block`, and reads
+//! `intake_inbound`.
 
 pub mod briefs;
 pub mod decide;

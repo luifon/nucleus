@@ -682,8 +682,6 @@ pub struct IntakeConfig {
     #[serde(default)]
     pub github: IntakeGithubConfig,
     #[serde(default)]
-    pub whatsapp: IntakeWhatsAppConfig,
-    #[serde(default)]
     pub texts: IntakeTexts,
 }
 
@@ -726,24 +724,6 @@ pub struct IntakeGithubConfig {
     /// `owner/name`. Nucleus never reads a remote URL from a clone.
     #[serde(default = "default_intake_remote_url")]
     pub remote_url: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct IntakeWhatsAppConfig {
-    /// Create a WhatsApp group (the bot and the operator only) for each item
-    /// that reaches refinement. Off: every item thread runs in the DM.
-    #[serde(default = "default_true_bool")]
-    pub refinement_groups: bool,
-    /// At most this many groups are created in any 24 hours. Automated group
-    /// creation from a personal account can trigger WhatsApp's anti-spam
-    /// checks; past the limit the item's thread runs in the DM.
-    #[serde(default = "default_intake_max_groups_per_day")]
-    pub max_groups_per_day: u32,
-    /// A group that the bot has not created after this many minutes (bot
-    /// offline, creation failed without an answer) is given up and the
-    /// thread runs in the DM.
-    #[serde(default = "default_intake_group_wait_minutes")]
-    pub group_wait_minutes: u32,
 }
 
 /// Operator-facing texts of the pipeline (`[intake.texts]`), all written by
@@ -1014,12 +994,6 @@ fn default_intake_max_pages() -> u32 {
 fn default_intake_remote_url() -> String {
     "https://github.com/{repo}.git".into()
 }
-fn default_intake_max_groups_per_day() -> u32 {
-    3
-}
-fn default_intake_group_wait_minutes() -> u32 {
-    15
-}
 
 impl Default for IntakeConfig {
     fn default() -> Self {
@@ -1040,7 +1014,6 @@ impl Default for IntakeConfig {
             hidden_content_hold: true,
             repos: vec![],
             github: IntakeGithubConfig::default(),
-            whatsapp: IntakeWhatsAppConfig::default(),
             texts: IntakeTexts::default(),
         }
     }
@@ -1054,16 +1027,6 @@ impl Default for IntakeGithubConfig {
             collaborator_cache_secs: default_intake_collaborator_cache_secs(),
             max_pages: default_intake_max_pages(),
             remote_url: default_intake_remote_url(),
-        }
-    }
-}
-
-impl Default for IntakeWhatsAppConfig {
-    fn default() -> Self {
-        Self {
-            refinement_groups: true,
-            max_groups_per_day: default_intake_max_groups_per_day(),
-            group_wait_minutes: default_intake_group_wait_minutes(),
         }
     }
 }

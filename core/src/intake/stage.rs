@@ -293,40 +293,6 @@ pub fn split_plan(reply: &str, label: &str) -> (String, Option<String>) {
     (shown.trim().to_string(), (!plan.is_empty()).then_some(plan))
 }
 
-// ── WhatsApp groups ──────────────────────────────────────────────────────
-
-/// True when one more group may be requested: fewer than `max_per_day`
-/// requests in the 24 hours before `now`. `requested` holds the request
-/// times (RFC3339).
-pub fn group_budget_allows(requested: &[String], now: chrono::DateTime<chrono::Utc>, max_per_day: u32) -> bool {
-    if max_per_day == 0 {
-        return false;
-    }
-    let since = now - chrono::Duration::hours(24);
-    let recent = requested
-        .iter()
-        .filter_map(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .filter(|t| t.with_timezone(&chrono::Utc) > since)
-        .count();
-    recent < max_per_day as usize
-}
-
-/// WhatsApp group subject for an item: `#<n> <short title>`, at most 60
-/// characters.
-pub fn group_subject(n: i64, title: &str) -> String {
-    let head = format!("#{n} ");
-    let room = 60usize.saturating_sub(head.chars().count());
-    let title: String = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let short = if title.chars().count() > room {
-        let mut s: String = title.chars().take(room.saturating_sub(1)).collect();
-        s.push('…');
-        s
-    } else {
-        title
-    };
-    format!("{head}{short}")
-}
-
 /// Branch name for an item: `nucleus/item-<n>`. Code-owned: no part of
 /// the issue title goes into it, because the branch name is written into
 /// the implementation agent's brief outside the data fence.
@@ -477,22 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn group_budget_counts_the_last_24_hours() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
-        let old = "2026-09-23T11:00:00.000Z".to_string();
-        let recent = "2026-09-24T09:00:00.000Z".to_string();
-        assert!(group_budget_allows(&[], now, 3));
-        assert!(group_budget_allows(&[recent.clone(), recent.clone(), old.clone(), old.clone()], now, 3));
-        assert!(!group_budget_allows(&[recent.clone(), recent.clone(), recent.clone()], now, 3));
-        assert!(!group_budget_allows(&[], now, 0), "0 disables group creation");
-    }
-
-    #[test]
-    fn subjects_and_branches() {
-        assert_eq!(group_subject(7, "Fix  the\ttypo"), "#7 Fix the typo");
-        let long = group_subject(12, &"word ".repeat(40));
-        assert_eq!(long.chars().count(), 60);
-        assert!(long.starts_with("#12 word") && long.ends_with('…'));
+    fn branches() {
         assert_eq!(branch_name(3), "nucleus/item-3");
     }
 }

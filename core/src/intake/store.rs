@@ -214,7 +214,7 @@ ALTER TABLE items DROP COLUMN comment_draft";
 
 /// Confirmation questions the pipeline asked the operator on WhatsApp
 /// (ADR-036, "Operator decisions"). A question is asked in one place
-/// (`scope`: `dm` or `group:<n>`) and only the next answer from there
+/// (`scope`: `dm`; `group:<n>` until groups were removed, see [`SCHEMA_V5`]) and only the next answer from there
 /// settles it, until `expires_at`. The decision is stored with what the
 /// operator saw when he was asked: the plan version or the hold
 /// fingerprint it binds to.
@@ -243,6 +243,24 @@ CREATE TABLE confirmations (
 );
 CREATE INDEX idx_confirmations_scope ON confirmations(scope, state, id)";
 
+/// Per-item WhatsApp groups are removed (ADR-036, "Amendment: no WhatsApp
+/// groups"): every item's WhatsApp surface is the operator's DM.
+///
+/// - an item whose thread ran in a group (`group`) or waited for one
+///   (`pending`) now uses the DM;
+/// - a confirmation question still open in a group scope can no longer be
+///   answered there: it is closed as `replaced`;
+/// - the group columns are dropped. The bot's own group tables in
+///   whatsapp.db are dropped by the bot after it has left every group they
+///   record (messaging/whatsapp/src/intake.ts).
+const SCHEMA_V5: &str = "
+UPDATE items SET surface = 'dm' WHERE surface IN ('group', 'pending');
+UPDATE confirmations SET state = 'replaced', closed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE scope LIKE 'group:%' AND state = 'pending';
+ALTER TABLE items DROP COLUMN group_requested_at;
+ALTER TABLE items DROP COLUMN group_jid;
+ALTER TABLE items DROP COLUMN group_closed_at";
+
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(super::INTAKE_DB_PATH)).await?;
@@ -253,6 +271,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             crate::migrate::Migration { version: 2, name: "hidden-content hold", step: crate::migrate::Step::Sql(SCHEMA_V2) },
             crate::migrate::Migration { version: 3, name: "no comment approval", step: crate::migrate::Step::Sql(SCHEMA_V3) },
             crate::migrate::Migration { version: 4, name: "operator confirmations", step: crate::migrate::Step::Sql(SCHEMA_V4) },
+            crate::migrate::Migration { version: 5, name: "no whatsapp groups", step: crate::migrate::Step::Sql(SCHEMA_V5) },
         ],
     )
     .await
@@ -261,7 +280,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// True when `pool` (a read-only intake.db) has the full schema: the
 /// migration ledger records [`SCHEMA_VERSION`] and the item tables exist.
@@ -560,12 +579,9 @@ pub struct Item {
     /// The random operation id of the issue comment (stored before it is
     /// posted; its marker line finds an earlier post after a crash).
     pub comment_op: Option<String>,
-    /// Where the item's thread runs on WhatsApp: `none` (not yet),
-    /// `pending` (group requested), `group`, `dm`.
+    /// Whether the item has a WhatsApp thread: `none` (nothing sent yet) or
+    /// `dm` (its notices go to the operator's DM, marked `#<n>`).
     pub surface: String,
-    pub group_requested_at: Option<String>,
-    pub group_jid: Option<String>,
-    pub group_closed_at: Option<String>,
     /// The stage task running now.
     pub current_task_id: Option<String>,
     /// The task the next stage task names as its parent.
@@ -674,7 +690,7 @@ pub struct ItemTask {
 const ITEM_COLUMNS: &str = "id, event_id, repo, title, stage, failed_stage, error, classification, eval_json, \
     plan_draft, plan_version, approved_plan, approved_version, approved_at, approved_via, branch, worktree, \
     base_ref, impl_summary, head_sha, tests_status, tests_output, pr_url, comment_state, comment_url, comment_op, \
-    surface, group_requested_at, group_jid, group_closed_at, current_task_id, last_task_id, step_errors, \
+    surface, current_task_id, last_task_id, step_errors, \
     created_at, updated_at, closed_at, rev_title, rev_body, revision_hash, gate_event_id, label_event_id, \
     gate_actor, gate_at, stale_reason, base_sha, pushed_sha, hold_stage, hold_json, hold_hash, held_at, \
     released_hash, released_at, released_via";
@@ -843,9 +859,6 @@ const SETTABLE: &[&str] = &[
     "comment_url",
     "comment_op",
     "surface",
-    "group_requested_at",
-    "group_jid",
-    "group_closed_at",
     "current_task_id",
     "last_task_id",
     "step_errors",
@@ -1507,13 +1520,6 @@ pub async fn set_meta(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// When each WhatsApp group was requested (the group budget).
-pub async fn group_request_times(pool: &SqlitePool) -> Result<Vec<String>> {
-    Ok(sqlx::query_scalar("SELECT group_requested_at FROM items WHERE group_requested_at IS NOT NULL")
-        .fetch_all(pool)
-        .await?)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1763,6 +1769,79 @@ pub(crate) mod tests {
         let it = item(&pool, 6).await.unwrap();
         assert!(advance(&pool, 6, it.stage(), StageEvent::Retry { failed_in: Stage::Pr }, "retry", vec![]).await.unwrap());
         assert_eq!(item(&pool, 6).await.unwrap().stage(), Stage::Pr);
+    }
+
+    /// A database at version 4, as the deployed code left it.
+    pub(crate) async fn db_at_v4(dir: &Path) -> SqlitePool {
+        std::fs::create_dir_all(dir.join("memory")).unwrap();
+        let pool = crate::db::open(&dir.join(super::super::INTAKE_DB_PATH)).await.unwrap();
+        crate::migrate::migrate(
+            &pool,
+            &[
+                crate::migrate::Migration { version: 1, name: "intake schema", step: crate::migrate::Step::Sql(SCHEMA_V1) },
+                crate::migrate::Migration { version: 2, name: "hidden-content hold", step: crate::migrate::Step::Sql(SCHEMA_V2) },
+                crate::migrate::Migration { version: 3, name: "no comment approval", step: crate::migrate::Step::Sql(SCHEMA_V3) },
+                crate::migrate::Migration { version: 4, name: "operator confirmations", step: crate::migrate::Step::Sql(SCHEMA_V4) },
+            ],
+        )
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn the_group_surfaces_are_migrated_to_the_dm() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db_at_v4(dir.path()).await;
+        // (surface, group_jid, stage): a cancelled item whose thread ran in a
+        // group, one waiting for its group, one in the DM, one not on
+        // WhatsApp yet.
+        let rows = [("group", Some("g1"), "cancelled"), ("pending", None, "refinement"), ("dm", None, "refinement"), ("none", None, "eval")];
+        for (n, (surface, jid, stage)) in rows.into_iter().enumerate() {
+            let ev = sqlx::query(
+                "INSERT INTO events (source, external_id, kind, title, body, labels_json, state, raw_json, accepted, first_seen_at, last_seen_at)
+                 VALUES ('github', ?1, 'issue', 't', 'b', '[]', 'open', '{}', 1, 't', 't')",
+            )
+            .bind(format!("acme/widget#{n}"))
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            sqlx::query(
+                "INSERT INTO items (event_id, repo, title, stage, surface, group_jid, group_requested_at, created_at, updated_at)
+                 VALUES (?1, 'acme/widget', 't', ?2, ?3, ?4, CASE WHEN ?3 IN ('group', 'pending') THEN 't' END, 't', 't')",
+            )
+            .bind(ev)
+            .bind(stage)
+            .bind(surface)
+            .bind(jid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (scope, state) in [("group:1", "pending"), ("dm", "pending"), ("group:2", "declined")] {
+            sqlx::query(
+                "INSERT INTO confirmations (scope, item_id, decision, question, asked_by, state, created_at, expires_at)
+                 VALUES (?1, 2, 'cancel', 'q', 'wa:x', ?2, 't', '9999')",
+            )
+            .bind(scope)
+            .bind(state)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+        let pool = open(dir.path()).await.unwrap();
+        assert!(schema_ready(&pool).await);
+        let surfaces: Vec<String> = sqlx::query_scalar("SELECT surface FROM items ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(surfaces, ["dm", "dm", "dm", "none"]);
+        let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('items')").fetch_all(&pool).await.unwrap();
+        assert!(!cols.iter().any(|c| c.starts_with("group_")), "{cols:?}");
+        let states: Vec<String> = sqlx::query_scalar("SELECT state FROM confirmations ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(states, ["replaced", "pending", "declined"], "an open question in a group scope is closed");
+        for id in 1..=4 {
+            item(&pool, id).await.expect("every migrated row reads as an Item");
+        }
     }
 
     #[tokio::test]
