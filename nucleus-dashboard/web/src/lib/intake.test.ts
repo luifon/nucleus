@@ -1,9 +1,17 @@
 import { describe, expect, test } from "vitest";
-import type { IntakeItem } from "@/lib/api/intake";
+import { ApiError } from "@/lib/api/client";
+import { fixtureItem } from "./intake.fixtures";
 import {
   authorLabel,
   canApprovePlan,
+  canApproveShown,
   canCancelItem,
+  canCompose,
+  enterSends,
+  itemFromSearch,
+  planStatus,
+  planVersions,
+  sendReply,
   canRelease,
   canReply,
   findingKindLabel,
@@ -18,64 +26,7 @@ import {
   waitingOn,
 } from "./intake";
 
-function item(over: Partial<IntakeItem> = {}): IntakeItem {
-  return {
-    id: 4,
-    event_id: 1,
-    repo: "acme/widget",
-    title: "Fix typo",
-    stage: "refinement",
-    failed_stage: null,
-    error: null,
-    classification: "complex",
-    eval_json: null,
-    plan_draft: null,
-    plan_version: 0,
-    approved_plan: null,
-    approved_version: null,
-    approved_at: null,
-    approved_via: null,
-    branch: null,
-    worktree: null,
-    base_ref: null,
-    impl_summary: null,
-    tests_status: null,
-    tests_output: null,
-    pr_url: null,
-    comment_state: "none",
-    comment_url: null,
-    comment_op: null,
-    surface: "group",
-    group_requested_at: null,
-    group_jid: null,
-    group_closed_at: null,
-    current_task_id: null,
-    last_task_id: null,
-    step_errors: 0,
-    created_at: "2026-09-24T10:00:00.000Z",
-    updated_at: "2026-09-24T10:00:00.000Z",
-    closed_at: null,
-    head_sha: null,
-    rev_title: "Fix typo",
-    rev_body: "body",
-    revision_hash: null,
-    gate_event_id: "labeled:1",
-    label_event_id: "labeled:1",
-    gate_actor: "maintainer",
-    gate_at: "2026-09-24T09:00:00.000Z",
-    stale_reason: null,
-    base_sha: null,
-    pushed_sha: null,
-    hold_stage: null,
-    hold_json: null,
-    hold_hash: null,
-    held_at: null,
-    released_hash: null,
-    released_at: null,
-    released_via: null,
-    ...over,
-  };
-}
+const item = fixtureItem;
 
 describe("plan approval", () => {
   test("needs a plan and no running turn", () => {
@@ -186,5 +137,86 @@ describe("stale and blocked items", () => {
     expect(canCancelItem(s)).toBe(false);
     expect(stageKind(s)).toBe("down");
     expect(waitingOn(s)).toMatch(/add the label again/);
+  });
+});
+
+describe("item page", () => {
+  test("the deep link parameter names a positive item number", () => {
+    const at = (q: string) => itemFromSearch(new URLSearchParams(q));
+    expect(at("item=12")).toBe(12);
+    expect(at("item= 7 ")).toBe(7);
+    expect(at("")).toBeNull();
+    expect(at("item=0")).toBeNull();
+    expect(at("item=-3")).toBeNull();
+    expect(at("item=4x")).toBeNull();
+    expect(at("item=99999999999999999999")).toBeNull();
+  });
+
+  test("plan versions come from `plans`, oldest first", () => {
+    const plans = [
+      { version: 2, text: "two", at: "2026-09-24T11:00:00.000Z" },
+      { version: 1, text: "one", at: "2026-09-24T10:00:00.000Z" },
+    ];
+    expect(planVersions({ item: item({ plan_version: 2, plan_draft: "two" }), plans }).map((p) => p.version)).toEqual([1, 2]);
+  });
+
+  test("without `plans` the versions are rebuilt from the item row", () => {
+    expect(planVersions({ item: item() })).toEqual([]);
+    expect(planVersions({ item: item({ plan_version: 3, plan_draft: "draft" }), plans: [] })).toEqual([{ version: 3, text: "draft", at: null }]);
+    const approved = item({
+      stage: "implementation",
+      plan_version: 3,
+      plan_draft: "draft",
+      approved_plan: "draft",
+      approved_version: 3,
+      approved_at: "2026-09-24T12:00:00.000Z",
+    });
+    expect(planVersions({ item: approved })).toEqual([{ version: 3, text: "draft", at: "2026-09-24T12:00:00.000Z" }]);
+  });
+
+  test("plan status and the approve button follow the version on screen", () => {
+    const it = item({ plan_version: 3 });
+    expect(planStatus(3, it)).toBe("proposed");
+    expect(planStatus(2, it)).toBe("replaced");
+    expect(planStatus(3, item({ plan_version: 3, approved_version: 3 }))).toBe("approved");
+    expect(canApproveShown(it, 3)).toBe(true);
+    expect(canApproveShown(it, 2)).toBe(false);
+    expect(canApproveShown(it, null)).toBe(false);
+    expect(canApproveShown(item({ plan_version: 3, current_task_id: "t" }), 3)).toBe(false);
+  });
+
+  test("the composer is open until the item is finished", () => {
+    expect(canCompose(item())).toBe(true);
+    expect(canCompose(item({ stage: "implementation" }))).toBe(true);
+    expect(canCompose(item({ stage: "closed" }))).toBe(false);
+  });
+
+  test("Enter sends on a desktop keyboard only", () => {
+    expect(enterSends({ key: "Enter", shiftKey: false }, false)).toBe(true);
+    expect(enterSends({ key: "Enter", shiftKey: true }, false)).toBe(false);
+    expect(enterSends({ key: "Enter", shiftKey: false, isComposing: true }, false)).toBe(false);
+    expect(enterSends({ key: "Enter", shiftKey: false }, true)).toBe(false);
+    expect(enterSends({ key: "a", shiftKey: false }, false)).toBe(false);
+  });
+
+  test("a reply posts the id and text; a 409 is the pipeline's message for the operator", async () => {
+    const calls: [number, string][] = [];
+    const ok = await sendReply(4, "looks good", async (id, text) => {
+      calls.push([id, text]);
+      return item();
+    });
+    expect(calls).toEqual([[4, "looks good"]]);
+    expect(ok.kind).toBe("sent");
+
+    const notInRefinement = "Item #4 is in implementation; replies are read during refinement only.";
+    const refused = await sendReply(4, "x", async () => {
+      throw new ApiError("/intake/api/reply", 409, notInRefinement);
+    });
+    expect(refused).toEqual({ kind: "refused", message: notInRefinement });
+
+    const broken = await sendReply(4, "x", async () => {
+      throw new ApiError("/intake/api/reply", 500, "database locked");
+    });
+    expect(broken).toEqual({ kind: "error", message: "database locked" });
   });
 });

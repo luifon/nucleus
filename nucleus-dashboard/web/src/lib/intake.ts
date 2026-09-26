@@ -4,7 +4,7 @@
 // be refused.
 
 import type { StatusKind } from "@/components/StatusPill";
-import type { IntakeHiddenFinding, IntakeItem, IntakeMessage, IntakeStage } from "@/lib/api/intake";
+import type { IntakeHiddenFinding, IntakeItem, IntakeMessage, IntakePlanVersion, IntakeStage } from "@/lib/api/intake";
 
 /** The stages in pipeline order, for the stage track. */
 export const STAGE_TRACK: readonly IntakeStage[] = ["queued", "eval", "refinement", "implementation", "pr", "closed"];
@@ -181,5 +181,103 @@ export function surfaceLabel(item: Pick<IntakeItem, "surface" | "id">): string {
       return `WhatsApp DM, marked #${item.id}`;
     default:
       return "not on WhatsApp yet";
+  }
+}
+
+/** Closed, cancelled or stale: nothing changes any more, so the item page
+ *  stops refreshing and offers no actions. */
+export function isTerminal(stage: IntakeStage): boolean {
+  return !isOpenItem(stage);
+}
+
+/** The deep link to an item's page (`/intake?item=<n>`), which the
+ *  WhatsApp notices carry. */
+export function itemHref(id: number): string {
+  return `/intake?item=${id}`;
+}
+
+/** The item a `/intake` URL opens: a positive integer `item` parameter,
+ *  or null for the list. */
+export function itemFromSearch(params: URLSearchParams): number | null {
+  const raw = params.get("item")?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+/** A plan version as the plan panel shows it. `at` is null for a version
+ *  rebuilt from the item row (servers that do not send `plans`). */
+export interface PlanVersionView {
+  version: number;
+  text: string;
+  at: string | null;
+}
+
+/** Every plan version, oldest first. Uses `plans` from the detail when the
+ *  server sends it; otherwise rebuilds what the item row still holds (the
+ *  approved plan and the latest draft). */
+export function planVersions(detail: { item: IntakeItem; plans?: readonly IntakePlanVersion[] | null }): PlanVersionView[] {
+  const plans = detail.plans ?? [];
+  if (plans.length > 0) {
+    return [...plans].sort((a, b) => a.version - b.version).map((p) => ({ version: p.version, text: p.text, at: p.at }));
+  }
+  const it = detail.item;
+  const out: PlanVersionView[] = [];
+  if (it.approved_plan !== null && it.approved_version !== null) {
+    out.push({ version: it.approved_version, text: it.approved_plan, at: it.approved_at });
+  }
+  if (it.plan_draft !== null && it.plan_version > 0 && it.plan_version !== it.approved_version) {
+    out.push({ version: it.plan_version, text: it.plan_draft, at: null });
+  }
+  return out.sort((a, b) => a.version - b.version);
+}
+
+/** How a plan version stands: approved, the proposal waiting for a
+ *  decision, or an earlier proposal a later one replaced. */
+export function planStatus(version: number, item: Pick<IntakeItem, "approved_version" | "plan_version">): "approved" | "proposed" | "replaced" {
+  if (item.approved_version === version) return "approved";
+  if (item.approved_version === null && version === item.plan_version) return "proposed";
+  return "replaced";
+}
+
+/** The approve button shows only for the version on screen, when that is
+ *  the item's current proposal and the item can take an approval. */
+export function canApproveShown(
+  item: Pick<IntakeItem, "stage" | "plan_version" | "current_task_id">,
+  shownVersion: number | null,
+): boolean {
+  return shownVersion !== null && shownVersion === item.plan_version && canApprovePlan(item);
+}
+
+/** The composer is open while the item is not finished; the server
+ *  refuses a reply outside refinement and the page shows its message. */
+export function canCompose(item: Pick<IntakeItem, "stage">): boolean {
+  return isOpenItem(item.stage);
+}
+
+/** Enter sends on a keyboard with a fine pointer; Shift+Enter, an IME
+ *  composition, or a touch keyboard (coarse pointer) add a new line. */
+export function enterSends(e: { key: string; shiftKey: boolean; isComposing?: boolean }, coarsePointer: boolean): boolean {
+  return e.key === "Enter" && !e.shiftKey && !e.isComposing && !coarsePointer;
+}
+
+/** What a reply attempt ended in. `refused`: the pipeline answered 409 with
+ *  a message for the operator (not in refinement, empty, too long). */
+export type ReplyOutcome =
+  | { kind: "sent"; item: IntakeItem }
+  | { kind: "refused"; message: string }
+  | { kind: "error"; message: string };
+
+export async function sendReply(
+  id: number,
+  text: string,
+  post: (id: number, text: string) => Promise<IntakeItem>,
+): Promise<ReplyOutcome> {
+  try {
+    return { kind: "sent", item: await post(id, text) };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    const status = (e as { status?: unknown } | null)?.status;
+    return status === 409 ? { kind: "refused", message } : { kind: "error", message };
   }
 }

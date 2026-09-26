@@ -51,10 +51,21 @@ export type IntakeMessage = Omit<IntakeMessageWire, "author" | "via"> & {
   via: "whatsapp" | "dashboard" | "cli" | "pipeline" | "whatsapp-session";
 };
 
+// TEMPORARY — remove when the generated type includes plans. The backend
+// change that adds `plans` to the detail response is built on a parallel
+// branch; until it merges, IntakeDetailWire has no such field and older
+// servers do not send it. Replace with the generated `IntakePlanVersion`
+// and drop the optional `plans` below once `npm run generate:api` emits it.
+/** One stored plan version of an item (oldest first in `plans`). */
+export type IntakePlanVersion = { version: number; text: string; at: string };
+
 export type IntakeDetail = Omit<IntakeDetailWire, "item" | "messages" | "tasks"> & {
   item: IntakeItem;
   messages: IntakeMessage[];
   tasks: Task[];
+  /** TEMPORARY optional (remove when the generated type includes plans):
+   *  every plan version, oldest first. Read as `detail.plans ?? []`. */
+  plans?: IntakePlanVersion[];
 };
 
 /** Newest first. `all: false` leaves out closed and cancelled items, and
