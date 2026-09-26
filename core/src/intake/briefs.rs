@@ -340,6 +340,16 @@ Your final message is shown to the operator on the dashboard, as you write it; W
 short notice with its first words. Keep it short and concrete. Ask the questions you need \
 answered, one short list at most. Write in the language of the operator's messages (English when \
 there are none).\n\n\
+The dashboard can show a question as options the operator clicks. To ask one that way, put a canvas \
+block in your final message, in the format of the dashboard chat (ADR-012): a line \
+<canvas v=\"1\" type=\"TYPE\" id=\"UNIQUE-ID\" title=\"Short title\">, one JSON object, and a line \
+</canvas>. TYPE is decision ({{\"options\":[{{\"key\":\"a\",\"label\":\"Option A\"}}]}}, pick one), \
+multi-select ({{\"options\":[{{\"key\":\"a\",\"label\":\"Item A\",\"checked\":true}}]}}), confirm \
+({{\"prompt\":\"Keep the old endpoint?\"}}) or form ({{\"fields\":[{{\"key\":\"name\",\"label\":\"Name\",\
+\"kind\":\"text\"}}]}}). Use a new id for every block and one block per question. The operator's choice \
+comes back as his next message, <canvas-response v=\"1\" id=\"...\" type=\"...\">{{...}}</canvas-response>; \
+a plain-text answer counts the same. Never offer approving the plan, releasing the item or cancelling \
+it as an option: those decisions come from Nucleus, not from you.\n\n\
 When you have a complete plan, include it once in your final message between a line \
 {PLAN_OPEN} and a line {PLAN_CLOSE}. The plan becomes the implementation agent's only brief: \
 make it self-contained (goal, the files and parts to change, the steps, the tests to add or \
@@ -650,6 +660,10 @@ pub(crate) mod tests {
         let r = refinement_brief(&long, &ev, &d, &thread, 199).unwrap();
         assert!(r.contains(PLAN_OPEN) && r.contains("[earlier messages left out]"));
         assert!(r.contains(&format!("at most {PLAN_LIMIT} characters")), "the agent is told the limit");
+        // Questions as canvas blocks, never the operator's decisions.
+        assert!(r.contains(r#"<canvas v="1" type="TYPE" id="UNIQUE-ID" title="Short title">"#), "the canvas format");
+        assert!(r.contains(r#"{"options":[{"key":"a","label":"Option A"}]}"#), "JSON braces are not doubled");
+        assert!(r.contains("Never offer approving the plan, releasing the item or cancelling it as an option"));
         assert!(r.chars().count() < crate::tasks::MAX_BRIEF_CHARS, "{}", r.chars().count());
         let i = implementation_brief(&long, &ev, &d, "nucleus/item-1-fix", "main", Some("cargo test")).unwrap();
         assert!(i.contains("`cargo test`") && i.contains("Do not push"));
