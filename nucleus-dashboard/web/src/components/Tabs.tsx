@@ -16,18 +16,23 @@ export default function Tabs<T extends string>({
   tabs,
   value,
   onChange,
+  className = "mb-5",
 }: {
   tabs: Tab<T>[];
   value: T;
   onChange: (next: T) => void;
+  /** Outer spacing; the strip's own border and layout stay fixed. */
+  className?: string;
 }) {
   return (
-    <div className="mb-5 flex items-center gap-1 border-b border-[var(--color-nucleus-border)]">
+    <div role="tablist" className={`flex items-center gap-1 border-b border-[var(--color-nucleus-border)] ${className}`}>
       {tabs.map((t) => {
         const active = t.value === value;
         return (
           <button
             key={t.value}
+            role="tab"
+            aria-selected={active}
             onClick={() => onChange(t.value)}
             className={[
               "relative -mb-px flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm transition-colors",
