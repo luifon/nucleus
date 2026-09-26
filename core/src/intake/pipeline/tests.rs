@@ -1602,3 +1602,19 @@ async fn with_the_hold_off_nothing_is_held() {
     let eval = tasks::get(&f.ctx.tasks_db, it.current_task_id.as_deref().unwrap(), &Scope::Operator).await.unwrap();
     assert!(!eval.brief.contains(crate::intake::briefs::RELEASED_NOTE));
 }
+
+#[test]
+fn only_the_configured_author_email_is_left_out_of_the_guard_input() {
+    let email = "pipeline@example.invalid";
+    let header = format!("Nucleus issue pipeline <{email}>\nNucleus issue pipeline <{email}>\nImplement #8\n\nwrite to other@example.invalid\n");
+    let scanned = super::header_for_guard(&header, email);
+    assert!(!scanned.contains(email), "{scanned}");
+    assert_eq!(scanned.matches("<configured commit author email>").count(), 2);
+    // Any other address still reaches the guard.
+    assert!(scanned.contains("other@example.invalid"));
+    // The bare address outside the author/committer brackets is not replaced.
+    let bare = format!("A <{email}>\nsee {email}\n");
+    assert!(super::header_for_guard(&bare, email).contains(&format!("see {email}")));
+    // No configured email: the header is unchanged.
+    assert_eq!(super::header_for_guard(&header, ""), header);
+}

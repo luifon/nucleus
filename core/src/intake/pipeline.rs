@@ -1678,9 +1678,26 @@ fn commit_spec(ctx: &Ctx, item: &Item, ev: &Event) -> git::CommitSpec {
     };
     git::CommitSpec {
         author_name: publish::plain_line(&ctx.cfg.commit_author_name, 100),
-        author_email: publish::plain_line(&ctx.cfg.commit_author_email, 200).replace('＠', "@"),
+        author_email: configured_author_email(ctx),
         message: format!("{subject}\n\nNucleus-Item: {}", item.id),
     }
+}
+
+/// The author and committer email of the one commit Nucleus publishes, as
+/// written into the commit (`[intake] commit_author_email`).
+fn configured_author_email(ctx: &Ctx) -> String {
+    publish::plain_line(&ctx.cfg.commit_author_email, 200).replace('＠', "@")
+}
+
+/// The commit header as the secret guard reads it. The operator chose the
+/// configured author email for publishing, and the guard flags every email
+/// address, so exactly that address (in `<...>`) is replaced by a fixed
+/// label. Any other address in the header is still scanned.
+fn header_for_guard(header: &str, author_email: &str) -> String {
+    if author_email.is_empty() {
+        return header.to_string();
+    }
+    header.replace(&format!("<{author_email}>"), "<configured commit author email>")
 }
 
 /// The line that links the pull request to its source.
@@ -1794,7 +1811,7 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
         )
         .await;
     };
-    let header = git::commit_header(&mirror, &sha).await?;
+    let header = header_for_guard(&git::commit_header(&mirror, &sha).await?, &configured_author_email(ctx));
     if let Verdict::Hit(cats) = ctx.guard.scan(&format!("{title}\n{body}\n{header}\n{added}")).await {
         return block(ctx, item, "the commit or the pull request text", &cats).await;
     }
