@@ -1,8 +1,8 @@
 //! Intake surface (ADR-036): the issue pipeline's items.
 //!
 //!   GET  /intake/api/list?all=          — items, newest first (open only unless all)
-//!   GET  /intake/api/detail?id=         — one item: event, eval, thread, tasks, stage log
-//!   POST /intake/api/reply {id,text}    — operator message in the item's thread
+//!   GET  /intake/api/detail?id=         — one item: event, eval, plan versions, thread, tasks, stage log
+//!   POST /intake/api/reply {id,text}    — operator message in the item's thread (discussion only, any stage)
 //!   POST /intake/api/approve-plan {id,version}
 //!   POST /intake/api/cancel {id}
 //!   POST /intake/api/retry {id}
@@ -16,8 +16,11 @@
 //!
 //! Threat model: as for the Tasks page (ADR-033 §7). The dashboard is on the
 //! tailnet only and acts with the operator's scope. Every write accepts a
-//! JSON body only and refuses a request a browser marks as cross-site. A
-//! plan approval names the version the operator saw; the pipeline refuses
+//! JSON body only and refuses a request a browser marks as cross-site. Text
+//! typed on the dashboard is discussion only: it is stored in the thread
+//! (the refinement agent reads it during refinement) and never interpreted
+//! as a decision; decisions are the explicit routes. A plan approval names
+//! the version the operator saw; the pipeline refuses
 //! it when a newer plan exists or the agent is still answering. A release
 //! of a held item is refused, and the item goes stale, when the issue or a
 //! comment it uses changed after the findings were computed.
@@ -32,7 +35,7 @@ use axum::{
 use nucleus_core::intake::pipeline::{self, Ctx, Refusal};
 use nucleus_core::intake::hidden::{Finding, Hold, Source};
 use nucleus_core::intake::stage::EvalResult;
-use nucleus_core::intake::{store, Event, Item, ItemMessage, ItemTransition};
+use nucleus_core::intake::{store, Event, Item, ItemMessage, ItemTransition, PlanVersion};
 use nucleus_core::tasks::{self, Task};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -72,6 +75,10 @@ struct IntakeDetail {
     /// The raw text of each location that has findings (title, body,
     /// `comment <id>`), complete, for review with the ranges marked.
     hidden_sources: Vec<Source>,
+    /// Every accepted plan version, whole, oldest first. An approval names
+    /// one of these versions (`approve-plan`); only the latest can be
+    /// approved.
+    plans: Vec<PlanVersion>,
     messages: Vec<ItemMessage>,
     /// Every stage task of the item, oldest first (from the task ledger).
     tasks: Vec<Task>,
@@ -94,6 +101,19 @@ struct IntakeReplyReq {
     #[ts(type = "number")]
     id: i64,
     text: String,
+}
+
+/// What `POST /reply` did: the message is saved in the item's thread in
+/// every stage.
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
+struct IntakeReplyResult {
+    item: Item,
+    /// The refinement agent reads the message at its next turn.
+    reaches_agent: bool,
+    /// Why no agent reads it (the item is not in refinement), for the
+    /// operator; null when the agent does.
+    note: Option<String>,
 }
 
 #[derive(Deserialize, ts_rs::TS)]
@@ -148,6 +168,7 @@ async fn detail(State(s): State<Arc<IntakeState>>, Query(q): Query<DetailQ>) -> 
     let eval = item.eval_json.as_deref().and_then(|j| serde_json::from_str(j).ok());
     let hold: Hold = item.hold_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
     let (hidden, hidden_sources) = (hold.findings, hold.sources);
+    let plans = store::plan_versions(&pool, item.id).await.map_err(IntakeError::other)?;
     let messages = store::messages(&pool, item.id).await.map_err(IntakeError::other)?;
     let transitions = store::transitions(&pool, item.id).await.map_err(IntakeError::other)?;
     let mut task_rows = Vec::new();
@@ -160,7 +181,7 @@ async fn detail(State(s): State<Arc<IntakeState>>, Query(q): Query<DetailQ>) -> 
             }
         }
     }
-    Ok(Json(IntakeDetail { item, event, eval, hidden, hidden_sources, messages, tasks: task_rows, transitions }))
+    Ok(Json(IntakeDetail { item, event, eval, hidden, hidden_sources, plans, messages, tasks: task_rows, transitions }))
 }
 
 fn same_origin(headers: &HeaderMap) -> Result<(), IntakeError> {
@@ -215,11 +236,11 @@ fn kick_tick(ws: &std::path::Path) {
     }
 }
 
-fn outcome(r: anyhow::Result<Item>, ws: &std::path::Path) -> Result<Json<Item>, IntakeError> {
+fn outcome<T>(r: anyhow::Result<T>, ws: &std::path::Path) -> Result<Json<T>, IntakeError> {
     match r {
-        Ok(item) => {
+        Ok(v) => {
             kick_tick(ws);
-            Ok(Json(item))
+            Ok(Json(v))
         }
         Err(e) if e.downcast_ref::<Refusal>().is_some() => Err(IntakeError::Conflict(e.to_string())),
         Err(e) => Err(IntakeError::Conflict(format!("{e:#}"))),
@@ -230,10 +251,13 @@ async fn reply(
     State(s): State<Arc<IntakeState>>,
     headers: HeaderMap,
     Json(req): Json<IntakeReplyReq>,
-) -> Result<Json<Item>, IntakeError> {
+) -> Result<Json<IntakeReplyResult>, IntakeError> {
     same_origin(&headers)?;
     let c = ctx(&s).await?;
-    outcome(pipeline::reply(&c, req.id, &req.text, "dashboard").await, &s.workspace_root)
+    let r = pipeline::reply(&c, req.id, &req.text, "dashboard")
+        .await
+        .map(|o| IntakeReplyResult { item: o.item, reaches_agent: o.reaches_agent, note: o.note });
+    outcome(r, &s.workspace_root)
 }
 
 async fn approve_plan(
@@ -476,6 +500,83 @@ mod tests {
         assert!(store::update(&c.db, d, nucleus_core::intake::Stage::Held, vec![("hold_hash", hold_b.clone().into())]).await.unwrap());
         assert_eq!(post_release(&app, d, &hold_a).await, StatusCode::CONFLICT);
         assert_eq!(store::item(&c.db, d).await.unwrap().stage, "held");
+    }
+
+    async fn post_reply(app: &Router, id: i64, text: &str) -> (StatusCode, serde_json::Value) {
+        let req = axum::http::Request::post("/reply")
+            .header("content-type", "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .body(axum::body::Body::from(serde_json::json!({ "id": id, "text": text }).to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_message_is_saved_in_every_stage_and_reaches_the_agent_in_refinement() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let st = enabled_state(dir.path());
+        let app = router(st.clone());
+        let c = ctx(&st).await.unwrap();
+        let n = hidden_item(&c, "note-r").await;
+        for stage in ["queued", "eval", "refinement", "implementation", "pr", "blocked", "failed", "closed", "cancelled", "stale"] {
+            sqlx::query("UPDATE items SET stage = ?2 WHERE id = ?1").bind(n).bind(stage).execute(&c.db).await.unwrap();
+            let (status, body) = post_reply(&app, n, &format!("a note in {stage}")).await;
+            assert_eq!(status, StatusCode::OK, "{stage}: {body}");
+            let reaches = stage == "refinement";
+            assert_eq!(body["reaches_agent"], reaches, "{stage}");
+            assert_eq!(body["item"]["id"], n);
+            if reaches {
+                assert!(body["note"].is_null());
+            } else {
+                let note = body["note"].as_str().unwrap();
+                assert!(note.contains(&format!("in the {stage} stage, not in refinement")) && note.contains("saved"), "{note}");
+            }
+            let m = store::messages(&c.db, n).await.unwrap().pop().unwrap();
+            assert_eq!((m.author.as_str(), m.via.as_str(), m.body.as_str()), ("operator", "dashboard", format!("a note in {stage}").as_str()));
+            assert_eq!(m.pending_agent, reaches as i64, "{stage}");
+            assert_eq!(m.wa_state.as_deref(), Some("none"), "a dashboard message is not sent to WhatsApp");
+        }
+        // Held while in refinement: the agent reads it after the release.
+        sqlx::query("UPDATE items SET stage = 'held', hold_stage = 'refinement' WHERE id = ?1").bind(n).execute(&c.db).await.unwrap();
+        let (_, body) = post_reply(&app, n, "after the release").await;
+        assert_eq!(body["reaches_agent"], true);
+        // An empty message is refused.
+        assert_eq!(post_reply(&app, n, "   ").await.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn the_detail_lists_every_plan_version_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let st = enabled_state(dir.path());
+        let app = router(st.clone());
+        let c = ctx(&st).await.unwrap();
+        let n = hidden_item(&c, "note-p").await;
+        for (v, text) in [(2, "second plan"), (1, "first plan")] {
+            sqlx::query("INSERT INTO plan_versions (item_id, version, text, proposed_at) VALUES (?1, ?2, ?3, ?4)")
+                .bind(n)
+                .bind(v)
+                .bind(text)
+                .bind(format!("2026-09-2{v}T10:00:00.000Z"))
+                .execute(&c.db)
+                .await
+                .unwrap();
+        }
+        let req = axum::http::Request::get(format!("/detail?id={n}")).body(axum::body::Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(
+            body["plans"],
+            serde_json::json!([
+                { "version": 1, "text": "first plan", "at": "2026-09-21T10:00:00.000Z" },
+                { "version": 2, "text": "second plan", "at": "2026-09-22T10:00:00.000Z" }
+            ])
+        );
+        assert!(body["item"].get("plan_refusals").is_none(), "internal columns stay off the wire");
     }
 
     #[tokio::test]
