@@ -243,7 +243,7 @@ CREATE TABLE confirmations (
 );
 CREATE INDEX idx_confirmations_scope ON confirmations(scope, state, id)";
 
-/// Per-item WhatsApp groups are removed (ADR-036, "Amendment: no WhatsApp
+/// Per-item WhatsApp groups are removed (ADR-036, "No WhatsApp
 /// groups"): every item's WhatsApp surface is the operator's DM.
 ///
 /// - an item whose thread ran in a group (`group`) or waited for one
@@ -261,14 +261,115 @@ ALTER TABLE items DROP COLUMN group_requested_at;
 ALTER TABLE items DROP COLUMN group_jid;
 ALTER TABLE items DROP COLUMN group_closed_at";
 
-/// WhatsApp gets short notices, not thread messages (ADR-036, "Amendment:
-/// short notices"). `item_messages.notice` is the code-owned notice a thread
+/// WhatsApp gets short notices, not thread messages (ADR-036, "WhatsApp gets short
+/// notices"). `item_messages.notice` is the code-owned notice a thread
 /// message sends to the operator's DM (NULL: nothing is sent). Thread
 /// messages still waiting to be copied to WhatsApp in full are not sent any
 /// more: the long bodies stay on the dashboard.
 const SCHEMA_V6: &str = "
 ALTER TABLE item_messages ADD COLUMN notice TEXT;
 UPDATE item_messages SET wa_state = 'none' WHERE wa_state IS NULL";
+
+/// Plans are passed whole or refused, and every accepted plan version is
+/// kept (ADR-036, "Plans are never cut"):
+///
+/// - `plan_versions`: one row per accepted plan version of an item, its
+///   text whole and when the agent proposed it;
+/// - `item_messages.plan_version`: the plan version an agent reply carried
+///   (the brief's history shows a reference in its place);
+/// - `items.plan_refused_chars`, `items.plan_refusals`: the length of the
+///   latest proposed plan when it was refused for its length (NULL when the
+///   latest reply was accepted), and how many replies in a row were.
+///
+/// Backfill, where known: the plan each existing agent reply carried (its
+/// `── plan vN ──` block), then the item's `plan_draft` (the latest plan)
+/// and `approved_plan`, which are the authoritative text of their versions.
+/// A Rust step: it parses the shown replies. It is one transaction and
+/// every statement is repeatable, so a crash before the version row is
+/// recorded runs it again safely.
+fn schema_v7(pool: &SqlitePool) -> futures::future::BoxFuture<'_, Result<()>> {
+    Box::pin(async move {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS plan_versions (
+                item_id     INTEGER NOT NULL REFERENCES items(id),
+                version     INTEGER NOT NULL,
+                text        TEXT NOT NULL,
+                proposed_at TEXT NOT NULL,
+                PRIMARY KEY (item_id, version)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        for (table, col, ddl) in [
+            ("item_messages", "plan_version", "ALTER TABLE item_messages ADD COLUMN plan_version INTEGER"),
+            ("items", "plan_refused_chars", "ALTER TABLE items ADD COLUMN plan_refused_chars INTEGER"),
+            ("items", "plan_refusals", "ALTER TABLE items ADD COLUMN plan_refusals INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let have: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"))
+                .bind(col)
+                .fetch_one(&mut *tx)
+                .await?;
+            if have == 0 {
+                sqlx::query(ddl).execute(&mut *tx).await?;
+            }
+        }
+        // The plan each agent reply carried.
+        let replies: Vec<(i64, i64, String, String)> =
+            sqlx::query_as("SELECT id, item_id, at, body FROM item_messages WHERE author = 'agent' AND plan_version IS NULL")
+                .fetch_all(&mut *tx)
+                .await?;
+        for (id, item_id, at, body) in replies {
+            let Some(v) = carried_plan_version(&body) else { continue };
+            sqlx::query("UPDATE item_messages SET plan_version = ?2 WHERE id = ?1").bind(id).bind(v).execute(&mut *tx).await?;
+            if let Some(text) = super::stage::shown_plan(&body, &super::stage::plan_label(v)).filter(|t| !t.is_empty()) {
+                sqlx::query("INSERT OR IGNORE INTO plan_versions (item_id, version, text, proposed_at) VALUES (?1, ?2, ?3, ?4)")
+                    .bind(item_id)
+                    .bind(v)
+                    .bind(text)
+                    .bind(&at)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        // The item's own record of its approved and its latest plan. When
+        // no reply dates a version, the approval (the plan was proposed
+        // before it) or the item's last change stands in.
+        for (text_col, version_col, at_fallback) in
+            [("approved_plan", "approved_version", "COALESCE(i.approved_at, i.updated_at)"), ("plan_draft", "plan_version", "i.updated_at")]
+        {
+            sqlx::query(&format!(
+                "INSERT INTO plan_versions (item_id, version, text, proposed_at)
+                 SELECT i.id, i.{version_col}, i.{text_col},
+                        COALESCE((SELECT MAX(m.at) FROM item_messages m
+                                   WHERE m.item_id = i.id AND m.author = 'agent' AND m.plan_version = i.{version_col}),
+                                 {at_fallback})
+                   FROM items i
+                  WHERE i.{text_col} IS NOT NULL AND i.{version_col} IS NOT NULL AND i.{version_col} > 0
+                 ON CONFLICT (item_id, version) DO UPDATE SET text = excluded.text"
+            ))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    })
+}
+
+/// The plan version a shown agent reply carries: the version of its last
+/// `── plan vN ──` line that has a matching end line after it.
+fn carried_plan_version(body: &str) -> Option<i64> {
+    let mut found = None;
+    for (i, _) in body.match_indices("── plan v") {
+        let rest = &body[i + "── plan v".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let Ok(v) = digits.parse::<i64>() else { continue };
+        if rest[digits.len()..].starts_with(" ──") && super::stage::shown_plan(body, &super::stage::plan_label(v)).is_some() {
+            found = Some(v);
+        }
+    }
+    found
+}
 
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
@@ -282,6 +383,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             crate::migrate::Migration { version: 4, name: "operator confirmations", step: crate::migrate::Step::Sql(SCHEMA_V4) },
             crate::migrate::Migration { version: 5, name: "no whatsapp groups", step: crate::migrate::Step::Sql(SCHEMA_V5) },
             crate::migrate::Migration { version: 6, name: "whatsapp notices", step: crate::migrate::Step::Sql(SCHEMA_V6) },
+            crate::migrate::Migration { version: 7, name: "plan versions", step: crate::migrate::Step::Rust(schema_v7) },
         ],
     )
     .await
@@ -290,7 +392,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// True when `pool` (a read-only intake.db) has the full schema: the
 /// migration ledger records [`SCHEMA_VERSION`] and the item tables exist.
@@ -637,6 +739,15 @@ pub struct Item {
     pub released_hash: Option<String>,
     pub released_at: Option<String>,
     pub released_via: Option<String>,
+    /// The length of the latest proposed plan when it was refused for being
+    /// longer than [`super::briefs::PLAN_LIMIT`]; `None` when the latest
+    /// reply was accepted. The next refinement brief says so. Not part of
+    /// the dashboard's wire type (the thread shows the refusal).
+    #[serde(skip)]
+    pub plan_refused_chars: Option<i64>,
+    /// Refinement replies refused in a row for their plan's length.
+    #[serde(skip)]
+    pub plan_refusals: i64,
 }
 
 impl Item {
@@ -675,6 +786,22 @@ pub struct ItemMessage {
     /// WhatsApp DM (never the body). Not part of the dashboard's wire type.
     #[serde(skip)]
     pub notice: Option<String>,
+    /// The plan version an agent reply carried (its plan is in the body
+    /// between the `── plan vN ──` lines). Not part of the wire type: the
+    /// dashboard reads the versions from the detail's `plans`.
+    #[serde(skip)]
+    pub plan_version: Option<i64>,
+}
+
+/// One accepted plan version of an item, whole.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow, ts_rs::TS)]
+#[ts(export, rename = "IntakePlanVersion")]
+pub struct PlanVersion {
+    #[ts(type = "number")]
+    pub version: i64,
+    pub text: String,
+    /// When the refinement agent proposed it.
+    pub at: String,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow, ts_rs::TS)]
@@ -707,7 +834,7 @@ const ITEM_COLUMNS: &str = "id, event_id, repo, title, stage, failed_stage, erro
     surface, current_task_id, last_task_id, step_errors, \
     created_at, updated_at, closed_at, rev_title, rev_body, revision_hash, gate_event_id, label_event_id, \
     gate_actor, gate_at, stale_reason, base_sha, pushed_sha, hold_stage, hold_json, hold_hash, held_at, \
-    released_hash, released_at, released_via";
+    released_hash, released_at, released_via, plan_refused_chars, plan_refusals";
 
 /// What a new item is bound to: the event's revision and the gate event.
 #[derive(Debug, Clone)]
@@ -888,6 +1015,8 @@ const SETTABLE: &[&str] = &[
     "released_hash",
     "released_at",
     "released_via",
+    "plan_refused_chars",
+    "plan_refusals",
 ];
 
 fn set_clause(set: &[(&str, Val)], first_param: usize) -> Result<String> {
@@ -1139,9 +1268,21 @@ pub async fn add_message(pool: &SqlitePool, id: i64, m: NewMessage<'_>) -> Resul
 /// one transaction (a plain thread message is applied by being stored).
 pub async fn add_message_caused(pool: &SqlitePool, id: i64, m: NewMessage<'_>, cause: Option<&str>) -> Result<Option<i64>> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let added = insert_message(&mut tx, id, &m, None).await?;
+    mark_applied(&mut tx, cause).await?;
+    tx.commit().await?;
+    Ok(added)
+}
+
+async fn insert_message(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: i64,
+    m: &NewMessage<'_>,
+    plan_version: Option<i64>,
+) -> Result<Option<i64>> {
     let res = sqlx::query(
-        "INSERT OR IGNORE INTO item_messages (item_id, at, author, via, body, external_ref, pending_agent, wa_state, notice)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT OR IGNORE INTO item_messages (item_id, at, author, via, body, external_ref, pending_agent, wa_state, notice, plan_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )
     .bind(id)
     .bind(crate::timestamp::now())
@@ -1152,16 +1293,66 @@ pub async fn add_message_caused(pool: &SqlitePool, id: i64, m: NewMessage<'_>, c
     .bind(m.pending_agent as i64)
     .bind(if m.notice.is_some() { None } else { Some("none") })
     .bind(&m.notice)
-    .execute(&mut *tx)
+    .bind(plan_version)
+    .execute(&mut **tx)
     .await?;
-    mark_applied(&mut tx, cause).await?;
-    tx.commit().await?;
     Ok((res.rows_affected() == 1).then(|| res.last_insert_rowid()))
+}
+
+/// What a finished refinement turn records.
+pub struct TurnRecord<'a> {
+    /// Thread messages, each with the plan version it carries.
+    pub messages: Vec<(NewMessage<'a>, Option<i64>)>,
+    /// A plan accepted as a new version: `(version, text)`.
+    pub plan: Option<(i64, &'a str)>,
+    /// Item columns to set.
+    pub set: Vec<(&'a str, Val)>,
+}
+
+/// Record finished refinement turn `task_id` of item `id` in one
+/// transaction: the item's columns, its thread messages and an accepted
+/// plan version, only while the item is in refinement with that turn as its
+/// current task. Returns `false` (and records nothing) when it is not.
+pub async fn record_turn(pool: &SqlitePool, id: i64, task_id: &str, turn: TurnRecord<'_>) -> Result<bool> {
+    let extra = set_clause(&turn.set, 4)?;
+    let sql = format!(
+        "UPDATE items SET updated_at = ?2{}{extra} WHERE id = ?1 AND stage = 'refinement' AND current_task_id = ?3",
+        if extra.is_empty() { "" } else { ", " }
+    );
+    let now = crate::timestamp::now();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let q = sqlx::query(&sql).bind(id).bind(&now).bind(task_id);
+    if bind_vals(q, &turn.set).execute(&mut *tx).await?.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    for (m, v) in &turn.messages {
+        insert_message(&mut tx, id, m, *v).await?;
+    }
+    if let Some((version, text)) = turn.plan {
+        sqlx::query("INSERT OR IGNORE INTO plan_versions (item_id, version, text, proposed_at) VALUES (?1, ?2, ?3, ?4)")
+            .bind(id)
+            .bind(version)
+            .bind(text)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Every accepted plan version of item `id`, oldest first.
+pub async fn plan_versions(pool: &SqlitePool, id: i64) -> Result<Vec<PlanVersion>> {
+    Ok(sqlx::query_as("SELECT version, text, proposed_at AS at FROM plan_versions WHERE item_id = ?1 ORDER BY version")
+        .bind(id)
+        .fetch_all(pool)
+        .await?)
 }
 
 pub async fn messages(pool: &SqlitePool, id: i64) -> Result<Vec<ItemMessage>> {
     Ok(sqlx::query_as(
-        "SELECT id, item_id, at, author, via, body, pending_agent, read_by_task, wa_state, notice
+        "SELECT id, item_id, at, author, via, body, pending_agent, read_by_task, wa_state, notice, plan_version
            FROM item_messages WHERE item_id = ?1 ORDER BY id",
     )
     .bind(id)
@@ -1867,6 +2058,83 @@ pub(crate) mod tests {
         for id in 1..=4 {
             item(&pool, id).await.expect("every migrated row reads as an Item");
         }
+    }
+
+    #[tokio::test]
+    async fn the_migrations_keep_every_known_plan_and_move_a_group_item_to_the_dm() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db_at_v4(dir.path()).await;
+        let ev = |n: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO events (source, external_id, kind, title, body, labels_json, state, raw_json, accepted, first_seen_at, last_seen_at)
+                     VALUES ('github', ?1, 'issue', 't', 'b', '[]', 'open', '{}', 1, 't', 't')",
+                )
+                .bind(format!("acme/widget#{n}"))
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid()
+            }
+        };
+        // Item 1: in refinement in a group, plan v2 proposed; its thread holds
+        // the replies that carried v1 and v2, and an unsent message.
+        let e1 = ev(1).await;
+        sqlx::query(
+            "INSERT INTO items (event_id, repo, title, stage, surface, group_jid, plan_draft, plan_version, created_at, updated_at)
+             VALUES (?1, 'acme/widget', 't', 'refinement', 'group', 'g1', 'the whole plan v2', 2, 't', '2026-09-25T10:00:00.000Z')",
+        )
+        .bind(e1)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (at, body, wa) in [
+            ("2026-09-24T10:00:00.000Z", "Idea.\n── plan v1 ──\nthe whole plan v1\n── end of plan v1 ──\nOK?", Some("queued")),
+            ("2026-09-24T11:00:00.000Z", "Better.\n── plan v2 ──\nthe whole plan v2\n── end of plan v2 ──", None),
+        ] {
+            sqlx::query("INSERT INTO item_messages (item_id, at, author, via, body, wa_state) VALUES (1, ?1, 'agent', 'pipeline', ?2, ?3)")
+                .bind(at)
+                .bind(body)
+                .bind(wa)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // Item 2: cancelled after its plan v1 was approved; no reply is left
+        // to recover it from.
+        let e2 = ev(2).await;
+        sqlx::query(
+            "INSERT INTO items (event_id, repo, title, stage, surface, plan_draft, plan_version, approved_plan, approved_version,
+                                approved_at, created_at, updated_at)
+             VALUES (?1, 'acme/widget', 't', 'cancelled', 'dm', 'approved text', 1, 'approved text', 1, '2026-09-23T09:00:00.000Z', 't', 't')",
+        )
+        .bind(e2)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let pool = open(dir.path()).await.unwrap();
+        assert!(schema_ready(&pool).await);
+        let it = item(&pool, 1).await.unwrap();
+        assert_eq!((it.surface.as_str(), it.plan_refused_chars, it.plan_refusals), ("dm", None, 0));
+        let v1 = plan_versions(&pool, 1).await.unwrap();
+        assert_eq!(
+            v1,
+            [
+                PlanVersion { version: 1, text: "the whole plan v1".into(), at: "2026-09-24T10:00:00.000Z".into() },
+                PlanVersion { version: 2, text: "the whole plan v2".into(), at: "2026-09-24T11:00:00.000Z".into() },
+            ]
+        );
+        let msgs = messages(&pool, 1).await.unwrap();
+        assert_eq!(msgs.iter().map(|m| m.plan_version).collect::<Vec<_>>(), [Some(1), Some(2)]);
+        assert_eq!(msgs[1].wa_state.as_deref(), Some("none"), "an unsent message is not sent in full after the change");
+        let v2 = plan_versions(&pool, 2).await.unwrap();
+        assert_eq!(v2, [PlanVersion { version: 1, text: "approved text".into(), at: "2026-09-23T09:00:00.000Z".into() }]);
+        // Running the plan step again changes nothing.
+        schema_v7(&pool).await.unwrap();
+        assert_eq!(plan_versions(&pool, 1).await.unwrap(), v1);
     }
 
     #[tokio::test]

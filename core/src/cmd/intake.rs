@@ -66,7 +66,8 @@ enum Cmd {
         #[arg(long)]
         hidden: bool,
     },
-    /// Write in an item's thread (refinement only). `--text -` reads stdin.
+    /// Write in an item's thread (any stage; the refinement agent reads it
+    /// during refinement). `--text -` reads stdin.
     Reply {
         item: String,
         #[arg(long)]
@@ -400,7 +401,10 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
                 text
             };
             let n = item_number(&item)?;
-            pipeline::reply(&ctx, n, &text, via).await.map(|_| println!("message added to item #{n}"))
+            pipeline::reply(&ctx, n, &text, via).await.map(|r| match r.note {
+                Some(note) => println!("{note}"),
+                None => println!("message added to item #{n}; the refinement agent reads it at its next turn"),
+            })
         }
         Cmd::ApprovePlan { item, version } => {
             let n = item_number(&item)?;

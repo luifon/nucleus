@@ -859,7 +859,7 @@ pub struct IntakeTexts {
     /// (`{stage}`).
     pub reply_saved_not_in_refinement: String,
 
-    // ── WhatsApp notices (ADR-036, "Amendment: short notices") ──────────
+    // ── WhatsApp notices (ADR-036, "WhatsApp gets short notices") ──────────
     //
     // Every WhatsApp message the pipeline sends about an item is one of these:
     // one line, code-owned, never a plan, an agent reply or a finding list.

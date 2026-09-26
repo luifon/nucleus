@@ -48,7 +48,7 @@ pub mod tools;
 
 pub use event::{Event, NewEvent};
 pub use stage::Stage;
-pub use store::{Item, ItemMessage, ItemTransition};
+pub use store::{Item, ItemMessage, ItemTransition, PlanVersion};
 
 /// Relative to the workspace root.
 pub const INTAKE_DB_PATH: &str = "memory/intake.db";

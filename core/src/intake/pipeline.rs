@@ -1299,10 +1299,25 @@ async fn approve_plan_caused(ctx: &Ctx, n: i64, version: Option<u32>, via: &str,
     Ok(item)
 }
 
-/// An operator message from the dashboard or the CLI. Only during
-/// refinement, where an agent reads it; it is also sent to the item's
-/// WhatsApp thread so both surfaces show the same conversation.
-pub async fn reply(ctx: &Ctx, n: i64, text: &str, via: &str) -> Result<Item> {
+/// What an operator message from the dashboard or the CLI did.
+#[derive(Debug, Clone)]
+pub struct ReplyOutcome {
+    pub item: Item,
+    /// The refinement agent reads the message at its next turn (now, or
+    /// after the release of an item held during refinement).
+    pub reaches_agent: bool,
+    /// Why no agent reads it: the item is not in refinement. `None` when one
+    /// does.
+    pub note: Option<String>,
+}
+
+/// An operator message from the dashboard or the CLI: discussion only, kept
+/// in the item's thread in every stage. During refinement (or while held
+/// from refinement) the agent reads it at its next turn; in any other stage
+/// it is saved and the outcome says that no agent reads it. It is not sent
+/// to WhatsApp. Decisions have their own explicit commands (approve a plan
+/// version, release a hold, cancel); the text is never interpreted.
+pub async fn reply(ctx: &Ctx, n: i64, text: &str, via: &str) -> Result<ReplyOutcome> {
     let text = text.trim();
     if text.is_empty() {
         return refuse("The message is empty.".into());
@@ -1311,16 +1326,19 @@ pub async fn reply(ctx: &Ctx, n: i64, text: &str, via: &str) -> Result<Item> {
         return refuse("The message is longer than 8000 characters.".into());
     }
     let item = store::item(&ctx.db, n).await?;
-    if item.stage() != Stage::Refinement {
-        return refuse(fill_vars(&ctx.cfg.texts.not_in_refinement, &item_vars(ctx, &item)));
-    }
+    let reaches_agent = match item.stage() {
+        Stage::Refinement => true,
+        Stage::Held => item.hold_stage.as_deref() == Some(Stage::Refinement.as_str()),
+        _ => false,
+    };
     store::add_message(
         &ctx.db,
         n,
-        NewMessage { author: "operator", via, body: text, external_ref: None, pending_agent: true, notice: None },
+        NewMessage { author: "operator", via, body: text, external_ref: None, pending_agent: reaches_agent, notice: None },
     )
     .await?;
-    Ok(item)
+    let note = (!reaches_agent).then(|| fill_vars(&ctx.cfg.texts.reply_saved_not_in_refinement, &item_vars(ctx, &item)));
+    Ok(ReplyOutcome { item, reaches_agent, note })
 }
 
 /// Stop an item: cancel its running task and close it.
@@ -2071,41 +2089,7 @@ async fn step_eval(ctx: &Ctx, item: &Item) -> Result<()> {
 async fn step_refinement(ctx: &Ctx, item: &Item) -> Result<()> {
     match task_state(ctx, item).await? {
         TaskState::Running => Ok(()),
-        TaskState::Done { id, result } => {
-            let next = item.plan_version + 1;
-            let (shown, plan) = stage::split_plan(&result, &format!("plan v{next}"));
-            let mut body = shown.clone();
-            let mut set = vec![("current_task_id", Val::Text(None)), ("last_task_id", id.clone().into())];
-            let notice = if let Some(p) = plan {
-                set.push(("plan_draft", p.into()));
-                set.push(("plan_version", next.into()));
-                let mut vars = item_vars(ctx, item);
-                vars.retain(|(k, _)| *k != "version");
-                vars.push(("version", next.to_string()));
-                body.push_str("\n\n");
-                body.push_str(&fill_vars(&ctx.cfg.texts.approve_hint, &vars));
-                notice_text(ctx, &ctx.cfg.texts.notice_plan_ready, item, &[("version", &next.to_string())])
-            } else {
-                agent_replied_notice(ctx, item, &shown).await
-            };
-            // Keyed by the task: a crash before the update below does not
-            // add the reply twice.
-            store::add_message(
-                &ctx.db,
-                item.id,
-                NewMessage {
-                    author: "agent",
-                    via: "pipeline",
-                    body: &body,
-                    external_ref: Some(&format!("task:{id}")),
-                    pending_agent: false,
-                    notice: Some(notice),
-                },
-            )
-            .await?;
-            store::update(&ctx.db, item.id, Stage::Refinement, set).await?;
-            Ok(())
-        }
+        TaskState::Done { id, result } => finish_refinement_turn(ctx, item, &id, &result).await,
         TaskState::Ended { id, why } => {
             store::unread(&ctx.db, item.id, &id).await?;
             store::update(
@@ -2119,7 +2103,13 @@ async fn step_refinement(ctx: &Ctx, item: &Item) -> Result<()> {
         }
         TaskState::None => {
             let thread = store::messages(&ctx.db, item.id).await?;
-            let pending = thread.iter().filter(|m| m.author == "operator" && m.pending_agent == 1).map(|m| m.id).max();
+            // New operator messages, or a Nucleus note that asks the agent to
+            // shorten a refused plan.
+            let pending = thread
+                .iter()
+                .filter(|m| m.pending_agent == 1 && matches!(m.author.as_str(), "operator" | "nucleus"))
+                .map(|m| m.id)
+                .max();
             let answered_before = thread.iter().any(|m| m.author == "agent");
             if pending.is_none() && answered_before {
                 return Ok(()); // waiting for the operator
@@ -2133,7 +2123,10 @@ async fn step_refinement(ctx: &Ctx, item: &Item) -> Result<()> {
                 return Ok(());
             }
             let up_to = pending.unwrap_or(0);
-            let brief = briefs::refinement_brief(item, &ev, &d, &thread, up_to);
+            let brief = match briefs::refinement_brief(item, &ev, &d, &thread, up_to) {
+                Ok(b) => b,
+                Err(e) => return block_because(ctx, item, e.to_string()).await,
+            };
             let task =
                 start_task(ctx, item, Stage::Refinement, "intake-refine", brief, &worktree(item)?, WorkerProfile::ReadOnly)
                     .await?;
@@ -2143,6 +2136,83 @@ async fn step_refinement(ctx: &Ctx, item: &Item) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// A refinement reply over the plan limit is followed by this many
+/// automatic turns that ask the agent to shorten it; after that the agent
+/// waits for the operator.
+const MAX_PLAN_RETRIES: i64 = 2;
+
+/// Record a finished refinement turn (ADR-036, "Plans are never
+/// cut"). The reply goes to the thread with its notice. A plan in it
+/// becomes the next plan version, kept whole in `plan_versions`, only when
+/// it is at most [`briefs::PLAN_LIMIT`] characters. A longer plan is
+/// refused: the thread shows a placeholder in its place and a Nucleus note
+/// with its length, and the next turn (started at once, at most
+/// [`MAX_PLAN_RETRIES`] times in a row) is asked to shorten it. Everything
+/// is one transaction, keyed by the task, so a crash records it once.
+async fn finish_refinement_turn(ctx: &Ctx, item: &Item, task: &str, result: &str) -> Result<()> {
+    let t = &ctx.cfg.texts;
+    let next = item.plan_version + 1;
+    let label = stage::plan_label(next);
+    let (shown, plan) = stage::split_plan(result, &label);
+    let reply_ref = format!("task:{task}");
+    let note_ref = format!("plan-refused:{task}");
+    let mut set = vec![("current_task_id", Val::Text(None)), ("last_task_id", task.to_string().into())];
+    let mut messages = Vec::new();
+    let mut accepted: Option<(i64, String)> = None;
+    let (body, carried, notice, refusal) = match plan {
+        Some(p) if p.chars().count() > briefs::PLAN_LIMIT => {
+            let chars = p.chars().count();
+            let refusals = item.plan_refusals + 1;
+            let retry = refusals <= MAX_PLAN_RETRIES;
+            set.push(("plan_refused_chars", (chars as i64).into()));
+            set.push(("plan_refusals", refusals.into()));
+            let body = stage::replace_shown_plan(&shown, &label, &briefs::refused_plan_placeholder(chars));
+            // An automatic turn follows: the operator hears from the next
+            // reply. Otherwise he is told now.
+            let notice = if retry { None } else { Some(agent_replied_notice(ctx, item, &body).await) };
+            let vars = [("chars", chars.to_string()), ("limit", briefs::PLAN_LIMIT.to_string()), ("count", refusals.to_string())];
+            let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let text = fill(if retry { &t.plan_too_long } else { &t.plan_too_long_stopped }, &vars);
+            tracing::warn!(item = item.id, chars, refusals, "intake: a proposed plan over the limit was refused");
+            (body, None, notice, Some((text, retry)))
+        }
+        Some(p) => {
+            set.push(("plan_draft", p.clone().into()));
+            set.push(("plan_version", next.into()));
+            set.push(("plan_refused_chars", Val::Int(None)));
+            set.push(("plan_refusals", 0i64.into()));
+            let mut vars = item_vars(ctx, item);
+            vars.retain(|(k, _)| *k != "version");
+            vars.push(("version", next.to_string()));
+            let body = format!("{shown}\n\n{}", fill_vars(&t.approve_hint, &vars));
+            let notice = notice_text(ctx, &t.notice_plan_ready, item, &[("version", &next.to_string())]);
+            accepted = Some((next, p));
+            (body, Some(next), Some(notice), None)
+        }
+        None => {
+            set.push(("plan_refused_chars", Val::Int(None)));
+            set.push(("plan_refusals", 0i64.into()));
+            let notice = agent_replied_notice(ctx, item, &shown).await;
+            (shown.clone(), None, Some(notice), None)
+        }
+    };
+    messages.push((
+        NewMessage { author: "agent", via: "pipeline", body: &body, external_ref: Some(&reply_ref), pending_agent: false, notice },
+        carried,
+    ));
+    if let Some((text, retry)) = &refusal {
+        messages.push((
+            NewMessage { author: "nucleus", via: "pipeline", body: text, external_ref: Some(&note_ref), pending_agent: *retry, notice: None },
+            None,
+        ));
+    }
+    let turn = store::TurnRecord { messages, plan: accepted.as_ref().map(|(v, p)| (*v, p.as_str())), set };
+    if !store::record_turn(&ctx.db, item.id, task, turn).await? {
+        tracing::info!(item = item.id, task, "intake: a refinement reply arrived after the item moved on; not recorded");
+    }
+    Ok(())
 }
 
 async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
@@ -2186,7 +2256,10 @@ async fn step_implementation(ctx: &Ctx, item: &Item) -> Result<()> {
             if !hold_check(ctx, &item, &d).await? {
                 return Ok(());
             }
-            let brief = briefs::implementation_brief(&item, &ev, &d, &branch, &base_ref, repo.test_command.as_deref());
+            let brief = match briefs::implementation_brief(&item, &ev, &d, &branch, &base_ref, repo.test_command.as_deref()) {
+                Ok(b) => b,
+                Err(e) => return block_because(ctx, &item, e.to_string()).await,
+            };
             start_task(ctx, &item, Stage::Implementation, "intake-implement", brief, &wt, WorkerProfile::Code).await?;
             Ok(())
         }

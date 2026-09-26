@@ -525,12 +525,19 @@ async fn dashboard_replies_reach_the_agent_and_the_whatsapp_thread() {
     assert!(t.brief.contains("Operator (via dashboard)") && t.brief.contains("JSON, please"));
     let out = outbound(&f).await;
     assert!(!out.iter().any(|(_, b)| b.contains("JSON, please")), "the operator's own message is not echoed: {out:?}");
-    // Outside refinement a dashboard reply is refused.
+    // Outside refinement a dashboard reply is saved, and the outcome says
+    // that no agent reads it.
     finish_current(&f, TaskStatus::Done, Some("===PLAN===\nx\n===END PLAN==="), None).await;
     tick(&f).await;
     approve_plan(&f.ctx, 1, Some(1), "dashboard").await.unwrap();
-    let e = reply(&f.ctx, 1, "late", "dashboard").await.unwrap_err();
-    assert!(e.downcast_ref::<Refusal>().is_some());
+    let r = reply(&f.ctx, 1, "late", "dashboard").await.unwrap();
+    assert!(!r.reaches_agent);
+    assert_eq!(
+        r.note.as_deref(),
+        Some("Your message is saved in item #1's thread. The item is in the implementation stage, not in refinement, so no agent reads it.")
+    );
+    let last = store::messages(&f.ctx.db, 1).await.unwrap().pop().unwrap();
+    assert_eq!((last.body.as_str(), last.via.as_str(), last.pending_agent), ("late", "dashboard", 0));
 }
 
 #[tokio::test]
@@ -2358,7 +2365,7 @@ async fn a_yes_to_a_question_without_a_whatsapp_timestamp_is_asked_again() {
     assert_eq!(item1(&f).await.released_via.as_deref(), Some("whatsapp"));
 }
 
-// ── WhatsApp notices (ADR-036, "Amendment: short notices") ─────────────
+// ── WhatsApp notices (ADR-036, "WhatsApp gets short notices") ─────────────
 
 #[test]
 fn a_notice_carries_the_item_link_only_when_the_public_url_is_set() {
@@ -2506,4 +2513,124 @@ async fn a_failure_notice_has_a_one_line_reason_and_a_guarded_one_is_withheld() 
     tick(&f).await;
     let n = outbound(&f).await.last().unwrap().1.clone();
     assert!(n.contains("the reason is on the dashboard.") && !n.contains("FAKE-SECRET-VALUE"), "{n}");
+}
+
+// ── plans are never cut (ADR-036, "Plans are never cut") ──────
+
+/// A plan of exactly `n` characters with a distinct start and end.
+fn plan_text(n: usize) -> String {
+    let mut p = String::from("PLAN-START\n");
+    while p.chars().count() < n - "\nPLAN-END".len() {
+        p.push_str("step: change a file and add a test\n");
+    }
+    p.truncate(n - "\nPLAN-END".len());
+    p.push_str("\nPLAN-END");
+    p
+}
+
+/// Item #1 in refinement with its first turn running.
+async fn in_refinement(f: &Fixture) {
+    accept(f, 1).await;
+    tick(f).await;
+    finish_current(f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
+    tick(f).await;
+    assert!(item1(f).await.current_task_id.is_some());
+}
+
+#[tokio::test]
+async fn a_12000_character_plan_reaches_both_briefs_whole_and_every_version_is_kept() {
+    let f = fixture().await;
+    in_refinement(&f).await;
+    finish_current(&f, TaskStatus::Done, Some("===PLAN===\n1. first idea\n===END PLAN==="), None).await;
+    tick(&f).await;
+    inbound(&f, 1, "m1", "More detail, please").await;
+    tick(&f).await;
+    let plan = plan_text(12_000);
+    finish_current(&f, TaskStatus::Done, Some(&format!("Here it is.\n===PLAN===\n{plan}\n===END PLAN===")), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.plan_version, it.plan_draft.as_deref()), (2, Some(plan.as_str())));
+    // Every accepted version is kept, whole, oldest first.
+    let versions = store::plan_versions(&f.ctx.db, 1).await.unwrap();
+    assert_eq!(versions.iter().map(|v| (v.version, v.text.as_str())).collect::<Vec<_>>(), [(1, "1. first idea"), (2, plan.as_str())]);
+    // The next turn's brief carries the latest plan byte for byte, and the
+    // earlier reply's plan only as a reference.
+    inbound(&f, 1, "m2", "Looks close").await;
+    tick(&f).await;
+    let turn = tasks::get(&f.ctx.tasks_db, item1(&f).await.current_task_id.as_deref().unwrap(), &Scope::Operator).await.unwrap();
+    assert!(turn.brief.contains(&plan), "the refinement brief carries the plan whole");
+    assert!(turn.brief.contains("(plan v1, see the dashboard)") && turn.brief.contains("(plan v2, shown in full above)"));
+    finish_current(&f, TaskStatus::Done, Some("No change needed."), None).await;
+    tick(&f).await;
+    approve_plan(&f.ctx, 1, Some(2), "dashboard").await.unwrap();
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!(it.approved_plan.as_deref(), Some(plan.as_str()));
+    let imp = tasks::get(&f.ctx.tasks_db, it.current_task_id.as_deref().unwrap(), &Scope::Operator).await.unwrap();
+    assert!(imp.brief.contains(&plan), "the implementation brief carries the plan whole");
+}
+
+#[tokio::test]
+async fn a_plan_over_the_limit_is_refused_with_a_note_and_the_next_turn_is_told() {
+    let f = fixture().await;
+    in_refinement(&f).await;
+    let long = plan_text(briefs::PLAN_LIMIT + 1);
+    let n = long.chars().count();
+    let reply = |_: usize| format!("A thorough plan.\n===PLAN===\n{long}\n===END PLAN===\nOK?");
+    finish_current(&f, TaskStatus::Done, Some(&reply(1)), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.plan_version, it.plan_draft.as_deref()), (0, None), "no plan version");
+    assert_eq!((it.plan_refused_chars, it.plan_refusals), (Some(n as i64), 1));
+    assert!(store::plan_versions(&f.ctx.db, 1).await.unwrap().is_empty());
+    let thread = store::messages(&f.ctx.db, 1).await.unwrap();
+    let agent = thread.iter().find(|m| m.author == "agent").unwrap();
+    assert!(!agent.body.contains("PLAN-START") && agent.body.contains(&format!("A proposed plan of {n} characters was not accepted")), "{}", agent.body);
+    let note = thread.iter().rev().find(|m| m.author == "nucleus").unwrap();
+    assert_eq!(note.body, format!("The proposed plan has {n} characters; the limit is 20000. The agent was asked to shorten it."));
+    // A new turn starts at once and is told the same.
+    tick(&f).await;
+    let turn = tasks::get(&f.ctx.tasks_db, item1(&f).await.current_task_id.as_deref().expect("an automatic turn"), &Scope::Operator).await.unwrap();
+    assert!(turn.brief.contains(&format!("it had {n} characters and the limit is 20000")), "the refusal is named");
+    assert!(turn.brief.contains(&note.body), "the note is a new message of the turn");
+    assert!(!outbound(&f).await.iter().any(|(_, b)| b.contains("PLAN-START")), "no plan text on WhatsApp");
+    // A second refusal asks again; the third stops and waits for the operator.
+    finish_current(&f, TaskStatus::Done, Some(&reply(2)), None).await;
+    tick(&f).await;
+    tick(&f).await;
+    assert!(item1(&f).await.current_task_id.is_some(), "the second refusal still asks again");
+    let before = outbound(&f).await.len();
+    finish_current(&f, TaskStatus::Done, Some(&reply(3)), None).await;
+    tick(&f).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.current_task_id.as_deref(), it.plan_refusals), (None, 3), "the agent waits for the operator");
+    let stopped = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().rev().find(|m| m.author == "nucleus").unwrap();
+    assert!(stopped.body.contains("refused 3 times in a row"), "{}", stopped.body);
+    let out = outbound(&f).await;
+    assert_eq!(out.len(), before + 1, "the operator is told once: {out:?}");
+    assert!(out.last().unwrap().1.starts_with("💬 Item #1: the agent replied"), "{out:?}");
+    // A plan within the limit is accepted and clears the refusal.
+    inbound(&f, 1, "m1", "Keep it short").await;
+    tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some("===PLAN===\n1. short\n===END PLAN==="), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.plan_version, it.plan_refused_chars, it.plan_refusals), (1, None, 0));
+}
+
+#[tokio::test]
+async fn a_brief_over_the_ledger_limit_blocks_the_item_with_the_reason() {
+    let f = fixture().await;
+    in_refinement(&f).await;
+    finish_current(&f, TaskStatus::Done, Some(&format!("===PLAN===\n{}\n===END PLAN===", plan_text(briefs::PLAN_LIMIT))), None).await;
+    tick(&f).await;
+    for _ in 0..3 {
+        reply(&f.ctx, 1, &"x".repeat(7_900), "dashboard").await.unwrap();
+    }
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!(it.stage(), Stage::Blocked, "{:?}", it.error);
+    assert!(it.error.as_deref().unwrap().contains("the refinement brief has") && it.error.as_deref().unwrap().contains("nothing was cut"));
+    assert!(kinds(&f, 1).await.iter().filter(|k| *k == "intake-refine").count() == 1, "no second turn was started");
 }

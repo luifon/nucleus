@@ -70,7 +70,7 @@ pub struct Pending {
 
 /// Where an operator message came from. Every message reaches the pipeline
 /// through the operator's DM: per-item WhatsApp groups were removed (ADR-036,
-/// "Amendment: no WhatsApp groups").
+/// "No WhatsApp groups").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     /// The operator's DM. `item` is the item the message names: it starts

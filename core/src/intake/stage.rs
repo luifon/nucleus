@@ -287,10 +287,46 @@ pub fn split_plan(reply: &str, label: &str) -> (String, Option<String>) {
         return (reply.trim().to_string(), None);
     };
     let plan = plan.to_string();
-    let shown = reply
-        .replace(PLAN_OPEN, &format!("── {label} ──"))
-        .replace(PLAN_CLOSE, &format!("── end of {label} ──"));
+    let (open, close) = shown_markers(label);
+    let shown = reply.replace(PLAN_OPEN, &open).replace(PLAN_CLOSE, &close);
     (shown.trim().to_string(), (!plan.is_empty()).then_some(plan))
+}
+
+/// The label of plan version `v` in a shown reply: `plan v<v>`.
+pub fn plan_label(v: i64) -> String {
+    format!("plan v{v}")
+}
+
+/// The lines [`split_plan`] puts in place of the plan markers:
+/// `── <label> ──` and `── end of <label> ──`.
+pub fn shown_markers(label: &str) -> (String, String) {
+    (format!("── {label} ──"), format!("── end of {label} ──"))
+}
+
+/// Where the plan labelled `label` lies in a reply [`split_plan`] showed:
+/// from the last start line to the first end line after it, as
+/// [`split_plan`] took it. (start of the start line, end of the end line).
+fn shown_plan_span(shown: &str, label: &str) -> Option<(usize, usize)> {
+    let (open, close) = shown_markers(label);
+    let start = shown.rfind(&open)?;
+    let end = start + shown[start..].find(&close)? + close.len();
+    Some((start, end))
+}
+
+/// The plan labelled `label` in a reply [`split_plan`] showed, trimmed.
+pub fn shown_plan<'a>(shown: &'a str, label: &str) -> Option<&'a str> {
+    let (start, end) = shown_plan_span(shown, label)?;
+    let (open, close) = shown_markers(label);
+    Some(shown[start + open.len()..end - close.len()].trim())
+}
+
+/// `shown` with the plan labelled `label`, markers included, replaced by
+/// `with`. Unchanged when the markers are not there.
+pub fn replace_shown_plan(shown: &str, label: &str, with: &str) -> String {
+    match shown_plan_span(shown, label) {
+        Some((start, end)) => format!("{}{with}{}", &shown[..start], &shown[end..]),
+        None => shown.to_string(),
+    }
 }
 
 /// Branch name for an item: `nucleus/item-<n>`. Code-owned: no part of
@@ -440,6 +476,19 @@ mod tests {
         assert_eq!((shown.as_str(), plan), ("Two questions first.", None));
         let (_, plan) = split_plan("===PLAN===\n\n===END PLAN===", "plan v1");
         assert_eq!(plan, None, "an empty plan is not a plan");
+    }
+
+    #[test]
+    fn a_shown_plan_is_found_and_replaced_as_split_plan_took_it() {
+        let reply = "Draft:\n===PLAN===\nold\n===END PLAN===\nBetter:\n===PLAN===\n1. a\n2. b\n===END PLAN===\nOK?";
+        let (shown, plan) = split_plan(reply, &plan_label(3));
+        assert_eq!(plan.as_deref(), Some("1. a\n2. b"));
+        assert_eq!(shown_plan(&shown, "plan v3"), plan.as_deref(), "the same text split_plan took");
+        let r = replace_shown_plan(&shown, "plan v3", "(plan v3, see the dashboard)");
+        assert!(r.ends_with("Better:\n(plan v3, see the dashboard)\nOK?"), "{r}");
+        assert!(r.contains("── plan v3 ──\nold\n"), "an earlier block is left as written: {r}");
+        assert_eq!(replace_shown_plan("no plan here", "plan v1", "x"), "no plan here");
+        assert_eq!(shown_plan("no plan here", "plan v1"), None);
     }
 
     #[test]
