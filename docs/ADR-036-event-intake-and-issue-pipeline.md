@@ -370,8 +370,10 @@ cross-site, as the Tasks cancel does (ADR-033 §7).
 
 `nucleus intake tick [--poll] | list [--all] [--json] | show <n> [--json] [--hidden] |
 reply <n> --text T | approve-plan <n> [--version V] | cancel <n> | retry <n> |
-release <n> --hold <code> | group-resolve <n> --left|--absent`. The explicit
-commands stay for the terminal; WhatsApp uses plain words.
+release <n> --hold <code> | group-resolve <n> --left|--absent | interpret-latest`.
+The explicit commands stay for the terminal; WhatsApp uses plain words.
+`interpret-latest` has the operator's latest stored DM message interpreted
+("Amendment: operator decisions in plain words").
 
 `list` and `show` print JSON with `--json`. JSON is for programs and is not
 fenced; only when the caller is the WhatsApp DM session is the output (JSON
@@ -382,12 +384,12 @@ WhatsApp group creation whose outcome is unknown (finding 6).
 | Caller (`crate::caller`) | May |
 |---|---|
 | Operator | every command (`group-resolve` and `release` only from the operator) |
-| WhatsApp DM chat session | `list`, `show`, `cancel` (not in a turn that read an agent message) |
+| WhatsApp DM chat session | `list`, `show`, `cancel`, `interpret-latest` (not in a turn that read an agent message) |
 | Detached process (launchd, the bot, the dashboard) | `tick` |
 | Workers, other sessions, unscoped chats, unknown | nothing |
 
 The DM persona gets an "Issue pipeline items" section and the pre-approved
-patterns `Bash(./target/release/nucleus intake list|show|cancel:*)`. The
+patterns `Bash(./target/release/nucleus intake list|show|cancel|interpret-latest:*)`. The
 session answers questions about items in plain language and tells the
 operator where to decide (the item's group, or a DM message that starts
 with `#n` or replies to an item's message); it cannot approve, release,
@@ -412,7 +414,9 @@ reply in a thread, or retry.
   `intake_groups` (group state) and `intake_inbound` (operator messages,
   read past a watermark kept in intake.db, with a processing state per
   message in intake.db's `inbound_commands`; a row is interpreted only when
-  the bot marked it `sender = 'operator'`). The bot owns the schema of all
+  the bot marked it `sender = 'operator'`; rows with `item_key = chat` are
+  read only by `interpret-latest`). Rust also writes the one-row
+  `intake_chat_block` (the DM chat session's list of waiting decisions). The bot owns the schema of all
   three intake tables (`messaging/whatsapp/src/intake.ts`);
   `whatsapp_queue::open` creates the queue table only so a producer works
   before the bot booted.
@@ -1488,11 +1492,49 @@ that quotes a message the pipeline sent (a thread message names its item; a
 question or note the pipeline sent in the DM, source `intake:ask` or
 `intake:note`, names none), and the next DM message after the pipeline asked
 a question in the DM (`intake:ask`), within 15 minutes of it being sent.
-Other DM messages go to the DM chat session as before: the chat session is
-the operator's general assistant, and sending every DM message to the
-interpreter while items wait would take it over. The bot stores each routed
+These fast paths go straight to the interpreter. The bot stores each routed
 message with `sender = 'operator'` after its identity check; the pipeline
 refuses to interpret a row without it.
+
+Every other operator DM message goes to the DM chat session, as before, so
+a cold "approve it" hours later also reaches the chat session first. Two
+things make it work there without sending every DM message to a one-shot
+interpreter (that would add a model session to every unrelated chat
+message):
+
+- **The chat session knows what waits.** Every tick writes a code-built
+  block (`pipeline::chat_block`) into whatsapp.db (`intake_chat_block`, one
+  row, Rust writes, the bot reads): a code-owned header, the interpreter's
+  pending lines for the DM (item number, what it waits for, allowed
+  decisions; no issue text), and an instruction (`[intake.texts]
+  chat_block_header`, `chat_block_instruction`). The bot types the block
+  after every operator message in the operator's DM chat session while it
+  is not empty (the turn engine's `operatorContext`; only for a DM chat id
+  whose digits are the operator's).
+- **The chat session can only trigger.** The bot also stores each operator
+  DM message that goes to the chat session in `intake_inbound` with
+  `item_key = chat` and `sender = operator`; the tick skips these rows. When
+  the operator's message asks for one of the listed decisions, the chat
+  session runs `nucleus intake interpret-latest`. The command takes no text:
+  code reads the newest `chat` row with `sender = operator` from the
+  calling session's own DM chat (from the operator's terminal, any DM chat),
+  no older than 15 minutes, and runs the same interpreter flow on that
+  stored text (`pipeline::interpret_latest`). A row is interpreted at most
+  once: its `inbound_commands` state is final after the first run. On a
+  decision (or an answer to an open question) the full flow runs,
+  confirmations and replies included, and the command prints `HANDLED`
+  with the line the session ends its turn with (`[handled by the issue
+  pipeline]`); the turn engine sends no reply for a turn whose whole final
+  text is that line, because the pipeline already answered. On a discussion
+  or anything unclear, the pipeline sends and keeps nothing, and the
+  command prints `NOT A DECISION`; the session answers normally.
+
+Who may run `interpret-latest` (`crate::caller`, `cmd/intake.rs::authorize`):
+the WhatsApp DM chat session and the operator's terminal, not in a turn
+that read an agent message. A worker, a group chat session, any other
+Nucleus session, a detached process or an unknown caller may not. A session
+that runs it without reason costs one interpreter session and changes
+nothing unless the operator's own latest message is a decision.
 
 ### The interpreter
 
@@ -1618,14 +1660,33 @@ thread runs in a group is also answered in the DM with the result note.
   minute); a message is not read when nothing waits for a decision and no
   question is open. An interpreter that cannot start is retried by the
   inbound mechanism (finding 7) and reported after 5 attempts.
-- A DM message that names no item and does not answer a question goes to
-  the chat session, which cannot decide; the operator starts it with `#n`,
-  replies to a pipeline message, or writes in the item's group.
+- A decision written cold in the DM depends on the chat session noticing
+  it against the block and running `interpret-latest`. When the session
+  misses it, the operator gets an ordinary chat answer; the chat session
+  itself still cannot decide anything.
+- The block reaches the DM chat session only for a chat id whose digits are
+  the operator's number; a DM that arrives in `@lid` form without a phone
+  number gets no block (the fast paths still work).
 - The 15-minute window for an unmarked DM answer starts when the question
   was sent; an unrelated DM message sent in that window goes to the
   pipeline (and gets the list) instead of the chat session.
 
 ### Verification of the amendment
+
+The chat-session trigger: a cold "approve it" in the DM with one plan
+waiting goes to the chat session, the tick does not interpret it, a fake
+chat session that sees the published block runs `interpret-latest`, and the
+plan is approved (`a_cold_approve_in_the_dm_runs_through_the_chat_sessions_trigger`);
+the command interprets the newest stored operator row of its own chat, not
+another sender's, a group's, another chat's or an older one's
+(`interpret_latest_interprets_the_stored_operator_text_only`); a row is
+interpreted once and a discussion sends nothing
+(`a_dm_row_is_interpreted_at_most_once`); an unrelated DM message with items
+waiting starts no interpreter (`an_unrelated_dm_message_starts_no_interpreter`);
+the caller rules (`cmd::intake::tests::authorization_by_caller`); the block
+after the operator's message and the silent handled turn
+(`chat_engine.test.ts`); the block table and the `chat` rows
+(`intake.test.ts`).
 
 Rust (`cargo test -p nucleus-core intake`, fake interpreter): "looks good,
 go ahead" in item #1's group approves plan v1 at once
@@ -1684,10 +1745,18 @@ real model on real messages, and the answer window on the live account.
 - **Whole-message commands as a second path next to the interpreter.** Two
   paths would give two behaviors for the same words; the interpreter reads
   `#2 approve` too.
-- **Sending every DM message to the interpreter while items wait.** The DM
-  chat session is the operator's general assistant; it would stop answering
-  for as long as a plan waits. Only marked messages, replies to pipeline
-  messages and answers within 15 minutes of a question go to the pipeline.
+- **Sending every DM message to the interpreter while items wait.** It adds
+  a model session to every unrelated chat message and delays every answer
+  of the operator's general assistant for as long as a plan waits. The chat
+  session sees the list and triggers the interpreter on the stored message
+  instead.
+- **Only the fast paths (a `#n` marker, a quote, the answer window).** A
+  cold "approve it" in the DM went to the chat session, which could not
+  decide: the failure the operator reported.
+- **Letting the chat session pass the text to interpret.** The session reads
+  other text (tool output, agent messages); `interpret-latest` reads the
+  operator's stored message instead, so the session can start an
+  interpretation but not choose what is interpreted.
 - **The implementation agent pushes and opens the PR.** It would need
   network access and the operator's `gh` credentials inside the session,
   which rules out a later sandbox.

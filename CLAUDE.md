@@ -595,8 +595,15 @@ JSON-parsed numbers.
   `[intake.texts]` texts; the interpreter's question is cut, stripped of
   Markdown and passed through the secret guard. Only the operator's exact
   identity counts. The terminal and the dashboard keep explicit commands.
-  A chat session may list, show and cancel items; it never approves or
-  releases.
+  A `#n` message, a quote of a pipeline message or an answer within 15
+  minutes of a DM question goes straight to the interpreter; any other DM
+  message goes to the DM chat session, which gets a code-built block of
+  the waiting decisions (no issue text) with each operator message and runs
+  `nucleus intake interpret-latest` when he asks for one. That command takes
+  no text: it interprets his latest stored DM row (`item_key = chat`,
+  `sender = operator`), each row once, and only the DM chat session and the
+  operator's terminal may run it. A chat session may list, show and cancel
+  items and trigger that interpretation; it never approves or releases.
 - Thread messages reach WhatsApp only through `outbound_queue` (target
   policy, secret filter). Intake groups are created and left only by the
   bot (`messaging/whatsapp/src/intake.ts`), within `[intake.whatsapp]
