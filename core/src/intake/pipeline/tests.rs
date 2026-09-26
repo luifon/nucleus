@@ -170,12 +170,16 @@ async fn fixture() -> Fixture {
         public_url: None,
     };
     // A stand-in for tools/check-secrets.sh with the same interface: exit 2
-    // and a `    - <category>:<value>` line for a hit.
+    // and a `    - <category>:<value>` line for a hit. Like the real script
+    // it flags an ASCII email address (`x@y.z`), and not the fullwidth `＠`
+    // form.
     std::fs::create_dir_all(ws.join("tools")).unwrap();
     std::fs::write(
         ws.join("tools/check-secrets.sh"),
         "#!/usr/bin/env bash\nhay=\"$(cat)\"\ncase \"$hay\" in *FAKE-SECRET-VALUE*) echo 'hit' >&2; \
-         echo '    - value:FAKE-SECRET-VALUE' >&2; exit 2 ;; esac\nexit 0\n",
+         echo '    - value:FAKE-SECRET-VALUE' >&2; exit 2 ;; esac\n\
+         if printf '%s' \"$hay\" | grep -Eq '[A-Za-z0-9._%+-]+[@][A-Za-z0-9-]+[.][A-Za-z.]+'; then \
+         echo '    - pii-email' >&2; exit 2; fi\nexit 0\n",
     )
     .unwrap();
     // The bot's own tables, as messaging/whatsapp creates them.
@@ -1165,15 +1169,19 @@ async fn only_one_code_owned_commit_is_published() {
     assert!(!remote_has(&f, "nucleus/item-1"));
 }
 
-/// A guard that finds nothing and, while it scans, runs `hook` once
-/// (the issue changes at GitHub between the two live reads).
+/// A guard that finds nothing and, while it scans the pull request text
+/// (the notices are scanned too, earlier), runs `hook` once (the issue
+/// changes at GitHub between the two live reads).
 struct HookGuard {
     hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[async_trait::async_trait]
 impl crate::intake::publish::SecretGuard for HookGuard {
-    async fn scan(&self, _text: &str) -> crate::intake::publish::Verdict {
+    async fn scan(&self, text: &str) -> crate::intake::publish::Verdict {
+        if !text.contains("Nucleus #") {
+            return crate::intake::publish::Verdict::Clean;
+        }
         if let Some(h) = self.hook.lock().unwrap().take() {
             h();
         }
@@ -2633,4 +2641,90 @@ async fn a_brief_over_the_ledger_limit_blocks_the_item_with_the_reason() {
     assert_eq!(it.stage(), Stage::Blocked, "{:?}", it.error);
     assert!(it.error.as_deref().unwrap().contains("the refinement brief has") && it.error.as_deref().unwrap().contains("nothing was cut"));
     assert!(kinds(&f, 1).await.iter().filter(|k| *k == "intake-refine").count() == 1, "no second turn was started");
+}
+
+// ── the secret guard reads raw text before any normalization ──────────────
+
+#[tokio::test]
+async fn a_reply_with_an_email_address_gets_no_preview() {
+    let f = fixture().await;
+    in_refinement(&f).await;
+    // Built at runtime: the committed-secrets scanner reads a literal
+    // address as personal information.
+    let reply = format!("Should I ask {}@{} about the format?", "someone", "example.invalid");
+    finish_current(&f, TaskStatus::Done, Some(&reply), None).await;
+    tick(&f).await;
+    let n = outbound(&f).await.last().unwrap().1.clone();
+    assert_eq!(n, "💬 Item #1: the agent replied. Full reply on the dashboard.", "the normalized form never passes: {n}");
+    assert!(!n.contains('＠') && !n.contains("someone"), "{n}");
+    // The thread keeps the reply for the dashboard.
+    assert!(store::messages(&f.ctx.db, 1).await.unwrap().iter().any(|m| m.body == reply));
+}
+
+#[tokio::test]
+async fn a_title_with_an_email_address_sends_the_fixed_notice() {
+    let f = fixture().await;
+    let title = format!("Mail {}@{} the report", "someone", "example.invalid");
+    live_titled(&f, 1, &title, &["nucleus"], "open", "body", serde_json::json!([labeled(101, "maintainer", "2026-09-20T10:05:00Z")]), None);
+    let mut e = issue(1, &["nucleus"], "open");
+    e.title = title.clone();
+    record_event(&f.ctx, &e).await.unwrap();
+    tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
+    tick(&f).await;
+    let n = outbound(&f).await.last().unwrap().1.clone();
+    assert_eq!(n, "Item #1 has an update on the dashboard.", "{n}");
+}
+
+#[tokio::test]
+async fn a_failure_reason_with_an_email_address_is_withheld() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    super::fail(&f.ctx, &it, &format!("the remote refused {}@{}", "someone", "example.invalid")).await.unwrap();
+    tick(&f).await;
+    let n = outbound(&f).await.last().unwrap().1.clone();
+    assert!(n.contains("the reason is on the dashboard.") && !n.contains("someone"), "{n}");
+}
+
+#[tokio::test]
+async fn operator_messages_from_an_old_group_are_reported_once_and_marked_final() {
+    let f = fixture().await;
+    with_plan(&f).await;
+    let group = format!("{}@{}", "120363000000000005", "g.us");
+    inbound_row(&f, "1", &group, "g1", "approve the plan", "text", "operator").await;
+    inbound_row(&f, "1", &group, "g2", "and keep it small", "voice", "operator").await;
+    tick(&f).await;
+    tick(&f).await;
+    assert_eq!(f.interp.calls(), 0, "never interpreted");
+    assert_eq!(item1(&f).await.stage(), Stage::Refinement);
+    let reports: Vec<String> = outbound(&f).await.into_iter().map(|(_, b)| b).filter(|b| b.contains("no longer use WhatsApp groups")).collect();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(reports[0].contains("\"approve the plan\"; \"and keep it small\"") && reports[0].contains("send it again"), "{}", reports[0]);
+    for m in ["g1", "g2"] {
+        let st = store::inbound_state(&f.ctx.db, &format!("wa:{group}:{m}")).await.unwrap().unwrap();
+        assert_eq!(st.state, "failed", "final, never taken again");
+    }
+}
+
+#[tokio::test]
+async fn a_title_with_an_email_address_blocks_the_pull_request() {
+    // The PR title normalizes the issue title (`@` becomes `＠`); the guard
+    // reads the raw title as well, so the address is never published.
+    let f = fixture().await;
+    let title = format!("Mail {}@{} the report", "someone", "example.invalid");
+    live_titled(&f, 1, &title, &["nucleus"], "open", "body", serde_json::json!([labeled(101, "maintainer", "2026-09-20T10:05:00Z")]), None);
+    let mut e = issue(1, &["nucleus"], "open");
+    e.title = title;
+    record_event(&f.ctx, &e).await.unwrap();
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!(it.stage(), Stage::Blocked, "{:?}", it.error);
+    assert!(it.error.unwrap().contains("pii-email"));
+    assert!(!remote_has(&f, "nucleus/item-1") && f.gh.calls_with("pr create") == 0);
 }
