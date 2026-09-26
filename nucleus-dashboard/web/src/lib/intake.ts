@@ -4,7 +4,7 @@
 // be refused.
 
 import type { StatusKind } from "@/components/StatusPill";
-import type { IntakeHiddenFinding, IntakeItem, IntakeMessage, IntakePlanVersion, IntakeStage } from "@/lib/api/intake";
+import type { IntakeHiddenFinding, IntakeItem, IntakeMessage, IntakePlanVersion, IntakeReplyResult, IntakeStage } from "@/lib/api/intake";
 
 /** The stages in pipeline order, for the stage track. */
 export const STAGE_TRACK: readonly IntakeStage[] = ["queued", "eval", "refinement", "implementation", "pr", "closed"];
@@ -172,16 +172,7 @@ export function authorLabel(m: Pick<IntakeMessage, "author" | "via">): string {
 
 /** Where the item's WhatsApp thread runs, in words. */
 export function surfaceLabel(item: Pick<IntakeItem, "surface" | "id">): string {
-  switch (item.surface) {
-    case "group":
-      return "WhatsApp group";
-    case "pending":
-      return "WhatsApp group (being created)";
-    case "dm":
-      return `WhatsApp DM, marked #${item.id}`;
-    default:
-      return "not on WhatsApp yet";
-  }
+  return item.surface === "dm" ? `WhatsApp DM, marked #${item.id}` : "not on WhatsApp yet";
 }
 
 /** Closed, cancelled or stale: nothing changes any more, so the item page
@@ -205,31 +196,10 @@ export function itemFromSearch(params: URLSearchParams): number | null {
   return Number.isSafeInteger(n) && n > 0 ? n : null;
 }
 
-/** A plan version as the plan panel shows it. `at` is null for a version
- *  rebuilt from the item row (servers that do not send `plans`). */
-export interface PlanVersionView {
-  version: number;
-  text: string;
-  at: string | null;
-}
-
-/** Every plan version, oldest first. Uses `plans` from the detail when the
- *  server sends it; otherwise rebuilds what the item row still holds (the
- *  approved plan and the latest draft). */
-export function planVersions(detail: { item: IntakeItem; plans?: readonly IntakePlanVersion[] | null }): PlanVersionView[] {
-  const plans = detail.plans ?? [];
-  if (plans.length > 0) {
-    return [...plans].sort((a, b) => a.version - b.version).map((p) => ({ version: p.version, text: p.text, at: p.at }));
-  }
-  const it = detail.item;
-  const out: PlanVersionView[] = [];
-  if (it.approved_plan !== null && it.approved_version !== null) {
-    out.push({ version: it.approved_version, text: it.approved_plan, at: it.approved_at });
-  }
-  if (it.plan_draft !== null && it.plan_version > 0 && it.plan_version !== it.approved_version) {
-    out.push({ version: it.plan_version, text: it.plan_draft, at: null });
-  }
-  return out.sort((a, b) => a.version - b.version);
+/** Every accepted plan version, oldest first (the server already orders
+ *  them; sort defensively by version). */
+export function planVersions(detail: { plans: readonly IntakePlanVersion[] }): IntakePlanVersion[] {
+  return [...detail.plans].sort((a, b) => a.version - b.version);
 }
 
 /** How a plan version stands: approved, the proposal waiting for a
@@ -249,8 +219,9 @@ export function canApproveShown(
   return shownVersion !== null && shownVersion === item.plan_version && canApprovePlan(item);
 }
 
-/** The composer is open while the item is not finished; the server
- *  refuses a reply outside refinement and the page shows its message. */
+/** The composer is open while the item is not finished. A reply is saved
+ *  in every stage; outside refinement no agent reads it, and the server
+ *  says so in `note`. */
 export function canCompose(item: Pick<IntakeItem, "stage">): boolean {
   return isOpenItem(item.stage);
 }
@@ -261,23 +232,29 @@ export function enterSends(e: { key: string; shiftKey: boolean; isComposing?: bo
   return e.key === "Enter" && !e.shiftKey && !e.isComposing && !coarsePointer;
 }
 
-/** What a reply attempt ended in. `refused`: the pipeline answered 409 with
- *  a message for the operator (not in refinement, empty, too long). */
+/** The composer placeholder: the keyboard hint only where Enter sends
+ *  (the same pointer check as `enterSends`). */
+export function composerPlaceholder(coarsePointer: boolean): string {
+  return coarsePointer ? "reply…" : "reply…  (Enter sends · Shift+Enter new line)";
+}
+
+/** What a reply attempt ended in. `sent` carries the server's `note` when
+ *  the message was saved but no agent reads it now, and null when the agent
+ *  does. `error` is any non-2xx answer (an empty message is a 409). */
 export type ReplyOutcome =
-  | { kind: "sent"; item: IntakeItem }
-  | { kind: "refused"; message: string }
+  | { kind: "sent"; item: IntakeItem; note: string | null }
   | { kind: "error"; message: string };
 
 export async function sendReply(
   id: number,
   text: string,
-  post: (id: number, text: string) => Promise<IntakeItem>,
+  post: (id: number, text: string) => Promise<IntakeReplyResult>,
 ): Promise<ReplyOutcome> {
   try {
-    return { kind: "sent", item: await post(id, text) };
+    const r = await post(id, text);
+    const note = r.reaches_agent ? null : (r.note ?? "Saved in the thread. No agent reads it now.");
+    return { kind: "sent", item: r.item, note };
   } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    const status = (e as { status?: unknown } | null)?.status;
-    return status === 409 ? { kind: "refused", message } : { kind: "error", message };
+    return { kind: "error", message: e instanceof Error ? e.message : String(e) };
   }
 }

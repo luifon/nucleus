@@ -7,6 +7,7 @@ import type { IntakeItem as IntakeItemWire } from "./generated/IntakeItem";
 import type { IntakeMessage as IntakeMessageWire } from "./generated/IntakeMessage";
 import type { IntakeDetail as IntakeDetailWire } from "./generated/IntakeDetail";
 import type { IntakeReplyReq } from "./generated/IntakeReplyReq";
+import type { IntakeReplyResult as IntakeReplyResultWire } from "./generated/IntakeReplyResult";
 import type { IntakeApprovePlanReq } from "./generated/IntakeApprovePlanReq";
 import type { IntakeItemReq } from "./generated/IntakeItemReq";
 import type { IntakeReleaseReq } from "./generated/IntakeReleaseReq";
@@ -17,6 +18,7 @@ export type { IntakeHiddenFinding } from "./generated/IntakeHiddenFinding";
 export type { IntakeHiddenSource } from "./generated/IntakeHiddenSource";
 export type { IntakeEvent } from "./generated/IntakeEvent";
 export type { IntakeTransition } from "./generated/IntakeTransition";
+export type { IntakePlanVersion } from "./generated/IntakePlanVersion";
 
 /** UI-layer refinement of IntakeItem.stage (the values core/src/intake/stage.rs writes). */
 export type IntakeStage =
@@ -36,8 +38,9 @@ export type IntakeStage =
  *  on the issue (`skipped`: the event's source has no reply channel). */
 export type CommentState = "none" | "posted" | "skipped";
 
-/** UI-layer refinement of IntakeItem.surface. */
-export type ThreadSurface = "none" | "pending" | "group" | "dm";
+/** UI-layer refinement of IntakeItem.surface: the item's WhatsApp thread
+ *  is the operator's DM once it has one. */
+export type ThreadSurface = "none" | "dm";
 
 export type IntakeItem = Omit<IntakeItemWire, "stage" | "comment_state" | "surface"> & {
   stage: IntakeStage;
@@ -51,22 +54,16 @@ export type IntakeMessage = Omit<IntakeMessageWire, "author" | "via"> & {
   via: "whatsapp" | "dashboard" | "cli" | "pipeline" | "whatsapp-session";
 };
 
-// TEMPORARY — remove when the generated type includes plans. The backend
-// change that adds `plans` to the detail response is built on a parallel
-// branch; until it merges, IntakeDetailWire has no such field and older
-// servers do not send it. Replace with the generated `IntakePlanVersion`
-// and drop the optional `plans` below once `npm run generate:api` emits it.
-/** One stored plan version of an item (oldest first in `plans`). */
-export type IntakePlanVersion = { version: number; text: string; at: string };
-
+/** `plans` holds every accepted plan version, oldest first. */
 export type IntakeDetail = Omit<IntakeDetailWire, "item" | "messages" | "tasks"> & {
   item: IntakeItem;
   messages: IntakeMessage[];
   tasks: Task[];
-  /** TEMPORARY optional (remove when the generated type includes plans):
-   *  every plan version, oldest first. Read as `detail.plans ?? []`. */
-  plans?: IntakePlanVersion[];
 };
+
+/** What a dashboard reply did: saved in the thread in every stage;
+ *  `reaches_agent` false with a `note` when no agent reads it now. */
+export type IntakeReplyResult = Omit<IntakeReplyResultWire, "item"> & { item: IntakeItem };
 
 /** Newest first. `all: false` leaves out closed and cancelled items, and
  *  stale items a newer item of the same issue replaced. */
@@ -76,12 +73,14 @@ export const listIntakeItems = (opts: { all?: boolean } = {}, signal?: AbortSign
 export const getIntakeDetail = (id: number, signal?: AbortSignal) =>
   jsonGet<IntakeDetail>(`/intake/api/detail${qs({ id })}`, signal);
 
-// Every action answers 409 with `{ error }` when the pipeline refuses it
+// Every decision answers 409 with `{ error }` when the pipeline refuses it
 // (wrong stage, a newer plan, the agent still answering); ApiError carries
 // that message.
 
+/** Discussion only: saved in every stage (409 only for an empty or
+ *  too-long message). */
 export const replyToItem = (id: number, text: string) =>
-  jsonPost<IntakeItem, IntakeReplyReq>("/intake/api/reply", { id, text });
+  jsonPost<IntakeReplyResult, IntakeReplyReq>("/intake/api/reply", { id, text });
 
 export const approvePlan = (id: number, version: number) =>
   jsonPost<IntakeItem, IntakeApprovePlanReq>("/intake/api/approve-plan", { id, version });

@@ -1,6 +1,6 @@
 // Synthetic intake records for tests (the repo is public: no real values).
 
-import type { IntakeDetail, IntakeEvent, IntakeItem, IntakeMessage } from "@/lib/api/intake";
+import type { IntakeDetail, IntakeEvent, IntakeItem, IntakeMessage, IntakeReplyResult } from "@/lib/api/intake";
 
 export function fixtureItem(over: Partial<IntakeItem> = {}): IntakeItem {
   return {
@@ -29,10 +29,7 @@ export function fixtureItem(over: Partial<IntakeItem> = {}): IntakeItem {
     comment_state: "none",
     comment_url: null,
     comment_op: null,
-    surface: "group",
-    group_requested_at: null,
-    group_jid: null,
-    group_closed_at: null,
+    surface: "dm",
     current_task_id: null,
     last_task_id: null,
     step_errors: 0,
@@ -106,9 +103,18 @@ export function fixtureDetail(item: IntakeItem = fixtureItem(), over: Partial<In
     eval: null,
     hidden: [],
     hidden_sources: [],
+    plans: [],
     messages: [],
     tasks: [],
     transitions: [],
     ...over,
   };
+}
+
+export function fixturePlans(...texts: string[]): IntakeDetail["plans"] {
+  return texts.map((text, k) => ({ version: k + 1, text, at: `2026-09-24T10:${String(10 + k * 10).padStart(2, "0")}:00.000Z` }));
+}
+
+export function fixtureReplyResult(over: Partial<IntakeReplyResult> = {}): IntakeReplyResult {
+  return { item: fixtureItem(), reaches_agent: true, note: null, ...over };
 }

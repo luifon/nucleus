@@ -1,12 +1,13 @@
 import { describe, expect, test } from "vitest";
 import { ApiError } from "@/lib/api/client";
-import { fixtureItem } from "./intake.fixtures";
+import { fixtureItem, fixtureReplyResult } from "./intake.fixtures";
 import {
   authorLabel,
   canApprovePlan,
   canApproveShown,
   canCancelItem,
   canCompose,
+  composerPlaceholder,
   enterSends,
   itemFromSearch,
   planStatus,
@@ -157,21 +158,8 @@ describe("item page", () => {
       { version: 2, text: "two", at: "2026-09-24T11:00:00.000Z" },
       { version: 1, text: "one", at: "2026-09-24T10:00:00.000Z" },
     ];
-    expect(planVersions({ item: item({ plan_version: 2, plan_draft: "two" }), plans }).map((p) => p.version)).toEqual([1, 2]);
-  });
-
-  test("without `plans` the versions are rebuilt from the item row", () => {
-    expect(planVersions({ item: item() })).toEqual([]);
-    expect(planVersions({ item: item({ plan_version: 3, plan_draft: "draft" }), plans: [] })).toEqual([{ version: 3, text: "draft", at: null }]);
-    const approved = item({
-      stage: "implementation",
-      plan_version: 3,
-      plan_draft: "draft",
-      approved_plan: "draft",
-      approved_version: 3,
-      approved_at: "2026-09-24T12:00:00.000Z",
-    });
-    expect(planVersions({ item: approved })).toEqual([{ version: 3, text: "draft", at: "2026-09-24T12:00:00.000Z" }]);
+    expect(planVersions({ plans }).map((p) => p.version)).toEqual([1, 2]);
+    expect(planVersions({ plans: [] })).toEqual([]);
   });
 
   test("plan status and the approve button follow the version on screen", () => {
@@ -199,24 +187,43 @@ describe("item page", () => {
     expect(enterSends({ key: "a", shiftKey: false }, false)).toBe(false);
   });
 
-  test("a reply posts the id and text; a 409 is the pipeline's message for the operator", async () => {
+  test("the keyboard hint shows only where Enter sends", () => {
+    expect(composerPlaceholder(false)).toContain("Enter sends");
+    expect(composerPlaceholder(true)).not.toContain("Enter");
+  });
+
+  test("a reply that reaches the agent has no note", async () => {
     const calls: [number, string][] = [];
     const ok = await sendReply(4, "looks good", async (id, text) => {
       calls.push([id, text]);
-      return item();
+      return fixtureReplyResult();
     });
     expect(calls).toEqual([[4, "looks good"]]);
-    expect(ok.kind).toBe("sent");
+    expect(ok).toEqual({ kind: "sent", item: item(), note: null });
+  });
 
-    const notInRefinement = "Item #4 is in implementation; replies are read during refinement only.";
-    const refused = await sendReply(4, "x", async () => {
-      throw new ApiError("/intake/api/reply", 409, notInRefinement);
+  test("a reply saved outside refinement carries the server's note", async () => {
+    const note = "Saved. Item #4 is in implementation; the agent does not read it now.";
+    const saved = await sendReply(4, "x", async () =>
+      fixtureReplyResult({ item: item({ stage: "implementation" }), reaches_agent: false, note }),
+    );
+    expect(saved).toEqual({ kind: "sent", item: item({ stage: "implementation" }), note });
+    const noNote = await sendReply(4, "x", async () => fixtureReplyResult({ reaches_agent: false, note: null }));
+    expect(noNote.kind === "sent" && noNote.note).toBe("Saved in the thread. No agent reads it now.");
+  });
+
+  test("non-2xx answers are errors", async () => {
+    const empty = await sendReply(4, " ", async () => {
+      throw new ApiError("/intake/api/reply", 409, "The message is empty.");
     });
-    expect(refused).toEqual({ kind: "refused", message: notInRefinement });
-
+    expect(empty).toEqual({ kind: "error", message: "The message is empty." });
     const broken = await sendReply(4, "x", async () => {
       throw new ApiError("/intake/api/reply", 500, "database locked");
     });
     expect(broken).toEqual({ kind: "error", message: "database locked" });
+  });
+
+  test("the surface is the DM or nothing yet", () => {
+    expect(surfaceLabel(item({ surface: "none" }))).toBe("not on WhatsApp yet");
   });
 });

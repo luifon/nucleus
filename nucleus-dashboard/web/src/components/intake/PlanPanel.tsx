@@ -3,8 +3,8 @@ import { Check } from "lucide-react";
 import InlineConfirm from "@/components/InlineConfirm";
 import Markdown from "@/components/Markdown";
 import Select from "@/components/Select";
-import { approvePlan, type IntakeItem } from "@/lib/api";
-import { canApproveShown, planStatus, type PlanVersionView } from "@/lib/intake";
+import { approvePlan, type IntakeItem, type IntakePlanVersion } from "@/lib/api";
+import { canApproveShown, planStatus } from "@/lib/intake";
 import { collapseUnchanged, diffStats, lineDiff, type DiffRow } from "@/lib/linediff";
 import { shortTime } from "@/lib/tasks";
 import { ActionButton } from "./parts";
@@ -26,7 +26,7 @@ export default function PlanPanel({
   defaultView = "plan",
 }: {
   item: IntakeItem;
-  versions: readonly PlanVersionView[];
+  versions: readonly IntakePlanVersion[];
   busy: boolean;
   act: (fn: () => Promise<IntakeItem>) => Promise<boolean>;
   /** The version shown first; the latest when absent. */
@@ -74,7 +74,7 @@ export default function PlanPanel({
             }}
             options={[...versions].reverse().map((v) => ({
               value: String(v.version),
-              label: `v${v.version} · ${planStatus(v.version, item)}${v.at ? ` · ${shortTime(v.at)}` : ""}`,
+              label: `v${v.version} · ${planStatus(v.version, item)} · ${shortTime(v.at)}`,
             }))}
           />
           <PlanStatus status={status} item={item} />

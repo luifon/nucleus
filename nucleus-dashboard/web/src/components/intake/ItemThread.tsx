@@ -1,8 +1,8 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { Send } from "lucide-react";
 import Markdown from "@/components/Markdown";
-import { replyToItem, type IntakeItem, type IntakeMessage } from "@/lib/api";
-import { canCompose, enterSends, sendReply, threadOrder } from "@/lib/intake";
+import { replyToItem, type IntakeItem, type IntakeMessage, type IntakeReplyResult } from "@/lib/api";
+import { canCompose, composerPlaceholder, enterSends, sendReply, threadOrder } from "@/lib/intake";
 import { shortTime } from "@/lib/tasks";
 
 // The item's conversation, in the ChatPage pattern: the agent's replies
@@ -131,8 +131,8 @@ export function Composer({
   item: IntakeItem;
   onSent: (item: IntakeItem) => void;
   /** The reply call; tests pass a fake. */
-  post?: (id: number, text: string) => Promise<IntakeItem>;
-  /** A refusal message to show from the start (tests). */
+  post?: (id: number, text: string) => Promise<IntakeReplyResult>;
+  /** A notice to show from the start (tests). */
   initialNotice?: string | null;
 }) {
   const [draft, setDraft] = useState("");
@@ -150,12 +150,12 @@ export function Composer({
     const r = await sendReply(item.id, text, post);
     setSending(false);
     if (r.kind === "sent") {
+      // Saved in the thread; `note` says when no agent reads it now.
       setDraft("");
+      setNotice(r.note);
       onSent(r.item);
-    } else if (r.kind === "refused") {
-      // The draft stays so the operator can keep it.
-      setNotice(r.message);
     } else {
+      // The draft stays so the operator can send it again.
       setError(r.message);
     }
   };
@@ -173,7 +173,9 @@ export function Composer({
         </div>
       )}
       {item.stage !== "refinement" && !notice && (
-        <div className="mb-2 text-[11px] text-[var(--color-nucleus-faint)]">the agent reads replies during refinement; this item is in {item.stage}</div>
+        <div className="mb-2 text-[11px] text-[var(--color-nucleus-faint)]">
+          saved in the thread; the agent reads replies only during refinement, and this item is in {item.stage}
+        </div>
       )}
       <form
         className="flex items-end gap-2"
@@ -193,7 +195,7 @@ export function Composer({
           }}
           rows={2}
           aria-label="reply to the refinement agent"
-          placeholder={touch ? "reply…" : "reply…  (Enter sends · Shift+Enter new line)"}
+          placeholder={composerPlaceholder(touch)}
           disabled={sending}
           // 16px below md: iOS zooms the page into smaller text fields.
           className="min-h-[2.75rem] flex-1 resize-y rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-3 py-2 text-base md:text-sm text-[var(--color-nucleus-text)] focus:border-[var(--color-nucleus-accent)] focus:outline-none disabled:opacity-50"

@@ -121,7 +121,7 @@ export default function ItemHeader({
       {confirmCancel && cancel && (
         <InlineConfirm
           className="px-4 py-2 md:px-5"
-          message={`Cancel item #${item.id}? Its running task stops and its WhatsApp group is left. A cancelled item cannot be resumed.`}
+          message={`Cancel item #${item.id}? Its running task stops. A cancelled item cannot be resumed.`}
           confirmLabel={busy ? "cancelling…" : "cancel item"}
           busy={busy}
           onConfirm={() => void act(() => cancelItem(item.id)).then((ok) => ok && setConfirmCancel(false))}

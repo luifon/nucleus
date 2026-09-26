@@ -9,7 +9,7 @@ import type { ReactElement } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import IntakePage from "@/pages/IntakePage";
 import type { IntakeItem } from "@/lib/api";
-import { fixtureDetail, fixtureItem, fixtureMessage } from "@/lib/intake.fixtures";
+import { fixtureDetail, fixtureItem, fixtureMessage, fixturePlans } from "@/lib/intake.fixtures";
 import { ItemScreen } from "./ItemView";
 import ItemThread, { Composer } from "./ItemThread";
 import PlanPanel from "./PlanPanel";
@@ -60,10 +60,7 @@ describe("deep link", () => {
 });
 
 describe("actions shown per stage", () => {
-  const plans = [
-    { version: 1, text: "# Plan\n\nfirst", at: "2026-09-24T10:10:00.000Z" },
-    { version: 2, text: "# Plan\n\nsecond", at: "2026-09-24T10:20:00.000Z" },
-  ];
+  const plans = fixturePlans("# Plan\n\nfirst", "# Plan\n\nsecond");
   const screen = (it: IntakeItem, extra: Parameters<typeof fixtureDetail>[1] = {}) =>
     buttons(render(<ItemScreen detail={fixtureDetail(it, { plans, ...extra })} onChange={noop} />));
 
@@ -147,12 +144,20 @@ describe("conversation", () => {
     expect(html).toContain("not read by the agent yet");
   });
 
-  test("the composer posts outside refinement too and shows the pipeline's refusal", () => {
-    const notice = "Item #4 is in implementation; replies are read during refinement only.";
+  test("outside refinement the composer stays open, says no agent reads the reply, and shows the server's note", () => {
+    const notice = "Saved. Item #4 is in implementation; the agent does not read it now.";
     const html = render(<Composer item={fixtureItem({ stage: "implementation" })} onSent={noop} initialNotice={notice} />);
     expect(html).toContain('role="status"');
-    expect(html).toContain("Item #4 is in implementation");
+    expect(html).toContain("Item #4 is in implementation; the agent does not read it now.");
     expect(buttons(html)).toContain("send");
+    const before = render(<Composer item={fixtureItem({ stage: "implementation" })} onSent={noop} />);
+    expect(before).toContain("the agent reads replies only during refinement");
+  });
+
+  test("no UI text mentions WhatsApp groups", () => {
+    const html = render(<ItemScreen detail={fixtureDetail(fixtureItem(), { messages, plans: fixturePlans("x") })} onChange={noop} defaultPane="details" />);
+    expect(html).not.toMatch(/group/i);
+    expect(html).toContain("WhatsApp DM, marked #4");
   });
 
   test("during refinement the composer has no stage hint", () => {
@@ -164,12 +169,9 @@ describe("conversation", () => {
 
 describe("plan version selector", () => {
   const it = fixtureItem({ plan_version: 3, plan_draft: "c" });
-  const plans = [
-    { version: 1, text: "## Steps\n\n1. read\n2. edit", at: "2026-09-24T10:10:00.000Z" },
-    { version: 2, text: "## Steps\n\n1. read\n2. edit\n3. test", at: "2026-09-24T10:20:00.000Z" },
-    { version: 3, text: "## Steps\n\n1. read\n2. change\n3. test", at: "2026-09-24T10:30:00.000Z" },
-  ];
-  const versions = planVersions({ item: it, plans });
+  const plans = fixturePlans("## Steps\n\n1. read\n2. edit", "## Steps\n\n1. read\n2. edit\n3. test", "## Steps\n\n1. read\n2. change\n3. test");
+  // Out of order on purpose: the page sorts by version.
+  const versions = planVersions({ plans: [plans[2], plans[0], plans[1]] });
   const panel = (props: Partial<Parameters<typeof PlanPanel>[0]> = {}) =>
     render(<PlanPanel item={it} versions={versions} busy={false} act={noAct} {...props} />);
 
