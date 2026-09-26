@@ -1,20 +1,11 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import InlineConfirm from "@/components/InlineConfirm";
 import StatusPill from "@/components/StatusPill";
 import { useFetch } from "@/lib/hooks";
-import {
-  approveComment,
-  approvePlan,
-  getIntakeDetail,
-  releaseItem,
-  replyToItem,
-  skipComment,
-  type IntakeItem,
-} from "@/lib/api";
+import { approvePlan, getIntakeDetail, releaseItem, replyToItem, type IntakeItem } from "@/lib/api";
 import {
   authorLabel,
   canApprovePlan,
-  canDecideComment,
   canRelease,
   canReply,
   findingKindLabel,
@@ -28,12 +19,12 @@ import { clockTime, shortId, shortTime, taskDuration, taskStatusKind } from "@/l
 
 // Expanded view of one pipeline item: the source event, the eval, the plan
 // (with its approval), the thread with a reply box, the implementation and
-// test result, the pull request and the proposed issue comment, the stage
+// test result, the pull request and its link on the issue, the stage
 // tasks and the stage log. Refetched whenever `version` changes (the list
 // row derives it from the item, so a list refresh that changes the item
 // refreshes this panel too).
 
-type Confirm = "plan" | "comment" | "skip" | "release" | null;
+type Confirm = "plan" | "release" | null;
 
 export default function ItemDetailPanel({
   itemId,
@@ -48,15 +39,11 @@ export default function ItemDetailPanel({
 }) {
   const detail = useFetch((signal) => getIntakeDetail(itemId, signal), [itemId, version]);
   const [reply, setReply] = useState("");
-  const [comment, setComment] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<Confirm>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   const item = detail.data?.item;
-  // The comment editor starts from the proposed text each time a new
-  // proposal arrives.
-  useEffect(() => setComment(item?.comment_draft ?? null), [item?.comment_draft]);
 
   if (detail.error && !detail.data) {
     return <div className="border-t border-[var(--color-nucleus-border)] px-4 py-3 text-xs text-[var(--color-status-down)]">{detail.error}</div>;
@@ -304,55 +291,17 @@ export default function ItemDetailPanel({
       )}
 
       {item.comment_state !== "none" && (
-        <Field label={`issue comment: ${item.comment_state}`}>
-          {canDecideComment(item) ? (
-            <textarea
-              value={comment ?? ""}
-              onChange={(e) => setComment(e.target.value)}
-              rows={5}
-              className="w-full rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-2 py-1.5 font-mono text-xs text-[var(--color-nucleus-text)] outline-none focus:border-[var(--color-nucleus-accent)]"
-            />
-          ) : (
-            <Pre>{item.comment_draft ?? ""}</Pre>
-          )}
-          {item.comment_url && (
+        <Field label="pull request link on the issue">
+          {item.comment_state === "skipped" ? (
+            <span className="text-[var(--color-nucleus-faint)]">not posted: the event's source has no reply channel</span>
+          ) : item.comment_url ? (
             <a href={item.comment_url} target="_blank" rel="noreferrer" className="text-[var(--color-nucleus-accent)] hover:underline">
               posted comment
             </a>
-          )}
-          {canDecideComment(item) && confirm === null && (
-            <div className="mt-2 flex gap-2">
-              <ActionButton onClick={() => setConfirm("comment")} disabled={busy || !(comment ?? "").trim()}>
-                approve and post
-              </ActionButton>
-              <ActionButton onClick={() => setConfirm("skip")} disabled={busy}>
-                post nothing
-              </ActionButton>
-            </div>
+          ) : (
+            <span>posted</span>
           )}
         </Field>
-      )}
-      {confirm === "comment" && (
-        <InlineConfirm
-          className="px-0 py-2"
-          message="Post this comment on the issue? The issue is public."
-          confirmLabel={busy ? "posting…" : "post"}
-          busy={busy}
-          onConfirm={() =>
-            void act(() => approveComment(item.id, comment !== item.comment_draft ? (comment ?? undefined) : undefined))
-          }
-          onCancel={() => setConfirm(null)}
-        />
-      )}
-      {confirm === "skip" && (
-        <InlineConfirm
-          className="px-0 py-2"
-          message="Close the item without a comment on the issue?"
-          confirmLabel={busy ? "closing…" : "close without comment"}
-          busy={busy}
-          onConfirm={() => void act(() => skipComment(item.id))}
-          onCancel={() => setConfirm(null)}
-        />
       )}
 
       <Field label={`stage tasks (${tasks.length})`}>

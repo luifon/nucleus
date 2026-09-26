@@ -5,9 +5,8 @@
 //! The pull request body is built from code-owned fields only: the issue
 //! link, the branch, the changed files, the test command and its result,
 //! and the footer. No model text and no raw test output go into it. The
-//! one model-written text Nucleus publishes, the summary in the proposed
-//! issue comment, is cut to a fixed length and escaped so it cannot mention
-//! anyone, link, embed an image, carry HTML or break out of its paragraph.
+//! issue comment is the code-owned `[intake.texts] pr_comment` with the pull
+//! request link; Nucleus publishes no model-written text.
 //!
 //! Before a push, the diff to be pushed and the pull request's title and
 //! body go through [`SecretGuard`]; before the comment is posted, the
@@ -163,27 +162,6 @@ fn code_span(path: &str) -> String {
     format!("`{}`", super::clip(&p, 200))
 }
 
-/// A model-written summary for public text: one paragraph, at most `max`
-/// characters, Markdown and HTML characters escaped, no mention, no URL.
-pub fn escape_summary(s: &str, max: usize) -> String {
-    let one = plain_line(s, max);
-    let one = one.replace("://", "[:]//").replace("www.", "www[.]");
-    let mut out = String::with_capacity(one.len());
-    for c in one.chars() {
-        match c {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '!' | '#' | '|' | '~' | '{' | '}' | '+' | '-' | '=' | ':' => {
-                out.push('\\');
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 /// Most changed files listed in the pull request body.
 const MAX_FILES: usize = 100;
 
@@ -242,16 +220,6 @@ mod tests {
         assert_eq!(category("    - denylist/skill:somename").as_deref(), Some("denylist-or-private-skill"));
         assert_eq!(category("    - pii-email").as_deref(), Some("pii-email"));
         assert_eq!(category("✖ possible personal information"), None);
-    }
-
-    #[test]
-    fn summaries_cannot_mention_link_or_break_out() {
-        let s = escape_summary("Hi @octocat see [x](https://evil.example/a) ![i](u) <img src=x> ```\n# Title\nwww.example.org", 500);
-        assert!(!s.contains('@') && !s.contains("https://") && !s.contains("www.e"), "{s}");
-        assert!(!s.contains("<img") && s.contains("&lt;img"), "{s}");
-        assert!(!s.contains("](") && !s.contains("```") && !s.contains('\n'), "{s}");
-        assert!(s.contains("\\[x\\]") && s.contains("\\#"), "{s}");
-        assert!(escape_summary(&"a".repeat(2000), 600).chars().count() <= 601);
     }
 
     #[test]

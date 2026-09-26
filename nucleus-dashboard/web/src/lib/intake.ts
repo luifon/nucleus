@@ -7,7 +7,7 @@ import type { StatusKind } from "@/components/StatusPill";
 import type { IntakeHiddenFinding, IntakeItem, IntakeMessage, IntakeStage } from "@/lib/api/intake";
 
 /** The stages in pipeline order, for the stage track. */
-export const STAGE_TRACK: readonly IntakeStage[] = ["queued", "eval", "refinement", "implementation", "pr", "review", "closed"];
+export const STAGE_TRACK: readonly IntakeStage[] = ["queued", "eval", "refinement", "implementation", "pr", "closed"];
 
 /** Not finished: the pipeline still works on it or waits for the
  *  operator. `stale` is finished (only a new label starts new work). */
@@ -35,7 +35,6 @@ export function stageKind(item: Pick<IntakeItem, "stage" | "pr_url" | "current_t
       return item.pr_url ? "ok" : "idle";
     case "cancelled":
       return "idle";
-    case "review":
     case "held":
       return "warn";
     case "refinement":
@@ -50,7 +49,6 @@ export function waitingOn(item: IntakeItem): string | null {
   if (item.stage === "refinement" && !item.current_task_id) {
     return item.plan_version > 0 ? `plan v${item.plan_version} waits for approval or a reply` : "the agent asked for a reply";
   }
-  if (item.stage === "review" && item.comment_state === "proposed") return "the issue comment waits for approval";
   if (item.stage === "failed") return "failed — retry or cancel";
   if (item.stage === "blocked") return "blocked by the secret guard — fix, then retry or cancel";
   if (item.stage === "stale") return "stale — the issue changed; add the label again for a new item";
@@ -67,10 +65,6 @@ export function canApprovePlan(item: Pick<IntakeItem, "stage" | "plan_version" |
 /** The dashboard reply box is open during refinement only. */
 export function canReply(item: Pick<IntakeItem, "stage">): boolean {
   return item.stage === "refinement";
-}
-
-export function canDecideComment(item: Pick<IntakeItem, "stage" | "comment_state">): boolean {
-  return item.stage === "review" && item.comment_state === "proposed";
 }
 
 export function canRetry(item: Pick<IntakeItem, "stage">): boolean {

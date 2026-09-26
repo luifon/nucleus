@@ -748,8 +748,8 @@ pub struct IntakeWhatsAppConfig {
 
 /// Operator-facing texts of the pipeline (`[intake.texts]`). Placeholders:
 /// `{n}` item number, `{title}`, `{ref}` (`owner/name#12`), `{url}`,
-/// `{stage}`, `{version}`, `{error}`, `{pr_url}`, `{tests}`, `{comment}`,
-/// `{summary}`, `{classification}`, `{failed_in}` (the stage a failed item
+/// `{stage}`, `{version}`, `{error}`, `{pr_url}`, `{tests}`,
+/// `{classification}`, `{failed_in}` (the stage a failed item
 /// failed in), `{label}` (the gate label). `item_held` also has `{count}`
 /// (the number of findings), `{kinds}` (the findings counted by kind),
 /// `{findings}` (the first findings, one per line, shortened) and `{code}`
@@ -764,10 +764,12 @@ pub struct IntakeTexts {
     pub simple_started: String,
     pub approve_hint: String,
     pub plan_approved: String,
+    /// The draft PR is open (`{pr_url}`, `{tests}`, and `{summary}`: the
+    /// implementation agent's final message, at most 600 characters, as it
+    /// wrote it).
     pub pr_opened: String,
-    pub comment_proposal: String,
+    /// The pull request link was posted on the issue; the item is closed.
     pub comment_posted: String,
-    pub comment_skipped: String,
     pub item_failed: String,
     pub item_cancelled: String,
     pub item_closed: String,
@@ -786,8 +788,10 @@ pub struct IntakeTexts {
     pub no_plan: String,
     pub refinement_busy: String,
     pub unknown_item: String,
-    /// The comment Nucleus proposes for the issue once the draft PR is open.
-    pub issue_comment: String,
+    /// The comment Nucleus posts on the issue once the draft PR is open
+    /// (`{pr_url}` only). Code-owned and posted without approval, so it
+    /// must not take model output or issue text.
+    pub pr_comment: String,
 }
 
 impl Default for IntakeTexts {
@@ -804,13 +808,9 @@ impl Default for IntakeTexts {
                            is optional)."
                 .into(),
             plan_approved: "✅ Plan v{version} of item #{n} approved; implementation started.".into(),
-            pr_opened: "📬 Draft PR for item #{n} — {title}: {pr_url}\nTests: {tests}".into(),
-            comment_proposal: "Proposed comment on {ref}. Reply `#{n} approve comment` to post \
-                               it or `#{n} skip comment` to post nothing; the dashboard can \
-                               edit it first.\n\n{comment}"
+            pr_opened: "📬 Draft PR for item #{n} — {title}: {pr_url}\nTests: {tests}\n\nThe agent's summary:\n{summary}"
                 .into(),
-            comment_posted: "💬 Comment posted on {ref}. Item #{n} is closed.".into(),
-            comment_skipped: "Item #{n} is closed without a comment on {ref}.".into(),
+            comment_posted: "💬 The draft PR link is posted on {ref}. Item #{n} is closed.".into(),
             item_failed: "⚠️ Item #{n} — {title} failed during {failed_in}: {error}\nRetry from the \
                           dashboard (Intake page) or with `nucleus intake retry {n}`."
                 .into(),
@@ -841,7 +841,7 @@ impl Default for IntakeTexts {
                               arrives, so you approve the plan you read."
                 .into(),
             unknown_item: "There is no open item #{n}.".into(),
-            issue_comment: "A draft pull request for this issue is open: {pr_url}\n\n{summary}".into(),
+            pr_comment: "Draft pull request: {pr_url}".into(),
         }
     }
 }

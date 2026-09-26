@@ -1,7 +1,7 @@
 //! The pipeline driver (ADR-036): [`tick`] polls the sources, reads
 //! operator replies, and advances every open item one step; the operator
-//! actions ([`approve_plan`], [`approve_comment`], [`skip_comment`],
-//! [`reply`], [`cancel`], [`retry`], [`release`]) are the functions the CLI,
+//! actions ([`approve_plan`], [`reply`], [`cancel`], [`retry`],
+//! [`release`]) are the functions the CLI,
 //! the dashboard and the WhatsApp path call.
 //!
 //! Concurrency: a tick takes an advisory lock per part (`poll`,
@@ -561,8 +561,6 @@ pub async fn operator_text(ctx: &Ctx, item: &Item, text: &str, msg_ref: &str, in
     } else {
         match cmd {
             OperatorCommand::ApprovePlan(v) => approve_plan_caused(ctx, item.id, v, "whatsapp", cause).await.map(|_| ()),
-            OperatorCommand::ApproveComment => approve_comment_caused(ctx, item.id, None, "whatsapp", cause).await.map(|_| ()),
-            OperatorCommand::SkipComment => skip_comment_caused(ctx, item.id, "whatsapp", cause).await.map(|_| ()),
             OperatorCommand::Cancel => cancel_caused(ctx, item.id, "whatsapp", cause).await.map(|_| ()),
             OperatorCommand::Release(code) => {
                 release_caused(ctx, item.id, code.as_deref(), "whatsapp", cause).await.map(|_| ())
@@ -632,45 +630,6 @@ async fn approve_plan_caused(ctx: &Ctx, n: i64, version: Option<u32>, via: &str,
     let item = store::item(&ctx.db, n).await?;
     note(ctx, n, &fill_vars(&ctx.cfg.texts.plan_approved, &item_vars(ctx, &item))).await?;
     Ok(item)
-}
-
-/// Approve the proposed issue comment, optionally with the operator's own
-/// text. The next tick posts it.
-pub async fn approve_comment(ctx: &Ctx, n: i64, text: Option<String>, via: &str) -> Result<Item> {
-    approve_comment_caused(ctx, n, text, via, None).await
-}
-
-async fn approve_comment_caused(ctx: &Ctx, n: i64, text: Option<String>, via: &str, cause: Option<&str>) -> Result<Item> {
-    let item = store::item(&ctx.db, n).await?;
-    if item.stage() != Stage::Review || item.comment_state != "proposed" {
-        return refuse(format!("Item #{n} has no proposed comment waiting for approval."));
-    }
-    let mut set = vec![("comment_state", Val::from("approved"))];
-    if let Some(t) = text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
-        set.push(("comment_draft", t.into()));
-    }
-    if !store::update_caused(&ctx.db, n, Stage::Review, set, cause).await? {
-        return refuse(format!("Item #{n} changed while approving; look at it again."));
-    }
-    tracing::info!(item = n, via, "intake: comment approved");
-    store::item(&ctx.db, n).await
-}
-
-/// Close the review without a comment on the issue.
-pub async fn skip_comment(ctx: &Ctx, n: i64, via: &str) -> Result<Item> {
-    skip_comment_caused(ctx, n, via, None).await
-}
-
-async fn skip_comment_caused(ctx: &Ctx, n: i64, via: &str, cause: Option<&str>) -> Result<Item> {
-    let item = store::item(&ctx.db, n).await?;
-    if item.stage() != Stage::Review || !matches!(item.comment_state.as_str(), "proposed" | "approved") {
-        return refuse(format!("Item #{n} has no comment waiting."));
-    }
-    if !store::update_caused(&ctx.db, n, Stage::Review, vec![("comment_state", "skipped".into())], cause).await? {
-        return refuse(format!("Item #{n} changed while skipping the comment; look at it again."));
-    }
-    tracing::info!(item = n, via, "intake: comment skipped");
-    store::item(&ctx.db, n).await
 }
 
 /// An operator message from the dashboard or the CLI. Only during
@@ -937,7 +896,6 @@ async fn step_item(ctx: &Ctx, item: &Item, r: &mut TickReport) {
             Stage::Refinement => step_refinement(ctx, item).await,
             Stage::Implementation => step_implementation(ctx, item).await,
             Stage::Pr => step_pr(ctx, item).await,
-            Stage::Review => step_review(ctx, item).await,
             Stage::Failed | Stage::Blocked | Stage::Held | Stage::Closed | Stage::Cancelled | Stage::Stale => Ok(()),
         }
     }
@@ -1837,96 +1795,96 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
             github::create_draft_pr(&*ctx.gh, &item.repo, &branch, &base_ref, &title, &body).await?
         }
     };
-    let can_reply = adapter_for(ctx, &ev).is_some();
-    let summary = publish::escape_summary(item.impl_summary.as_deref().unwrap_or(""), 600);
-    let comment = fill(&ctx.cfg.texts.issue_comment, &[("pr_url", &url), ("summary", &summary)]);
-    let mut set = vec![("pr_url", Val::from(url.clone()))];
-    if can_reply {
-        set.push(("comment_draft", comment.clone().into()));
-        set.push(("comment_state", "proposed".into()));
-    } else {
-        set.push(("comment_state", "skipped".into()));
+    if item.pr_url.as_deref() != Some(url.as_str())
+        && !store::update(&ctx.db, item.id, Stage::Pr, vec![("pr_url", Val::from(url.clone()))]).await?
+    {
+        return Ok(());
     }
-    if store::advance(&ctx.db, item.id, Stage::Pr, StageEvent::PrOpened, "draft PR open", set).await? {
-        let it = store::item(&ctx.db, item.id).await?;
-        let vars = item_vars(ctx, &it);
-        let tests = it.tests_status.clone().unwrap_or_else(|| "not_run".into());
-        note_once(ctx, item.id, &fill_item(&ctx.cfg.texts.pr_opened, &vars, &[("tests", &tests)]), &format!("pr:{url}"))
-            .await?;
-        if can_reply {
-            let text =
-                fill_item(&ctx.cfg.texts.comment_proposal, &vars, &[("ref", &event_ref(&ev)), ("comment", &comment)]);
-            note_once(ctx, item.id, &text, &format!("comment-proposal:{url}")).await?;
-        }
-    }
-    Ok(())
+    let it = store::item(&ctx.db, item.id).await?;
+    let tests = it.tests_status.clone().unwrap_or_else(|| "not_run".into());
+    // The agent's own words, as it wrote them: this goes to the operator on
+    // WhatsApp, never to GitHub.
+    let summary = clip(it.impl_summary.as_deref().unwrap_or(""), 600);
+    note_once(
+        ctx,
+        item.id,
+        &fill_item(&ctx.cfg.texts.pr_opened, &item_vars(ctx, &it), &[("tests", &tests), ("summary", &summary)]),
+        &format!("pr:{url}"),
+    )
+    .await?;
+    post_pr_link(ctx, &it, &ev, &url, &first).await
 }
 
-async fn step_review(ctx: &Ctx, item: &Item) -> Result<()> {
-    let ev = store::event(&ctx.db, item.event_id).await?;
+/// The last write of the pull request stage: one code-owned comment on the
+/// issue with the pull request link (`[intake.texts] pr_comment`), then the
+/// item closes. No approval: the text holds no model output and no issue
+/// text. The protections of every write still apply: the secret guard, a
+/// random per-comment marker found only on a comment by the account Nucleus
+/// posts as (so a retry never posts twice), a fresh live read right before
+/// the write, and the pinned `gh`.
+async fn post_pr_link(ctx: &Ctx, item: &Item, ev: &Event, url: &str, first: &Revision) -> Result<()> {
     let vars = item_vars(ctx, item);
-    match item.comment_state.as_str() {
-        "approved" => {
-            let a = adapter_for(ctx, &ev).context("the event's source has no reply channel")?;
-            let first = first_read!(ctx, item, "the issue comment");
-            let draft = item.comment_draft.clone().unwrap_or_default();
-            if let Verdict::Hit(cats) = ctx.guard.scan(&draft).await {
-                return block(ctx, item, "the issue comment", &cats).await;
-            }
-            // A random operation id, stored before the post: its exact
-            // marker line, on a comment by the account Nucleus posts as, is
-            // the only proof of an earlier post.
-            let op = match &item.comment_op {
-                Some(op) => op.clone(),
-                None => {
-                    let op = random_hex(16)?;
-                    if !store::update(&ctx.db, item.id, Stage::Review, vec![("comment_op", op.clone().into())]).await? {
-                        return Ok(());
-                    }
-                    op
-                }
-            };
-            let marker = format!("{}item-{}:comment:{op}", github::COMMENT_MARKER_PREFIX, item.id);
-            let viewer = ctx.viewer().await?.to_string();
-            // The lookup (a retry must not post twice), then a fresh read,
-            // then the write.
-            let url = match a.find_reply(&ev, &marker, &viewer).await? {
-                Some(u) => Some(u),
-                None => {
-                    let _ = final_read!(ctx, item, "the issue comment", first);
-                    if !tools_unchanged(ctx, item, "the issue comment").await? {
-                        return Ok(());
-                    }
-                    a.post_reply(&ev, &draft, &marker).await?
-                }
-            };
-            if store::advance(
-                &ctx.db,
-                item.id,
-                Stage::Review,
-                StageEvent::Finished,
-                "comment posted",
-                vec![("comment_state", "posted".into()), ("comment_url", Val::Text(url))],
-            )
-            .await?
-            {
-                note(ctx, item.id, &fill_item(&ctx.cfg.texts.comment_posted, &vars, &[("ref", &event_ref(&ev))])).await?;
-            }
+    let Some(a) = adapter_for(ctx, ev) else {
+        // An operator-accepted event: nowhere to post.
+        let moved = store::advance(
+            &ctx.db,
+            item.id,
+            Stage::Pr,
+            StageEvent::Finished,
+            "draft PR open; no reply channel",
+            vec![("comment_state", "skipped".into())],
+        )
+        .await?;
+        if moved {
+            let mut v = vars.clone();
+            v.retain(|(k, _)| *k != "error");
+            let why = "the draft PR is open; the event's source has no reply channel";
+            note(ctx, item.id, &fill_item(&ctx.cfg.texts.item_closed, &v, &[("error", why)])).await?;
         }
-        "skipped" => {
-            let can_reply = adapter_for(ctx, &ev).is_some();
-            if store::advance(&ctx.db, item.id, Stage::Review, StageEvent::Finished, "no comment", vec![]).await? {
-                let text = if can_reply {
-                    fill_item(&ctx.cfg.texts.comment_skipped, &vars, &[("ref", &event_ref(&ev))])
-                } else {
-                    let mut v = vars.clone();
-                    v.retain(|(k, _)| *k != "error");
-                    fill_item(&ctx.cfg.texts.item_closed, &v, &[("error", "the draft PR is open; the event's source has no reply channel")])
-                };
-                note(ctx, item.id, &text).await?;
+        return Ok(());
+    };
+    let text = fill(&ctx.cfg.texts.pr_comment, &[("pr_url", url)]);
+    if let Verdict::Hit(cats) = ctx.guard.scan(&text).await {
+        return block(ctx, item, "the issue comment", &cats).await;
+    }
+    // A random operation id, stored before the post: its exact marker line,
+    // on a comment by the account Nucleus posts as, is the only proof of an
+    // earlier post.
+    let op = match &item.comment_op {
+        Some(op) => op.clone(),
+        None => {
+            let op = random_hex(16)?;
+            if !store::update(&ctx.db, item.id, Stage::Pr, vec![("comment_op", op.clone().into())]).await? {
+                return Ok(());
             }
+            op
         }
-        _ => {}
+    };
+    let marker = format!("{}item-{}:comment:{op}", github::COMMENT_MARKER_PREFIX, item.id);
+    let viewer = ctx.viewer().await?.to_string();
+    // The lookup (a retry must not post twice), then a fresh read, then the
+    // write.
+    let posted = match a.find_reply(ev, &marker, &viewer).await? {
+        Some(u) => Some(u),
+        None => {
+            let _ = final_read!(ctx, item, "the issue comment", *first);
+            if !tools_unchanged(ctx, item, "the issue comment").await? {
+                return Ok(());
+            }
+            a.post_reply(ev, &text, &marker).await?
+        }
+    };
+    if store::advance(
+        &ctx.db,
+        item.id,
+        Stage::Pr,
+        StageEvent::Finished,
+        "draft PR open; link posted on the issue",
+        vec![("comment_state", "posted".into()), ("comment_url", Val::Text(posted))],
+    )
+    .await?
+    {
+        note(ctx, item.id, &fill_item(&ctx.cfg.texts.comment_posted, &vars, &[("ref", &event_ref(ev))])).await?;
     }
     Ok(())
 }

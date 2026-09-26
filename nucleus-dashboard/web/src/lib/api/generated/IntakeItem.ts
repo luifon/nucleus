@@ -49,9 +49,10 @@ head_sha: string | null,
 /**
  * `passed`, `failed`, `timeout` or `not_run` (Nucleus's own run).
  */
-tests_status: string | null, tests_output: string | null, pr_url: string | null, comment_draft: string | null,
+tests_status: string | null, tests_output: string | null, pr_url: string | null,
 /**
- * `none`, `proposed`, `approved`, `posted`, `skipped`.
+ * The pull request link on the issue: `none` (not posted yet),
+ * `posted`, or `skipped` (the event's source has no reply channel).
  */
 comment_state: string, comment_url: string | null,
 /**

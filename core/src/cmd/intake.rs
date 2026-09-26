@@ -74,14 +74,6 @@ enum Cmd {
         #[arg(long)]
         version: Option<u32>,
     },
-    /// Approve the proposed issue comment (optionally replacing its text).
-    ApproveComment {
-        item: String,
-        #[arg(long)]
-        text: Option<String>,
-    },
-    /// Close the review without commenting on the issue.
-    SkipComment { item: String },
     /// Stop an item and its running task.
     Cancel { item: String },
     /// Resume a failed item at the stage it failed in.
@@ -233,7 +225,7 @@ async fn render_show(db: &sqlx::SqlitePool, n: i64, json: bool, label: &str, hid
         writeln!(out, "draft PR: {u}")?;
     }
     if it.comment_state != "none" {
-        writeln!(out, "issue comment: {}", it.comment_state)?;
+        writeln!(out, "pull request link on the issue: {}", it.comment_state)?;
     }
     writeln!(out, "WhatsApp thread: {}", it.surface)?;
     writeln!(out, "\nthread (last 15):")?;
@@ -360,16 +352,6 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             pipeline::approve_plan(&ctx, n, version, via)
                 .await
                 .map(|i| println!("plan v{} of item #{n} approved", i.approved_version.unwrap_or(0)))
-        }
-        Cmd::ApproveComment { item, text } => {
-            let n = item_number(&item)?;
-            pipeline::approve_comment(&ctx, n, text, via)
-                .await
-                .map(|_| println!("comment of item #{n} approved; the next tick posts it"))
-        }
-        Cmd::SkipComment { item } => {
-            let n = item_number(&item)?;
-            pipeline::skip_comment(&ctx, n, via).await.map(|_| println!("item #{n} closes without a comment"))
         }
         Cmd::Cancel { item } => {
             let n = item_number(&item)?;

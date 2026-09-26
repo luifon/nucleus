@@ -202,7 +202,7 @@ async fn tick(f: &Fixture) -> TickReport {
 }
 
 #[tokio::test]
-async fn simple_issue_goes_from_intake_to_a_draft_pr_and_an_approved_comment() {
+async fn simple_issue_goes_from_intake_to_a_draft_pr_and_the_pr_link_on_the_issue() {
     let f = fixture().await;
     // Intake: a labeled issue becomes item #1 once its gate is read at
     // GitHub; an unlabeled one stays an event.
@@ -244,11 +244,13 @@ async fn simple_issue_goes_from_intake_to_a_draft_pr_and_an_approved_comment() {
     // The agent's work: an uncommitted change (Nucleus commits it).
     std::fs::write(wt.join("README.md"), "hello\n").unwrap();
     finish_current(&f, TaskStatus::Done, Some("Fixed the typo in README.md. Tests pass."), None).await;
-    tick(&f).await; // implementation → pr (tests run) → push + draft PR → review
+    // implementation → pr (tests run) → push + draft PR → the PR link on the
+    // issue, with no approval → closed; cleanup
+    tick(&f).await;
     let it = item1(&f).await;
-    assert_eq!((it.stage(), it.tests_status.as_deref()), (Stage::Review, Some("passed")));
+    assert_eq!((it.stage(), it.tests_status.as_deref()), (Stage::Closed, Some("passed")));
     assert_eq!(it.pr_url.as_deref(), Some("https://example.invalid/acme/widget/pull/5"));
-    assert_eq!(it.comment_state, "proposed");
+    assert_eq!(it.comment_state, "posted");
     sh(&f.remote, &format!("git rev-parse --verify -q refs/heads/{branch}"));
     let create = f.gh.calls.lock().unwrap().iter().find(|c| c.contains("pr create")).cloned().unwrap();
     assert!(create.contains("--draft") && create.contains("Closes #1") && create.contains("nucleus-intake:item-1"), "{create}");
@@ -256,23 +258,42 @@ async fn simple_issue_goes_from_intake_to_a_draft_pr_and_an_approved_comment() {
     assert!(!create.contains("Fixed the typo"), "the agent's text is not published: {create}");
     assert_eq!(f.gh.calls_with("pr merge"), 0);
 
+    // One code-owned comment with the PR link, posted after the PR.
+    assert_eq!(f.gh.calls_with("issue comment 1"), 1);
+    let post = f.gh.calls.lock().unwrap().iter().find(|c| c.contains("issue comment 1")).cloned().unwrap();
+    assert!(post.contains("BODY<<Draft pull request: https://example.invalid/acme/widget/pull/5\n\n<!-- nucleus-intake:item-1:comment:"), "{post}");
+    assert!(!post.contains("Fixed the typo"), "no model text on the issue: {post}");
+    let calls = f.gh.calls.lock().unwrap().clone();
+    let created = calls.iter().position(|c| c.contains("pr create")).unwrap();
+    let commented = calls.iter().position(|c| c.contains("issue comment 1")).unwrap();
+    assert!(created < commented, "the link is posted after the PR exists");
     // Every thread message went to the DM with the item's marker.
     let out = outbound(&f).await;
     assert!(out.iter().all(|(t, b)| t == "dm" && b.starts_with("[#1] ")), "{out:?}");
-    assert!(out.iter().any(|(_, b)| b.contains("pull/5")));
-    assert!(out.iter().any(|(_, b)| b.contains("Proposed comment on acme/widget#1")));
-
-    // Nothing is posted before the operator approves.
-    tick(&f).await;
-    assert_eq!(f.gh.calls_with("issue comment"), 0);
-    inbound(&f, 1, "m1", "approve comment").await;
-    tick(&f).await; // approval read; comment posted; closed; cleanup
-    let it = item1(&f).await;
-    assert_eq!((it.stage(), it.comment_state.as_str()), (Stage::Closed, "posted"));
-    assert_eq!(f.gh.calls_with("issue comment 1"), 1);
+    assert!(out.iter().any(|(_, b)| b.contains("pull/5") && b.contains("Fixed the typo in README.md. Tests pass.")), "{out:?}");
+    assert!(out.iter().any(|(_, b)| b.contains("The draft PR link is posted on acme/widget#1")), "{out:?}");
+    assert!(!out.iter().any(|(_, b)| b.contains("approve")), "nothing waits for the operator: {out:?}");
     assert!(!wt.exists(), "the worktree is removed when the item closes");
     let path: Vec<String> = store::transitions(&f.ctx.db, 1).await.unwrap().into_iter().map(|t| t.to_stage).collect();
-    assert_eq!(path, ["queued", "eval", "implementation", "pr", "review", "closed"]);
+    assert_eq!(path, ["queued", "eval", "implementation", "pr", "closed"]);
+    // A later tick posts nothing more.
+    tick(&f).await;
+    assert_eq!(f.gh.calls_with("issue comment"), 1);
+}
+
+#[tokio::test]
+async fn the_implementation_summary_reaches_whatsapp_without_markdown_escapes() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    to_implementation(&f).await;
+    tick(&f).await;
+    std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(&f, TaskStatus::Done, Some("I changed `README.md` and *one* line (the typo)."), None).await;
+    tick(&f).await;
+    let out = outbound(&f).await;
+    let pr = out.iter().map(|(_, b)| b).find(|b| b.contains("pull/5")).expect("the PR message");
+    assert!(pr.contains("I changed `README.md` and *one* line (the typo)."), "{pr}");
+    assert!(out.iter().all(|(_, b)| !b.contains('\\')), "no backslash escapes: {out:?}");
 }
 
 #[tokio::test]
@@ -780,7 +801,7 @@ async fn reopening_the_issue_starts_a_new_item() {
 }
 
 #[tokio::test]
-async fn removing_the_label_stops_an_item_in_review() {
+async fn removing_the_label_stops_an_item_before_the_pr_link_is_posted() {
     let f = fixture().await;
     accept(&f, 1).await;
     to_implementation(&f).await;
@@ -788,13 +809,17 @@ async fn removing_the_label_stops_an_item_in_review() {
     let wt = PathBuf::from(item1(&f).await.worktree.unwrap());
     std::fs::write(wt.join("README.md"), "hello\n").unwrap();
     finish_current(&f, TaskStatus::Done, Some("done"), None).await;
-    tick(&f).await;
-    assert_eq!(item1(&f).await.stage(), Stage::Review);
-    approve_comment(&f.ctx, 1, None, "cli").await.unwrap();
+    // Posting fails once: the PR is open, the link is not posted yet.
+    f.gh.set("issue comment", false, "", "gh: HTTP 502");
+    let _ = super::tick(&f.ctx, false).await.unwrap();
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.comment_state.as_str()), (Stage::Pr, "none"));
+    assert!(it.pr_url.is_some());
+    f.gh.set("issue comment", true, "https://example.invalid/acme/widget/issues/1#issuecomment-9\n", "");
     poll_again(&f, 1, &[], "open", "body", "unlabeled").await;
     tick(&f).await;
     assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
-    assert_eq!(f.gh.calls_with("issue comment"), 0, "no comment after the label was removed");
+    assert_eq!(f.gh.calls_with("issue comment"), 1, "no comment after the label was removed");
 }
 
 #[tokio::test]
@@ -834,19 +859,21 @@ async fn the_secret_guard_blocks_a_push_and_a_comment() {
     assert_eq!(it.stage(), Stage::Blocked);
     assert!(it.error.unwrap().contains("guard-unavailable"));
 
-    // The issue comment is scanned before it is posted.
+    // The issue comment is scanned before it is posted (here the
+    // configured text carries a value the guard blocks).
     let f = fixture().await;
+    let mut cfg = f.ctx.cfg.clone();
+    cfg.texts.pr_comment = "See FAKE-SECRET-VALUE {pr_url}".into();
+    let f = Fixture { ctx: Ctx { cfg, ..f.ctx }, ..f };
     accept(&f, 1).await;
     to_implementation(&f).await;
     tick(&f).await;
     std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
     finish_current(&f, TaskStatus::Done, Some("done"), None).await;
     tick(&f).await;
-    assert_eq!(item1(&f).await.stage(), Stage::Review);
-    approve_comment(&f.ctx, 1, Some("See FAKE-SECRET-VALUE".into()), "dashboard").await.unwrap();
-    tick(&f).await;
     let it = item1(&f).await;
-    assert_eq!((it.stage(), it.failed_stage.as_deref()), (Stage::Blocked, Some("review")));
+    assert_eq!((it.stage(), it.failed_stage.as_deref()), (Stage::Blocked, Some("pr")));
+    assert!(it.pr_url.is_some(), "the PR was opened; only the comment was stopped");
     assert_eq!(f.gh.calls_with("issue comment"), 0);
 }
 
@@ -1084,7 +1111,7 @@ async fn only_one_code_owned_commit_is_published() {
     finish_current(&f, TaskStatus::Done, Some("done"), None).await;
     tick(&f).await;
     let it = item1(&f).await;
-    assert_eq!(it.stage(), Stage::Review, "{:?}", it.error);
+    assert_eq!(it.stage(), Stage::Closed, "{:?}", it.error);
     let branch = it.branch.unwrap();
     assert_eq!(remote_git(&f, &["rev-list", "--count", &format!("main..{branch}")]).trim(), "1", "one commit");
     let log = remote_git(&f, &["log", "--format=%an|%ae|%cn|%ce|%B", &branch]);
@@ -1148,7 +1175,7 @@ async fn a_change_during_the_scan_stops_the_push() {
     assert!(it.error.unwrap().contains("changed while Nucleus prepared push"));
     assert!(!remote_has(&f, "nucleus/item-1") && f.gh.calls_with("pr create") == 0);
     tick(&f).await;
-    assert_eq!(item1(&f).await.stage(), Stage::Review);
+    assert_eq!(item1(&f).await.stage(), Stage::Closed);
     assert!(remote_has(&f, "nucleus/item-1"));
 
     // The body edited during the scan: the item goes stale, nothing pushed.
@@ -1227,19 +1254,20 @@ async fn the_comment_is_written_only_after_a_fresh_read_that_follows_the_lookup(
     tick(&f).await;
     std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
     finish_current(&f, TaskStatus::Done, Some("done"), None).await;
-    tick(&f).await;
-    approve_comment(&f.ctx, 1, None, "cli").await.unwrap();
-    // The step's first live read lists the comments once; the idempotency
-    // lookup is the second comments call. Right after it, the label is
-    // removed: only a read after the lookup can see that.
-    f.gh.after("issues/1/comments", |gh| {
+    // The first comments call after the pull request is created is the
+    // idempotency lookup. Right after it, the label is removed: only a read
+    // after the lookup can see that.
+    f.gh.after("pr create", |gh| {
         gh.after("issues/1/comments", |gh| {
             let unlabeled = serde_json::json!({ "number": 1, "title": "Issue 1", "body": "body", "state": "open", "labels": [] });
             gh.set("repos/acme/widget/issues/1$", true, &unlabeled.to_string(), "");
         })
     });
     tick(&f).await;
-    assert_eq!(item1(&f).await.stage(), Stage::Cancelled);
+    let it = item1(&f).await;
+    assert_eq!(it.stage(), Stage::Cancelled);
+    assert!(it.error.unwrap().contains("read before the issue comment"));
+    assert_eq!(f.gh.calls_with("pr create"), 1);
     assert_eq!(f.gh.calls_with("issue comment"), 0);
 }
 
@@ -1351,7 +1379,7 @@ async fn a_push_before_a_crash_is_recognized_and_not_repeated() {
     // The next tick finds the commit at the remote, records it, and goes on.
     tick(&f).await;
     let it = item1(&f).await;
-    assert_eq!((it.stage(), it.pushed_sha.as_deref()), (Stage::Review, Some(sha.as_str())));
+    assert_eq!((it.stage(), it.pushed_sha.as_deref()), (Stage::Closed, Some(sha.as_str())));
     assert_eq!(f.gh.calls_with("pr create"), 1);
 }
 
@@ -1367,20 +1395,19 @@ async fn forged_markers_and_foreign_pull_requests_are_ignored() {
     tick(&f).await;
     std::fs::write(PathBuf::from(item1(&f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
     finish_current(&f, TaskStatus::Done, Some("done"), None).await;
+    // Someone else posts a comment with a copied marker once the PR exists
+    // (any operation id they could guess or copy).
+    f.gh.after("pr create", |gh| {
+        let forged = serde_json::json!([{ "id": 7, "user": { "login": "intruder" }, "created_at": "t", "html_url": "https://example.invalid/c/7",
+            "body": "<!-- nucleus-intake:item-1:comment -->" }]);
+        gh.set("issues/1/comments", true, &forged.to_string(), "");
+    });
     tick(&f).await;
     let it = item1(&f).await;
     assert_eq!(it.pr_url.as_deref(), Some("https://example.invalid/acme/widget/pull/5"), "Nucleus opened its own PR");
     assert_eq!(f.gh.calls_with("pr create"), 1);
-    // The operator approves the comment; someone else posts a comment with a
-    // copied marker first (any operation id they could guess or copy).
-    approve_comment(&f.ctx, 1, None, "cli").await.unwrap();
-    let forged = serde_json::json!([{ "id": 7, "user": { "login": "intruder" }, "created_at": "t", "html_url": "https://example.invalid/c/7",
-        "body": "<!-- nucleus-intake:item-1:comment -->" }]);
-    f.gh.set("issues/1/comments", true, &forged.to_string(), "");
-    tick(&f).await;
-    let it = item1(&f).await;
     assert_eq!((it.stage(), it.comment_state.as_str()), (Stage::Closed, "posted"));
-    assert_eq!(f.gh.calls_with("issue comment 1"), 1, "the approved comment was posted");
+    assert_eq!(f.gh.calls_with("issue comment 1"), 1, "the PR link was posted");
     let op = it.comment_op.unwrap();
     assert_eq!(op.len(), 32, "a 128-bit operation id");
     let post = f.gh.calls.lock().unwrap().iter().find(|c| c.contains("issue comment 1")).cloned().unwrap();

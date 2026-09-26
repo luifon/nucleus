@@ -4,7 +4,6 @@ import {
   authorLabel,
   canApprovePlan,
   canCancelItem,
-  canDecideComment,
   canRelease,
   canReply,
   findingKindLabel,
@@ -43,7 +42,6 @@ function item(over: Partial<IntakeItem> = {}): IntakeItem {
     tests_status: null,
     tests_output: null,
     pr_url: null,
-    comment_draft: null,
     comment_state: "none",
     comment_url: null,
     comment_op: null,
@@ -96,12 +94,11 @@ describe("plan approval", () => {
 describe("actions by stage", () => {
   test("reply only during refinement", () => {
     expect(canReply(item())).toBe(true);
-    expect(canReply(item({ stage: "review" }))).toBe(false);
+    expect(canReply(item({ stage: "pr" }))).toBe(false);
   });
-  test("comment decisions only for a proposed comment in review", () => {
-    expect(canDecideComment(item({ stage: "review", comment_state: "proposed" }))).toBe(true);
-    expect(canDecideComment(item({ stage: "review", comment_state: "approved" }))).toBe(false);
-    expect(waitingOn(item({ stage: "review", comment_state: "proposed" }))).toMatch(/comment/);
+  test("nothing waits for the operator once the pull request stage starts", () => {
+    expect(waitingOn(item({ stage: "pr", pr_url: "https://example.invalid/pull/1" }))).toBeNull();
+    expect(waitingOn(item({ stage: "closed", comment_state: "posted" }))).toBeNull();
   });
   test("retry for failed items, cancel for open ones", () => {
     expect(canRetry(item({ stage: "failed" }))).toBe(true);
@@ -124,7 +121,8 @@ describe("display", () => {
     expect(isWorking(item({ stage: "eval" }))).toBe(true);
     expect(isWorking(item())).toBe(false);
     expect(isWorking(item({ current_task_id: "t" }))).toBe(true);
-    expect(isWorking(item({ stage: "review" }))).toBe(false);
+    expect(isWorking(item({ stage: "pr" }))).toBe(true);
+    expect(isWorking(item({ stage: "closed" }))).toBe(false);
   });
   test("labels", () => {
     expect(surfaceLabel(item({ surface: "dm" }))).toBe("WhatsApp DM, marked #4");

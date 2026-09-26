@@ -4,8 +4,6 @@
 //!   GET  /intake/api/detail?id=         — one item: event, eval, thread, tasks, stage log
 //!   POST /intake/api/reply {id,text}    — operator message in the item's thread
 //!   POST /intake/api/approve-plan {id,version}
-//!   POST /intake/api/approve-comment {id,text?}
-//!   POST /intake/api/skip-comment {id}
 //!   POST /intake/api/cancel {id}
 //!   POST /intake/api/retry {id}
 //!   POST /intake/api/release {id,hold} — continue a held item; `hold` is the fingerprint the panel showed
@@ -52,8 +50,6 @@ pub fn router(state: Arc<IntakeState>) -> Router {
         .route("/detail", get(detail))
         .route("/reply", post(reply))
         .route("/approve-plan", post(approve_plan))
-        .route("/approve-comment", post(approve_comment))
-        .route("/skip-comment", post(skip_comment))
         .route("/cancel", post(cancel))
         .route("/retry", post(retry))
         .route("/release", post(release))
@@ -105,16 +101,6 @@ struct IntakeApprovePlanReq {
     id: i64,
     /// The plan version the operator read.
     version: u32,
-}
-
-#[derive(Deserialize, ts_rs::TS)]
-#[ts(export)]
-struct IntakeApproveCommentReq {
-    #[ts(type = "number")]
-    id: i64,
-    /// Replacement text; the proposed text when absent.
-    #[ts(optional)]
-    text: Option<String>,
 }
 
 #[derive(Deserialize, ts_rs::TS)]
@@ -252,26 +238,6 @@ async fn approve_plan(
     same_origin(&headers)?;
     let c = ctx(&s).await?;
     outcome(pipeline::approve_plan(&c, req.id, Some(req.version), "dashboard").await, &s.workspace_root)
-}
-
-async fn approve_comment(
-    State(s): State<Arc<IntakeState>>,
-    headers: HeaderMap,
-    Json(req): Json<IntakeApproveCommentReq>,
-) -> Result<Json<Item>, IntakeError> {
-    same_origin(&headers)?;
-    let c = ctx(&s).await?;
-    outcome(pipeline::approve_comment(&c, req.id, req.text, "dashboard").await, &s.workspace_root)
-}
-
-async fn skip_comment(
-    State(s): State<Arc<IntakeState>>,
-    headers: HeaderMap,
-    Json(req): Json<IntakeItemReq>,
-) -> Result<Json<Item>, IntakeError> {
-    same_origin(&headers)?;
-    let c = ctx(&s).await?;
-    outcome(pipeline::skip_comment(&c, req.id, "dashboard").await, &s.workspace_root)
 }
 
 async fn cancel(

@@ -180,6 +180,38 @@ ALTER TABLE items ADD COLUMN released_hash TEXT;
 ALTER TABLE items ADD COLUMN released_at TEXT;
 ALTER TABLE items ADD COLUMN released_via TEXT";
 
+/// The issue comment needs no approval any more (ADR-036, "Operator
+/// decisions"): the `review` stage and the proposed comment are gone, and
+/// the `pr` stage posts the pull request link itself. Rows that exist are
+/// moved as follows:
+///
+/// - an item in `review` whose comment was not posted (`none`, `proposed`,
+///   `approved`) goes back to `pr`, which finds its pull request and posts
+///   the link. `comment_op` is kept, so a comment an earlier attempt posted
+///   is found by its marker and not posted twice;
+/// - an item in `review` whose comment was `posted` or `skipped` would
+///   have closed at the next tick: it is closed now;
+/// - a failed or blocked item that stopped in `review` resumes in `pr`;
+/// - `proposed` and `approved` become `none`; `comment_draft` is dropped.
+///
+/// Every stage change is logged in `item_transitions`.
+const SCHEMA_V3: &str = "
+INSERT INTO item_transitions (item_id, at, from_stage, to_stage, reason)
+    SELECT id, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'review', 'pr',
+           'migrated: the issue comment needs no approval, the pr stage posts the pull request link'
+      FROM items WHERE stage = 'review' AND comment_state NOT IN ('posted', 'skipped');
+INSERT INTO item_transitions (item_id, at, from_stage, to_stage, reason)
+    SELECT id, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'review', 'closed',
+           'migrated: the review stage was removed, the comment was already posted or skipped'
+      FROM items WHERE stage = 'review' AND comment_state IN ('posted', 'skipped');
+UPDATE items SET stage = 'closed', closed_at = COALESCE(closed_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE stage = 'review' AND comment_state IN ('posted', 'skipped');
+UPDATE items SET stage = 'pr', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE stage = 'review';
+UPDATE items SET failed_stage = 'pr' WHERE failed_stage = 'review';
+UPDATE items SET comment_state = 'none' WHERE comment_state IN ('proposed', 'approved');
+ALTER TABLE items DROP COLUMN comment_draft";
+
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(super::INTAKE_DB_PATH)).await?;
@@ -188,6 +220,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
         &[
             crate::migrate::Migration { version: 1, name: "intake schema", step: crate::migrate::Step::Sql(SCHEMA_V1) },
             crate::migrate::Migration { version: 2, name: "hidden-content hold", step: crate::migrate::Step::Sql(SCHEMA_V2) },
+            crate::migrate::Migration { version: 3, name: "no comment approval", step: crate::migrate::Step::Sql(SCHEMA_V3) },
         ],
     )
     .await
@@ -196,7 +229,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// True when `pool` (a read-only intake.db) has the full schema: the
 /// migration ledger records [`SCHEMA_VERSION`] and the item tables exist.
@@ -488,8 +521,8 @@ pub struct Item {
     pub tests_status: Option<String>,
     pub tests_output: Option<String>,
     pub pr_url: Option<String>,
-    pub comment_draft: Option<String>,
-    /// `none`, `proposed`, `approved`, `posted`, `skipped`.
+    /// The pull request link on the issue: `none` (not posted yet),
+    /// `posted`, or `skipped` (the event's source has no reply channel).
     pub comment_state: String,
     pub comment_url: Option<String>,
     /// The random operation id of the issue comment (stored before it is
@@ -608,7 +641,7 @@ pub struct ItemTask {
 
 const ITEM_COLUMNS: &str = "id, event_id, repo, title, stage, failed_stage, error, classification, eval_json, \
     plan_draft, plan_version, approved_plan, approved_version, approved_at, approved_via, branch, worktree, \
-    base_ref, impl_summary, head_sha, tests_status, tests_output, pr_url, comment_draft, comment_state, comment_url, comment_op, \
+    base_ref, impl_summary, head_sha, tests_status, tests_output, pr_url, comment_state, comment_url, comment_op, \
     surface, group_requested_at, group_jid, group_closed_at, current_task_id, last_task_id, step_errors, \
     created_at, updated_at, closed_at, rev_title, rev_body, revision_hash, gate_event_id, label_event_id, \
     gate_actor, gate_at, stale_reason, base_sha, pushed_sha, hold_stage, hold_json, hold_hash, held_at, \
@@ -774,7 +807,6 @@ const SETTABLE: &[&str] = &[
     "tests_status",
     "tests_output",
     "pr_url",
-    "comment_draft",
     "comment_state",
     "comment_url",
     "comment_op",
@@ -1396,6 +1428,95 @@ pub(crate) mod tests {
         assert_eq!(bind_comment(&pool, it.id, "55", "dev", "h1").await.unwrap(), CommentBinding::Same);
         assert_eq!(bind_comment(&pool, it.id, "55", "dev", "h2").await.unwrap(), CommentBinding::Changed);
         assert_eq!(bound_comments(&pool, it.id).await.unwrap(), ["55"]);
+    }
+
+    #[tokio::test]
+    async fn the_review_stage_is_migrated_away() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        // A database at version 2, as the deployed code left it.
+        let pool = crate::db::open(&dir.path().join(super::super::INTAKE_DB_PATH)).await.unwrap();
+        crate::migrate::migrate(
+            &pool,
+            &[
+                crate::migrate::Migration { version: 1, name: "intake schema", step: crate::migrate::Step::Sql(SCHEMA_V1) },
+                crate::migrate::Migration { version: 2, name: "hidden-content hold", step: crate::migrate::Step::Sql(SCHEMA_V2) },
+            ],
+        )
+        .await
+        .unwrap();
+        let rows = [
+            // (stage, comment_state, failed_stage, comment_op)
+            ("review", "proposed", None, None),
+            ("review", "approved", None, Some("op1")),
+            ("review", "posted", None, None),
+            ("review", "skipped", None, None),
+            ("failed", "none", Some("review"), None),
+            ("blocked", "approved", Some("review"), None),
+            ("closed", "posted", None, None),
+        ];
+        for (n, (stage, cs, failed, op)) in rows.into_iter().enumerate() {
+            // One event per item: an event has at most one open item.
+            let ev = sqlx::query(
+                "INSERT INTO events (source, external_id, kind, title, body, labels_json, state, raw_json, accepted, first_seen_at, last_seen_at)
+                 VALUES ('github', ?1, 'issue', 't', 'b', '[]', 'open', '{}', 1, 't', 't')",
+            )
+            .bind(format!("acme/widget#{n}"))
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            sqlx::query(
+                "INSERT INTO items (event_id, repo, title, stage, comment_state, comment_draft, failed_stage, comment_op, created_at, updated_at)
+                 VALUES (?5, 'acme/widget', 't', ?1, ?2, 'draft text', ?3, ?4, 't', 't')",
+            )
+            .bind(stage)
+            .bind(cs)
+            .bind(failed)
+            .bind(op)
+            .bind(ev)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+        let pool = open(dir.path()).await.unwrap();
+        assert!(schema_ready(&pool).await);
+        let got: Vec<(String, String, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT stage, comment_state, failed_stage, comment_op, closed_at FROM items ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let brief: Vec<(&str, &str, Option<&str>, Option<&str>)> =
+            got.iter().map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_deref(), r.3.as_deref())).collect();
+        assert_eq!(
+            brief,
+            [
+                ("pr", "none", None, None),
+                ("pr", "none", None, Some("op1")),
+                ("closed", "posted", None, None),
+                ("closed", "skipped", None, None),
+                ("failed", "none", Some("pr"), None),
+                ("blocked", "none", Some("pr"), None),
+                ("closed", "posted", None, None),
+            ]
+        );
+        assert!(got[2].4.is_some() && got[3].4.is_some(), "closed rows have closed_at");
+        for id in 1..=7 {
+            item(&pool, id).await.expect("every migrated row reads as an Item");
+        }
+        let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('items')").fetch_all(&pool).await.unwrap();
+        assert!(!cols.iter().any(|c| c == "comment_draft"));
+        let log: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT item_id, from_stage, to_stage FROM item_transitions ORDER BY item_id").fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            log,
+            [(1, "review".into(), "pr".into()), (2, "review".into(), "pr".into()), (3, "review".into(), "closed".into()), (4, "review".into(), "closed".into())]
+        );
+        // A retry of the blocked item resumes in pr.
+        let it = item(&pool, 6).await.unwrap();
+        assert!(advance(&pool, 6, it.stage(), StageEvent::Retry { failed_in: Stage::Pr }, "retry", vec![]).await.unwrap());
+        assert_eq!(item(&pool, 6).await.unwrap().stage(), Stage::Pr);
     }
 
     #[tokio::test]

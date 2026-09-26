@@ -9,7 +9,7 @@ import { isOpenItem, isWorking } from "@/lib/intake";
 
 // Issue pipeline items (ADR-036): list with stage, repo and what waits on
 // the operator; the detail holds the eval, the plan, the thread with a
-// reply box, the implementation, the PR and the issue comment. The list
+// reply box, the implementation, the PR and its link on the issue. The list
 // refreshes every POLL_MS while an agent or Nucleus works on an item.
 const POLL_MS = 5_000;
 
