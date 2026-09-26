@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ADR-015. Dev: Vite at :5173 proxies the /api, /chat/api and /gallery
+// ADR-015. Dev: Vite at :5173 proxies the /api, /chat/api and other API
 // routes to the axum server at :8092. Prod: axum serves `dist/` (no Vite).
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -23,10 +23,6 @@ export default defineConfig({
       "/tasks/api": "http://localhost:8092",
       "/intake/api": "http://localhost:8092",
       "/skills/api": "http://localhost:8092",
-      // Image-generation surface (ADR-019): API + served PNGs proxy to axum;
-      // the SPA route /gallery itself stays with Vite for HMR.
-      "/gallery/api": "http://localhost:8092",
-      "/gallery/files": "http://localhost:8092",
     },
   },
   build: {

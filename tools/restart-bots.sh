@@ -53,9 +53,6 @@ labels_for() {
   ' agents.toml | sed "s/^dev\.nucleus\./$PREFIX./"
 }
 TARGETS="$(labels_for launchd-daemon)"
-# Bonsai (ADR-019) is external, not an agents.toml entry — mirrors the gate
-# used by install.sh / healthcheck.sh.
-[ -n "${NUCLEUS_BONSAI_DIR:-}" ] && TARGETS="$TARGETS ${PREFIX}.bonsai"
 TARGETS="$TARGETS ${RESTART_EXTRA_PERSISTENT:-}"
 
 # --- drain guard ---------------------------------------------------------

@@ -1,6 +1,6 @@
 // Barrel — re-exports the domain modules whose consumers import from
-// "@/lib/api". gallery and documents are imported by path instead, so
-// they're intentionally not re-exported here. Don't add aggregated
+// "@/lib/api". documents is imported by path instead, so it's
+// intentionally not re-exported here. Don't add aggregated
 // helpers here — those belong in the relevant domain file.
 
 export * from "./client";

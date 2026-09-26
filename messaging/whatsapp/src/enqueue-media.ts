@@ -12,7 +12,7 @@
 //     the third). Bumps retrieve_count + audit.
 //
 //   --path /abs/file --kind image|document --target <digits|jid|group-name>
-//     Generic producer path (gallery etc.). The target must be the
+//     Generic producer path. The target must be the
 //     operator's DM or a configured group (target_policy.ts); refused here
 //     otherwise, and validated again by the drain.
 //

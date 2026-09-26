@@ -3,7 +3,6 @@ pub mod chat;
 pub mod dashboard;
 pub mod diary;
 pub mod documents;
-pub mod gallery;
 pub mod intake;
 pub mod news;
 pub mod reminders;
