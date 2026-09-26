@@ -362,7 +362,8 @@ function legacyDb(rows: Array<{ item: string; jid: string | null; status: string
   const raw = new DatabaseSync(db);
   raw.exec(`
     CREATE TABLE intake_group_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, item_key TEXT NOT NULL, action TEXT NOT NULL,
-      subject TEXT, enqueued_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
+      subject TEXT, enqueued_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', result TEXT, handled_at TEXT,
+      nonce TEXT, calling_at TEXT);
     CREATE TABLE intake_groups (item_key TEXT PRIMARY KEY, jid TEXT, subject TEXT, status TEXT NOT NULL, reason TEXT,
       created_at TEXT NOT NULL, closed_at TEXT, members_json TEXT, token TEXT, checked_at TEXT);
   `);
@@ -421,7 +422,7 @@ test("at start the bot leaves every open old group, marks it closed, then drops 
   assert.equal(alerts.length, 0);
   // A later start finds nothing to do.
   const again = await cleanupLegacyGroups({ store: new IntakeStore(db), api, alertOperator: (t) => alerts.push(t), log: quiet });
-  assert.deepEqual(again, { left: [], failed: [], dropped: true });
+  assert.deepEqual(again, { left: [], failed: [], dropped: true, kept: [] });
 });
 
 test("a failed leave keeps its row for the next start and is reported only after 3 failures", async () => {
@@ -441,7 +442,7 @@ test("a failed leave keeps its row for the next start and is reported only after
     });
   let r = await run(new Set([g1]));
   assert.deepEqual([r.left, r.failed, r.dropped], [["2"], ["1"], false]);
-  assert.deepEqual(tables(db), ["intake_group_requests", "intake_groups"], "the tables stay while a group is open");
+  assert.deepEqual(tables(db), ["intake_groups"], "the group table stays while a group is open; the settled requests go");
   for (let start = 2; start < LEGACY_LEAVE_ALERT_AFTER; start++) {
     r = await run(new Set([g1]));
     assert.deepEqual(r.failed, ["1"]);
@@ -476,4 +477,78 @@ test("an unknown creation with several matches, or when the groups cannot be lis
   // No group carries the nonce: there is none to leave.
   r = await cleanupLegacyGroups({ store: new IntakeStore(db), api: legacyApi().api, alertOperator: () => {}, log: quiet });
   assert.deepEqual([r.left, r.failed, r.dropped], [[], [], true]);
+});
+
+test("an old creation with an unknown outcome keeps the request table until it is settled, and is reported after 3 starts", async () => {
+  const db = legacyDb([{ item: "1", jid: null, status: "closed" }]);
+  const raw = new DatabaseSync(db);
+  // Item 8: claimed and sent to WhatsApp, then the bot stopped (no group
+  // row). Item 9: claimed but never sent. Item 1: its group row is closed.
+  raw.exec(`
+    INSERT INTO intake_group_requests (item_key, action, enqueued_at, status, nonce, calling_at) VALUES ('8', 'create', 't', 'creating', 'n8', 't');
+    INSERT INTO intake_group_requests (item_key, action, enqueued_at, status, nonce, calling_at) VALUES ('9', 'create', 't', 'creating', 'n9', NULL);
+    INSERT INTO intake_group_requests (item_key, action, enqueued_at, status, nonce, calling_at) VALUES ('1', 'create', 't', 'creating', 'n1', 't');
+  `);
+  const alerts: Array<{ text: string; key: string }> = [];
+  const offline: LegacyGroupApi = {
+    leave: async () => {},
+    listParticipating: async () => {
+      throw new Error("offline");
+    },
+  };
+  const run = (api: LegacyGroupApi) =>
+    cleanupLegacyGroups({ store: new IntakeStore(db), api, alertOperator: (text, key) => alerts.push({ text, key }), log: quiet });
+  let r = await run(offline);
+  assert.deepEqual(r.kept, ["intake_group_requests"], "the requests stay while item 8's creation is unknown");
+  assert.deepEqual(tables(db), ["intake_group_requests"], "the group table itself is dropped");
+  r = await run(offline);
+  assert.equal(alerts.length, 0, "not reported before the third start");
+  r = await run(offline);
+  assert.equal(alerts.length, 1);
+  assert.match(alerts[0].text, /Item #8: an old WhatsApp group may have been created .* after 3 starts\. .*"~n8"/);
+  assert.equal(alerts[0].key, "intake:group-request:2");
+  // Found by its nonce and left: settled, the table goes.
+  const g8 = ["120363000000000081", "g.us"].join("@");
+  const { api, calls } = legacyApi({ groups: [{ jid: g8, subject: "#8 Fix ~n8" }] });
+  r = await run(api);
+  assert.deepEqual([r.left, r.kept, r.dropped], [["8"], [], true]);
+  assert.deepEqual(calls, ["list", `leave ${g8}`]);
+});
+
+test("full intake messages queued by an earlier version are withdrawn at start and replaced by one notice per item", () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  const out = new OutboundQueueStore(db);
+  const group = ["120363000000000091", "g.us"].join("@");
+  const full = out.enqueue({ target: "dm", body: "[#4] A long agent reply with the whole plan…", source: "intake:4", dedupKey: "intake:4:m1" });
+  const full2 = out.enqueue({ target: "dm", body: "[#4] (operator, via dashboard) JSON", source: "intake:4", dedupKey: "intake:4:m2" });
+  const inFlight = out.enqueue({ target: "dm", body: "[#5] Plan v2 …", source: "intake:5", dedupKey: "intake:5:m3" });
+  new DatabaseSync(db).prepare(`UPDATE outbound_queue SET status = 'in_flight', in_flight_at = ? WHERE id = ?`).run(new Date().toISOString(), inFlight);
+  const toGroup = out.enqueue({ target: group, body: "Plan v1 of item 6", source: "intake:6", dedupKey: "intake:6:m4" });
+  const notice = out.enqueue({ target: "dm", body: "🛠 Item #7: implementation started.", source: "intake:7", dedupKey: "intake:7:m5" });
+  const ask = out.enqueue({ target: "dm", body: "Cancel item #7? Answer yes or no.", source: "intake:ask", dedupKey: "intake:answer:x" });
+  const sent = out.enqueue({ target: "dm", body: "[#8] old", source: "intake:8", dedupKey: "intake:8:m6" });
+  new DatabaseSync(db).prepare(`UPDATE outbound_queue SET status = 'sent' WHERE id = ?`).run(sent);
+  const items = store.withdrawLegacyThreadMessages("Item #{n} has messages on the dashboard. {link}", "https://dash.example.invalid/");
+  assert.deepEqual(items.sort(), ["4", "5", "6"]);
+  const status = (id: number) =>
+    (new DatabaseSync(db).prepare(`SELECT status FROM outbound_queue WHERE id = ?`).get(id) as { status: string }).status;
+  for (const id of [full, full2, inFlight, toGroup]) assert.equal(status(id), "failed", `row ${id} is withdrawn`);
+  for (const id of [notice, ask]) assert.equal(status(id), "pending", `row ${id} is a notice or a question and stays`);
+  assert.equal(status(sent), "sent");
+  const added = new DatabaseSync(db)
+    .prepare(`SELECT target, body, source FROM outbound_queue WHERE dedup_key LIKE 'intake:withdrawn:%' ORDER BY source`)
+    .all() as Array<{ target: string; body: string; source: string }>;
+  assert.deepEqual(
+    added.map((r) => ({ ...r })),
+    ["4", "5", "6"].map((n) => ({ target: "dm", body: `Item #${n} has messages on the dashboard. https://dash.example.invalid/intake?item=${n}`, source: `intake:${n}` })),
+  );
+  // A second start withdraws nothing more and queues no second notice; with
+  // no public URL the notice has no link.
+  assert.deepEqual(store.withdrawLegacyThreadMessages("x", null), []);
+  const db2 = tmpDb();
+  new OutboundQueueStore(db2).enqueue({ target: "dm", body: "[#3] reply", source: "intake:3" });
+  new IntakeStore(db2).withdrawLegacyThreadMessages("Item #{n} has messages on the dashboard. {link}", null);
+  const body = (new DatabaseSync(db2).prepare(`SELECT body FROM outbound_queue WHERE dedup_key = 'intake:withdrawn:3'`).get() as { body: string }).body;
+  assert.equal(body, "Item #3 has messages on the dashboard.");
 });

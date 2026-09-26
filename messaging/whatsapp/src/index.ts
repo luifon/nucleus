@@ -392,6 +392,11 @@ async function main() {
   // doesn't use it — corrections happen via follow-up captures + move ops
   // (see CLAUDE.md Rule 9 + ADR-005).
   const outbound = new OutboundQueueStore(config.dbPath);
+  // ADR-036: before the drain can run, full thread messages an earlier
+  // version queued are withdrawn; each item gets one short notice with its
+  // dashboard link instead.
+  const withdrawn = intakeStore.withdrawLegacyThreadMessages(texts.intakeWithdrawn, config.publicUrl);
+  if (withdrawn.length > 0) log.info({ items: withdrawn }, "whatsapp: queued full intake messages withdrawn");
   // Sent-message content for Baileys retry requests (getMessage), kept 7
   // days; pruned at boot and daily.
   const sent = new SentMessageStore(config.dbPath, { retentionMs: config.link.sentRetentionMs, maxRows: config.link.sentMaxRows });
@@ -951,6 +956,7 @@ async function runLegacyGroupCleanup(bot: Bot): Promise<void> {
       bot.outbound.enqueue({ target: "dm", source: "intake", body: text, dedupKey });
     },
     log: { info: (o, m) => log.info(o, m), warn: (o, m) => log.warn(o, m) },
+    texts,
   });
   if (r.left.length > 0 || r.failed.length > 0) {
     log.info({ left: r.left, failed: r.failed, dropped: r.dropped }, "whatsapp: old intake groups cleaned up");
