@@ -600,7 +600,8 @@ JSON-parsed numbers.
   the DM gate, approvals, the DM fast paths, the stored `chat` rows
   and the block. Other `WHATSAPP_ALLOWED_DM_JIDS` entries are contacts the
   bot chats with, never the operator.
-  The terminal and the dashboard keep explicit commands.
+  The terminal keeps explicit commands; the dashboard has its board and
+  explicit routes too (see the dashboard bullet below).
   A `#n` message, a quote of a pipeline message or an answer within 15
   minutes of a DM question goes straight to the interpreter; any other DM
   message goes to the DM chat session, which gets a code-built block of
@@ -630,8 +631,20 @@ JSON-parsed numbers.
   shorten it), briefs carry the latest or approved plan whole, and a brief
   over `tasks::MAX_BRIEF_CHARS` blocks the item. Never add a clip of plan
   text. Every accepted version is kept in `plan_versions`.
-- Text typed on the dashboard (`POST /intake/api/reply`) is discussion
-  only, saved in every stage; decisions stay on the explicit routes.
+- While an item waits on the operator, the dashboard's item page shows a
+  decision board of code-derived options (`boardFor` in
+  `nucleus-dashboard/web/src/lib/intake.ts`: approve plan vN, release,
+  retry, continue discussing, cancel with a second step), never options
+  from model text. Text typed on the page (`POST /intake/api/reply`,
+  `pipeline::dashboard_message`) is the operator's, as his DM is: while the
+  item's pending entry is waiting or a question of the page is open, it
+  goes through the same interpreter path, limited to that item, with the
+  same binding and confirmation rules (questions in scope `dashboard:<n>`,
+  answered by words or `POST /intake/api/answer`, ordered by stored times,
+  never by WhatsApp timestamps). Otherwise, and for canvas responses, it is
+  discussion and no interpreter starts. The refinement agent may ask
+  questions as ADR-012 canvas blocks; a click on one is discussion only and
+  never offers approve, release or cancel.
 - Every write to `memory/intake.db` goes through `nucleus_core::intake`.
   Nucleus keeps one bare mirror per repo and one clone per item under
   `[intake] work_dir`, outside this checkout. Nucleus's own git commands

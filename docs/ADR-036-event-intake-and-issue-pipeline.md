@@ -6,7 +6,8 @@ review (2026-09-24, see "Amendment: review findings"), amended with the hidden-c
 operator decisions in plain words and the pull request link comment without approval (2026-09-26, see
 "Amendment: operator decisions in plain words"), amended to remove per-item WhatsApp groups, send short
 notices with a dashboard link and pass plans whole (2026-09-26, see "Amendment: no WhatsApp groups, short
-notices, whole plans"); live verification pending (real `gh` against the configured repos, the interpreter on
+notices, whole plans"), amended with the dashboard's decision board and dashboard text through the
+interpreter (2026-09-26, see "Amendment: the decision board"); live verification pending (real `gh` against the configured repos, the interpreter on
 real messages, the one-time group leave on the live account).
 
 **Builds on / changes:**
@@ -363,7 +364,7 @@ the thread with a reply box (refinement only; also sent to WhatsApp), the
 implementation summary, Nucleus's test result, the PR, whether its link is
 posted on the issue, the stage tasks from the ledger and the stage log.
 Retry and cancel are row actions. Every confirmation uses `InlineConfirm`.
-API: `/intake/api/{list,detail,reply,approve-plan,cancel,retry,release}`;
+API: `/intake/api/{list,detail,reply,answer,approve-plan,cancel,retry,release}`;
 wire types are generated (Rule
 12). Writes accept JSON bodies only and refuse requests a browser marks as
 cross-site, as the Tasks cancel does (ADR-033 §7).
@@ -2051,6 +2052,8 @@ the agent reads it at its next turn; otherwise `note` says that the item is
 not in refinement and the message is saved. The text is discussion only and
 is never interpreted; decisions stay on their explicit routes
 (`approve-plan` bound to a version, `release` bound to a hold, `cancel`).
+"Amendment: the decision board" replaces this: while the item waits for the
+operator the text is interpreted.
 
 ### Verification of the amendment
 
@@ -2073,6 +2076,99 @@ dashboard: `a_dashboard_message_is_saved_in_every_stage_and_reaches_the_agent_in
 (`src/intake.test.ts`): the one-time leave, its retry and its report after 3
 failures, an ambiguous nonce match, the tables dropped only when no group is
 open. Not verified here: the one-time leave on the live account.
+
+## Amendment: the decision board (2026-09-26)
+
+### Why
+
+The operator typed "approve the plan" into the item page's reply box. Text
+typed on the dashboard was discussion only, so it went to the refinement
+agent, which cannot approve, and nothing happened. The operator must never
+need to know a command: when an item waits on him, the page shows the valid
+options, and words typed on the page work as they do on WhatsApp.
+
+### The board
+
+While the item waits on the operator, the bottom of the conversation shows a
+board in place of the composer (`DecisionBoard.tsx`, drawn in the canvas box
+of ADR-012, `CanvasFrame.tsx`, which the chat's canvas blocks also use). Its
+options come from code (`boardFor` in `web/src/lib/intake.ts`), from the
+item's stage and data, never from model text:
+
+| Item | Options |
+|---|---|
+| refinement, plan vN proposed, no turn running | Approve plan vN (bound to vN), Continue discussing, Cancel item |
+| refinement, no plan, the agent waits for a reply | no board: the composer |
+| held | Release (bound to the `hold_hash` the page shows; the findings are listed above the options), Continue discussing, Cancel item |
+| failed, blocked | Retry, Cancel item |
+| queued, eval, a refinement turn running, implementation, pr | the status line and Write a message |
+| closed, cancelled, stale | neither the board nor the composer |
+
+Approve, release and retry call their explicit routes at once: the option is
+the explicit choice and names the version or the hold. Cancel item asks a
+second step on the board. "Continue discussing" and "Write a message" show
+the composer, focused, with "Back to options"; the board comes back when the
+stage, the plan version, the running turn, the hold or the open question
+changes. A refusal shows the server's text on the board. The arrow keys move
+the highlight (wrapping), Home and End jump, Enter selects; a tap selects.
+
+### Dashboard text through the interpreter
+
+`POST /intake/api/reply` calls `pipeline::dashboard_message`. The dashboard
+is the operator's own authenticated surface (tailnet only), so its text is
+his. While the item's pending entry is `waiting` (a plan to approve, a
+reply, a release) or a confirmation question of the page is open, the text
+goes through `handle_message` with `Origin::Dashboard { item }`: the pending
+list holds this item only, and the interpreter, the binding and the
+confirmation rules are the WhatsApp ones. A typed plan approval on the page
+names its item and runs at once; a release or a cancel is asked first. The
+question is stored with scope `dashboard:<n>` (a WhatsApp "yes" does not
+answer it), added to the thread as a Nucleus note, returned in the detail
+(`question: IntakeQuestion`) and shown on the board as a Yes / No step,
+which calls `POST /intake/api/answer {id, question, yes}`
+(`pipeline::dashboard_answer`, the same `settle` path as a typed yes or no).
+Answers to dashboard messages are thread notes, never WhatsApp messages;
+decisions are recorded `via dashboard`. A dashboard message has no WhatsApp
+timestamps: it answers a question stored (`created_at`) before its arrival
+stamp, which is taken before anything else. The `inbound_commands` row of a
+dashboard message has `wa_row_id = 0`.
+
+No interpreter session starts when nothing waits on the operator: the text
+is discussion (`pipeline::reply`). A message made only of canvas responses
+is discussion too (`decide::is_canvas_response`), so a click on an agent's
+question can never become a decision. The reply result reports what
+happened: `outcome` is `discussion`, `decision` (with `decision`),
+`question`, `unclear` (the question and the option list in `note`),
+`declined` or `refused`; the composer shows it. The dashboard process gets a
+`SessionInterpreter`; `NoInterpreter` is removed.
+
+### Agent questions as canvas blocks
+
+The refinement brief allows the agent to ask its questions as ADR-012 canvas
+blocks (`decision`, `multi-select`, `confirm`, `form`), says the operator's
+choice comes back as his next message, and forbids offering approve, release
+or cancel as options. The item thread renders agent replies with the chat's
+parser (`parseMessage`) and answered state (a later operator message with a
+response for the block's id); labels and titles render as plain text. A
+choice posts `buildResponse` through `POST /intake/api/reply` as discussion.
+The WhatsApp preview of such a reply replaces each block with "[a question
+with options on the dashboard]".
+
+### Verification of the amendment
+
+Rust: `approving_the_plan_typed_on_the_dashboard_approves_the_pending_version`,
+`cancelling_typed_on_the_dashboard_asks_first_on_the_board`,
+`discussion_typed_on_the_dashboard_reaches_the_agent`,
+`nothing_waiting_starts_no_interpreter`, `a_reply_preview_leaves_canvas_blocks_out`,
+`only_a_message_made_of_canvas_responses_is_one`,
+`a_dashboard_origin_names_its_item_and_page`; dashboard:
+`text_on_a_waiting_item_is_interpreted_and_its_question_answered_on_the_board`,
+`a_dashboard_message_is_saved_in_every_stage_and_reaches_the_agent_in_refinement`.
+TypeScript (`src/lib/intake.test.ts`, `ItemPage.test.tsx`): the options per
+stage, Continue discussing and Back to options, the cancel second step, the
+question step, the keyboard selection, canvas blocks in agent replies with
+the answered state and plain-text labels. Not verified here: the interpreter
+on real dashboard text.
 
 ## Rejected alternatives
 
