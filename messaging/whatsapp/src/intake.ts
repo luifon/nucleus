@@ -190,6 +190,57 @@ export async function isOperatorId(
   return false;
 }
 
+/** How long a LID the mapping resolved to the operator counts for the
+ *  checks that cannot ask the mapping (role lookup, target policy). */
+export const OPERATOR_LID_TTL_MS = 10 * 60 * 1000;
+
+/** LIDs the live mapping resolved to the operator, for the synchronous
+ *  checks only (ADR-036). An entry counts for `OPERATOR_LID_TTL_MS` after
+ *  it was last verified; `refresh` verifies every entry against the live
+ *  mapping again (on each inbound message) and drops the ones that no
+ *  longer resolve to the operator. The asynchronous checks never read it:
+ *  they call the mapping each time (`isOperatorId`). WHATSAPP_OPERATOR_LIDS
+ *  entries are not kept here and do not depend on the mapping. */
+export class OperatorLidCache {
+  private verified = new Map<string, number>();
+
+  constructor(private readonly ttlMs = OPERATOR_LID_TTL_MS) {}
+
+  /** A LID (digits) the mapping has just resolved to the operator. */
+  note(digits: string, nowMs = Date.now()): void {
+    if (digits) this.verified.set(digits, nowMs);
+  }
+
+  /** The entries verified within the TTL. */
+  current(nowMs = Date.now()): Set<string> {
+    const out = new Set<string>();
+    for (const [d, at] of this.verified) {
+      if (nowMs - at < this.ttlMs) out.add(d);
+    }
+    return out;
+  }
+
+  /** Verify every entry against the live mapping; keep and re-date the
+   *  ones that still resolve to the operator's phone, drop the others. */
+  async refresh(
+    operatorId: string | null,
+    pnForLid: (lid: string) => Promise<string | null | undefined>,
+    nowMs = Date.now(),
+  ): Promise<void> {
+    for (const d of [...this.verified.keys()]) {
+      let ok = false;
+      try {
+        const pn = await pnForLid(`${d}@lid`);
+        ok = !!operatorId && !!pn && normalizeSenderId(pn) === operatorId;
+      } catch {
+        ok = false;
+      }
+      if (ok) this.verified.set(d, nowMs);
+      else this.verified.delete(d);
+    }
+  }
+}
+
 /** The DM gate: a DM chat is admitted when its digits are in the DM
  *  allowlist (the operator or another contact, as normal chat) or when it
  *  is the operator by `isOperatorId` (a LID the allowlist does not list).

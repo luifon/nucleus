@@ -7,7 +7,15 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { enqueueRefusal, GroupAllowlist, resolveTarget, type TargetConfig } from "./target_policy.js";
+import {
+  enqueueRefusal,
+  GroupAllowlist,
+  isOperatorOnly,
+  pickOperatorDm,
+  resolveQueuedTarget,
+  resolveTarget,
+  type TargetConfig,
+} from "./target_policy.js";
 
 // Synthetic identifiers built at runtime: the committed-secrets scanner reads
 // literal JIDs and phone numbers as real identifiers.
@@ -24,6 +32,35 @@ const config: TargetConfig = {
   allowedGroupNames: [],
   brainDumpGroupNames: ["Capture Group"],
 };
+
+test("operator-only messages reach only the operator; replies stay in the writer's chat", async () => {
+  // The operator (phone OP, LID OP_LID) and another allowed contact (OTHER).
+  const OP_LID = ["12345", "6789012345"].join("");
+  const both: TargetConfig = { ...config, allowedDmSenders: new Set([OP, OTHER]), operatorLids: new Set([OP_LID]) };
+  const groups = new GroupAllowlist(both);
+  const opChat = `${OP_LID}@lid`;
+  const otherChat = `${OTHER}@s.whatsapp.net`;
+  const isOp = async (jid: string) => jid === opChat || jid.startsWith(`${OP}@`);
+  const isOpSync = (c: string) => c === opChat || c.startsWith(`${OP}@`);
+  // The other contact was active more recently: `dm` still picks the operator.
+  const recency = [otherChat, opChat];
+  assert.equal(pickOperatorDm(recency, isOpSync, OP), opChat);
+  assert.equal(pickOperatorDm([otherChat], isOpSync, OP), `${OP}@s.whatsapp.net`, "falls back to the phone JID");
+  const q = (target: string, source: string, operatorDm = () => pickOperatorDm(recency, isOpSync, OP), isOperator = isOp) =>
+    resolveQueuedTarget({ target, source, config: both, groups, operatorDm, operatorPhone: OP, isOperator });
+  assert.equal(await q("dm", "intake:ask"), opChat);
+  // A pipeline message addressed to the other contact's chat is refused.
+  assert.equal(await q(otherChat, "intake:3"), null);
+  assert.equal(await q(otherChat, "reminders"), null);
+  // A chat-engine reply to the other contact goes to that contact.
+  assert.equal(await q(otherChat, "chat-reply"), otherChat);
+  // A reminder to whatsapp-dm (the first allowlist entry) reaches the operator.
+  assert.equal(await q(OP, "reminders"), `${OP}@s.whatsapp.net`);
+  // A LID the live check no longer accepts: `dm` falls back to the phone.
+  assert.equal(await q("dm", "intake:ask", () => opChat, async (j) => j.startsWith(`${OP}@`)), `${OP}@s.whatsapp.net`);
+  assert.equal(isOperatorOnly("dm", "chat-reply"), true);
+  assert.equal(isOperatorOnly(otherChat, "chat-reply"), false);
+});
 
 test("an operator LID is a sendable DM; another LID is not", () => {
   const groups = new GroupAllowlist(config);

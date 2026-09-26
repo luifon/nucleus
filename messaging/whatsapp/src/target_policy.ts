@@ -87,6 +87,57 @@ export function isOperatorDm(target: string, config: TargetConfig): boolean {
   return digits.length > 0 && config.allowedDmSenders.has(digits);
 }
 
+/** True when a queued message may only go to the operator (ADR-036): the
+ *  `dm` shorthand, and every message from the issue pipeline, reminders
+ *  and vault checks, whatever target it names. Chat-engine replies (and
+ *  other replies in the chat that wrote) are not operator-only: they go to
+ *  the allowed contact who wrote. */
+export function isOperatorOnly(target: string, source: string): boolean {
+  return target === "dm" || /^intake(:|$)/.test(source) || source === "reminders" || source === "vault-check";
+}
+
+/** The operator's DM chat for the `dm` shorthand: the most recently active
+ *  chat (newest first in `chats`) that `isOperatorChat` accepts, else his
+ *  phone JID. Another allowed contact's chat is never chosen, however
+ *  recent. Pure. */
+export function pickOperatorDm(
+  chats: readonly string[],
+  isOperatorChat: (chatId: string) => boolean,
+  operatorPhone: string | null,
+): string | null {
+  const hit = chats.find((c) => !c.endsWith("@g.us") && isOperatorChat(c));
+  if (hit) return hit;
+  return operatorPhone ? `${operatorPhone}@s.whatsapp.net` : null;
+}
+
+/** The target policy for a queued message (the drain): `resolveTarget`,
+ *  and for an operator-only message (`isOperatorOnly`) the resolved DM
+ *  must be the operator by the live check at send time (`isOperator`, the
+ *  shared `isOperatorId` with the live LID mapping). `dm` resolves to
+ *  `operatorDm()` when that chat passes the live check, and to the
+ *  operator's phone JID otherwise. Groups are decided by `resolveTarget`
+ *  alone. */
+export async function resolveQueuedTarget(input: {
+  target: string;
+  source: string;
+  config: TargetConfig;
+  groups: GroupAllowlist;
+  operatorDm: () => string | null;
+  operatorPhone: string | null;
+  isOperator: (jid: string) => Promise<boolean>;
+}): Promise<string | null> {
+  const { target, config, groups } = input;
+  if (target === "dm") {
+    const chat = input.operatorDm();
+    const jid = chat ? resolveTarget(chat, config, groups) : null;
+    if (jid && (await input.isOperator(jid))) return jid;
+    return input.operatorPhone ? resolveTarget(input.operatorPhone, config, groups) : null;
+  }
+  const jid = resolveTarget(target, config, groups);
+  if (!jid || jid.endsWith("@g.us") || !isOperatorOnly(target, input.source)) return jid;
+  return (await input.isOperator(jid)) ? jid : null;
+}
+
 /** The JID to send `target` to, or null when it is not allowed. `dm` is
  *  resolved by `operatorDm` (the queue's shorthand for the operator's DM).
  *  An operator DM keeps an `@lid` form as is (WhatsApp delivers some DMs

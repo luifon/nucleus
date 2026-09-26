@@ -101,7 +101,9 @@ export interface DrainLog {
 export interface DrainDeps {
   store: OutboundQueueStore;
   /** Allowlisted JID for a row target, or null. */
-  resolveTarget: (target: string) => string | null;
+  /** The target policy for one row (target_policy.ts); `source` tells
+   *  operator-only messages from replies in the writer's chat. */
+  resolveTarget: (target: string, source: string) => string | null | Promise<string | null>;
   send: (jid: string, content: AnyMessageContent, opts: { messageId: string; quoted?: WAMessage }) => Promise<WAMessage | undefined>;
   newMessageId: () => string;
   rules: () => SecretRules;
@@ -205,7 +207,7 @@ export class OutboundDrain {
     for (const r of rows) {
       if (!this.up) break;
       if (r.kind !== "text" && mediaSent >= MAX_MEDIA_SENDS_PER_TICK) continue;
-      const jid = this.d.resolveTarget(r.target);
+      const jid = await this.d.resolveTarget(r.target, r.source);
       if (!jid) {
         const { status } = this.d.store.markFailure(r.id, `unknown target: ${r.target}`, OUTBOUND_MAX_ATTEMPTS);
         if (status === "failed") cleanupMedia(r);

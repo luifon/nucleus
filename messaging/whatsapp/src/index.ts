@@ -82,7 +82,7 @@ import { JobStore, JOBS_TMUX_SESSION, startJob, withQuickWindow } from "./jobs.j
 import { DocStore } from "./docstore.js";
 import { makeVaultManifestHook } from "./docstore_vault.js";
 import { transcribe } from "./transcribe.js";
-import { GroupAllowlist, resolveTarget } from "./target_policy.js";
+import { GroupAllowlist, pickOperatorDm, resolveQueuedTarget } from "./target_policy.js";
 import { handleBrainDump, sweepExpiredPlans, type BraindumpDeps } from "./braindump_flow.js";
 import {
   CHAT_KEY,
@@ -91,6 +91,7 @@ import {
   IntakeStore,
   admitDm,
   isOperatorId,
+  OperatorLidCache,
   routeOperatorDm,
   stripGroupMarker,
   type InputKind,
@@ -163,20 +164,32 @@ let baileysLogger = makeBaileysLogger(null);
 type ChatRole = "whatsapp-group" | "braindump" | "intake" | "dm";
 let groupAllowlist: GroupAllowlist | null = null;
 
-/** ADR-036: `@lid` DM chats the LID mapping resolved to the operator when
- *  the DM gate admitted them (digits). With WHATSAPP_OPERATOR_LIDS they are
- *  the operator's LIDs for the synchronous checks (role lookup, target
- *  policy), which cannot ask the mapping. */
-const mappedOperatorLids = new Set<string>();
+/** ADR-036: LIDs the live mapping resolved to the operator, for the
+ *  synchronous checks (role lookup, target policy), which cannot ask the
+ *  mapping. Each entry counts for 10 minutes and is verified against the
+ *  mapping again on every inbound message; the asynchronous checks never
+ *  read it. */
+const operatorLidCache = new OperatorLidCache();
 
-/** The operator's LIDs known now: configured, and resolved by the mapping. */
+/** The operator's LIDs for the synchronous checks: WHATSAPP_OPERATOR_LIDS,
+ *  and the LIDs the mapping resolved to him recently. */
 function operatorLidsNow(config: Config): Set<string> {
-  return new Set([...config.operatorLids, ...mappedOperatorLids]);
+  return new Set([...config.operatorLids, ...operatorLidCache.current()]);
 }
 
-/** The operator's identities for `isOperatorId` (ADR-036). */
+/** The operator's identities for `isOperatorId` (ADR-036): his phone and
+ *  WHATSAPP_OPERATOR_LIDS; any other LID is checked against the live
+ *  mapping on every call. */
 function botOperatorIds(config: Config): OperatorIds {
-  return { operatorId: config.operatorId, operatorLids: operatorLidsNow(config) };
+  return { operatorId: config.operatorId, operatorLids: config.operatorLids };
+}
+
+/** True when `chatId` is the operator's DM for the synchronous checks. */
+function isOperatorChatSync(chatId: string, config: Config): boolean {
+  const digits = normalizeSenderId(chatId);
+  if (!digits) return false;
+  if (digits === config.operatorId) return true;
+  return chatId.endsWith("@lid") && operatorLidsNow(config).has(digits);
 }
 
 /** JID-shape discriminator (ADR-005b). Groups end `@g.us`; DMs end
@@ -562,7 +575,7 @@ async function main() {
   const secretRules = new SecretRuleSource(config.workspaceRoot);
   const drain = new OutboundDrain({
     store: outbound,
-    resolveTarget: (target) => resolveOutboundTarget(target, config, store),
+    resolveTarget: (target, source) => resolveOutboundTarget(target, source, config, store),
     send: (jid, content, opts) => {
       if (process.env.NUCLEUS_WHATSAPP_FORCE_SEND_FAIL === "1") {
         return Promise.reject(new Error("Connection Closed (synthetic — NUCLEUS_WHATSAPP_FORCE_SEND_FAIL)"));
@@ -699,13 +712,12 @@ function runNucleus(config: Config, args: string[]): void {
 
 /** The chat key the operator's DM runs under: the most recently active DM
  *  chat whose id is on the DM allowlist, else the first allowlisted number. */
+/** The operator's DM chat for the `dm` shorthand (ADR-036): the most
+ *  recently active chat that is the operator's (his phone, a
+ *  WHATSAPP_OPERATOR_LIDS entry, or a LID the mapping resolved to him),
+ *  else his phone JID. Never another allowed contact's chat. */
 function operatorDmChat(config: Config, store: ChatSessionStore): string | null {
-  const latest = store.latestChatAmong(
-    (id) => chatType(id) === "dm" && config.allowedDmSenders.has(normalizeSenderId(id)),
-  );
-  if (latest) return latest;
-  const first = config.allowedDmSenders.values().next();
-  return first.done ? null : `${first.value}@s.whatsapp.net`;
+  return pickOperatorDm(store.chatsByRecency(), (c) => isOperatorChatSync(c, config), config.operatorId);
 }
 
 /** ADR-033: hand queued context messages to the engine. */
@@ -994,12 +1006,20 @@ function startOutboundDrain(drain: OutboundDrain): void {
 /** Translate a queue row's `target` string to a JID with the shared
  *  target policy (target_policy.ts): `dm` (the operator's DM chat, resolved
  *  like session_inbox's `dm`, so a task's result and its context message
- *  land in the same chat), the operator's DM by number or JID, or an
- *  allowed group by JID or name. Returns null for anything else — no
- *  sending to arbitrary chats. */
-function resolveOutboundTarget(target: string, config: Config, store: ChatSessionStore): string | null {
-  const policy = { ...config, operatorLids: operatorLidsNow(config) };
-  return resolveTarget(target, policy, groupAllowlist ?? new GroupAllowlist(config), () => operatorDmChat(config, store));
+ *  land in the same chat), an allowed DM by number or JID, or an allowed
+ *  group by JID or name. An operator-only message (the pipeline, reminders,
+ *  `dm`) reaches a DM only when it is the operator by the live check.
+ *  Returns null for anything else — no sending to arbitrary chats. */
+async function resolveOutboundTarget(target: string, source: string, config: Config, store: ChatSessionStore): Promise<string | null> {
+  return resolveQueuedTarget({
+    target,
+    source,
+    config: { ...config, operatorLids: operatorLidsNow(config) },
+    groups: groupAllowlist ?? new GroupAllowlist(config),
+    operatorDm: () => operatorDmChat(config, store),
+    operatorPhone: config.operatorId,
+    isOperator: (jid) => isOperatorId(jid, botOperatorIds(config), pnForLid),
+  });
 }
 
 /** Check `participant` against the configured sender allowlist. Modern
@@ -1062,13 +1082,16 @@ async function handleMessage(sock: WASocket, msg: WAMessage, bot: Bot): Promise<
   // 1. Resolve role: groups match by literal JID in `allowedJids`; DMs
   //    match by normalized digit-only chatId user-part against the DM
   //    sender set (handles both @s.whatsapp.net and @lid forms).
+  // ADR-036: re-verify the LIDs the mapping resolved to the operator, so a
+  // LID remapped to someone else stops counting at once.
+  await operatorLidCache.refresh(config.operatorId, pnForLid);
   let role = resolveRole(chatId, config);
   // ADR-036: a DM from a LID only the connection's mapping resolves to the
   // operator is the operator's DM (the shared check, `isOperatorId`).
   if (!role && chatType(chatId) === "dm" && chatId.endsWith("@lid")) {
     const gate = await admitDm({ chatId, allowedDm: config.allowedDmSenders, operator: botOperatorIds(config), pnForLid });
     if (gate.operator) {
-      mappedOperatorLids.add(normalizeSenderId(chatId));
+      operatorLidCache.note(normalizeSenderId(chatId));
       role = "dm";
     }
   }

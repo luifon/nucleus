@@ -300,6 +300,13 @@ export class ChatSessionStore {
   /** Most recently active chat whose id normalizes to one of `digits` — the
    *  chat key the operator's DM currently runs under (@s.whatsapp.net or
    *  @lid). */
+  /** Every chat with a session, most recently active first. */
+  chatsByRecency(): string[] {
+    return (this.db.prepare("SELECT chat_id FROM chat_sessions ORDER BY last_active DESC").all() as Array<{ chat_id: string }>).map(
+      (r) => r.chat_id,
+    );
+  }
+
   latestChatAmong(match: (chatId: string) => boolean): string | null {
     const rows = this.db
       .prepare("SELECT chat_id FROM chat_sessions ORDER BY last_active DESC")

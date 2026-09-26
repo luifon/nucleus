@@ -24,6 +24,8 @@ import {
   admitDm,
   dmChatIntake,
   isOperatorId,
+  OperatorLidCache,
+  OPERATOR_LID_TTL_MS,
   type OperatorIds,
   MAX_CLOSE_ATTEMPTS,
   routeDm,
@@ -210,6 +212,32 @@ test("the next DM message answers a question the pipeline asked, for 15 minutes"
   assert.equal(store.expectsDmAnswer(sentAt + 3000), true);
   store.recordInbound({ itemKey: DM_KEY, chatId: `${OP}@s.whatsapp.net`, waMsgId: "d1", text: "yes", inputKind: "text", sender: "operator", nowMs: sentAt + 4000 });
   assert.equal(store.expectsDmAnswer(sentAt + 5000), false);
+});
+
+test("a remapped LID stops being the operator", async () => {
+  let map: Record<string, string> = { [`${OP_LID}@lid`]: `${OP}@s.whatsapp.net` };
+  const pn = async (lid: string) => map[lid] ?? null;
+  const cache = new OperatorLidCache();
+  const t0 = 1_000_000;
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(), pn), true);
+  cache.note(OP_LID, t0);
+  assert.deepEqual([...cache.current(t0 + 1000)], [OP_LID]);
+  // The mapping now resolves the LID to someone else: the live check fails
+  // at once, and the next refresh drops it from the synchronous checks.
+  map = { [`${OP_LID}@lid`]: `${STRANGER}@s.whatsapp.net` };
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(), pn), false);
+  await cache.refresh(OP, pn, t0 + 2000);
+  assert.deepEqual([...cache.current(t0 + 2000)], []);
+  // An entry counts only within the TTL unless a refresh verifies it again.
+  map = { [`${OP_LID}@lid`]: `${OP}@s.whatsapp.net` };
+  cache.note(OP_LID, t0);
+  assert.deepEqual([...cache.current(t0 + OPERATOR_LID_TTL_MS + 1)], []);
+  await cache.refresh(OP, pn, t0 + OPERATOR_LID_TTL_MS + 1);
+  assert.deepEqual([...cache.current(t0 + OPERATOR_LID_TTL_MS + 2)], [OP_LID]);
+  // A failing mapping drops it too; WHATSAPP_OPERATOR_LIDS does not depend on it.
+  await cache.refresh(OP, async () => { throw new Error("mapping gone"); }, t0 + OPERATOR_LID_TTL_MS + 3);
+  assert.deepEqual([...cache.current(t0 + OPERATOR_LID_TTL_MS + 3)], []);
+  assert.equal(await isOperatorId(`${OP_LID}@lid`, ops(OP, OP_LID), async () => { throw new Error("mapping gone"); }), true);
 });
 
 test("the DM gate admits other allowlisted contacts as normal chat and the operator by the shared check", async () => {
