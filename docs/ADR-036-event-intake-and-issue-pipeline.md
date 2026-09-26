@@ -4,8 +4,10 @@
 review (2026-09-24, see "Amendment: review findings"), amended with the hidden-content hold
 (2026-09-25, see "Amendment: the hidden-content hold", revised after its review the same day), amended with
 operator decisions in plain words and the pull request link comment without approval (2026-09-26, see
-"Amendment: operator decisions in plain words"); live verification pending (real `gh` against the configured
-repos, real WhatsApp group creation, the interpreter on real messages).
+"Amendment: operator decisions in plain words"), amended to remove per-item WhatsApp groups, send short
+notices with a dashboard link and pass plans whole (2026-09-26, see "Amendment: no WhatsApp groups, short
+notices, whole plans"); live verification pending (real `gh` against the configured repos, the interpreter on
+real messages, the one-time group leave on the live account).
 
 **Builds on / changes:**
 - [[ADR-033]] — every agent step is a task in the task ledger (`origin =
@@ -1894,6 +1896,148 @@ routing by marker, by quoted pipeline message and by the answer window,
 the window's start, end and use by the first DM message, another sender
 never routed, `sender` stored. Not verified here: the interpreter with a
 real model on real messages, and the answer window on the live account.
+
+## Amendment: no WhatsApp groups, short notices, whole plans (2026-09-26)
+
+### Why
+
+Three problems came up in use.
+
+- A real plan v5 of 12 191 characters reached the implementation agent cut
+  off in step 3: the brief clipped the approved plan to 6 000 characters,
+  so its later steps, its tests and its out-of-scope list were missing.
+  Refinement turns also saw earlier plans cut off (each thread message was
+  clipped to 4 500 characters). The agent built from a plan the operator
+  did not approve.
+- Per-item WhatsApp groups cost more than they gave. Creating groups from a
+  personal account needs a daily limit and anti-spam care, an unknown
+  creation needs nonce recovery, quarantine and a manual `group-resolve`,
+  and every group needs a membership tripwire and a sender gate. The
+  operator reads and decides in the DM anyway.
+- Long plans, agent replies and finding lists do not read well on a phone.
+  The dashboard shows them whole; WhatsApp needs to say what happened and
+  where to read it.
+
+### Plans are never cut
+
+- `briefs::PLAN_LIMIT` = 20 000 characters. A refinement reply whose plan
+  is longer does not become a plan version. The thread shows a placeholder
+  in its place and a Nucleus note (`[intake.texts] plan_too_long`: "The
+  proposed plan has N characters; the limit is 20000. The agent was asked
+  to shorten it."). The note is a new message of the next turn, which
+  starts at once and carries a code-owned paragraph, outside the data
+  fence, that names the refused length. After two automatic turns in a row
+  (`MAX_PLAN_RETRIES`) the third refusal stops (`plan_too_long_stopped`)
+  and the agent waits for the operator, who gets the agent-reply notice.
+  `items.plan_refused_chars` and `items.plan_refusals` hold that state; an
+  accepted plan or a reply without a plan clears it.
+- The refinement brief carries the latest plan whole, and the
+  implementation brief carries the approved plan whole. A brief that
+  carries a plan caps the issue text lower (refinement: body 3 000,
+  comments 2 000; implementation: body 4 000, comments 3 000; eval text
+  2 000 everywhere), and the refinement history gives way, oldest message
+  first, until the brief fits `tasks::MAX_BRIEF_CHARS` (32 000). New
+  operator messages are never cut. A brief that still does not fit is
+  `briefs::BriefTooLong`: the item goes to `blocked` with that reason, and
+  nothing is cut.
+- In the history, an agent reply that carried plan vN shows "(plan vN,
+  shown in full above)" for the latest plan and "(plan vN, see the
+  dashboard)" for an older one (`item_messages.plan_version` records which
+  version a reply carried; the text is replaced between its `── plan vN ──`
+  lines).
+- A finished refinement turn is recorded in one transaction
+  (`store::record_turn`): the reply, the note, the item's columns and the
+  plan version, only while that turn is still the item's current task.
+
+### Plan versions are kept
+
+`plan_versions (item_id, version, text, proposed_at)` keeps every accepted
+plan version whole. The dashboard detail has `plans: IntakePlanVersion[]`
+(`version`, `text`, `at`), oldest first. Migration 7 backfills, where
+known: the plan each stored agent reply carried (between its shown
+markers), then the item's `approved_plan` and `plan_draft`, which are the
+authoritative text of their versions.
+
+### No WhatsApp groups
+
+Removed, with no parallel path: group requests and surfaces, reconciliation
+and `group_closed_at`, `[intake.whatsapp]` (`refinement_groups`,
+`max_groups_per_day`, `group_wait_minutes`), `nucleus intake group-resolve`,
+the group origin of operator decisions (the "in a group, the list holds only
+that group's item" rule), and in the bot the group executor, nonce recovery,
+quarantine, the membership baseline, the `intake` role in the target
+allowlist and the group sender gate. Every item's WhatsApp surface is the
+operator's DM. A stored `intake_inbound` row from a group chat is never
+interpreted.
+
+Migration 5 moves items with surface `group` or `pending` to `dm`, closes
+open confirmation questions in a `group:<n>` scope (`replaced`) and drops the
+three group columns. The bot, once per process on its first open connection
+(`cleanupLegacyGroups` in `messaging/whatsapp/src/intake.ts`), leaves every
+group `intake_groups` still records as open (an unknown creation is looked
+for once by its nonce: one match is left, none means there is no group,
+several count as a failure), marks it closed, and drops `intake_groups` and
+`intake_group_requests` when no group is left open. A failed leave keeps its
+row for the next start and is reported to the operator in the DM after 3
+failures (`LEGACY_LEAVE_ALERT_AFTER`), once per item.
+
+### WhatsApp gets short notices
+
+Every WhatsApp message the pipeline sends about an item is a one-line,
+code-owned `[intake.texts] notice_*` text with the item's dashboard link,
+`${NUCLEUS_PUBLIC_URL}/intake?item=<n>` (no link when the variable is
+unset): a new item needs a plan; the agent replied (the first ~200
+characters of the reply, cut at a word boundary with "…", WhatsApp
+formatting characters and quote and heading marks removed, passed through
+the secret guard, otherwise sent without the preview); plan vN is ready to
+approve; held for hidden content (the count only); released;
+implementation started; draft PR opened (with its link); blocked or failed
+(a one-line reason of at most 160 characters, replaced by a fixed text when
+the secret guard flags it); stopped (stale or closed at the source);
+cancelled. The confirmation questions keep their words and get the link.
+No plan, agent reply, finding list or implementation summary goes to
+WhatsApp; the thread notes keep them for the dashboard, and the operator's
+own dashboard messages are not echoed. Each thread message stores its notice
+(`item_messages.notice`, migration 6); the flush sends only notices, under
+source `intake:<n>`, so a reply to one still reaches the item. A thread
+message still waiting to be copied to WhatsApp in full when migration 6 runs
+is not sent.
+
+The operator's DM replies work as before: the interpreter reads decisions,
+discussion goes to the item's thread (`via = whatsapp`) and to the
+refinement agent, confirmations are asked and answered in the DM.
+
+### Messages typed on the dashboard
+
+`POST /intake/api/reply` stores the text in the item's thread with
+`via = dashboard` in every stage and returns `IntakeReplyResult { item,
+reaches_agent, note }`. During refinement (or while held from refinement)
+the agent reads it at its next turn; otherwise `note` says that the item is
+not in refinement and the message is saved. The text is discussion only and
+is never interpreted; decisions stay on their explicit routes
+(`approve-plan` bound to a version, `release` bound to a hold, `cancel`).
+
+### Verification of the amendment
+
+Rust: `a_12000_character_plan_reaches_both_briefs_byte_identical` and
+`a_12000_character_plan_reaches_both_briefs_whole_and_every_version_is_kept`;
+`a_plan_over_the_limit_is_refused_with_a_note_and_the_next_turn_is_told`;
+`the_largest_allowed_plan_with_a_maximal_issue_fits_the_ledger`;
+`a_brief_that_cannot_fit_is_refused_never_cut` and
+`a_brief_over_the_ledger_limit_blocks_the_item_with_the_reason`;
+`earlier_plans_in_the_history_are_references`;
+`the_migrations_keep_every_known_plan_and_move_a_group_item_to_the_dm` and
+`the_group_surfaces_are_migrated_to_the_dm`;
+`a_notice_carries_the_item_link_only_when_the_public_url_is_set`;
+`no_notice_exceeds_600_characters`;
+`the_reply_preview_is_plain_and_cut_at_a_word_boundary`;
+`refinement_notices_carry_a_preview_or_the_plan_version_and_the_link`;
+`a_failure_notice_has_a_one_line_reason_and_a_guarded_one_is_withheld`;
+dashboard: `a_dashboard_message_is_saved_in_every_stage_and_reaches_the_agent_in_refinement`,
+`the_detail_lists_every_plan_version_oldest_first`. TypeScript
+(`src/intake.test.ts`): the one-time leave, its retry and its report after 3
+failures, an ambiguous nonce match, the tables dropped only when no group is
+open. Not verified here: the one-time leave on the live account.
 
 ## Rejected alternatives
 

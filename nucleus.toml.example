@@ -261,7 +261,7 @@ max_runtime_hours = 12
 # remote_url = "https://github.com/{repo}.git"
 #
 # Every item's WhatsApp thread is the operator's DM, marked #<n> (per-item
-# groups were removed: ADR-036, "Amendment: no WhatsApp groups"). The
+# groups were removed: ADR-036, "No WhatsApp groups"). The
 # operator decides there in his own words (approve the plan, release a held
 # item, cancel); a model with no tools reads each message and code decides
 # what happens (ADR-036, "Operator decisions"). A DM message without an item

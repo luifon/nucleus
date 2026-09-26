@@ -20,7 +20,7 @@
 //      interpret-latest` and type the pipeline's decision block after them
 //      (the DM chat session).
 //   3. Once, at start: leave the per-item WhatsApp groups an earlier version
-//      created (ADR-036, "Amendment: no WhatsApp groups";
+//      created (ADR-036, "No WhatsApp groups";
 //      `cleanupLegacyGroups`), then drop their tables.
 
 import { DatabaseSync } from "node:sqlite";
@@ -505,7 +505,7 @@ export class IntakeStore {
   }
 }
 
-/** A group an earlier version created for an item (ADR-036, "Amendment: no
+/** A group an earlier version created for an item (ADR-036, "No
  *  WhatsApp groups"). */
 export interface LegacyGroup {
   itemKey: string;

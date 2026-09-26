@@ -597,7 +597,7 @@ JSON-parsed numbers.
   identity counts, decided by one function (`isOperatorId` in
   `messaging/whatsapp/src/intake.ts`: his phone digits, a LID listed in
   `WHATSAPP_OPERATOR_LIDS`, or a LID the connection maps to his phone) for
-  both inbound gates, approvals, the DM fast paths, the stored `chat` rows
+  the DM gate, approvals, the DM fast paths, the stored `chat` rows
   and the block. Other `WHATSAPP_ALLOWED_DM_JIDS` entries are contacts the
   bot chats with, never the operator.
   The terminal and the dashboard keep explicit commands.
@@ -617,12 +617,21 @@ JSON-parsed numbers.
   identities, checked live at send time (`resolveQueuedTarget`). A chat
   session may list and show items and trigger that interpretation; it
   never cancels, approves or releases.
-- Thread messages reach WhatsApp only through `outbound_queue` (target
-  policy, secret filter). Intake groups are created and left only by the
-  bot (`messaging/whatsapp/src/intake.ts`), within `[intake.whatsapp]
-  max_groups_per_day`. A group creation with an unknown result is never
-  counted as closed; only the bot leaving it or the operator running
-  `nucleus intake group-resolve` closes it.
+- Every item's WhatsApp surface is the operator's DM; there are no per-item
+  groups (the bot leaves the old ones once at start and then drops their
+  tables). WhatsApp gets only short, code-owned `[intake.texts] notice_*`
+  texts through `outbound_queue` (target policy, secret filter), each with
+  the item's dashboard link (`NUCLEUS_PUBLIC_URL/intake?item=<n>`, none when
+  unset). Never send a plan, an agent reply, a finding list or another long
+  body to WhatsApp; the agent-reply preview (~200 characters) passes the
+  secret guard first. The dashboard thread keeps the full text.
+- A plan reaches an agent whole or not at all: a proposed plan over
+  `briefs::PLAN_LIMIT` never becomes a version (the agent is asked to
+  shorten it), briefs carry the latest or approved plan whole, and a brief
+  over `tasks::MAX_BRIEF_CHARS` blocks the item. Never add a clip of plan
+  text. Every accepted version is kept in `plan_versions`.
+- Text typed on the dashboard (`POST /intake/api/reply`) is discussion
+  only, saved in every stage; decisions stay on the explicit routes.
 - Every write to `memory/intake.db` goes through `nucleus_core::intake`.
   Nucleus keeps one bare mirror per repo and one clone per item under
   `[intake] work_dir`, outside this checkout. Nucleus's own git commands

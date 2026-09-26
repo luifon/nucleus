@@ -785,7 +785,7 @@ async function connect(bot: Bot): Promise<void> {
       // unexpected event fires. Then start the outbound drain — the
       // drainer needs the allowlist to authorize each target — unless this
       // connection closed in the meantime (the next open starts it).
-      // ADR-036, "Amendment: no WhatsApp groups": once per process, leave
+      // ADR-036, "No WhatsApp groups": once per process, leave
       // the per-item groups an earlier version created, then drop their
       // tables. A failed leave is tried again at the next start.
       if (!legacyGroupCleanupStarted) {
