@@ -12,12 +12,13 @@
 //! ([`store::advance`]).
 
 use super::briefs;
+use super::decide::{self, Decision, Origin, Reading};
 use super::event::{Discussion, Event, NewEvent, SourceAdapter};
 use super::git;
 use super::github::{self, GhRunner, GithubIssues};
 use super::hidden;
 use super::publish::{self, SecretGuard, Verdict};
-use super::stage::{self, OperatorCommand, Stage, StageEvent};
+use super::stage::{self, Stage, StageEvent};
 use super::store::{self, Item, NewMessage, Val};
 use super::{clip, fill};
 use crate::config::{IntakeConfig, IntakeRepo, Settings, TasksConfig};
@@ -68,6 +69,8 @@ pub struct Ctx {
     pub tools: Arc<super::tools::ToolPins>,
     /// The account `gh` acts as, read once per process (`gh api user`).
     pub viewer: tokio::sync::OnceCell<String>,
+    /// Reads the operator's WhatsApp messages ([`decide::SessionInterpreter`]).
+    pub interpreter: Arc<dyn decide::Interpreter>,
 }
 
 impl Ctx {
@@ -99,6 +102,7 @@ impl Ctx {
             guard: Arc::new(publish::ScriptGuard { workspace_root: ws.to_path_buf() }),
             tools: Arc::new(tools),
             viewer: tokio::sync::OnceCell::new(),
+            interpreter: Arc::new(decide::SessionInterpreter { workspace_root: ws.to_path_buf(), claude: settings.claude.clone() }),
         })
     }
 }
@@ -439,16 +443,19 @@ async fn admit_one(ctx: &Ctx, ev: &Event) -> Result<Option<Item>> {
     Ok(item)
 }
 
-// ── operator replies from WhatsApp ───────────────────────────────────────
+// ── operator messages from WhatsApp ──────────────────────────────────────
 
 const WA_INBOUND_WATERMARK: &str = "wa_inbound_last_id";
 /// An operator message whose application fails this many times (not a
-/// refusal: a database or other error) is given up and reported.
+/// refusal: a database error, an interpreter that cannot start) is given
+/// up and reported.
 const MAX_INBOUND_ATTEMPTS: i64 = 5;
+/// A confirmation question waits this long for its answer.
+pub const CONFIRMATION_MINUTES: i64 = 15;
 
-/// Read the operator messages the bot routed to items since the last read.
-/// Each message has a processing state in intake.db (`received` →
-/// `applied` / `failed`, [`store::inbound_receive`]); a message is applied
+/// Read the operator messages the bot routed to the pipeline since the
+/// last read. Each message has a processing state in intake.db (`received`
+/// → `applied` / `failed`, [`store::inbound_receive`]); a message is applied
 /// once, keyed by its WhatsApp id, and the watermark moves only past
 /// messages that are applied or failed for good. A message that fails for
 /// another reason stops the read (later messages wait, so their order is
@@ -472,9 +479,8 @@ async fn ingest_whatsapp(ctx: &Ctx) -> Result<()> {
                     &ctx.wa,
                     crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM,
                     &format!(
-                        "Your message for item #{} could not be applied after {} attempts; it was not acted on. \
-                         Check the item and send it again.",
-                        row.item_key.trim_start_matches('#'),
+                        "Your message about the issue pipeline could not be handled after {} attempts, so nothing \
+                         was done. Check the item on the dashboard and send the message again.",
                         st.attempts
                     ),
                     "intake",
@@ -488,94 +494,395 @@ async fn ingest_whatsapp(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Apply one operator message from WhatsApp; on return it is applied or
-/// failed for good (a refusal), or an error is returned.
+/// Where one routed message came from, then [`operator_message`]. A row the
+/// bot did not mark as the operator's own message is never interpreted.
 async fn apply_inbound(ctx: &Ctx, row: &crate::whatsapp_queue::IntakeInbound, msg_ref: &str) -> Result<()> {
-    let n: Option<i64> = row.item_key.trim().trim_start_matches('#').parse().ok();
-    let item = match n {
-        Some(n) => store::item(&ctx.db, n).await.ok(),
-        None => None,
+    if row.sender != "operator" {
+        tracing::warn!(msg = %msg_ref, sender = %row.sender, "intake: a message not from the operator's identity was ignored");
+        return store::inbound_finish(&ctx.db, msg_ref, "failed", Some("not from the operator's identity; not interpreted")).await;
+    }
+    let key = row.item_key.trim().trim_start_matches('#');
+    let origin = if row.chat_id.ends_with("@g.us") {
+        match key.parse() {
+            Ok(item) => Origin::Group { item, jid: row.chat_id.clone() },
+            Err(_) => return store::inbound_finish(&ctx.db, msg_ref, "failed", Some("a group message without an item")).await,
+        }
+    } else if key == crate::whatsapp_queue::INTAKE_DM_KEY {
+        Origin::Dm { item: None }
+    } else {
+        match key.parse() {
+            Ok(n) => Origin::Dm { item: Some(n) },
+            Err(_) => return store::inbound_finish(&ctx.db, msg_ref, "failed", Some("no item")).await,
+        }
     };
-    match item {
-        Some(item) if !item.stage().is_terminal() => operator_text(ctx, &item, &row.text, msg_ref, &row.input_kind).await,
-        _ => {
-            let body = fill(&ctx.cfg.texts.unknown_item, &[("n", row.item_key.trim_start_matches('#'))]);
-            crate::whatsapp_queue::enqueue_text_once(
-                &ctx.wa,
-                crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM,
-                &body,
-                "intake",
-                &format!("intake:unknown:{}", row.id),
-            )
-            .await?;
-            store::inbound_finish(&ctx.db, msg_ref, "failed", Some("no open item")).await
+    operator_message(ctx, &origin, &row.text, msg_ref, &row.input_kind).await
+}
+
+/// One operator message (ADR-036, "Operator decisions"). The interpreter
+/// ([`decide::Interpreter`]) reads it with the list of pending decisions;
+/// code then decides what happens:
+///
+/// - a decision runs only for an item of the list and a decision that item
+///   allows, bound to the plan version or hold fingerprint the list showed.
+///   A release, a cancel, a decision from a voice note or a forwarded
+///   message, and a decision whose item was inferred in the DM while
+///   several items wait, get a confirmation question first; a plan approval
+///   typed in the item's own group or naming the item runs at once;
+/// - a discussion message goes to the item's thread, and to the refinement
+///   agent during refinement;
+/// - anything else gets the interpreter's question (cleaned) or a fixed
+///   text, and the list of what each item waits for and what each option
+///   does.
+///
+/// `msg_ref` is the message's [`store::inbound_receive`] key: the thread
+/// keeps the message once, and every effect and the `applied` mark are one
+/// transaction, so a message handled again after a crash is applied once.
+pub async fn operator_message(ctx: &Ctx, origin: &Origin, text: &str, msg_ref: &str, input_kind: &str) -> Result<()> {
+    if store::inbound_state(&ctx.db, msg_ref).await?.map(|s| s.is_final()).unwrap_or(false) {
+        return Ok(()); // applied or refused before
+    }
+    let t = &ctx.cfg.texts;
+    if let Some(n) = origin.item() {
+        let open = matches!(store::item(&ctx.db, n).await, Ok(it) if !it.stage().is_terminal());
+        if !open {
+            answer(ctx, origin, &fill(&t.unknown_item, &[("n", &n.to_string())]), msg_ref, false).await?;
+            return store::inbound_finish(&ctx.db, msg_ref, "failed", Some("no open item")).await;
+        }
+    }
+    let now = crate::timestamp::now();
+    let scope = origin.scope();
+    let late: Option<String> = store::expire_confirmations(&ctx.db, &scope, &now).await?.last().map(|c| {
+        fill(&t.confirmation_expired, &[("n", &c.item_id.to_string()), ("minutes", &CONFIRMATION_MINUTES.to_string())])
+    });
+    let open = store::open_confirmation(&ctx.db, &scope, msg_ref, &now).await?;
+    let pending = pending_decisions(ctx, origin).await?;
+    if pending.is_empty() && open.is_none() {
+        // Nothing waits for a decision: no model is asked.
+        let body = paragraphs(&[late.as_deref(), Some(&decide::options_text(t, &pending))]);
+        answer(ctx, origin, &body, msg_ref, false).await?;
+        return store::inbound_finish(&ctx.db, msg_ref, "applied", None).await;
+    }
+    let request = decide::Request {
+        message: text.to_string(),
+        origin: origin.describe(),
+        pending: pending.iter().map(decide::pending_line).collect(),
+        confirmation: open.as_ref().map(|c| c.question.clone()),
+    };
+    let reading = decide::parse_reading(&ctx.interpreter.interpret(&request).await?);
+    tracing::info!(msg = %msg_ref, ?reading, "intake: operator message interpreted");
+    let typed = input_kind == "text";
+    match (reading, open) {
+        (Reading::Confirm, Some(c)) => {
+            keep_message(ctx, c.item_id, text, msg_ref).await?;
+            if !store::claim_confirmation(&ctx.db, c.id, msg_ref).await? {
+                return unclear(ctx, origin, &pending, None, late, text, msg_ref).await;
+            }
+            let Some(decision) = Decision::parse(&c.decision) else { bail!("confirmation {} has an unknown decision", c.id) };
+            run_decision(ctx, origin, c.item_id, decision, c.plan_version, c.hold_hash.as_deref(), msg_ref).await
+        }
+        (Reading::Decline, Some(c)) => {
+            keep_message(ctx, c.item_id, text, msg_ref).await?;
+            answer(ctx, origin, &fill(&t.declined, &[("n", &c.item_id.to_string())]), msg_ref, false).await?;
+            store::decline_confirmation(&ctx.db, c.id, msg_ref).await
+        }
+        (reading, open) => {
+            // Any other message ends an open question: a later "yes" does
+            // not answer it.
+            if open.is_some() {
+                store::replace_confirmations(&ctx.db, &scope).await?;
+            }
+            match reading {
+                Reading::Decision { item, decision } => {
+                    decided(ctx, origin, &pending, item, decision, typed, text, msg_ref).await
+                }
+                Reading::Discussion { item } => discussed(ctx, origin, &pending, item, text, msg_ref).await,
+                Reading::Unclear { question } => unclear(ctx, origin, &pending, question, late, text, msg_ref).await,
+                Reading::Confirm | Reading::Decline => unclear(ctx, origin, &pending, None, late, text, msg_ref).await,
+            }
         }
     }
 }
 
-/// One operator message from the item's WhatsApp thread: a command, or a
-/// message for the thread (and for the refinement agent during
-/// refinement). `msg_ref` is the message's [`store::inbound_receive`] key:
-/// the thread keeps the message once, and the command's effect and the
-/// `applied` mark are one transaction, so a message handled again after a
-/// crash is applied exactly once. Only typed text (`input_kind` `text`) can
-/// be a command; a command in a voice note or a forwarded message is kept
-/// as a message and refused.
-pub async fn operator_text(ctx: &Ctx, item: &Item, text: &str, msg_ref: &str, input_kind: &str) -> Result<()> {
-    if store::inbound_state(&ctx.db, msg_ref).await?.map(|s| s.is_final()).unwrap_or(false) {
-        return Ok(()); // applied or refused before
-    }
-    let cmd = stage::parse_command(text);
-    let typed = input_kind == "text";
-    // A message for an item held during refinement is read by the turn that
-    // runs after the release.
-    let in_refinement = item.stage() == Stage::Refinement
-        || (item.stage() == Stage::Held && item.hold_stage.as_deref() == Some(Stage::Refinement.as_str()));
-    let for_agent = cmd == OperatorCommand::Message && in_refinement;
-    let message = NewMessage {
-        author: "operator",
-        via: "whatsapp",
-        body: text,
-        external_ref: Some(msg_ref),
-        pending_agent: for_agent,
-        to_whatsapp: false,
+/// Non-empty parts joined by a blank line.
+fn paragraphs(parts: &[Option<&str>]) -> String {
+    parts.iter().flatten().filter(|p| !p.trim().is_empty()).copied().collect::<Vec<_>>().join("\n\n")
+}
+
+/// Keep the operator's message in item `n`'s thread (once, by its
+/// WhatsApp id). It came from WhatsApp, so it is not sent back there.
+async fn keep_message(ctx: &Ctx, n: i64, text: &str, msg_ref: &str) -> Result<()> {
+    store::add_message(
+        &ctx.db,
+        n,
+        NewMessage { author: "operator", via: "whatsapp", body: text, external_ref: Some(msg_ref), pending_agent: false, to_whatsapp: false },
+    )
+    .await?;
+    Ok(())
+}
+
+/// A code-owned reply to an operator message, in the chat it came from,
+/// through the outbound queue (target policy, secret filter). In the DM,
+/// `question` marks a reply that waits for an answer (`intake:ask`): the
+/// bot routes the operator's next DM message to the pipeline for 15
+/// minutes after it was sent.
+async fn answer(ctx: &Ctx, origin: &Origin, body: &str, msg_ref: &str, question: bool) -> Result<()> {
+    let (target, source) = match origin {
+        Origin::Group { item, jid } => (jid.clone(), format!("intake:{item}")),
+        Origin::Dm { .. } => (
+            crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM.to_string(),
+            if question { "intake:ask".to_string() } else { "intake:note".to_string() },
+        ),
     };
-    if cmd == OperatorCommand::Message {
-        // Stored and applied in one transaction.
-        store::add_message_caused(&ctx.db, item.id, message, Some(msg_ref)).await?;
-        if !in_refinement {
-            note_once(ctx, item.id, &fill_vars(&ctx.cfg.texts.stage_note, &item_vars(ctx, item)), &format!("stage-note:{msg_ref}"))
-                .await?;
-        }
-        return Ok(());
-    }
-    // A command: the thread keeps the operator's message (once), then the
-    // command runs with the message as its cause.
-    store::add_message(&ctx.db, item.id, message).await?;
-    let cause = Some(msg_ref);
-    let outcome = if !typed {
-        refuse(format!(
-            "Item #{}: commands must be typed; a {input_kind} message is kept in the thread and not acted on.",
-            item.id
-        ))
-    } else {
-        match cmd {
-            OperatorCommand::ApprovePlan(v) => approve_plan_caused(ctx, item.id, v, "whatsapp", cause).await.map(|_| ()),
-            OperatorCommand::Cancel => cancel_caused(ctx, item.id, "whatsapp", cause).await.map(|_| ()),
-            OperatorCommand::Release(code) => {
-                release_caused(ctx, item.id, code.as_deref(), "whatsapp", cause).await.map(|_| ())
+    crate::whatsapp_queue::enqueue_text_once(&ctx.wa, &target, body, &source, &format!("intake:answer:{msg_ref}")).await?;
+    Ok(())
+}
+
+/// The list of pending decisions for a message from `origin`, built by code
+/// from each item's stage: in an item's group, that item; in the DM, every
+/// item that waits for the operator, and the item the message names.
+async fn pending_decisions(ctx: &Ctx, origin: &Origin) -> Result<Vec<decide::Pending>> {
+    let ids = match origin {
+        Origin::Group { item, .. } => vec![*item],
+        Origin::Dm { .. } => store::active_item_ids(&ctx.db).await?,
+    };
+    let mut out = Vec::new();
+    for id in ids {
+        let Ok(item) = store::item(&ctx.db, id).await else { continue };
+        if let Some(p) = pending_for(ctx, &item) {
+            if p.waiting || origin.item() == Some(id) || matches!(origin, Origin::Group { .. }) {
+                out.push(p);
             }
-            OperatorCommand::Message => unreachable!("handled above"),
         }
+    }
+    Ok(out)
+}
+
+/// What `item` waits for and the decisions it allows now; `None` for a
+/// closed item.
+fn pending_for(ctx: &Ctx, item: &Item) -> Option<decide::Pending> {
+    let t = &ctx.cfg.texts;
+    let v = item.plan_version.to_string();
+    let base = decide::Pending {
+        item: item.id,
+        waits_for: String::new(),
+        allowed: vec![Decision::Cancel],
+        plan_version: None,
+        hold_hash: None,
+        findings: 0,
+        waiting: false,
+        discussion: false,
+    };
+    Some(match item.stage() {
+        s if s.is_terminal() => return None,
+        Stage::Refinement if item.current_task_id.is_some() => decide::Pending {
+            waits_for: if item.plan_version > 0 { fill(&t.wait_busy_plan, &[("version", &v)]) } else { t.wait_busy.clone() },
+            discussion: true,
+            ..base
+        },
+        Stage::Refinement if item.plan_version > 0 && item.plan_draft.is_some() => decide::Pending {
+            waits_for: fill(&t.wait_plan, &[("version", &v)]),
+            allowed: vec![Decision::ApprovePlan, Decision::Cancel],
+            plan_version: Some(item.plan_version),
+            waiting: true,
+            discussion: true,
+            ..base
+        },
+        Stage::Refinement => decide::Pending { waits_for: t.wait_reply.clone(), waiting: true, discussion: true, ..base },
+        Stage::Held => {
+            let findings = item
+                .hold_json
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<hidden::Hold>(j).ok())
+                .map(|h| h.findings.len())
+                .unwrap_or(0);
+            decide::Pending {
+                waits_for: fill(&t.wait_hold, &[("count", &findings.to_string())]),
+                allowed: vec![Decision::Release, Decision::Cancel],
+                hold_hash: item.hold_hash.clone(),
+                findings,
+                waiting: true,
+                discussion: item.hold_stage.as_deref() == Some(Stage::Refinement.as_str()),
+                ..base
+            }
+        }
+        s => decide::Pending { waits_for: fill(&t.wait_stage, &[("stage", s.as_str())]), ..base },
+    })
+}
+
+/// The interpreter read a decision.
+#[allow(clippy::too_many_arguments)]
+async fn decided(
+    ctx: &Ctx,
+    origin: &Origin,
+    pending: &[decide::Pending],
+    item: i64,
+    decision: Decision,
+    typed: bool,
+    text: &str,
+    msg_ref: &str,
+) -> Result<()> {
+    let t = &ctx.cfg.texts;
+    let Some(p) = pending.iter().find(|p| p.item == item && p.allowed.contains(&decision)) else {
+        if let Some(n) = origin.item() {
+            keep_message(ctx, n, text, msg_ref).await?;
+        }
+        let refused = fill(&t.decision_refused, &[("n", &item.to_string())]);
+        answer(ctx, origin, &paragraphs(&[Some(&refused), Some(&decide::options_text(t, pending))]), msg_ref, true).await?;
+        return store::inbound_finish(&ctx.db, msg_ref, "failed", Some(&format!("{} is not allowed for item #{item} now", decision.as_str())))
+            .await;
+    };
+    keep_message(ctx, item, text, msg_ref).await?;
+    let named = origin.item() == Some(item);
+    let waiting = pending.iter().filter(|p| p.waiting).count();
+    let confirm = decision != Decision::ApprovePlan || !typed || (!named && waiting > 1);
+    if !confirm {
+        return run_decision(ctx, origin, item, decision, p.plan_version, p.hold_hash.as_deref(), msg_ref).await;
+    }
+    let question = decide::confirm_text(t, p, decision);
+    answer(ctx, origin, &question, msg_ref, true).await?;
+    let expires = (chrono::Utc::now() + chrono::Duration::minutes(CONFIRMATION_MINUTES))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    store::ask_confirmation(
+        &ctx.db,
+        &store::NewConfirmation {
+            scope: &origin.scope(),
+            item_id: item,
+            decision: decision.as_str(),
+            plan_version: p.plan_version,
+            hold_hash: p.hold_hash.as_deref(),
+            question: &question,
+            asked_by: msg_ref,
+            expires_at: &expires,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Run a decision through the operator actions, bound to the plan version
+/// or hold fingerprint the operator was shown, with `msg_ref` as its cause.
+/// A refusal is answered with the reason and the current list.
+async fn run_decision(
+    ctx: &Ctx,
+    origin: &Origin,
+    item: i64,
+    decision: Decision,
+    plan_version: Option<i64>,
+    hold_hash: Option<&str>,
+    msg_ref: &str,
+) -> Result<()> {
+    let cause = Some(msg_ref);
+    let outcome = match decision {
+        Decision::ApprovePlan => match plan_version.and_then(|v| u32::try_from(v).ok()) {
+            Some(v) => approve_plan_caused(ctx, item, Some(v), "whatsapp", cause).await,
+            None => refuse(fill(&ctx.cfg.texts.no_plan, &[("n", &item.to_string())])),
+        },
+        Decision::Release => match hold_hash {
+            Some(h) => release_caused(ctx, item, Some(h), "whatsapp", cause).await,
+            None => refuse(format!("Item #{item} has no record of what it was held for.")),
+        },
+        Decision::Cancel => cancel_caused(ctx, item, "whatsapp", cause).await,
     };
     match outcome {
-        Ok(()) => store::inbound_finish(&ctx.db, msg_ref, "applied", None).await,
+        Ok(it) => {
+            store::inbound_finish(&ctx.db, msg_ref, "applied", None).await?;
+            // The result note goes to the item's thread. A decision taken in
+            // the DM for an item whose thread runs elsewhere is also
+            // answered in the DM.
+            if matches!(origin, Origin::Dm { .. }) && it.surface != "dm" {
+                if let Some(m) = store::messages(&ctx.db, item).await?.into_iter().rev().find(|m| m.author == "nucleus") {
+                    answer(ctx, origin, &m.body, msg_ref, false).await?;
+                }
+            }
+            Ok(())
+        }
         Err(e) if e.downcast_ref::<Refusal>().is_some() => {
-            note_once(ctx, item.id, &e.to_string(), &format!("refusal:{msg_ref}")).await?;
+            let pending = pending_decisions(ctx, origin).await?;
+            let body = paragraphs(&[Some(&e.to_string()), Some(&decide::options_text(&ctx.cfg.texts, &pending))]);
+            answer(ctx, origin, &body, msg_ref, true).await?;
             store::inbound_finish(&ctx.db, msg_ref, "failed", Some(&e.to_string())).await
         }
         Err(e) => Err(e),
     }
+}
+
+/// The interpreter read a discussion message: it goes to the thread of the
+/// item it is about, and to the refinement agent during refinement. The
+/// item is the one the message came from or names, the one the interpreter
+/// named (from the list), or the only waiting item; otherwise the operator
+/// is asked which item he means.
+async fn discussed(
+    ctx: &Ctx,
+    origin: &Origin,
+    pending: &[decide::Pending],
+    item: Option<i64>,
+    text: &str,
+    msg_ref: &str,
+) -> Result<()> {
+    let t = &ctx.cfg.texts;
+    let waiting: Vec<&decide::Pending> = pending.iter().filter(|p| p.waiting).collect();
+    let target = origin
+        .item()
+        .or_else(|| item.filter(|n| pending.iter().any(|p| p.item == *n)))
+        .or_else(|| (waiting.len() == 1).then(|| waiting[0].item));
+    let Some(n) = target else {
+        let body = paragraphs(&[Some(&t.which_item), Some(&decide::options_text(t, pending))]);
+        answer(ctx, origin, &body, msg_ref, true).await?;
+        return store::inbound_finish(&ctx.db, msg_ref, "applied", None).await;
+    };
+    let entry = pending.iter().find(|p| p.item == n);
+    let to_agent = entry.map(|p| p.discussion).unwrap_or(false);
+    if !to_agent {
+        let it = store::item(&ctx.db, n).await?;
+        let note = fill_vars(&t.not_in_refinement, &item_vars(ctx, &it));
+        let options: Vec<decide::Pending> = entry.cloned().into_iter().collect();
+        let body = paragraphs(&[Some(&note), Some(&t.message_saved), Some(&decide::options_text(t, &options))]);
+        answer(ctx, origin, &body, msg_ref, true).await?;
+    }
+    store::add_message_caused(
+        &ctx.db,
+        n,
+        NewMessage {
+            author: "operator",
+            via: "whatsapp",
+            body: text,
+            external_ref: Some(msg_ref),
+            pending_agent: to_agent,
+            to_whatsapp: false,
+        },
+        Some(msg_ref),
+    )
+    .await?;
+    Ok(())
+}
+
+/// The interpreter did not understand the message: its question (one plain
+/// line that passed the secret guard) or the fixed `unclear` text, then
+/// what each item waits for and what each option does.
+async fn unclear(
+    ctx: &Ctx,
+    origin: &Origin,
+    pending: &[decide::Pending],
+    question: Option<String>,
+    late: Option<String>,
+    text: &str,
+    msg_ref: &str,
+) -> Result<()> {
+    let t = &ctx.cfg.texts;
+    let mut asked = question.and_then(|q| decide::clean_question(&q, decide::MAX_QUESTION_CHARS));
+    if let Some(q) = &asked {
+        if let Verdict::Hit(cats) = ctx.guard.scan(q).await {
+            tracing::warn!(msg = %msg_ref, ?cats, "intake: the interpreter's question was dropped by the secret guard");
+            asked = None;
+        }
+    }
+    let head = asked.unwrap_or_else(|| t.unclear.clone());
+    let body = paragraphs(&[late.as_deref(), Some(&head), Some(&decide::options_text(t, pending))]);
+    if let Some(n) = origin.item() {
+        keep_message(ctx, n, text, msg_ref).await?;
+    }
+    answer(ctx, origin, &body, msg_ref, true).await?;
+    store::inbound_finish(&ctx.db, msg_ref, "applied", None).await
 }
 
 // ── operator actions ─────────────────────────────────────────────────────
@@ -595,7 +902,7 @@ async fn approve_plan_caused(ctx: &Ctx, n: i64, version: Option<u32>, via: &str,
     let item = store::item(&ctx.db, n).await?;
     let vars = item_vars(ctx, &item);
     if item.stage() != Stage::Refinement {
-        return refuse(fill_vars(&ctx.cfg.texts.stage_note, &vars));
+        return refuse(fill_vars(&ctx.cfg.texts.not_in_refinement, &vars));
     }
     if item.current_task_id.is_some() {
         return refuse(fill_vars(&ctx.cfg.texts.refinement_busy, &vars));
@@ -608,11 +915,11 @@ async fn approve_plan_caused(ctx: &Ctx, n: i64, version: Option<u32>, via: &str,
             return refuse(format!("Plan v{v} is not the latest plan of item #{n}; the latest is v{}.", item.plan_version));
         }
     }
-    let moved = store::advance_caused(
+    // Bound to the version read above in the statement itself: a plan
+    // written after this read is never the one approved.
+    let moved = store::advance_if_plan(
         &ctx.db,
         n,
-        Stage::Refinement,
-        StageEvent::PlanApproved,
         &format!("plan v{} approved via {via}", item.plan_version),
         vec![
             ("approved_plan", plan.into()),
@@ -622,10 +929,11 @@ async fn approve_plan_caused(ctx: &Ctx, n: i64, version: Option<u32>, via: &str,
             ("current_task_id", Val::Text(None)),
         ],
         cause,
+        item.plan_version,
     )
     .await?;
     if !moved {
-        return refuse(format!("Item #{n} changed while approving; look at it again."));
+        return refuse(format!("Item #{n} changed while approving (a new plan, or the agent started a reply); look at it again."));
     }
     let item = store::item(&ctx.db, n).await?;
     note(ctx, n, &fill_vars(&ctx.cfg.texts.plan_approved, &item_vars(ctx, &item))).await?;
@@ -645,7 +953,7 @@ pub async fn reply(ctx: &Ctx, n: i64, text: &str, via: &str) -> Result<Item> {
     }
     let item = store::item(&ctx.db, n).await?;
     if item.stage() != Stage::Refinement {
-        return refuse(fill_vars(&ctx.cfg.texts.stage_note, &item_vars(ctx, &item)));
+        return refuse(fill_vars(&ctx.cfg.texts.not_in_refinement, &item_vars(ctx, &item)));
     }
     store::add_message(
         &ctx.db,
@@ -726,8 +1034,8 @@ pub async fn retry(ctx: &Ctx, n: i64, via: &str) -> Result<Item> {
 /// Release an item held for hidden content: it continues at the stage it
 /// was held in, and its briefs say that the operator released the hidden
 /// content. `hold` is the hold the operator reviewed: the full fingerprint
-/// (dashboard) or its short code (CLI `--hold`, WhatsApp `#n release
-/// <code>`). It must name the current hold; this is checked before the live
+/// (the dashboard, and a WhatsApp decision bound to the hold its list
+/// showed) or its short code (CLI `--hold`). It must name the current hold; this is checked before the live
 /// read and again in the transaction that changes the stage, so a release
 /// of an earlier hold never releases a later one. The issue is then read
 /// again: when it or a comment the item uses changed since the findings
@@ -748,8 +1056,8 @@ async fn release_caused(ctx: &Ctx, n: i64, hold: Option<&str>, via: &str, cause:
     match hold {
         None => {
             return refuse(format!(
-                "Item #{n}: name the hold you reviewed. Its current code is {code}: reply `#{n} release {code}` after \
-                 reading the findings (dashboard or `nucleus intake show {n} --hidden`)."
+                "Item #{n}: name the hold you reviewed. Its current code is {code}; read the findings on the dashboard \
+                 or with `nucleus intake show {n} --hidden` first."
             ))
         }
         Some(h) if !hidden::names_hold(h, &shown) => {
@@ -1064,8 +1372,9 @@ async fn hold(ctx: &Ctx, item: &Item, found: &hidden::Hold, fp: &str) -> Result<
         ("hold_stage", item.stage.clone().into()),
         ("current_task_id", Val::Text(None)),
     ];
-    // The operator is told in the DM, where `#<n> release` routes to the
-    // item, when the item has no WhatsApp thread yet.
+    // The operator is told in the DM, where a message marked `#<n>` (or a
+    // reply to this one) reaches the item, when it has no WhatsApp thread
+    // yet.
     if item.surface == "none" {
         set.push(("surface", "dm".into()));
     }

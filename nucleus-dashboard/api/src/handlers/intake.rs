@@ -191,6 +191,9 @@ async fn ctx(s: &IntakeState) -> Result<Ctx, IntakeError> {
         guard: Arc::new(nucleus_core::intake::publish::ScriptGuard { workspace_root: ws.clone() }),
         tools: Arc::new(tools),
         viewer: tokio::sync::OnceCell::new(),
+        // The dashboard takes explicit decisions; it never reads WhatsApp
+        // messages.
+        interpreter: Arc::new(nucleus_core::intake::decide::NoInterpreter),
     })
 }
 

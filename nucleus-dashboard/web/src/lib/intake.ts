@@ -138,7 +138,7 @@ export function markRanges(text: string, ranges: readonly Pick<IntakeHiddenFindi
   return out;
 }
 
-/** The short hold code the operator types in WhatsApp (`#12 release a1b2c3`). */
+/** The short hold code (`nucleus intake release <n> --hold <code>`). */
 export function holdCode(hash: string | null): string {
   return (hash ?? "").slice(0, 6);
 }

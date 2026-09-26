@@ -431,19 +431,32 @@ pub struct IntakeInbound {
     pub text: String,
     pub received_at: String,
     /// `text` when the operator typed it; `voice` (a transcription) or
-    /// `forwarded` otherwise. Only typed text can be a command.
+    /// `forwarded` otherwise. A decision from anything but typed text is
+    /// always confirmed first.
     pub input_kind: String,
+    /// `operator` when the bot checked that the sender is the operator's
+    /// own identity; any other value (a table from before the column
+    /// existed reads as `unknown`) is never interpreted.
+    pub sender: String,
 }
+
+/// `item_key` of a DM message that names no item (ADR-036): it answers a
+/// question the pipeline asked in the DM.
+pub const INTAKE_DM_KEY: &str = "dm";
 
 /// Rows of `intake_inbound` with an id above `after`, oldest first.
 pub async fn intake_inbound_after(pool: &SqlitePool, after: i64, limit: i64) -> Result<Vec<IntakeInbound>> {
     if !table_exists(pool, "intake_inbound").await? {
         return Ok(vec![]);
     }
-    Ok(sqlx::query_as(
-        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, input_kind FROM intake_inbound
-          WHERE id > ?1 ORDER BY id LIMIT ?2",
-    )
+    let has_sender: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('intake_inbound') WHERE name = 'sender'")
+        .fetch_one(pool)
+        .await?;
+    let sender = if has_sender { "sender" } else { "'unknown' AS sender" };
+    Ok(sqlx::query_as(&format!(
+        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, input_kind, {sender} FROM intake_inbound
+          WHERE id > ?1 ORDER BY id LIMIT ?2"
+    ))
     .bind(after)
     .bind(limit)
     .fetch_all(pool)
@@ -583,6 +596,28 @@ mod tests {
         // Before the bot created its tables, nothing is there to read.
         assert!(intake_group(&pool, "3").await.unwrap().is_none());
         assert!(intake_inbound_after(&pool, 0, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_inbound_table_without_the_sender_column_reads_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let pool = open(dir.path()).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE intake_inbound (id INTEGER PRIMARY KEY AUTOINCREMENT, item_key TEXT NOT NULL, chat_id TEXT NOT NULL,
+             wa_msg_id TEXT NOT NULL, text TEXT NOT NULL, received_at TEXT NOT NULL, input_kind TEXT NOT NULL DEFAULT 'text')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at) VALUES ('1', 'c', 'm', 'hi', 't')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(intake_inbound_after(&pool, 0, 10).await.unwrap()[0].sender, "unknown");
+        sqlx::query("ALTER TABLE intake_inbound ADD COLUMN sender TEXT NOT NULL DEFAULT 'unknown'").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE intake_inbound SET sender = 'operator'").execute(&pool).await.unwrap();
+        assert_eq!(intake_inbound_after(&pool, 0, 10).await.unwrap()[0].sender, "operator");
     }
 
     #[test]

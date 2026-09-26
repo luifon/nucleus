@@ -10,8 +10,10 @@ import path from "node:path";
 import { ChatSessionStore, OutboundQueueStore } from "./db.js";
 import { parseToml } from "./config.js";
 import {
+  ANSWER_WINDOW_MS,
   classifyCreateError,
   closeBackoffMs,
+  DM_KEY,
   newNonce,
   nonceSuffix,
   GroupExecutor,
@@ -125,44 +127,90 @@ test("DM messages go to an item by its marker or by a quoted pipeline message", 
   assert.equal(routeDm("#1 priority today is the report", null, has), null, "an ordinary message keeps its #");
   assert.equal(routeDm("hello", null, has), null);
   assert.deepEqual(routeDm("approve", "7", has), { item: "7", text: "approve" });
-  assert.deepEqual(routeDm("#7 approve comment", "7", has), { item: "7", text: "approve comment" });
+  assert.deepEqual(routeDm("#7 looks good", "7", has), { item: "7", text: "looks good" });
+  // A reply to a question or note the pipeline sent in the DM, and the next
+  // message while the pipeline waits for an answer, reach it without an item.
+  assert.deepEqual(routeDm("yes", DM_KEY, has), { item: DM_KEY, text: "yes" });
+  assert.deepEqual(routeDm("  yes ", null, has, true), { item: DM_KEY, text: "yes" });
+  assert.deepEqual(routeDm("#3 no", null, has, true), { item: "3", text: "no" }, "a marker still names the item");
+  assert.equal(routeDm("yes", null, has, false), null, "no question waits: the chat session gets it");
   assert.equal(stripGroupMarker("#5 approve", "5"), "approve");
   assert.equal(stripGroupMarker("#6 approve", "5"), "#6 approve");
 });
 
-test("#n release <code> reaches the item as a command only when the operator typed it", async () => {
+test("only the operator's own DM reaches the pipeline, with how the message was written", async () => {
   const has = (n: string) => n === "3";
   const noLid = async () => null;
   const base = { operatorId: OP, pnForLid: noLid, quotedItem: null, hasDmThread: has };
   const opChat = `${OP}@s.whatsapp.net`;
-  // Typed by the operator: routed as text, which the pipeline acts on.
-  assert.deepEqual(await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release a1b2c3", inputKind: "text" }), {
+  assert.deepEqual(await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release it", inputKind: "text" }), {
     item: "3",
-    text: "release a1b2c3",
+    text: "release it",
     inputKind: "text",
   });
   // A transcribed voice note or a forwarded message keeps its kind; the
-  // pipeline keeps it in the thread and does not act on it.
-  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release a1b2c3", inputKind: "voice" }))?.inputKind, "voice");
-  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release a1b2c3", inputKind: "forwarded" }))?.inputKind, "forwarded");
-  // Another sender's "#3 release a1b2c3" never reaches the item.
+  // pipeline confirms a decision from it before it runs.
+  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release it", inputKind: "voice" }))?.inputKind, "voice");
+  assert.equal((await routeOperatorDm({ ...base, chatId: opChat, text: "#3 release it", inputKind: "forwarded" }))?.inputKind, "forwarded");
+  // Another sender's message never reaches the pipeline, not even while it
+  // waits for the operator's answer.
   const other = `${["55119", "88888888"].join("")}@s.whatsapp.net`;
-  assert.equal(await routeOperatorDm({ ...base, chatId: other, text: "#3 release a1b2c3", inputKind: "text" }), null);
+  assert.equal(await routeOperatorDm({ ...base, chatId: other, text: "#3 release it", inputKind: "text" }), null);
+  assert.equal(await routeOperatorDm({ ...base, chatId: other, text: "yes", expectingAnswer: true, inputKind: "text" }), null);
+  assert.deepEqual(await routeOperatorDm({ ...base, chatId: opChat, text: "yes", expectingAnswer: true, inputKind: "voice" }), {
+    item: DM_KEY,
+    text: "yes",
+    inputKind: "voice",
+  });
   // The operator in LID form, resolved through the connection's mapping.
   const lid = ["123456789012345", "lid"].join("@");
-  const viaLid = await routeOperatorDm({ ...base, chatId: lid, pnForLid: async () => opChat, text: "#3 release a1b2c3", inputKind: "text" });
+  const viaLid = await routeOperatorDm({ ...base, chatId: lid, pnForLid: async () => opChat, text: "#3 release it", inputKind: "text" });
   assert.equal(viaLid?.item, "3");
   // An unknown LID is not the operator.
-  assert.equal(await routeOperatorDm({ ...base, chatId: lid, text: "#3 release a1b2c3", inputKind: "text" }), null);
+  assert.equal(await routeOperatorDm({ ...base, chatId: lid, text: "#3 release it", inputKind: "text" }), null);
+});
+
+test("the next DM message answers a question the pipeline asked, for 15 minutes", () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  const out = new OutboundQueueStore(db);
+  const t0 = Date.now();
+  assert.equal(store.expectsDmAnswer(t0), false, "nothing asked");
+  // A note that asks nothing does not open the window.
+  const note = out.enqueue({ target: "dm", body: "Nothing was done for item #1.", source: "intake:note", dedupKey: "n1" });
+  out.markSent(note, "WANOTE");
+  assert.equal(store.expectsDmAnswer(t0), false);
+  // A question not sent yet cannot be answered.
+  const ask = out.enqueue({ target: "dm", body: "Release item #1? Answer yes or no.", source: "intake:ask", dedupKey: "a1" });
+  assert.equal(store.expectsDmAnswer(t0), false);
+  out.markSent(ask, "WAASK");
+  const sentAt = Date.parse(
+    (new DatabaseSync(db).prepare(`SELECT sent_at FROM outbound_queue WHERE id = ?`).get(ask) as { sent_at: string }).sent_at,
+  );
+  assert.equal(store.expectsDmAnswer(sentAt + 1000), true);
+  assert.equal(store.expectsDmAnswer(sentAt + ANSWER_WINDOW_MS + 1), false, "the window closes after 15 minutes");
+  // Replies to either message reach the pipeline without an item.
+  assert.equal(store.itemForSentMessage("WAASK"), DM_KEY);
+  assert.equal(store.itemForSentMessage("WANOTE"), DM_KEY);
+  // The first DM message after the question is the answer; later ones go
+  // to the chat session again. A group message does not count.
+  store.recordInbound({ itemKey: "4", chatId: GROUP, waMsgId: "g1", text: "hi", inputKind: "text", sender: "operator", nowMs: sentAt + 2000 });
+  assert.equal(store.expectsDmAnswer(sentAt + 3000), true);
+  store.recordInbound({ itemKey: DM_KEY, chatId: `${OP}@s.whatsapp.net`, waMsgId: "d1", text: "yes", inputKind: "text", sender: "operator", nowMs: sentAt + 4000 });
+  assert.equal(store.expectsDmAnswer(sentAt + 5000), false);
 });
 
 test("operator messages are stored once and quoted messages map to their item", () => {
   const db = tmpDb();
   const store = new IntakeStore(db);
-  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi", inputKind: "voice" }), true);
-  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi", inputKind: "text" }), false);
-  const kind = new DatabaseSync(db).prepare(`SELECT input_kind FROM intake_inbound WHERE wa_msg_id = 'm1'`).get() as { input_kind: string };
-  assert.equal(kind.input_kind, "voice", "how the message was written is stored");
+  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi", inputKind: "voice", sender: "operator" }), true);
+  assert.equal(store.recordInbound({ itemKey: "2", chatId: GROUP, waMsgId: "m1", text: "hi", inputKind: "text", sender: "operator" }), false);
+  const row = new DatabaseSync(db).prepare(`SELECT input_kind, sender FROM intake_inbound WHERE wa_msg_id = 'm1'`).get() as {
+    input_kind: string;
+    sender: string;
+  };
+  assert.equal(row.input_kind, "voice", "how the message was written is stored");
+  assert.equal(row.sender, "operator", "the identity check is recorded for the pipeline");
   const out = new OutboundQueueStore(db);
   const id = out.enqueue({ target: "dm", body: "[#2] plan", source: "intake:2", dedupKey: "intake:2:m1" });
   out.markInFlight(id, "WAMSG1");

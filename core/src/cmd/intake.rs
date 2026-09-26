@@ -9,9 +9,9 @@
 //! - the operator: every command (`release` of a held item only from the
 //!   operator, like `approve-plan`);
 //! - the WhatsApp DM chat session: `list`, `show`, and `cancel` (not in a
-//!   turn that read an agent message). Approvals are the operator's own
-//!   messages in the item's thread, read by code, never a session's
-//!   command;
+//!   turn that read an agent message). Approvals and releases come from the
+//!   operator's own WhatsApp messages, read by the pipeline's interpreter
+//!   and decided by code, never from a session's command;
 //! - a detached process (launchd, the bot, the dashboard): `tick`;
 //! - workers and every other Nucleus session: nothing.
 
@@ -105,8 +105,8 @@ fn authorize(caller: &Caller, cmd: &Cmd) -> Result<()> {
         Role::Chat { origin, .. } if origin == "whatsapp-dm" => match cmd {
             Cmd::List { .. } | Cmd::Show { .. } | Cmd::Cancel { .. } => {}
             _ => bail!(
-                "a chat session can list, show and cancel items; approvals and replies are the \
-                 operator's own messages in the item's thread (`#<n> approve`), or the dashboard"
+                "a chat session can list, show and cancel items; approvals, releases and replies are the \
+                 operator's own WhatsApp messages about the item (the pipeline reads them), or the dashboard"
             ),
         },
         Role::Detached => {

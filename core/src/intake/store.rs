@@ -212,6 +212,37 @@ UPDATE items SET failed_stage = 'pr' WHERE failed_stage = 'review';
 UPDATE items SET comment_state = 'none' WHERE comment_state IN ('proposed', 'approved');
 ALTER TABLE items DROP COLUMN comment_draft";
 
+/// Confirmation questions the pipeline asked the operator on WhatsApp
+/// (ADR-036, "Operator decisions"). A question is asked in one place
+/// (`scope`: `dm` or `group:<n>`) and only the next answer from there
+/// settles it, until `expires_at`. The decision is stored with what the
+/// operator saw when he was asked: the plan version or the hold
+/// fingerprint it binds to.
+///
+/// `state`: `pending`, then `confirmed` (the answer applied it), `refused`
+/// (the answer was yes but the decision was refused), `declined`,
+/// `replaced` (another message came instead of an answer) or `expired`.
+/// `answer_ref` is the operator message being applied as the answer: set
+/// before the decision runs, and the decision's own transaction closes the
+/// question, so a crash never applies one answer twice.
+const SCHEMA_V4: &str = "
+CREATE TABLE confirmations (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope        TEXT NOT NULL,
+    item_id      INTEGER NOT NULL REFERENCES items(id),
+    decision     TEXT NOT NULL,
+    plan_version INTEGER,
+    hold_hash    TEXT,
+    question     TEXT NOT NULL,
+    asked_by     TEXT NOT NULL,
+    answer_ref   TEXT,
+    state        TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    closed_at    TEXT
+);
+CREATE INDEX idx_confirmations_scope ON confirmations(scope, state, id)";
+
 /// Open (creating and migrating) intake.db. Writers only.
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(super::INTAKE_DB_PATH)).await?;
@@ -221,6 +252,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             crate::migrate::Migration { version: 1, name: "intake schema", step: crate::migrate::Step::Sql(SCHEMA_V1) },
             crate::migrate::Migration { version: 2, name: "hidden-content hold", step: crate::migrate::Step::Sql(SCHEMA_V2) },
             crate::migrate::Migration { version: 3, name: "no comment approval", step: crate::migrate::Step::Sql(SCHEMA_V3) },
+            crate::migrate::Migration { version: 4, name: "operator confirmations", step: crate::migrate::Step::Sql(SCHEMA_V4) },
         ],
     )
     .await
@@ -229,7 +261,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// True when `pool` (a read-only intake.db) has the full schema: the
 /// migration ledger records [`SCHEMA_VERSION`] and the item tables exist.
@@ -881,6 +913,14 @@ pub async fn advance_caused(
     advance_where(pool, id, from, ev, reason, set, cause, None).await
 }
 
+/// An extra condition a stage change checks in its own `UPDATE`.
+enum Guard<'a> {
+    /// The item's `hold_hash` is still this one.
+    Hold(&'a str),
+    /// The latest plan is still this version and no refinement turn runs.
+    Plan(i64),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn advance_where(
     pool: &SqlitePool,
@@ -890,7 +930,7 @@ async fn advance_where(
     reason: &str,
     mut set: Vec<(&str, Val)>,
     cause: Option<&str>,
-    hold: Option<&str>,
+    guard: Option<Guard<'_>>,
 ) -> Result<bool> {
     let to = transition(from, &ev)?;
     let now = crate::timestamp::now();
@@ -908,17 +948,23 @@ async fn advance_where(
         set.push(("closed_at", now.clone().into()));
     }
     let extra = set_clause(&set, 5)?;
-    let hold_param = 5 + set.len();
+    let guard_param = 5 + set.len();
     let sql = format!(
         "UPDATE items SET stage = ?2, updated_at = ?3{}{extra} WHERE id = ?1 AND stage = ?4{}",
         if extra.is_empty() { "" } else { ", " },
-        if hold.is_some() { format!(" AND hold_hash = ?{hold_param}") } else { String::new() }
+        match guard {
+            Some(Guard::Hold(_)) => format!(" AND hold_hash = ?{guard_param}"),
+            Some(Guard::Plan(_)) => format!(" AND plan_version = ?{guard_param} AND current_task_id IS NULL"),
+            None => String::new(),
+        }
     );
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let q = sqlx::query(&sql).bind(id).bind(to.as_str()).bind(&now).bind(from.as_str());
     let mut q = bind_vals(q, &set);
-    if let Some(h) = hold {
-        q = q.bind(h.to_string());
+    match guard {
+        Some(Guard::Hold(h)) => q = q.bind(h.to_string()),
+        Some(Guard::Plan(v)) => q = q.bind(v),
+        None => {}
     }
     let moved = q.execute(&mut *tx).await?.rows_affected() == 1;
     if moved {
@@ -952,14 +998,37 @@ pub async fn advance_if_hold(
     cause: Option<&str>,
     hold: &str,
 ) -> Result<bool> {
-    advance_where(pool, id, Stage::Held, ev, reason, set, cause, Some(hold)).await
+    advance_where(pool, id, Stage::Held, ev, reason, set, cause, Some(Guard::Hold(hold))).await
+}
+
+/// Approve plan `version` of an item in refinement only while it is still
+/// the latest plan and no refinement turn runs: the check and the stage
+/// change are one statement, so a plan that arrives after the operator's
+/// approval was read is never the one approved.
+pub async fn advance_if_plan(
+    pool: &SqlitePool,
+    id: i64,
+    reason: &str,
+    set: Vec<(&str, Val)>,
+    cause: Option<&str>,
+    version: i64,
+) -> Result<bool> {
+    advance_where(pool, id, Stage::Refinement, StageEvent::PlanApproved, reason, set, cause, Some(Guard::Plan(version))).await
 }
 
 async fn mark_applied(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, cause: Option<&str>) -> Result<()> {
     if let Some(c) = cause {
+        let now = crate::timestamp::now();
         sqlx::query("UPDATE inbound_commands SET state = 'applied', error = NULL, updated_at = ?2 WHERE msg_ref = ?1")
             .bind(c)
-            .bind(crate::timestamp::now())
+            .bind(&now)
+            .execute(&mut **tx)
+            .await?;
+        // The message was the answer to a confirmation: applying it settles
+        // the question in the same transaction.
+        sqlx::query("UPDATE confirmations SET state = 'confirmed', closed_at = ?2 WHERE answer_ref = ?1 AND state = 'pending'")
+            .bind(c)
+            .bind(&now)
             .execute(&mut **tx)
             .await?;
     }
@@ -1152,14 +1221,174 @@ pub async fn inbound_finish(pool: &SqlitePool, msg_ref: &str, state: &str, error
     if !matches!(state, "applied" | "failed") {
         bail!("an inbound message ends applied or failed, not {state}");
     }
+    let now = crate::timestamp::now();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("UPDATE inbound_commands SET state = ?2, error = ?3, updated_at = ?4 WHERE msg_ref = ?1 AND state = 'received'")
         .bind(msg_ref)
         .bind(state)
         .bind(error)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE confirmations SET state = ?2, closed_at = ?3 WHERE answer_ref = ?1 AND state = 'pending'")
+        .bind(msg_ref)
+        .bind(if state == "applied" { "confirmed" } else { "refused" })
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+// ── confirmations ────────────────────────────────────────────────────────
+
+/// A confirmation question (see [`SCHEMA_V4`]).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct Confirmation {
+    pub id: i64,
+    pub scope: String,
+    pub item_id: i64,
+    pub decision: String,
+    pub plan_version: Option<i64>,
+    pub hold_hash: Option<String>,
+    pub question: String,
+    pub asked_by: String,
+    pub answer_ref: Option<String>,
+    pub state: String,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+const CONFIRMATION_COLUMNS: &str =
+    "id, scope, item_id, decision, plan_version, hold_hash, question, asked_by, answer_ref, state, created_at, expires_at";
+
+/// What a new confirmation binds to.
+pub struct NewConfirmation<'a> {
+    pub scope: &'a str,
+    pub item_id: i64,
+    pub decision: &'a str,
+    pub plan_version: Option<i64>,
+    pub hold_hash: Option<&'a str>,
+    pub question: &'a str,
+    /// The operator message the question answers.
+    pub asked_by: &'a str,
+    pub expires_at: &'a str,
+}
+
+/// Ask a confirmation: an earlier open question in the same scope is
+/// replaced, the new one is stored, and the operator message that led to
+/// it is marked applied, in one transaction.
+pub async fn ask_confirmation(pool: &SqlitePool, c: &NewConfirmation<'_>) -> Result<i64> {
+    let now = crate::timestamp::now();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("UPDATE confirmations SET state = 'replaced', closed_at = ?2 WHERE scope = ?1 AND state = 'pending'")
+        .bind(c.scope)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    let id = sqlx::query(
+        "INSERT INTO confirmations (scope, item_id, decision, plan_version, hold_hash, question, asked_by, state, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9)",
+    )
+    .bind(c.scope)
+    .bind(c.item_id)
+    .bind(c.decision)
+    .bind(c.plan_version)
+    .bind(c.hold_hash)
+    .bind(c.question)
+    .bind(c.asked_by)
+    .bind(&now)
+    .bind(c.expires_at)
+    .execute(&mut *tx)
+    .await?
+    .last_insert_rowid();
+    mark_applied(&mut tx, Some(c.asked_by)).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// The open question in `scope` that operator message `msg_ref` may answer:
+/// pending, not expired at `now`, and not being answered by another
+/// message.
+pub async fn open_confirmation(pool: &SqlitePool, scope: &str, msg_ref: &str, now: &str) -> Result<Option<Confirmation>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {CONFIRMATION_COLUMNS} FROM confirmations
+          WHERE scope = ?1 AND state = 'pending' AND expires_at > ?3 AND (answer_ref IS NULL OR answer_ref = ?2)
+          ORDER BY id DESC LIMIT 1"
+    ))
+    .bind(scope)
+    .bind(msg_ref)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Pending questions in `scope` that expired before `now`: marked
+/// `expired` and returned (the operator is told when he answers one late).
+pub async fn expire_confirmations(pool: &SqlitePool, scope: &str, now: &str) -> Result<Vec<Confirmation>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let rows: Vec<Confirmation> = sqlx::query_as(&format!(
+        "SELECT {CONFIRMATION_COLUMNS} FROM confirmations WHERE scope = ?1 AND state = 'pending' AND expires_at <= ?2 ORDER BY id"
+    ))
+    .bind(scope)
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE confirmations SET state = 'expired', closed_at = ?2 WHERE scope = ?1 AND state = 'pending' AND expires_at <= ?2")
+        .bind(scope)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// Record that operator message `msg_ref` is being applied as the answer
+/// to confirmation `id`. False when the question is no longer open for it.
+pub async fn claim_confirmation(pool: &SqlitePool, id: i64, msg_ref: &str) -> Result<bool> {
+    let res = sqlx::query(
+        "UPDATE confirmations SET answer_ref = ?2 WHERE id = ?1 AND state = 'pending' AND (answer_ref IS NULL OR answer_ref = ?2)",
+    )
+    .bind(id)
+    .bind(msg_ref)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// The operator answered no: the question is declined and his message
+/// applied, in one transaction.
+pub async fn decline_confirmation(pool: &SqlitePool, id: i64, msg_ref: &str) -> Result<()> {
+    let now = crate::timestamp::now();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("UPDATE confirmations SET state = 'declined', answer_ref = ?2, closed_at = ?3 WHERE id = ?1 AND state = 'pending'")
+        .bind(id)
+        .bind(msg_ref)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    mark_applied(&mut tx, Some(msg_ref)).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Another message came instead of an answer: the open questions in
+/// `scope` are replaced.
+pub async fn replace_confirmations(pool: &SqlitePool, scope: &str) -> Result<()> {
+    sqlx::query("UPDATE confirmations SET state = 'replaced', closed_at = ?2 WHERE scope = ?1 AND state = 'pending' AND answer_ref IS NULL")
+        .bind(scope)
         .bind(crate::timestamp::now())
         .execute(pool)
         .await?;
     Ok(())
+}
+
+pub async fn confirmation(pool: &SqlitePool, id: i64) -> Result<Confirmation> {
+    sqlx::query_as(&format!("SELECT {CONFIRMATION_COLUMNS} FROM confirmations WHERE id = ?1"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .with_context(|| format!("no confirmation {id}"))
 }
 
 /// Count a failed attempt at applying `msg_ref`; returns the new state.
@@ -1482,7 +1711,8 @@ pub(crate) mod tests {
         pool.close().await;
         let pool = open(dir.path()).await.unwrap();
         assert!(schema_ready(&pool).await);
-        let got: Vec<(String, String, Option<String>, Option<String>, Option<String>)> =
+        type Row = (String, String, Option<String>, Option<String>, Option<String>);
+        let got: Vec<Row> =
             sqlx::query_as("SELECT stage, comment_state, failed_stage, comment_op, closed_at FROM items ORDER BY id")
                 .fetch_all(&pool)
                 .await

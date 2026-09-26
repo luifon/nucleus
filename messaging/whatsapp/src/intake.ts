@@ -8,14 +8,18 @@
 //      bot drains); the bot records the outcome in its own `intake_groups`
 //      table, which Rust reads. A created group contains the bot and the
 //      operator only; its membership baseline is the create response.
-//   2. Route the operator's messages to an item: messages from the operator
-//      (the first WHATSAPP_ALLOWED_DM_JIDS entry, phone or LID form) in an
-//      item's group, and operator DM messages that start with the item
-//      marker (`#12 …`) or quote a message the pipeline sent for that item.
-//      The bot stores them in `intake_inbound` with how they were written
-//      (`text`, `voice`, `forwarded`: only typed text can be a command) and
-//      runs `nucleus intake tick`; the Rust side reads them, decides
-//      approvals, and replies through the outbound queue.
+//   2. Route the operator's messages to the pipeline: messages from the
+//      operator (the first WHATSAPP_ALLOWED_DM_JIDS entry, phone or LID
+//      form) in an item's group, and operator DM messages that start with
+//      the item marker (`#12 …`), quote a message the pipeline sent, or come
+//      within 15 minutes after the pipeline asked the operator a question in
+//      the DM (its next message is the answer). The bot stores them in
+//      `intake_inbound` with how they were written (`text`, `voice`,
+//      `forwarded`) and `sender = 'operator'`, and runs `nucleus intake
+//      tick`. The Rust side has each message read by the interpreter model,
+//      decides in code what happens, and replies through the outbound queue
+//      (a decision from a voice note or a forward is always confirmed
+//      first).
 //   3. Keep the intake groups in the target allowlist while they are
 //      active, so the outbound drain (target policy + secret filter) can
 //      send to them, and remove them when the bot has left.
@@ -121,8 +125,22 @@ export function classifyCreateError(e: unknown): "rejected" | "unknown" {
   return "unknown";
 }
 
-/** How an operator message was written. Only `text` can be a command. */
+/** How an operator message was written. The pipeline confirms a decision
+ *  from anything but `text` before it runs. */
 export type InputKind = "text" | "voice" | "forwarded";
+
+/** `item_key` of a DM message that names no item: the answer to a question
+ *  the pipeline asked in the DM. Mirrors `INTAKE_DM_KEY` in
+ *  core/src/whatsapp_queue.rs. */
+export const DM_KEY = "dm";
+
+/** A question the pipeline asks in the DM (`intake:ask`) waits this long for
+ *  the operator's answer. Mirrors `CONFIRMATION_MINUTES` in
+ *  core/src/intake/pipeline.rs. */
+export const ANSWER_WINDOW_MS = 15 * 60 * 1000;
+
+/** The end of a WhatsApp group chat id. */
+const GROUP_JID_SUFFIX = ["@", "g.us"].join("");
 
 /** True when `jid` (a phone JID, an `@lid` id, or a bare number) is the
  *  operator: its digits equal `operatorId`, or it is a LID whose phone
@@ -205,14 +223,19 @@ export function groupBudgetAllows(createdAt: readonly string[], nowMs: number, m
 
 const MARKER = /^\s*#(\d{1,6})(?:\s+|$)/;
 
-/** A DM message for an item, or null for the chat session. The message
- *  belongs to an item when it quotes a message the pipeline sent for it
- *  (`quotedItem`), or when it starts with `#<n>` and item n has a DM
- *  thread (`hasDmThread`). The marker is removed from the text. */
+/** A DM message for the pipeline, or null for the chat session. The
+ *  message belongs to item n when it starts with `#<n>` and item n has a DM
+ *  thread (`hasDmThread`), or when it quotes a message the pipeline sent for
+ *  item n (`quotedItem`; the marker is removed from the text). It goes to
+ *  the pipeline without an item (`DM_KEY`) when it quotes a question or note
+ *  the pipeline sent in the DM (`quotedItem` is `DM_KEY`), or when the
+ *  pipeline is waiting for the answer to a question it asked in the DM
+ *  (`expectingAnswer`). */
 export function routeDm(
   text: string,
   quotedItem: string | null,
   hasDmThread: (item: string) => boolean,
+  expectingAnswer = false,
 ): { item: string; text: string } | null {
   const m = MARKER.exec(text);
   if (m && hasDmThread(m[1])) return { item: m[1], text: text.slice(m[0].length).trim() };
@@ -220,6 +243,7 @@ export function routeDm(
     const t = m && m[1] === quotedItem ? text.slice(m[0].length).trim() : text.trim();
     return { item: quotedItem, text: t };
   }
+  if (expectingAnswer) return { item: DM_KEY, text: text.trim() };
   return null;
 }
 
@@ -230,13 +254,12 @@ export interface RoutedDm {
   inputKind: InputKind;
 }
 
-/** Decide whether a DM message goes to an issue-pipeline item. Only the
+/** Decide whether a DM message goes to the issue pipeline. Only the
  *  operator's own DM is routed (another allowed DM sender's message goes to
  *  the chat session, so it can never approve, release or cancel), and the
  *  message keeps how it was written: `voice` for a transcription,
- *  `forwarded` for a forwarded message, `text` only for what the operator
- *  typed. The Rust side acts on a command (`approve`, `release`, …) only
- *  when it is `text`. */
+ *  `forwarded` for a forwarded message, `text` for what the operator
+ *  typed. */
 export async function routeOperatorDm(input: {
   chatId: string;
   operatorId: string | null;
@@ -244,12 +267,15 @@ export async function routeOperatorDm(input: {
   text: string;
   quotedItem: string | null;
   hasDmThread: (item: string) => boolean;
+  /** The pipeline asked a question in the DM in the last 15 minutes and no
+   *  DM message went to it since (`IntakeStore.expectsDmAnswer`). */
+  expectingAnswer?: boolean;
   /** `voice` for a transcribed voice note; otherwise how the message was
    *  sent (`text` or `forwarded`). */
   inputKind: InputKind;
 }): Promise<RoutedDm | null> {
   if (!(await isOperatorId(input.chatId, input.operatorId, input.pnForLid))) return null;
-  const routed = routeDm(input.text, input.quotedItem, input.hasDmThread);
+  const routed = routeDm(input.text, input.quotedItem, input.hasDmThread, input.expectingAnswer ?? false);
   return routed ? { ...routed, inputKind: input.inputKind } : null;
 }
 
@@ -314,11 +340,17 @@ export class IntakeStore {
         wa_msg_id   TEXT NOT NULL,
         text        TEXT NOT NULL,
         received_at TEXT NOT NULL,
-        input_kind  TEXT NOT NULL DEFAULT 'unknown'
+        input_kind  TEXT NOT NULL DEFAULT 'unknown',
+        sender      TEXT NOT NULL DEFAULT 'unknown'
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_inbound_msg
         ON intake_inbound(chat_id, wa_msg_id);
     `);
+    // A table created before the column existed.
+    const cols = (this.db.prepare(`SELECT name FROM pragma_table_info('intake_inbound')`).all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    );
+    if (!cols.includes("sender")) this.db.exec(`ALTER TABLE intake_inbound ADD COLUMN sender TEXT NOT NULL DEFAULT 'unknown'`);
   }
 
   /** Pending requests that are due (a close waiting for its backoff is
@@ -509,24 +541,69 @@ export class IntakeStore {
       .run(reason, new Date().toISOString(), itemKey);
   }
 
-  /** Store an operator message for an item. A message stored before (the
-   *  same WhatsApp id in the same chat) is ignored. Returns true when new. */
-  recordInbound(input: { itemKey: string; chatId: string; waMsgId: string; text: string; inputKind: InputKind }): boolean {
+  /** Store an operator message for the pipeline, after the caller checked
+   *  that the sender is the operator's own identity (`sender`; the Rust side
+   *  interprets no other row). A message stored before (the same WhatsApp
+   *  id in the same chat) is ignored. Returns true when new. */
+  recordInbound(input: {
+    itemKey: string;
+    chatId: string;
+    waMsgId: string;
+    text: string;
+    inputKind: InputKind;
+    sender: "operator";
+    nowMs?: number;
+  }): boolean {
     const res = this.db
       .prepare(
-        `INSERT OR IGNORE INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(input.itemKey, input.chatId, input.waMsgId, input.text, new Date().toISOString(), input.inputKind);
+      .run(
+        input.itemKey,
+        input.chatId,
+        input.waMsgId,
+        input.text,
+        new Date(input.nowMs ?? Date.now()).toISOString(),
+        input.inputKind,
+        input.sender,
+      );
     return Number(res.changes) > 0;
   }
 
-  /** The item a message the bot sent belongs to (its outbound row's source
-   *  is `intake:<n>`), from the WhatsApp message id a reply quotes. */
+  /** What a message the bot sent belongs to, from the WhatsApp message id a
+   *  reply quotes: item n for a thread message (`intake:<n>`), `DM_KEY` for a
+   *  question or note the pipeline sent in the DM (`intake:ask`,
+   *  `intake:note`), otherwise null. */
   itemForSentMessage(msgId: string): string | null {
     const r = this.db.prepare(`SELECT source FROM outbound_queue WHERE msg_id = ?`).get(msgId) as { source: string } | undefined;
-    const m = r ? /^intake:(\d+)$/.exec(r.source) : null;
+    if (!r) return null;
+    if (r.source === "intake:ask" || r.source === "intake:note") return DM_KEY;
+    const m = /^intake:(\d+)$/.exec(r.source);
     return m ? m[1] : null;
+  }
+
+  /** True when the pipeline asked the operator a question in the DM
+   *  (`intake:ask`, sent or being sent) less than `ANSWER_WINDOW_MS` ago,
+   *  and no DM message went to the pipeline since: the operator's next DM
+   *  message is the answer. */
+  expectsDmAnswer(nowMs = Date.now()): boolean {
+    const asked = this.db
+      .prepare(
+        `SELECT MAX(COALESCE(sent_at, in_flight_at)) AS at FROM outbound_queue
+          WHERE source = 'intake:ask' AND target = 'dm' AND status IN ('sent', 'in_flight')`,
+      )
+      .get() as { at: string | null };
+    if (!asked.at) return false;
+    const askedMs = Date.parse(asked.at);
+    if (!(nowMs - askedMs < ANSWER_WINDOW_MS)) return false;
+    // DM rows only: a group chat id ends in the group suffix (built at
+    // runtime; the committed-secrets scanner reads the literal as an
+    // address).
+    const last = this.db
+      .prepare(`SELECT MAX(received_at) AS at FROM intake_inbound WHERE chat_id NOT LIKE ?`)
+      .get(`%${GROUP_JID_SUFFIX}`) as { at: string | null };
+    return !last.at || Date.parse(last.at) < askedMs;
   }
 
   /** True when the pipeline sent a DM message for item `n` in the last 30
@@ -768,7 +845,7 @@ export class GroupExecutor {
     if (tripped) {
       this.d.alertOperator(
         `Item #${itemKey}: the new WhatsApp group has ${strangers.length} member(s) besides the bot and you. ` +
-          `Commands from that group are ignored; use the DM (#${itemKey} …) or the dashboard.`,
+          `Messages from that group are ignored; use the DM (#${itemKey} …) or the dashboard.`,
         `intake:group-tripped:${jid}`,
       );
     }

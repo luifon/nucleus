@@ -746,17 +746,24 @@ pub struct IntakeWhatsAppConfig {
     pub group_wait_minutes: u32,
 }
 
-/// Operator-facing texts of the pipeline (`[intake.texts]`). Placeholders:
-/// `{n}` item number, `{title}`, `{ref}` (`owner/name#12`), `{url}`,
-/// `{stage}`, `{version}`, `{error}`, `{pr_url}`, `{tests}`,
-/// `{classification}`, `{failed_in}` (the stage a failed item
-/// failed in), `{label}` (the gate label). `item_held` also has `{count}`
-/// (the number of findings), `{kinds}` (the findings counted by kind),
-/// `{findings}` (the first findings, one per line, shortened) and `{code}`
-/// (the hold code a WhatsApp release must name); `item_released` has
-/// `{via}` (where the operator released it) and `{code}`. Operator commands start with `#{n}`: in the
-/// DM the marker routes the message to the item; in the item's group it is
-/// optional.
+/// Operator-facing texts of the pipeline (`[intake.texts]`), all written by
+/// code, never by a model. Placeholders: `{n}` item number, `{title}`,
+/// `{ref}` (`owner/name#12`), `{url}`, `{stage}`, `{version}` (a plan
+/// version), `{error}`, `{pr_url}`, `{tests}`, `{classification}`,
+/// `{failed_in}` (the stage a failed item failed in), `{label}` (the gate
+/// label). `item_held` also has `{count}` (the number of findings),
+/// `{kinds}` (the findings counted by kind), `{findings}` (the first
+/// findings, one per line, shortened) and `{code}` (the short hold code the
+/// terminal's `release --hold` takes); `item_released` has `{via}` (where
+/// the operator released it) and `{code}`.
+///
+/// The operator decides in plain words on WhatsApp (ADR-036, "Operator
+/// decisions"). The `wait_*`, `option_*`, `options_*` and `confirm_*`
+/// texts describe what an item waits for and what each decision does; they
+/// are shown to the interpreter model as the list of pending decisions and
+/// to the operator when a message is not understood. The `wait_*` texts are
+/// short phrases that follow `Item #{n}: `; the `option_*` texts are list
+/// entries.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct IntakeTexts {
@@ -784,10 +791,62 @@ pub struct IntakeTexts {
     pub item_held: String,
     /// The operator released a held item (`{via}`, `{stage}`).
     pub item_released: String,
-    pub stage_note: String,
+    /// A decision or a dashboard reply that needs refinement, for an item in
+    /// another stage (`{stage}`).
+    pub not_in_refinement: String,
+    /// Added after `not_in_refinement` when a WhatsApp message outside
+    /// refinement was kept in the thread.
+    pub message_saved: String,
     pub no_plan: String,
     pub refinement_busy: String,
     pub unknown_item: String,
+    /// What an item waits for: a plan approval (`{version}`).
+    pub wait_plan: String,
+    /// Refinement with no plan yet, waiting for the operator's reply.
+    pub wait_reply: String,
+    /// Refinement while the agent writes its reply (no plan yet).
+    pub wait_busy: String,
+    /// Refinement while the agent writes its reply, with plan `{version}`.
+    pub wait_busy_plan: String,
+    /// Held for hidden content (`{count}` findings).
+    pub wait_hold: String,
+    /// Any other open stage (`{stage}`): nothing waits for the operator.
+    pub wait_stage: String,
+    /// What approving the plan does (`{version}`).
+    pub option_approve_plan: String,
+    /// What releasing a held item does (`{n}`).
+    pub option_release: String,
+    /// What cancelling does.
+    pub option_cancel: String,
+    /// During refinement: any other message reaches the agent.
+    pub option_discuss: String,
+    /// Starts the list of items and options.
+    pub options_header: String,
+    /// One item in the list (`{n}`, `{waits_for}`: a `wait_*` text); its
+    /// options follow, one per line.
+    pub options_item: String,
+    /// Ends the list.
+    pub options_footer: String,
+    /// The list when nothing waits for the operator.
+    pub options_none: String,
+    /// A message the interpreter did not understand, when it asked nothing.
+    pub unclear: String,
+    /// A discussion message from the DM when several items wait and none
+    /// is named.
+    pub which_item: String,
+    /// A decision the item cannot take now (`{n}`).
+    pub decision_refused: String,
+    /// The confirmation question for a plan approval (`{n}`, `{version}`).
+    pub confirm_approve_plan: String,
+    /// The confirmation question for a release (`{n}`, `{count}`).
+    pub confirm_release: String,
+    /// The confirmation question for a cancel (`{n}`).
+    pub confirm_cancel: String,
+    /// The operator answered no to a confirmation (`{n}`).
+    pub declined: String,
+    /// The operator answered a confirmation after it expired (`{n}`,
+    /// `{minutes}`).
+    pub confirmation_expired: String,
     /// The comment Nucleus posts on the issue once the draft PR is open
     /// (`{pr_url}` only). Code-owned and posted without approval, so it
     /// must not take model output or issue text.
@@ -803,9 +862,8 @@ impl Default for IntakeTexts {
             simple_started: "🛠 Item #{n} — {title} ({ref}) was evaluated as simple; implementation \
                              started. {url}"
                 .into(),
-            approve_hint: "Reply `#{n} approve` to approve plan v{version}, or reply \
-                           `#{n} <message>` to keep discussing (in the item's group the `#{n}` \
-                           is optional)."
+            approve_hint: "Plan v{version} is ready. When it is right, tell me to approve it, for example \
+                           \"approve the plan\". To change it, write what should change."
                 .into(),
             plan_approved: "✅ Plan v{version} of item #{n} approved; implementation started.".into(),
             pr_opened: "📬 Draft PR for item #{n} — {title}: {pr_url}\nTests: {tests}\n\nThe agent's summary:\n{summary}"
@@ -827,20 +885,47 @@ impl Default for IntakeTexts {
             item_held: "🔍 Item #{n} — {title} is held (hold {code}): the issue text has content that \
                         GitHub's page does not show ({kinds}). No agent runs until you decide.\n{findings}\nRead \
                         every finding in full on the dashboard (Intake page) or with `nucleus intake show {n} \
-                        --hidden`. Then reply `#{n} release {code}` to continue with this content (the agent reads \
-                        it as data), or `#{n} cancel`."
+                        --hidden`. Then tell me to release the item (the agent reads the content as data) or to cancel \
+                        it. I ask you to confirm a release before it runs."
                 .into(),
             item_released: "▶️ Item #{n} released via {via} (hold {code}); it continues in the {stage} stage. The \
                             hidden content reaches the agent as data, marked as released by you."
                 .into(),
-            stage_note: "Item #{n} is in the {stage} stage; messages reach an agent only during \
-                         refinement. Your message is saved in the item's thread."
+            not_in_refinement: "Item #{n} is in the {stage} stage, not in refinement: no agent reads \
+                                messages and no plan waits for approval."
                 .into(),
+            message_saved: "Your message is saved in the item's thread.".into(),
             no_plan: "Item #{n} has no plan to approve yet.".into(),
             refinement_busy: "The agent is still answering in item #{n}; approve after its reply \
                               arrives, so you approve the plan you read."
                 .into(),
             unknown_item: "There is no open item #{n}.".into(),
+            wait_plan: "plan v{version} is waiting for your approval".into(),
+            wait_reply: "in refinement, the agent is waiting for your reply".into(),
+            wait_busy: "in refinement, the agent is writing a reply".into(),
+            wait_busy_plan: "in refinement, plan v{version} is proposed and the agent is writing a reply".into(),
+            wait_hold: "held for hidden content ({count} findings)".into(),
+            wait_stage: "in the {stage} stage, nothing is waiting for you".into(),
+            option_approve_plan: "approve plan v{version}: implementation starts from that plan".into(),
+            option_release: "release it: the agent continues and reads the hidden content as data. Read the \
+                             findings first on the dashboard or with `nucleus intake show {n} --hidden`."
+                .into(),
+            option_cancel: "cancel it: the item stops and nothing more is done for it".into(),
+            option_discuss: "write what should change: the refinement agent reads it and answers".into(),
+            options_header: "What each item is waiting for:".into(),
+            options_item: "Item #{n}: {waits_for}. You can:".into(),
+            options_footer: "Answer in your own words.".into(),
+            options_none: "No item is waiting for a decision from you.".into(),
+            unclear: "I did not understand which decision you mean.".into(),
+            which_item: "Several items are waiting. Which item is your message about?".into(),
+            decision_refused: "Item #{n} cannot take that decision now.".into(),
+            confirm_approve_plan: "Approve plan v{version} of item #{n}? Answer yes or no.".into(),
+            confirm_release: "Release item #{n} (held for hidden content, {count} findings)? Answer yes or no.".into(),
+            confirm_cancel: "Cancel item #{n}? Answer yes or no.".into(),
+            declined: "Nothing was done for item #{n}.".into(),
+            confirmation_expired: "My question about item #{n} expired after {minutes} minutes, so nothing was \
+                                   done."
+                .into(),
             pr_comment: "Draft pull request: {pr_url}".into(),
         }
     }

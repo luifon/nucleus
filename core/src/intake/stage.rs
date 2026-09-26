@@ -1,6 +1,7 @@
 //! Pipeline stages, their transitions, and the pure decisions the pipeline
-//! makes from agent output and operator messages (ADR-036). Everything here
-//! is pure and unit-tested; `pipeline.rs` applies it.
+//! makes from agent output (ADR-036). Everything here is pure and
+//! unit-tested; `pipeline.rs` applies it. Operator messages are read in
+//! `decide.rs`.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -292,40 +293,6 @@ pub fn split_plan(reply: &str, label: &str) -> (String, Option<String>) {
     (shown.trim().to_string(), (!plan.is_empty()).then_some(plan))
 }
 
-/// An operator message in an item's thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OperatorCommand {
-    /// Approve the latest plan; `Some(v)` names the version the operator
-    /// read, which must be the latest.
-    ApprovePlan(Option<u32>),
-    Cancel,
-    /// Release an item held for hidden content; the code names the hold
-    /// the operator reviewed (`None` is refused with the current code).
-    Release(Option<String>),
-    /// Anything else: a message for the refinement agent or the thread.
-    Message,
-}
-
-/// Read an operator message. Only a message that consists of the command
-/// alone is a command, so a sentence that contains "approve" stays a
-/// message. Approval is decided by code from the operator's own message
-/// (never by the model), because it releases implementation work.
-pub fn parse_command(text: &str) -> OperatorCommand {
-    let t = text.trim().trim_end_matches(['.', '!']).trim().to_lowercase();
-    let words: Vec<&str> = t.split_whitespace().collect();
-    let version = |w: &str| w.strip_prefix('v').and_then(|n| n.parse::<u32>().ok());
-    match words.as_slice() {
-        ["approve"] | ["approved"] | ["approve", "plan"] => OperatorCommand::ApprovePlan(None),
-        ["approve", v] | ["approve", "plan", v] if version(v).is_some() => OperatorCommand::ApprovePlan(version(v)),
-        ["cancel"] | ["cancel", "item"] => OperatorCommand::Cancel,
-        ["release"] | ["release", "item"] => OperatorCommand::Release(None),
-        ["release", code] if code.len() <= 64 && code.bytes().all(|c| c.is_ascii_hexdigit()) => {
-            OperatorCommand::Release(Some(code.to_string()))
-        }
-        _ => OperatorCommand::Message,
-    }
-}
-
 // ── WhatsApp groups ──────────────────────────────────────────────────────
 
 /// True when one more group may be requested: fewer than `max_per_day`
@@ -507,24 +474,6 @@ mod tests {
         assert_eq!((shown.as_str(), plan), ("Two questions first.", None));
         let (_, plan) = split_plan("===PLAN===\n\n===END PLAN===", "plan v1");
         assert_eq!(plan, None, "an empty plan is not a plan");
-    }
-
-    #[test]
-    fn operator_commands_are_whole_messages() {
-        use OperatorCommand::*;
-        assert_eq!(parse_command("approve"), ApprovePlan(None));
-        assert_eq!(parse_command("  Approve!  "), ApprovePlan(None));
-        assert_eq!(parse_command("approve plan"), ApprovePlan(None));
-        assert_eq!(parse_command("approve v3"), ApprovePlan(Some(3)));
-        assert_eq!(parse_command("approve plan v12"), ApprovePlan(Some(12)));
-        assert_eq!(parse_command("cancel"), Cancel);
-        assert_eq!(parse_command("Release"), Release(None));
-        assert_eq!(parse_command("release A1b2C3"), Release(Some("a1b2c3".into())));
-        assert_eq!(parse_command("release now"), Message);
-        assert_eq!(parse_command("release the item now"), Message);
-        assert_eq!(parse_command("I approve of the idea but change step 2"), Message);
-        assert_eq!(parse_command("approve vX"), Message);
-        assert_eq!(parse_command("please cancel the second step"), Message);
     }
 
     #[test]

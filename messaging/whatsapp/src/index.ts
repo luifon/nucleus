@@ -262,7 +262,7 @@ When the operator asks about items in plain language, read them:
 - ./target/release/nucleus intake show <n> — stage, eval, plan, thread, pull request
 - ./target/release/nucleus intake cancel <n> — stop an item, only when the operator asks
 
-You cannot approve plans or comments, cannot release a held item and cannot write in an item's thread: the operator approves by replying "#n approve" (or "#n approve comment") in the item's thread, or on the dashboard's Intake page. An item is "held" when its issue text has content GitHub's page does not show (an HTML comment, invisible characters, …); \`intake show <n>\` lists it, and the operator releases the item by typing "#n release <code>" (the hold code from the held message) in its thread, on the dashboard, or with \`nucleus intake release <n> --hold <code>\` in a terminal. Tell the operator that when it applies.`;
+You cannot approve plans, cannot release a held item and cannot write in an item's thread. The operator decides in his own words in the item's WhatsApp group, or in this DM with a message that starts with "#n" or replies to a message about the item; the pipeline reads that message itself and asks him to confirm when needed. The dashboard's Intake page and \`nucleus intake approve-plan|release|cancel\` in a terminal work too. An item is "held" when its issue text has content GitHub's page does not show (an HTML comment, invisible characters, …); \`intake show <n>\` lists it. Tell the operator that when it applies.`;
 
 /** ADR-036: the intake commands the DM session may run (the CLI refuses the
  *  others for a chat session). */
@@ -1087,7 +1087,7 @@ async function handleMessage(sock: WASocket, msg: WAMessage, bot: Bot): Promise<
         bot.outbound.enqueue({
           target: "dm",
           source: "intake",
-          body: `Item #${item ?? "?"}: its WhatsApp group's member list changed. Messages and commands from that group are ignored; use the DM (#${item ?? "n"} …) or the dashboard.`,
+          body: `Item #${item ?? "?"}: its WhatsApp group's member list changed. Messages from that group are ignored; use the DM (#${item ?? "n"} …) or the dashboard.`,
           dedupKey: `intake:group-tripped:${chatId}`,
         });
       }
@@ -1219,11 +1219,12 @@ async function dispatchInbound(
 
   if (!text.trim()) return;
 
-  // ADR-036: an operator DM message for an issue-pipeline item (it starts
-  // with the item's #n marker, or it replies to a message the pipeline sent
-  // for the item) goes to the item's thread, not to the chat session. Only
-  // the operator's own DM is routed; another allowed DM sender's message
-  // goes to the chat session as before.
+  // ADR-036: an operator DM message for the issue pipeline (it starts with
+  // an item's #n marker, replies to a message the pipeline sent, or answers
+  // a question the pipeline asked in the DM in the last 15 minutes) goes to
+  // the pipeline, not to the chat session. Only the operator's own DM is
+  // routed; another allowed DM sender's message goes to the chat session as
+  // before.
   if (role === "dm") {
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? null;
     const routed = await routeOperatorDm({
@@ -1233,6 +1234,7 @@ async function dispatchInbound(
       text,
       quotedItem: quoted ? bot.intakeStore.itemForSentMessage(quoted) : null,
       hasDmThread: (n) => bot.intakeStore.hasDmThread(n),
+      expectingAnswer: bot.intakeStore.expectsDmAnswer(),
       inputKind: inputKind === "voice" ? "voice" : typedKind(msg),
     });
     if (routed) {
@@ -1274,8 +1276,8 @@ function typedKind(msg: WAMessage): InputKind {
 
 /** ADR-036: the text of a message for an issue-pipeline item — the text or
  *  caption (`text`, or `forwarded`), or a voice memo's transcription
- *  (`voice`; never a command). Null when there is none (a transcription
- *  failure is noted in the chat). */
+ *  (`voice`; a decision from it is confirmed first). Null when there is none
+ *  (a transcription failure is noted in the chat). */
 async function messageText(
   sock: WASocket,
   msg: WAMessage,
@@ -1304,9 +1306,11 @@ async function messageText(
   return t ? { text: t, kind: typedKind(msg) } : null;
 }
 
-/** ADR-036: hand an operator message to the issue pipeline. The row in
- *  `intake_inbound` is the durable hand-off; the tick reads it (and runs
- *  at once here, and every minute from launchd). */
+/** ADR-036: hand an operator message to the issue pipeline. Both callers
+ *  checked that the sender is the operator's own identity (the intake
+ *  group's sender check, `routeOperatorDm`). The row in `intake_inbound` is
+ *  the durable hand-off; the tick reads it (and runs at once here, and every
+ *  minute from launchd). */
 function routeToItem(bot: Bot, itemKey: string, chatId: string, msg: WAMessage, text: string, inputKind: InputKind): void {
   if (!text) return;
   const fresh = bot.intakeStore.recordInbound({
@@ -1315,6 +1319,7 @@ function routeToItem(bot: Bot, itemKey: string, chatId: string, msg: WAMessage, 
     waMsgId: msg.key.id ?? `${Date.now()}`,
     text,
     inputKind,
+    sender: "operator",
   });
   log.info({ chatId, item: itemKey, fresh, inputKind }, "whatsapp: message routed to an issue-pipeline item");
   if (fresh) runNucleus(bot.config, ["intake", "tick"]);
