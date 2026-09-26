@@ -8,8 +8,11 @@
 //! Who may do what (`crate::caller`):
 //! - the operator: every command (`release` of a held item only from the
 //!   operator, like `approve-plan`);
-//! - the WhatsApp DM chat session: `list`, `show`, and `cancel` (not in a
-//!   turn that read an agent message). Approvals and releases come from the
+//! - the WhatsApp DM chat session: `list`, `show`, `cancel` and
+//!   `interpret-latest` (not in a turn that read an agent message).
+//!   `interpret-latest` takes no text: it has the operator's latest stored
+//!   DM message interpreted, so the session can trigger an interpretation
+//!   but never supply or change what is interpreted. Approvals and releases come from the
 //!   operator's own WhatsApp messages, read by the pipeline's interpreter
 //!   and decided by code, never from a session's command;
 //! - a detached process (launchd, the bot, the dashboard): `tick`;
@@ -76,6 +79,10 @@ enum Cmd {
     },
     /// Stop an item and its running task.
     Cancel { item: String },
+    /// Have the operator's latest WhatsApp DM message (as the bot stored
+    /// it, never text given here) read by the intake interpreter. For the
+    /// DM chat session, when that message looks like a pipeline decision.
+    InterpretLatest,
     /// Resume a failed item at the stage it failed in.
     Retry { item: String },
     /// Release an item held for hidden content (`show <n> --hidden` lists
@@ -103,9 +110,9 @@ fn authorize(caller: &Caller, cmd: &Cmd) -> Result<()> {
     match &caller.role {
         Role::Operator => {}
         Role::Chat { origin, .. } if origin == "whatsapp-dm" => match cmd {
-            Cmd::List { .. } | Cmd::Show { .. } | Cmd::Cancel { .. } => {}
+            Cmd::List { .. } | Cmd::Show { .. } | Cmd::Cancel { .. } | Cmd::InterpretLatest => {}
             _ => bail!(
-                "a chat session can list, show and cancel items; approvals, releases and replies are the \
+                "a chat session can list, show and cancel items and run interpret-latest; approvals, releases and replies are the \
                  operator's own WhatsApp messages about the item (the pipeline reads them), or the dashboard"
             ),
         },
@@ -127,6 +134,22 @@ fn authorize(caller: &Caller, cmd: &Cmd) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// What `interpret-latest` prints: a code-owned line the chat session
+/// follows.
+fn latest_text(r: &pipeline::Latest) -> String {
+    match r {
+        pipeline::Latest::Handled => format!(
+            "HANDLED: the issue pipeline took the operator's latest message as a decision and answered the operator \
+             in this chat itself. End your turn with exactly this line and nothing else: {}",
+            pipeline::INTAKE_HANDLED
+        ),
+        pipeline::Latest::NotADecision => "NOT A DECISION: the interpreter did not read a pipeline decision in the \
+             operator's latest message. Answer the operator normally."
+            .to_string(),
+        pipeline::Latest::NoMessage(why) => format!("NO MESSAGE: {why}. Answer the operator normally."),
+    }
 }
 
 /// `intake show` output: JSON, or text for the terminal.
@@ -357,6 +380,14 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             let n = item_number(&item)?;
             pipeline::cancel(&ctx, n, via).await.map(|_| println!("item #{n} cancelled"))
         }
+        Cmd::InterpretLatest => {
+            // A chat session only reaches its own chat's messages.
+            let chat = match &caller.role {
+                Role::Chat { chat, .. } => Some(chat.as_str()),
+                _ => None,
+            };
+            pipeline::interpret_latest(&ctx, chat).await.map(|r| println!("{}", latest_text(&r)))
+        }
         Cmd::Retry { item } => {
             let n = item_number(&item)?;
             pipeline::retry(&ctx, n, via).await.map(|i| println!("item #{n} resumed at {}", i.stage))
@@ -430,6 +461,22 @@ mod tests {
         assert!(authorize(&caller(chat.clone(), 0), &release()).is_err(), "a session never releases");
         assert!(authorize(&caller(Role::Detached, 0), &release()).is_err());
         assert!(authorize(&caller(Role::Worker { task_id: None }, 0), &release()).is_err());
+        // interpret-latest: the DM chat session and the operator only, never
+        // in a turn that read an agent message.
+        assert!(authorize(&caller(chat.clone(), 0), &Cmd::InterpretLatest).is_ok());
+        assert!(authorize(&caller(chat.clone(), 1), &Cmd::InterpretLatest).is_err(), "a turn that read an agent message");
+        assert!(authorize(&caller(Role::Operator, 0), &Cmd::InterpretLatest).is_ok());
+        let group_chat = Role::Chat { origin: "whatsapp-group".into(), chat: "g".into() };
+        for role in [
+            group_chat,
+            Role::Worker { task_id: Some("t".into()) },
+            Role::Session { kind: "discord".into() },
+            Role::UnscopedChat,
+            Role::Detached,
+            Role::Unknown("x".into()),
+        ] {
+            assert!(authorize(&caller(role.clone(), 0), &Cmd::InterpretLatest).is_err(), "{role:?}");
+        }
         let resolve = || Cmd::GroupResolve { item: "1".into(), left: true, absent: false };
         assert!(authorize(&caller(chat, 0), &resolve()).is_err(), "only the operator resolves a group");
         assert!(authorize(&caller(Role::Detached, 0), &resolve()).is_err());

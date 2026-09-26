@@ -234,6 +234,9 @@ pub async fn tick(ctx: &Ctx, force_poll: bool) -> Result<TickReport> {
             }
         }
     }
+    if let Err(e) = publish_chat_block(ctx).await {
+        r.errors.push(format!("publishing the DM session's decision list: {e:#}"));
+    }
     Ok(r)
 }
 
@@ -464,6 +467,12 @@ async fn ingest_whatsapp(ctx: &Ctx) -> Result<()> {
     let after: i64 = store::meta(&ctx.db, WA_INBOUND_WATERMARK).await?.and_then(|v| v.parse().ok()).unwrap_or(0);
     let rows = crate::whatsapp_queue::intake_inbound_after(&ctx.wa, after, 200).await?;
     for row in rows {
+        // An operator DM message that went to the chat session: it is
+        // interpreted only when the session asks (`interpret-latest`).
+        if row.item_key == crate::whatsapp_queue::INTAKE_CHAT_KEY {
+            store::set_meta(&ctx.db, WA_INBOUND_WATERMARK, &row.id.to_string()).await?;
+            continue;
+        }
         let msg_ref = format!("wa:{}:{}", row.chat_id, row.wa_msg_id);
         let state = store::inbound_receive(&ctx.db, &msg_ref, row.id, &row.item_key).await?;
         if !state.is_final() {
@@ -538,15 +547,89 @@ async fn apply_inbound(ctx: &Ctx, row: &crate::whatsapp_queue::IntakeInbound, ms
 /// keeps the message once, and every effect and the `applied` mark are one
 /// transaction, so a message handled again after a crash is applied once.
 pub async fn operator_message(ctx: &Ctx, origin: &Origin, text: &str, msg_ref: &str, input_kind: &str) -> Result<()> {
+    handle_message(ctx, origin, text, msg_ref, input_kind, Trigger::Routed).await.map(|_| ())
+}
+
+/// How an operator message reached the interpreter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    /// The bot routed it to the pipeline (a group, a `#n` marker, a quoted
+    /// pipeline message, an answer within the window).
+    Routed,
+    /// The DM chat session ran `nucleus intake interpret-latest` on the
+    /// operator's latest DM message: only a decision (or the answer to a
+    /// question) is handled here; anything else goes back to the session.
+    ChatSession,
+}
+
+/// What [`interpret_latest`] did with the operator's latest DM message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Latest {
+    /// The pipeline took the message as a decision (or an answer to its
+    /// question) and replied to the operator itself.
+    Handled,
+    /// The interpreter did not read a decision; the chat session answers.
+    NotADecision,
+    /// No operator DM message from the last 15 minutes waits for an
+    /// interpretation (none, too old, or already interpreted).
+    NoMessage(String),
+}
+
+/// The line a chat session ends its turn with after [`Latest::Handled`]:
+/// the turn engine sends no reply for a turn whose final text is exactly
+/// this line (the pipeline already answered). Mirrors `INTAKE_HANDLED` in
+/// messaging/whatsapp/src/chat_engine.ts.
+pub const INTAKE_HANDLED: &str = "[handled by the issue pipeline]";
+
+/// An operator DM message older than this is not interpreted on the chat
+/// session's request.
+const LATEST_MAX_AGE_MINUTES: i64 = 15;
+
+/// `nucleus intake interpret-latest`: interpret the operator's latest DM
+/// message, as the bot stored it (`intake_inbound`, `item_key = chat`,
+/// `sender = operator`), never text the caller supplies. `chat` limits it
+/// to one DM chat (the calling chat session's). A row is interpreted at
+/// most once: a row with a final state is not taken again.
+pub async fn interpret_latest(ctx: &Ctx, chat: Option<&str>) -> Result<Latest> {
+    let Some(row) = crate::whatsapp_queue::latest_chat_message(&ctx.wa, chat).await? else {
+        return Ok(Latest::NoMessage("no operator DM message is stored".into()));
+    };
+    let age = chrono::DateTime::parse_from_rfc3339(&row.received_at)
+        .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_minutes())
+        .unwrap_or(i64::MAX);
+    if age > LATEST_MAX_AGE_MINUTES {
+        return Ok(Latest::NoMessage(format!("the operator's latest DM message is older than {LATEST_MAX_AGE_MINUTES} minutes")));
+    }
+    let msg_ref = format!("wa:{}:{}", row.chat_id, row.wa_msg_id);
+    let state = store::inbound_receive(&ctx.db, &msg_ref, row.id, &row.item_key).await?;
+    if state.is_final() {
+        return Ok(Latest::NoMessage("the operator's latest DM message was already interpreted".into()));
+    }
+    let r = handle_message(ctx, &Origin::Dm { item: None }, &row.text, &msg_ref, &row.input_kind, Trigger::ChatSession).await;
+    if let Err(e) = &r {
+        let _ = store::inbound_attempt_failed(&ctx.db, &msg_ref, &clip(&format!("{e:#}"), 1_000)).await;
+    }
+    r
+}
+
+async fn handle_message(
+    ctx: &Ctx,
+    origin: &Origin,
+    text: &str,
+    msg_ref: &str,
+    input_kind: &str,
+    trigger: Trigger,
+) -> Result<Latest> {
     if store::inbound_state(&ctx.db, msg_ref).await?.map(|s| s.is_final()).unwrap_or(false) {
-        return Ok(()); // applied or refused before
+        return Ok(Latest::NoMessage("already interpreted".into())); // applied or refused before
     }
     let t = &ctx.cfg.texts;
     if let Some(n) = origin.item() {
         let open = matches!(store::item(&ctx.db, n).await, Ok(it) if !it.stage().is_terminal());
         if !open {
             answer(ctx, origin, &fill(&t.unknown_item, &[("n", &n.to_string())]), msg_ref, false).await?;
-            return store::inbound_finish(&ctx.db, msg_ref, "failed", Some("no open item")).await;
+            store::inbound_finish(&ctx.db, msg_ref, "failed", Some("no open item")).await?;
+            return Ok(Latest::Handled);
         }
     }
     let now = crate::timestamp::now();
@@ -556,11 +639,18 @@ pub async fn operator_message(ctx: &Ctx, origin: &Origin, text: &str, msg_ref: &
     });
     let open = store::open_confirmation(&ctx.db, &scope, msg_ref, &now).await?;
     let pending = pending_decisions(ctx, origin).await?;
+    let not_a_decision = |why: &'static str| async move {
+        store::inbound_finish(&ctx.db, msg_ref, "applied", Some(why)).await.map(|_| Latest::NotADecision)
+    };
     if pending.is_empty() && open.is_none() {
         // Nothing waits for a decision: no model is asked.
+        if trigger == Trigger::ChatSession {
+            return not_a_decision("nothing waits for a decision; the chat session answers").await;
+        }
         let body = paragraphs(&[late.as_deref(), Some(&decide::options_text(t, &pending))]);
         answer(ctx, origin, &body, msg_ref, false).await?;
-        return store::inbound_finish(&ctx.db, msg_ref, "applied", None).await;
+        store::inbound_finish(&ctx.db, msg_ref, "applied", None).await?;
+        return Ok(Latest::Handled);
     }
     let request = decide::Request {
         message: text.to_string(),
@@ -571,14 +661,27 @@ pub async fn operator_message(ctx: &Ctx, origin: &Origin, text: &str, msg_ref: &
     let reading = decide::parse_reading(&ctx.interpreter.interpret(&request).await?);
     tracing::info!(msg = %msg_ref, ?reading, "intake: operator message interpreted");
     let typed = input_kind == "text";
-    match (reading, open) {
+    // From the chat session, only a decision or an answer to the open
+    // question belongs to the pipeline; anything else is the session's to
+    // answer, and the pipeline sends nothing.
+    if trigger == Trigger::ChatSession {
+        let mine = matches!(
+            (&reading, &open),
+            (Reading::Decision { .. }, _) | (Reading::Confirm, Some(_)) | (Reading::Decline, Some(_))
+        );
+        if !mine {
+            return not_a_decision("not a decision; the chat session answers").await;
+        }
+    }
+    let handled = match (reading, open) {
         (Reading::Confirm, Some(c)) => {
             keep_message(ctx, c.item_id, text, msg_ref).await?;
             if !store::claim_confirmation(&ctx.db, c.id, msg_ref).await? {
-                return unclear(ctx, origin, &pending, None, late, text, msg_ref).await;
+                unclear(ctx, origin, &pending, None, late, text, msg_ref).await
+            } else {
+                let Some(decision) = Decision::parse(&c.decision) else { bail!("confirmation {} has an unknown decision", c.id) };
+                run_decision(ctx, origin, c.item_id, decision, c.plan_version, c.hold_hash.as_deref(), msg_ref).await
             }
-            let Some(decision) = Decision::parse(&c.decision) else { bail!("confirmation {} has an unknown decision", c.id) };
-            run_decision(ctx, origin, c.item_id, decision, c.plan_version, c.hold_hash.as_deref(), msg_ref).await
         }
         (Reading::Decline, Some(c)) => {
             keep_message(ctx, c.item_id, text, msg_ref).await?;
@@ -600,7 +703,32 @@ pub async fn operator_message(ctx: &Ctx, origin: &Origin, text: &str, msg_ref: &
                 Reading::Confirm | Reading::Decline => unclear(ctx, origin, &pending, None, late, text, msg_ref).await,
             }
         }
+    };
+    handled.map(|_| Latest::Handled)
+}
+
+/// The code-owned block the WhatsApp DM chat session is given with every
+/// operator message (ADR-036): what waits for a decision, one line per
+/// item, and when to run `nucleus intake interpret-latest`. Empty when
+/// nothing waits. No issue text: the lines are the interpreter's pending
+/// lines.
+pub async fn chat_block(ctx: &Ctx) -> Result<String> {
+    let pending = pending_decisions(ctx, &Origin::Dm { item: None }).await?;
+    if pending.is_empty() {
+        return Ok(String::new());
     }
+    let t = &ctx.cfg.texts;
+    let mut out = vec![t.chat_block_header.clone()];
+    out.extend(pending.iter().map(|p| format!("- {}", decide::pending_line(p))));
+    out.push(fill(&t.chat_block_instruction, &[("handled", INTAKE_HANDLED)]));
+    Ok(out.join("\n"))
+}
+
+/// Write [`chat_block`] where the bot reads it (`intake_chat_block` in
+/// whatsapp.db).
+async fn publish_chat_block(ctx: &Ctx) -> Result<()> {
+    let block = chat_block(ctx).await?;
+    crate::whatsapp_queue::set_intake_chat_block(&ctx.wa, &block).await
 }
 
 /// Non-empty parts joined by a blank line.

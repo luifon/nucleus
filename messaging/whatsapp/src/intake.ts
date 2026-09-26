@@ -134,6 +134,12 @@ export type InputKind = "text" | "voice" | "forwarded";
  *  core/src/whatsapp_queue.rs. */
 export const DM_KEY = "dm";
 
+/** `item_key` of an operator DM message that went to the chat session. It
+ *  is stored so `nucleus intake interpret-latest` can read the operator's
+ *  own text when the chat session asks; the tick never interprets it by
+ *  itself. Mirrors `INTAKE_CHAT_KEY` in core/src/whatsapp_queue.rs. */
+export const CHAT_KEY = "chat";
+
 /** A question the pipeline asks in the DM (`intake:ask`) waits this long for
  *  the operator's answer. Mirrors `CONFIRMATION_MINUTES` in
  *  core/src/intake/pipeline.rs. */
@@ -345,6 +351,14 @@ export class IntakeStore {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_inbound_msg
         ON intake_inbound(chat_id, wa_msg_id);
+
+      -- ADR-036: the DM chat session's list of waiting intake decisions.
+      -- One row; Rust writes it (whatsapp_queue.rs), the bot only reads it.
+      CREATE TABLE IF NOT EXISTS intake_chat_block (
+        id         INTEGER PRIMARY KEY CHECK (id = 1),
+        block      TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `);
     // A table created before the column existed.
     const cols = (this.db.prepare(`SELECT name FROM pragma_table_info('intake_inbound')`).all() as Array<{ name: string }>).map(
@@ -569,6 +583,14 @@ export class IntakeStore {
         input.sender,
       );
     return Number(res.changes) > 0;
+  }
+
+  /** The code-owned block the pipeline wrote for the DM chat session: what
+   *  waits for an intake decision and when to run `interpret-latest`; ""
+   *  when nothing waits. */
+  chatBlock(): string {
+    const r = this.db.prepare(`SELECT block FROM intake_chat_block WHERE id = 1`).get() as { block: string } | undefined;
+    return r?.block ?? "";
   }
 
   /** What a message the bot sent belongs to, from the WhatsApp message id a

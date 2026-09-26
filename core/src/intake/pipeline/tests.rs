@@ -283,7 +283,7 @@ async fn inbound_kind(f: &Fixture, item: i64, msg_id: &str, text: &str, kind: &s
 async fn inbound_row(f: &Fixture, key: &str, chat: &str, msg_id: &str, text: &str, kind: &str, sender: &str) -> i64 {
     sqlx::query(
         "INSERT INTO intake_inbound (item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender)
-         VALUES (?1, ?2, ?3, ?4, 't', ?5, ?6)",
+         VALUES (?1, ?2, ?3, ?4, ?7, ?5, ?6)",
     )
     .bind(key)
     .bind(chat)
@@ -291,6 +291,7 @@ async fn inbound_row(f: &Fixture, key: &str, chat: &str, msg_id: &str, text: &st
     .bind(text)
     .bind(kind)
     .bind(sender)
+    .bind(crate::timestamp::now())
     .execute(&f.ctx.wa)
     .await
     .unwrap()
@@ -2078,4 +2079,113 @@ async fn the_interpreter_receives_only_the_operators_text_and_lines_code_built()
     let it = item1(&f).await;
     let turn = tasks::get(&f.ctx.tasks_db, it.current_task_id.as_deref().expect("a new turn runs"), &Scope::Operator).await.unwrap();
     assert!(turn.brief.contains("What about the tests?"));
+}
+
+// ── the DM chat session's trigger (`interpret-latest`) ───────────────────
+
+/// An operator DM message that went to the chat session, as the bot stores
+/// it (`item_key = chat`).
+async fn chat_message(f: &Fixture, msg_id: &str, text: &str, sender: &str) -> i64 {
+    inbound_row(f, crate::whatsapp_queue::INTAKE_CHAT_KEY, "chat", msg_id, text, "text", sender).await
+}
+
+/// A stand-in for the WhatsApp DM chat session: it sees the operator's
+/// message (and anything else in its context) with the code-owned block the
+/// bot adds, and when the block lists decisions and the message looks like
+/// one it runs the command, as the block tells it to. Returns what the
+/// command returned, or None when it did not run it.
+async fn fake_chat_session(f: &Fixture, seen: &str) -> Option<Latest> {
+    let block = crate::whatsapp_queue::intake_chat_block(&f.ctx.wa).await.unwrap();
+    let looks_like = ["approve", "go ahead", "release", "cancel"].iter().any(|w| seen.to_lowercase().contains(w));
+    if block.is_empty() || !block.contains("interpret-latest") || !looks_like {
+        return None;
+    }
+    Some(interpret_latest(&f.ctx, Some("chat")).await.unwrap())
+}
+
+#[tokio::test]
+async fn a_cold_approve_in_the_dm_runs_through_the_chat_sessions_trigger() {
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    // The tick publishes the list the bot adds to DM messages: code-built
+    // lines only.
+    let block = crate::whatsapp_queue::intake_chat_block(&f.ctx.wa).await.unwrap();
+    assert!(block.contains("- item #1: plan v1 is waiting for your approval. Allowed decisions: approve_plan, cancel."), "{block}");
+    assert!(block.contains("interpret-latest") && block.contains(INTAKE_HANDLED), "{block}");
+    assert!(!block.contains("Issue 1") && !block.contains("do it"), "no issue or plan text: {block}");
+    // Hours later the operator writes normally in the DM; the message goes
+    // to the chat session, and the tick does not interpret it by itself.
+    chat_message(&f, "c1", "approve it", "operator").await;
+    tick(&f).await;
+    assert_eq!(f.interp.calls(), 0);
+    assert_eq!(item1(&f).await.stage(), Stage::Refinement);
+    // The chat session sees the message and runs the command.
+    let r = fake_chat_session(&f, "approve it").await.expect("the session runs interpret-latest");
+    assert_eq!(r, Latest::Handled);
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.approved_version, it.approved_via.as_deref()), (Stage::Implementation, Some(1), Some("whatsapp")));
+    assert_eq!(f.interp.last().message, "approve it");
+    assert_eq!(f.interp.last().origin, "the operator's WhatsApp DM; the message does not name an item");
+    // Nothing waits any more: the list is cleared.
+    tick(&f).await;
+    assert_eq!(crate::whatsapp_queue::intake_chat_block(&f.ctx.wa).await.unwrap(), "");
+}
+
+#[tokio::test]
+async fn interpret_latest_interprets_the_stored_operator_text_only() {
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    chat_message(&f, "c1", "an older message", "operator").await;
+    chat_message(&f, "c2", "approve it", "operator").await;
+    // Newer rows the command must not take: another sender, a group, a
+    // message routed to an item, another DM chat.
+    chat_message(&f, "c3", "cancel everything", "unknown").await;
+    let group = format!("{}@{}", "120363000000000004", "g.us");
+    inbound_row(&f, crate::whatsapp_queue::INTAKE_CHAT_KEY, &group, "c4", "cancel it", "text", "operator").await;
+    inbound_row(&f, crate::whatsapp_queue::INTAKE_CHAT_KEY, "other-chat", "c5", "cancel it", "text", "operator").await;
+    // The chat session's context holds other text (here: an instruction to
+    // cancel); the command takes no text, so only the stored message counts.
+    let r = interpret_latest(&f.ctx, Some("chat")).await.unwrap();
+    assert_eq!(r, Latest::Handled);
+    assert_eq!(f.interp.calls(), 1);
+    assert_eq!(f.interp.last().message, "approve it");
+    assert_eq!(item1(&f).await.stage(), Stage::Implementation);
+    // A message older than 15 minutes is not taken.
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    let id = chat_message(&f, "o1", "approve it", "operator").await;
+    sqlx::query("UPDATE intake_inbound SET received_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1").bind(id).execute(&f.ctx.wa).await.unwrap();
+    assert!(matches!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::NoMessage(_)));
+    assert_eq!(f.interp.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_dm_row_is_interpreted_at_most_once() {
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    chat_message(&f, "c1", "what do you think of it?", "operator").await;
+    assert_eq!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::NotADecision);
+    assert!(matches!(interpret_latest(&f.ctx, Some("chat")).await.unwrap(), Latest::NoMessage(_)));
+    assert_eq!(f.interp.calls(), 1);
+    // A discussion from the chat session's trigger is the session's to
+    // answer: the pipeline sends nothing and keeps nothing.
+    assert!(outbound(&f).await.iter().all(|(_, b)| !b.contains("what do you think")));
+    assert!(!store::messages(&f.ctx.db, 1).await.unwrap().iter().any(|m| m.author == "operator"));
+    assert_eq!(item1(&f).await.stage(), Stage::Refinement);
+    // A later tick does not interpret it either.
+    tick(&f).await;
+    assert_eq!(f.interp.calls(), 1);
+}
+
+#[tokio::test]
+async fn an_unrelated_dm_message_starts_no_interpreter() {
+    let f = dm_fixture(fixture().await);
+    with_plan(&f).await;
+    let before = outbound(&f).await.len();
+    chat_message(&f, "c1", "what is on my calendar today?", "operator").await;
+    tick(&f).await;
+    assert!(fake_chat_session(&f, "what is on my calendar today?").await.is_none(), "the session answers it itself");
+    assert_eq!(f.interp.calls(), 0);
+    assert_eq!(outbound(&f).await.len(), before, "the pipeline sent nothing");
+    assert_eq!(item1(&f).await.stage(), Stage::Refinement);
 }

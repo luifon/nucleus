@@ -120,6 +120,14 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     )
     .execute(&pool)
     .await?;
+    // ADR-036: the DM chat session's list of waiting intake decisions. One
+    // row; Rust writes it, the bot reads it. Must match
+    // messaging/whatsapp/src/intake.ts.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS intake_chat_block (id INTEGER PRIMARY KEY CHECK (id = 1), block TEXT NOT NULL, updated_at TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await?;
     for ddl in [
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_group_requests_dedup ON intake_group_requests(dedup_key) WHERE dedup_key IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_outbound_status_enqueued ON outbound_queue(status, enqueued_at)",
@@ -443,6 +451,58 @@ pub struct IntakeInbound {
 /// `item_key` of a DM message that names no item (ADR-036): it answers a
 /// question the pipeline asked in the DM.
 pub const INTAKE_DM_KEY: &str = "dm";
+
+/// `item_key` of an operator DM message that went to the DM chat session
+/// (ADR-036): stored so `nucleus intake interpret-latest` can read the
+/// operator's own text; the tick never interprets it by itself.
+pub const INTAKE_CHAT_KEY: &str = "chat";
+
+/// The newest operator DM message that went to the chat session
+/// (`item_key = chat`, `sender = operator`, not a group), in `chat` when
+/// given.
+pub async fn latest_chat_message(pool: &SqlitePool, chat: Option<&str>) -> Result<Option<IntakeInbound>> {
+    if !table_exists(pool, "intake_inbound").await? {
+        return Ok(None);
+    }
+    let has_sender: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('intake_inbound') WHERE name = 'sender'")
+        .fetch_one(pool)
+        .await?;
+    if !has_sender {
+        return Ok(None);
+    }
+    Ok(sqlx::query_as(
+        "SELECT id, item_key, chat_id, wa_msg_id, text, received_at, input_kind, sender FROM intake_inbound
+          WHERE item_key = ?1 AND sender = 'operator' AND chat_id NOT LIKE ?2 AND (?3 IS NULL OR chat_id = ?3)
+          ORDER BY id DESC LIMIT 1",
+    )
+    .bind(INTAKE_CHAT_KEY)
+    .bind(format!("%@{}", "g.us"))
+    .bind(chat)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Replace the block the bot adds to every operator message it types into
+/// the DM chat session (`intake_chat_block`, one row): what waits for an
+/// intake decision. Empty when nothing waits. Rust writes it; the bot only
+/// reads it.
+pub async fn set_intake_chat_block(pool: &SqlitePool, block: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO intake_chat_block (id, block, updated_at) VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET block = excluded.block, updated_at = excluded.updated_at
+         WHERE intake_chat_block.block <> excluded.block",
+    )
+    .bind(block)
+    .bind(crate::timestamp::now())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The block [`set_intake_chat_block`] wrote.
+pub async fn intake_chat_block(pool: &SqlitePool) -> Result<String> {
+    Ok(sqlx::query_scalar("SELECT block FROM intake_chat_block WHERE id = 1").fetch_optional(pool).await?.unwrap_or_default())
+}
 
 /// Rows of `intake_inbound` with an id above `after`, oldest first.
 pub async fn intake_inbound_after(pool: &SqlitePool, after: i64, limit: i64) -> Result<Vec<IntakeInbound>> {

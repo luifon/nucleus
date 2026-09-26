@@ -17,6 +17,7 @@ import {
   clip,
   DEFAULT_TEXTS,
   extractRefs,
+  INTAKE_HANDLED,
   MAX_CONTEXT_CHARS,
   neutralizeMarkers,
   readNew,
@@ -92,7 +93,7 @@ const CFG: TurnsConfig = {
   texts: { ...DEFAULT_TEXTS, ack: "ACK" },
 };
 
-function setup(script: Script, cfg: TurnsConfig = CFG) {
+function setup(script: Script, cfg: TurnsConfig = CFG, operatorContext?: (chatId: string, pool: string) => string) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nucleus-engine-"));
   const dbPath = path.join(dir, "whatsapp.db");
   const store = new ChatSessionStore(dbPath);
@@ -116,6 +117,7 @@ function setup(script: Script, cfg: TurnsConfig = CFG) {
         return s;
       },
       apiRetryDelayMs: 50,
+      operatorContext,
     },
     {
       dm: { name: "dm", workspaceRoot: dir, tmuxSession: "nucleus-test-dm", idleTimeoutMs: 60_000, taskScope: true },
@@ -144,6 +146,43 @@ const msg = (text: string, id: string) => ({
   quotedJson: JSON.stringify({ key: { id, remoteJid: CHAT } }),
 });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+test("the intake decision block follows the operator's message; a turn the pipeline handled sends no reply", async () => {
+  const block = "[Issue pipeline: decisions waiting for the operator.]\n- item #1: plan v1 is waiting for your approval.";
+  let session: FakeSession | null = null;
+  const t = setup(
+    async (s, payload) => {
+      session = s;
+      s.prompt(payload);
+      // The session ran `nucleus intake interpret-latest`, which printed
+      // HANDLED; it ends its turn with the line it was given.
+      s.tool("t1");
+      s.say(INTAKE_HANDLED, "end_turn");
+      s.end();
+    },
+    CFG,
+    (chatId, pool) => (pool === "dm" && chatId === CHAT ? block : ""),
+  );
+  t.engine.receive(msg("approve it", "H1"));
+  await t.until(() => t.turns.unanswered(CHAT).length === 0);
+  await sleep(100);
+  await t.engine.tick();
+  const payload = session!.submitted[0].payload;
+  assert.ok(payload.indexOf("approve it") < payload.indexOf("[Issue pipeline:"), payload);
+  assert.ok(payload.includes("- item #1: plan v1 is waiting for your approval."), payload);
+  assert.equal(t.sent().filter((m) => m.source === "chat-reply").length, 0, JSON.stringify(t.sent()));
+});
+
+test("the handled line counts only as the whole final text", async () => {
+  const t = setup(async (s, payload) => {
+    s.prompt(payload);
+    s.say(`Done. ${INTAKE_HANDLED}`, "end_turn");
+    s.end();
+  });
+  t.engine.receive(msg("hello", "H2"));
+  await t.until(() => t.sent().some((m) => m.source === "chat-reply"));
+  assert.equal(t.sent().find((m) => m.source === "chat-reply")!.body, `Done. ${INTAKE_HANDLED}`);
+});
 
 test("extractRefs counts only marker lines; clip", () => {
   assert.deepEqual(

@@ -84,7 +84,7 @@ import { makeVaultManifestHook } from "./docstore_vault.js";
 import { transcribe } from "./transcribe.js";
 import { GroupAllowlist, resolveTarget } from "./target_policy.js";
 import { handleBrainDump, sweepExpiredPlans, type BraindumpDeps } from "./braindump_flow.js";
-import { GroupExecutor, IntakeStore, isOperatorId, routeOperatorDm, stripGroupMarker, type InputKind } from "./intake.js";
+import { CHAT_KEY, GroupExecutor, IntakeStore, isOperatorId, routeOperatorDm, stripGroupMarker, type InputKind } from "./intake.js";
 import { planCapture, applyPlan, interpretResponse, BRAINDUMP_TMUX_SESSION } from "./braindump.js";
 
 // Every tmux session this process spawns claude windows into. Defined once
@@ -262,11 +262,11 @@ When the operator asks about items in plain language, read them:
 - ./target/release/nucleus intake show <n> — stage, eval, plan, thread, pull request
 - ./target/release/nucleus intake cancel <n> — stop an item, only when the operator asks
 
-You cannot approve plans, cannot release a held item and cannot write in an item's thread. The operator decides in his own words in the item's WhatsApp group, or in this DM with a message that starts with "#n" or replies to a message about the item; the pipeline reads that message itself and asks him to confirm when needed. The dashboard's Intake page and \`nucleus intake approve-plan|release|cancel\` in a terminal work too. An item is "held" when its issue text has content GitHub's page does not show (an HTML comment, invisible characters, …); \`intake show <n>\` lists it. Tell the operator that when it applies.`;
+You cannot approve plans, cannot release a held item and cannot write in an item's thread. The operator decides in his own words, in the item's WhatsApp group or in this DM. While decisions wait, each of his messages here ends with a block written by Nucleus code that lists them; when his message asks for one of those decisions, run \`./target/release/nucleus intake interpret-latest\` (it takes no text: Nucleus reads his stored message itself, has it interpreted and asks him to confirm when needed). When it prints HANDLED, end your turn with exactly the line it gives and nothing else; otherwise answer normally. The dashboard's Intake page and \`nucleus intake approve-plan|release|cancel\` in a terminal work too. An item is "held" when its issue text has content GitHub's page does not show (an HTML comment, invisible characters, …); \`intake show <n>\` lists it. Tell the operator that when it applies.`;
 
 /** ADR-036: the intake commands the DM session may run (the CLI refuses the
  *  others for a chat session). */
-const INTAKE_TOOL_ALLOWLIST = ["list", "show", "cancel"].map((c) => `Bash(./target/release/nucleus intake ${c}:*)`);
+const INTAKE_TOOL_ALLOWLIST = ["list", "show", "cancel", "interpret-latest"].map((c) => `Bash(./target/release/nucleus intake ${c}:*)`);
 
 /** Bash patterns the DM pool pre-approves for background tasks: the five
  *  chat commands only. `tasks run` and `tasks sweep` are internal (and the
@@ -437,6 +437,9 @@ async function main() {
       cfg: config.turns,
       format: formatReply,
       outboundTarget: (chatId) => chatId,
+      // ADR-036: the operator's DM session sees which intake decisions wait.
+      operatorContext: (chatId, pool) =>
+        pool === "dm" && config.operatorId !== null && normalizeSenderId(chatId) === config.operatorId ? intakeStore.chatBlock() : "",
       presence: (chatId, state) => {
         liveSock?.sendPresenceUpdate(state, chatId).catch(() => {});
       },
@@ -1240,6 +1243,19 @@ async function dispatchInbound(
     if (routed) {
       routeToItem(bot, routed.item, chatId, msg, routed.text, routed.inputKind);
       return;
+    }
+    // ADR-036: keep the operator's own DM text for `nucleus intake
+    // interpret-latest`, which the chat session may run on it. No tick: the
+    // pipeline reads it only when the session asks.
+    if (await isOperatorId(chatId, config.operatorId, pnForLid)) {
+      bot.intakeStore.recordInbound({
+        itemKey: CHAT_KEY,
+        chatId,
+        waMsgId: msg.key.id ?? `${Date.now()}`,
+        text,
+        inputKind: inputKind === "voice" ? "voice" : typedKind(msg),
+        sender: "operator",
+      });
     }
   }
 

@@ -11,6 +11,7 @@ import { ChatSessionStore, OutboundQueueStore } from "./db.js";
 import { parseToml } from "./config.js";
 import {
   ANSWER_WINDOW_MS,
+  CHAT_KEY,
   classifyCreateError,
   closeBackoffMs,
   DM_KEY,
@@ -198,6 +199,27 @@ test("the next DM message answers a question the pipeline asked, for 15 minutes"
   assert.equal(store.expectsDmAnswer(sentAt + 3000), true);
   store.recordInbound({ itemKey: DM_KEY, chatId: `${OP}@s.whatsapp.net`, waMsgId: "d1", text: "yes", inputKind: "text", sender: "operator", nowMs: sentAt + 4000 });
   assert.equal(store.expectsDmAnswer(sentAt + 5000), false);
+});
+
+test("the DM session's decision block is read from the table the pipeline writes", () => {
+  const db = tmpDb();
+  const store = new IntakeStore(db);
+  assert.equal(store.chatBlock(), "", "nothing written yet");
+  new DatabaseSync(db)
+    .prepare(`INSERT INTO intake_chat_block (id, block, updated_at) VALUES (1, ?, 't')`)
+    .run("[Issue pipeline: decisions waiting for the operator.]\n- item #2: held for hidden content (1 findings).");
+  assert.match(store.chatBlock(), /item #2: held/);
+  // An operator DM message for the chat session is stored under the chat
+  // key, for `interpret-latest`, and marked as the operator's.
+  assert.equal(
+    store.recordInbound({ itemKey: CHAT_KEY, chatId: `${OP}@s.whatsapp.net`, waMsgId: "c1", text: "approve it", inputKind: "text", sender: "operator" }),
+    true,
+  );
+  const row = new DatabaseSync(db).prepare(`SELECT item_key, sender FROM intake_inbound WHERE wa_msg_id = 'c1'`).get() as {
+    item_key: string;
+    sender: string;
+  };
+  assert.deepEqual({ ...row }, { item_key: "chat", sender: "operator" });
 });
 
 test("operator messages are stored once and quoted messages map to their item", () => {

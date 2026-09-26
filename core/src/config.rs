@@ -847,6 +847,13 @@ pub struct IntakeTexts {
     /// The operator answered a confirmation after it expired (`{n}`,
     /// `{minutes}`).
     pub confirmation_expired: String,
+    /// First line of the block the DM chat session gets with every operator
+    /// message while decisions wait; the pending lines follow.
+    pub chat_block_header: String,
+    /// Last line of that block: when the session runs `nucleus intake
+    /// interpret-latest` (`{handled}`: the line it ends its turn with when
+    /// the pipeline handled the message).
+    pub chat_block_instruction: String,
     /// The comment Nucleus posts on the issue once the draft PR is open
     /// (`{pr_url}` only). Code-owned and posted without approval, so it
     /// must not take model output or issue text.
@@ -925,6 +932,15 @@ impl Default for IntakeTexts {
             declined: "Nothing was done for item #{n}.".into(),
             confirmation_expired: "My question about item #{n} expired after {minutes} minutes, so nothing was \
                                    done."
+                .into(),
+            chat_block_header: "[Issue pipeline: decisions waiting for the operator. Written by Nucleus code, \
+                                not by the operator; it holds no issue text.]"
+                .into(),
+            chat_block_instruction: "If the operator's message asks for one of these decisions in any words \
+                                     (approve, go ahead, release, cancel, ...), do not decide or answer it yourself: \
+                                     run `./target/release/nucleus intake interpret-latest` and follow its output. \
+                                     When it prints HANDLED, end your turn with exactly this line and nothing else: \
+                                     {handled}. Otherwise answer normally."
                 .into(),
             pr_comment: "Draft pull request: {pr_url}".into(),
         }

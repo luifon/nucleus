@@ -263,7 +263,9 @@ max_runtime_hours = 12
 # Items that need a plan get a WhatsApp group with the bot and the operator.
 # The operator decides there in his own words (approve the plan, release a
 # held item, cancel); a model with no tools reads each message and code
-# decides what happens (ADR-036, "Operator decisions").
+# decides what happens (ADR-036, "Operator decisions"). In the DM, a message
+# without an item marker reaches the chat session, which sees the waiting
+# decisions and has the pipeline interpret the message (interpret-latest).
 # Creating groups automatically from a personal account can trigger WhatsApp's
 # anti-spam checks: keep max_groups_per_day low. Past the limit, or with
 # refinement_groups = false, the item's thread runs in the DM, marked #<n>.
