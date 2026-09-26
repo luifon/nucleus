@@ -233,42 +233,6 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     let diary_state = Arc::new(handlers::diary::DiaryState { root: diary_root });
     app = app.nest("/diary/api", handlers::diary::router(diary_state));
 
-    // Image generation (gallery) — proxies prompts to the Bonsai FastAPI
-    // backend on the configured loopback port and persists results (ADR-019).
-    // Tolerated-missing: if gallery.db can't open, the surface is simply absent.
-    // The PNG bytes are served by the /gallery/files ServeDir mount below.
-    let gallery_files_dir = workspace_root.join("memory/gallery");
-    match db::open(&workspace_root.join("memory/gallery.db")).await {
-        Ok(pool) => match handlers::gallery::ensure_schema(&pool).await {
-            Ok(()) => {
-                let _ = std::fs::create_dir_all(&gallery_files_dir);
-                // SDXL (NoobAI) on MPS can take minutes per image — generous timeout.
-                let http = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(360))
-                    .build()
-                    .unwrap_or_default();
-                let gallery_state = Arc::new(handlers::gallery::GalleryState {
-                    pool,
-                    files_dir: gallery_files_dir.clone(),
-                    backends: vec![
-                        ("bonsai".to_string(), format!("http://127.0.0.1:{}", settings.ports.bonsai)),
-                    ],
-                    // Safe API fallback when a request omits `model` (always-up);
-                    // the UI defaults its selector to noobai independently.
-                    default_model: "bonsai".to_string(),
-                    http,
-                });
-                app = app.nest("/gallery/api", handlers::gallery::router(gallery_state));
-            }
-            Err(e) => {
-                tracing::warn!("nucleus-dashboard: gallery schema init failed: {} — /gallery disabled", e);
-            }
-        },
-        Err(e) => {
-            tracing::warn!("nucleus-dashboard: gallery.db not openable: {} — /gallery disabled", e);
-        }
-    }
-
     // Documents library viewer (ADR-018) — READ-ONLY over the TS-owned
     // documents.db (db::open_read_only; never db::open, whose
     // create_if_missing would conjure an empty foreign DB and mask "not
@@ -324,7 +288,6 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
 
     let app = app
         .nest_service("/assets", ServeDir::new(web_dist.join("assets")))
-        .nest_service("/gallery/files", ServeDir::new(gallery_files_dir))
         // ADR-018: identity-document bytes must never persist in a browser
         // cache (no-store) and must not be sniffed into a renderable type
         // (nosniff). The tailnet perimeter (ADR-011) is the access gate.

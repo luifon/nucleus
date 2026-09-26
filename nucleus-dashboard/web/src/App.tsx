@@ -9,7 +9,6 @@ import {
   BookOpen,
   Database,
   Newspaper,
-  Image as ImageIcon,
   FolderLock,
   Activity,
   Gauge,
@@ -27,7 +26,6 @@ import RemindersPage from "./pages/RemindersPage";
 import AgentsPage from "./pages/AgentsPage";
 import VaultPage from "./pages/VaultPage";
 import ChatPage from "./pages/ChatPage";
-import GalleryPage from "./pages/GalleryPage";
 import DocumentsPage from "./pages/DocumentsPage";
 import UsagePage from "./pages/UsagePage";
 import TasksPage from "./pages/TasksPage";
@@ -47,7 +45,6 @@ type RouteEntry = {
 const ROUTES: RouteEntry[] = [
   { path: "/",          label: "dashboard", icon: LayoutDashboard, group: "primary",       impl: "scaffolded" },
   { path: "/chat",      label: "chat",      icon: MessageSquare,   group: "primary",       impl: "scaffolded" },
-  { path: "/gallery",   label: "gallery",   icon: ImageIcon,       group: "primary",       impl: "scaffolded" },
   { path: "/documents", label: "documents", icon: FolderLock,      group: "primary",       impl: "scaffolded" },
   { path: "/news",      label: "news",      icon: Newspaper,       group: "primary",       impl: "scaffolded" },
   { path: "/agents",    label: "agents",    icon: Boxes,           group: "observability", impl: "scaffolded" },
@@ -114,7 +111,6 @@ export default function App() {
               <Route path="/vault" element={<VaultPage />} />
               <Route path="/vault/:tab" element={<VaultPage />} />
               <Route path="/chat" element={<ChatPage />} />
-              <Route path="/gallery" element={<GalleryPage />} />
               <Route path="/documents" element={<DocumentsPage />} />
               <Route path="/usage" element={<UsagePage />} />
               {ROUTES.filter((r) => r.impl === "pending").map((r) => (

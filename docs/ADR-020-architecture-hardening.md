@@ -124,8 +124,9 @@ every six months.
    had drifted (still checking the orphans) and leaked operator-specific
    labels into a committed file (Rule 1 violation). Now the lists come
    from the registry (`launchd-daemon` → persistent, `launchd-cron` →
-   periodic), bonsai via its env gate, and operator extras via
-   `HEALTHCHECK_EXTRA_PERSISTENT`/`_PERIODIC` in `.env`.
+   periodic), bonsai via its env gate (removed with ADR-019), and
+   operator extras via `HEALTHCHECK_EXTRA_PERSISTENT`/`_PERIODIC` in
+   `.env`.
 10. **Log rotation via newsyslog** (`tools/newsyslog/nucleus.conf.example`
     → `/etc/newsyslog.d/nucleus.conf`): `memory/*.log` rotates at 1MB,
     keep 5. **gzip deliberately omitted**: KeepAlive daemons hold their

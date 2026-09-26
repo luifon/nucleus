@@ -5,8 +5,7 @@ encrypted-Drive draft (2026-06-01), which superseded the vault-binding draft.
 **Date:** 2026-06-12
 **Related:** ADR-005b (WhatsApp DM mode), ADR-006 (reminders / `outbound_queue`),
 ADR-011 (tailnet perimeter — the dashboard surface's access gate),
-ADR-015 (dashboard), ADR-019 (image-generation gallery — a producer for the
-outbound media path), ADR-020 (DB ownership rule, typegen, drain hang
+ADR-015 (dashboard), ADR-020 (DB ownership rule, typegen, drain hang
 protection — all load-bearing here).
 
 ## Context
@@ -190,7 +189,7 @@ trust level it's theater (an attacker who can reach the dashboard can read
 ## Consequences
 
 - `outbound_queue` is the single media-delivery primitive (reminders,
-  gallery, doc retrieval) with one auth gate at the drain.
+  doc retrieval) with one auth gate at the drain.
 - The library is one `cp -r` to back up; zero key management.
 - Durability risk is single-disk and owned in writing (mitigations above);
   the future mirror has a named seam (`WHATSAPP_DOCUMENTS_DIR`).

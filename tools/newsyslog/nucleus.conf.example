@@ -9,7 +9,7 @@
 # no process to signal (don't HUP syslogd).
 #
 # Z (gzip) is DELIBERATELY omitted: KeepAlive daemons (discord, whatsapp,
-# nucleus-dashboard, bonsai, caddy) hold their launchd StandardOutPath fd
+# nucleus-dashboard, caddy) hold their launchd StandardOutPath fd
 # in append mode across rotation and keep writing into the renamed .0 file
 # until their next restart — gzip+unlink would silently destroy those
 # writes. Uncompressed archives preserve them, at a trivial disk cost

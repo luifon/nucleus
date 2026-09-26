@@ -122,8 +122,7 @@ install_newsyslog() {
 # hard-cut policy (ADR-020): a service deleted from tools/launchd/ is
 # unloaded and its plist removed on the next full install run. Caddy is
 # exempt (root LaunchDaemon in /Library/LaunchDaemons, never under $DEST,
-# but guard anyway). Bonsai is NOT an orphan even when its install is
-# skipped: its template exists.
+# but guard anyway).
 prune_orphans() {
   local removed=0 plist base service
   for plist in "$DEST/${PREFIX}".*.plist; do
@@ -173,18 +172,11 @@ for template in "$SCRIPT_DIR"/*.plist.example; do
   if [ -n "$FILTER" ] && [[ "$service" != *"$FILTER"* ]]; then
     continue
   fi
-  # The bonsai image-gen backend (ADR-019) is opt-in: skip it unless the
-  # operator has pointed NUCLEUS_BONSAI_DIR at a Bonsai-Image-Demo checkout.
-  if [ "$service" = "bonsai" ] && [ -z "${NUCLEUS_BONSAI_DIR:-}" ]; then
-    echo "skipping bonsai — NUCLEUS_BONSAI_DIR not set in .env"
-    continue
-  fi
   dest="$DEST/${PREFIX}.${service}.plist"
   sed \
     -e "s|__USER_HOME__|$HOME|g" \
     -e "s|__LAUNCHD_PREFIX__|$PREFIX|g" \
     -e "s|__TZ__|$NUCLEUS_TZ|g" \
-    -e "s|__NUCLEUS_BONSAI_DIR__|${NUCLEUS_BONSAI_DIR:-}|g" \
     "$template" > "$dest"
   # `launchctl disable` is sticky: it lives in launchd's override database,
   # survives bootout and outlives the plist itself. A label disabled months

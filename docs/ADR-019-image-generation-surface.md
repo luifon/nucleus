@@ -1,7 +1,20 @@
 # ADR-019 — Image generation surface (local Bonsai model + dashboard gallery)
 
-**Status:** Accepted (implemented 2026-06-01)
+**Status:** Withdrawn (2026-09-26). Implemented 2026-06-01.
 **Related:** ADR-015 (unified dashboard), ADR-018 (WhatsApp media — brick 3), ADR-011 (perimeter)
+
+## Withdrawal (2026-09-26)
+
+The surface was not used after its first tests, so it was removed completely:
+the `dev.nucleus.bonsai` launchd service and its plist template,
+`tools/bonsai-serve.sh`, the dashboard `/gallery` page and API
+(`handlers/gallery.rs`, `/gallery/api`, `/gallery/files`), `PortsConfig.bonsai`
+and `[ports].bonsai`, `NUCLEUS_BONSAI_DIR` and its gates in `install.sh`,
+`healthcheck.sh` and `restart-bots.sh`. The external Bonsai-Image-Demo checkout,
+its models, the Hugging Face cache entries, `memory/gallery/` and
+`memory/gallery.db` were deleted from the host. The rest of this document
+records the design as it was built. Adding image generation again would start
+from a new ADR.
 
 ## Amendments (2026-06-01)
 

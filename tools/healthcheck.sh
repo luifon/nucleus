@@ -17,7 +17,7 @@ set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
-# .env for NUCLEUS_LAUNCHD_PREFIX / NUCLEUS_BONSAI_DIR / HEALTHCHECK_EXTRA_*.
+# .env for NUCLEUS_LAUNCHD_PREFIX / HEALTHCHECK_EXTRA_*.
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
 PREFIX="${NUCLEUS_LAUNCHD_PREFIX:-dev.nucleus}"
 
@@ -47,10 +47,6 @@ labels_for() {  # $1 = launchd-daemon | launchd-cron
 }
 PERSISTENT="$(labels_for launchd-daemon)"
 PERIODIC="$(labels_for launchd-cron)"
-
-# Bonsai (ADR-019) is an external image-gen backend, not an agents.toml
-# entry — checked iff the operator opted in (mirrors install.sh's gate).
-[ -n "${NUCLEUS_BONSAI_DIR:-}" ] && PERSISTENT="$PERSISTENT ${PREFIX}.bonsai"
 
 # Operator-specific extra services (tunnel daemons, sidecars) live in .env,
 # never in this committed file. Space-separated launchd labels.

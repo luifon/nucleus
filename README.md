@@ -499,7 +499,7 @@ nucleus/
 - `docs/ADR-016-agent-registry-and-log-capture.md` — `agents.toml` registry, run-log capture, `/agents` front door, distiller consolidation
 - `docs/ADR-017-skill-gap-learner.md` — autonomous skill learner (on-the-fly review + periodic gap-detection/curator), the validation gate
 - `docs/ADR-018-whatsapp-media.md` — WhatsApp media + personal document library, encrypted Drive (proposed)
-- `docs/ADR-019-image-generation-surface.md` — local Bonsai image gen + dashboard gallery
+- `docs/ADR-019-image-generation-surface.md` — local Bonsai image gen + dashboard gallery (withdrawn 2026-09-26)
 - `docs/ADR-020-architecture-hardening.md` — hardening pass: session profiles, migrations, DB ownership rule, ops pruning/rotation, typegen — and the rejected alternatives
 - `docs/ADR-021-agent-session-messaging.md` — `session-send`: the one sanctioned agent-to-agent session injection primitive (attributed, idle-gated, logged)
 - `docs/ADR-022-concurrent-browser-automation.md` — Playwright MCP isolated contexts + shared storage state; `tools/playwright-auth/` owns logins
