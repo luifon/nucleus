@@ -2007,6 +2007,41 @@ The operator's DM replies work as before: the interpreter reads decisions,
 discussion goes to the item's thread (`via = whatsapp`) and to the
 refinement agent, confirmations are asked and answered in the DM.
 
+### Review fixes (2026-09-26)
+
+- **The guard reads raw text first.** Normalization for WhatsApp
+  (`publish::plain_line`) replaces `@` with `＠` and removes formatting, so
+  an address in normalized text passes the email patterns of
+  `tools/check-secrets.sh` and of the bot's outbound filter. The guard now
+  reads each raw source before it is normalized: the whole agent reply (a hit
+  sends the notice without a preview), the raw reason of a failed or stopped
+  item, the raw issue title of a notice that uses it, and the raw issue title
+  and source name next to the pull request text. Every finished notice is
+  scanned again; a hit on the title or the notice sends the fixed
+  `notice_withheld` text ("Item #n has an update on the dashboard").
+- **Queued full messages are withdrawn.** Migration 6 marks unsent thread
+  messages in intake.db, but an earlier version may already have put full
+  thread messages in `outbound_queue`. When the bot starts, before the drain
+  runs, `withdrawLegacyThreadMessages` marks `failed` (nothing is deleted)
+  every pending or in-flight intake row that is a full thread message (source
+  `intake:<n>`, body marked `[#n] `) or is addressed to a group, and queues one
+  `intakeWithdrawn` notice per item ("Item #n has messages on the dashboard"
+  and the link), keyed so a second start queues none.
+- **No stored operator message is dropped silently.** An operator message the
+  bot stored from an item's group and the pipeline never interpreted is
+  reported in one DM message with short previews (`group_messages_dropped`,
+  "send it again") and then marked final, like the messages of an interrupted
+  chat turn.
+- **The request table stays while a creation is unknown.** The bot drops
+  `intake_group_requests` only when no old creation can still mean a group
+  that `intake_groups` does not record (a `create` claimed and sent to
+  WhatsApp, with no closed or refused group row). Such a creation is looked
+  for by its nonce at each start: none found settles it, one found is left.
+  While it stays unknown the table is kept, the start is logged, and after 3
+  starts the operator is asked in the DM to check by hand
+  (`intakeGroupRequestUnresolved`). `intake_groups` is dropped on its own
+  when no group in it is open.
+
 ### Messages typed on the dashboard
 
 `POST /intake/api/reply` stores the text in the item's thread with
