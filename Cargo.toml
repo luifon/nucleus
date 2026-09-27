@@ -58,6 +58,16 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+# The profile `tools/build.sh` builds with (cargo reserves the name `install`).
+# Its output goes to target/install-build/, which no launchd job runs.
+# build.sh copies target/install-build/nucleus, signs the copy and moves it
+# over target/release/nucleus, so the file the jobs run is never changed in
+# place: cargo hard-links target/release/nucleus to
+# target/release/deps/nucleus-<hash>, and signing that file in place made
+# macOS stop the jobs at launch with "Code Signature Invalid" (ADR-030).
+[profile.install-build]
+inherits = "release"
+
 # The issue pipeline hashes git and gh before every spawn (ADR-036); an
 # unoptimized sha2 makes that slow in debug builds and tests.
 [profile.dev.package.sha2]
