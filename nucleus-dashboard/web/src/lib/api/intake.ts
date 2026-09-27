@@ -7,6 +7,7 @@ import type { IntakeItem as IntakeItemWire } from "./generated/IntakeItem";
 import type { IntakeMessage as IntakeMessageWire } from "./generated/IntakeMessage";
 import type { IntakeDetail as IntakeDetailWire } from "./generated/IntakeDetail";
 import type { IntakeReplyReq } from "./generated/IntakeReplyReq";
+import type { IntakeReplyKind } from "./generated/IntakeReplyKind";
 import type { IntakeReplyResult as IntakeReplyResultWire } from "./generated/IntakeReplyResult";
 import type { IntakeApprovePlanReq } from "./generated/IntakeApprovePlanReq";
 import type { IntakeItemReq } from "./generated/IntakeItemReq";
@@ -21,6 +22,7 @@ export type { IntakeHiddenSource } from "./generated/IntakeHiddenSource";
 export type { IntakeEvent } from "./generated/IntakeEvent";
 export type { IntakeTransition } from "./generated/IntakeTransition";
 export type { IntakePlanVersion } from "./generated/IntakePlanVersion";
+export type { IntakeReplyKind } from "./generated/IntakeReplyKind";
 
 /** UI-layer refinement of IntakeItem.stage (the values core/src/intake/stage.rs writes). */
 export type IntakeStage =
@@ -95,11 +97,12 @@ export const getIntakeDetail = (id: number, signal?: AbortSignal) =>
 
 /** Text typed on the item page. While the item waits for the operator the
  *  server reads it like his WhatsApp messages (a decision, a confirmation
- *  question, discussion, or unclear); otherwise, and for canvas responses,
- *  it is discussion. 409 for an empty or too-long message, or when the
+ *  question, discussion, or unclear); otherwise it is discussion. A canvas
+ *  answer (`kind: "canvas"`, a click on a question the agent asked) is
+ *  always discussion. 409 for an empty or too-long message, or when the
  *  message could not be read. */
-export const replyToItem = (id: number, text: string) =>
-  jsonPost<IntakeReplyResult, IntakeReplyReq>("/intake/api/reply", { id, text });
+export const replyToItem = (id: number, text: string, kind: IntakeReplyKind = "text") =>
+  jsonPost<IntakeReplyResult, IntakeReplyReq>("/intake/api/reply", { id, text, kind });
 
 /** Yes or No to the page's open confirmation question (`question`: its
  *  id). 409 when the question is no longer open. */

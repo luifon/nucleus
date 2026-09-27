@@ -647,13 +647,15 @@ pub struct DashboardOutcome {
 /// question is stored for this page (scope `dashboard:<n>`) and shown in the
 /// thread and on the board, discussion reaches the refinement agent, and an
 /// unclear message gets the question and the option list, in the thread.
-/// Otherwise, and for a message that is only canvas responses (a click on a
-/// question the agent asked, [`decide::is_canvas_response`]), no interpreter
-/// runs: the text is discussion ([`reply`]).
+/// Otherwise no interpreter runs and the text is discussion ([`reply`]); so
+/// is every canvas answer (a click on a question the agent asked): the
+/// dashboard marks it (`kind = Canvas`), and as a second guard any text that
+/// carries a canvas-response tag, parsed or not
+/// ([`decide::is_canvas_discussion`]), is discussion too.
 ///
 /// The message has no WhatsApp timestamps: it can answer a question stored
 /// before its arrival stamp, taken before anything else.
-pub async fn dashboard_message(ctx: &Ctx, n: i64, text: &str) -> Result<DashboardOutcome> {
+pub async fn dashboard_message(ctx: &Ctx, n: i64, text: &str, kind: ReplyKind) -> Result<DashboardOutcome> {
     let arrived_at = crate::timestamp::now();
     let text = reply_text(text)?;
     let item = store::item(&ctx.db, n).await?;
@@ -661,7 +663,8 @@ pub async fn dashboard_message(ctx: &Ctx, n: i64, text: &str) -> Result<Dashboar
     let scope = origin.scope();
     let waiting = pending_for(ctx, &item).is_some_and(|p| p.waiting);
     let question = store::open_confirmation(&ctx.db, &scope, "", &arrived_at).await?.is_some();
-    if decide::is_canvas_response(text) || !(waiting || question) {
+    let canvas = kind == ReplyKind::Canvas || decide::is_canvas_discussion(text);
+    if canvas || !(waiting || question) {
         let r = reply(ctx, n, text, "dashboard").await?;
         let outcome = Outcome::Discussed { item: n, to_agent: r.reaches_agent, answer: r.note };
         return Ok(DashboardOutcome { item: r.item, outcome });
@@ -679,6 +682,17 @@ pub async fn dashboard_message(ctx: &Ctx, n: i64, text: &str) -> Result<Dashboar
         }
     };
     Ok(DashboardOutcome { item: store::item(&ctx.db, n).await?, outcome })
+}
+
+/// What the dashboard says a reply is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplyKind {
+    /// Typed in the composer.
+    #[default]
+    Text,
+    /// A canvas answer: a click on a question the agent asked. Always
+    /// discussion.
+    Canvas,
 }
 
 /// The operator's Yes or No on the dashboard board for confirmation

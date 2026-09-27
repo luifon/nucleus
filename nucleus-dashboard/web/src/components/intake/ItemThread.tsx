@@ -8,6 +8,7 @@ import {
   type IntakeItem,
   type IntakeMessage,
   type IntakeQuestion,
+  type IntakeReplyKind,
   type IntakeReplyResult,
 } from "@/lib/api";
 import { parseMessage, parseResponses, type CanvasBlockData } from "@/lib/canvas";
@@ -65,7 +66,7 @@ export default function ItemThread({
   /** A held item's hidden-content findings, shown on the board. */
   findings?: readonly IntakeHiddenFinding[];
   /** The reply call (the composer and canvas answers); tests pass a fake. */
-  post?: (id: number, text: string) => Promise<IntakeReplyResult>;
+  post?: (id: number, text: string, kind?: IntakeReplyKind) => Promise<IntakeReplyResult>;
   boardActions?: BoardActions;
   /** Whether the board or the composer shows first (tests). */
   initialMode?: "board" | "composer";
@@ -93,7 +94,7 @@ export default function ItemThread({
   const answerCanvas = async (text: string) => {
     setCanvasBusy(true);
     setCanvasError(null);
-    const r = await sendReply(item.id, text, post);
+    const r = await sendReply(item.id, text, post, "canvas");
     setCanvasBusy(false);
     if (r.kind === "sent") onSent(r.item);
     else setCanvasError(r.message);
@@ -287,7 +288,7 @@ export function Composer({
   item: IntakeItem;
   onSent: (item: IntakeItem) => void;
   /** The reply call; tests pass a fake. */
-  post?: (id: number, text: string) => Promise<IntakeReplyResult>;
+  post?: (id: number, text: string, kind?: IntakeReplyKind) => Promise<IntakeReplyResult>;
   /** A notice to show from the start (tests). */
   initialNotice?: string | null;
   /** Shows "Back to options", which returns to the decision board. */

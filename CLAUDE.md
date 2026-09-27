@@ -641,10 +641,13 @@ JSON-parsed numbers.
   goes through the same interpreter path, limited to that item, with the
   same binding and confirmation rules (questions in scope `dashboard:<n>`,
   answered by words or `POST /intake/api/answer`, ordered by stored times,
-  never by WhatsApp timestamps). Otherwise, and for canvas responses, it is
-  discussion and no interpreter starts. The refinement agent may ask
-  questions as ADR-012 canvas blocks; a click on one is discussion only and
-  never offers approve, release or cancel.
+  never by WhatsApp timestamps). Otherwise it is discussion and no
+  interpreter starts. The refinement agent may ask questions as ADR-012
+  canvas blocks, never offering approve, release or cancel; a click on one
+  is discussion only, whatever its keys contain: the page sends it with
+  `kind: "canvas"`, and as a second guard any text with a canvas-response
+  tag (parsed by `decide::canvas_text` with a real JSON payload, or
+  malformed) never reaches the interpreter.
 - Every write to `memory/intake.db` goes through `nucleus_core::intake`.
   Nucleus keeps one bare mirror per repo and one clone per item under
   `[intake] work_dir`, outside this checkout. Nucleus's own git commands

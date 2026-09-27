@@ -224,6 +224,17 @@ describe("item page", () => {
     expect(noNote.kind === "sent" && noNote.note).toBe("Saved in the thread. No agent reads it now.");
   });
 
+  test("a canvas answer is sent marked as one; typed text as text", async () => {
+    const kinds: (string | undefined)[] = [];
+    const post = async (_id: number, _text: string, kind?: string) => {
+      kinds.push(kind);
+      return fixtureReplyResult();
+    };
+    await sendReply(4, "<canvas-response v=\"1\" id=\"a\" type=\"decision\">{\"choice\":\"x\"}</canvas-response>", post, "canvas");
+    await sendReply(4, "approve the plan", post);
+    expect(kinds).toEqual(["canvas", "text"]);
+  });
+
   test("the composer reports what Nucleus did with a message", () => {
     const r = (over: Parameters<typeof fixtureReplyResult>[0]) => replyNotice(fixtureReplyResult(over));
     expect(r({ outcome: "decision", decision: "approve_plan", reaches_agent: false })).toBe("Plan approved. Implementation starts.");

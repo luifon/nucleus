@@ -11,6 +11,7 @@ import type {
   IntakeMessage,
   IntakePlanVersion,
   IntakeQuestion,
+  IntakeReplyKind,
   IntakeReplyOutcome,
   IntakeReplyResult,
   IntakeStage,
@@ -271,10 +272,11 @@ export type ReplyOutcome =
 export async function sendReply(
   id: number,
   text: string,
-  post: (id: number, text: string) => Promise<IntakeReplyResult>,
+  post: (id: number, text: string, kind?: IntakeReplyKind) => Promise<IntakeReplyResult>,
+  kind: IntakeReplyKind = "text",
 ): Promise<ReplyOutcome> {
   try {
-    const r = await post(id, text);
+    const r = await post(id, text, kind);
     return { kind: "sent", item: r.item, outcome: r.outcome, note: replyNotice(r) };
   } catch (e) {
     return { kind: "error", message: e instanceof Error ? e.message : String(e) };
