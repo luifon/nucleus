@@ -19,16 +19,17 @@ export function ActionButton({
   /** Hover colour: accent for forward actions, down for destructive ones. */
   tone?: "accent" | "down";
 }) {
-  const hover =
+  // Destructive actions are red at rest, not only on hover.
+  const colours =
     tone === "down"
-      ? "hover:border-[var(--color-status-down)] hover:text-[var(--color-status-down)]"
-      : "hover:border-[var(--color-nucleus-accent)] hover:text-[var(--color-nucleus-accent)]";
+      ? "border-[var(--color-status-down)] text-[var(--color-status-down)] hover:bg-[color-mix(in_srgb,var(--color-status-down)_12%,transparent)]"
+      : "border-[var(--color-nucleus-border)] text-[var(--color-nucleus-faint)] hover:border-[var(--color-nucleus-accent)] hover:text-[var(--color-nucleus-accent)]";
   return (
     <button
       type={type}
       onClick={onClick}
       disabled={disabled}
-      className={`flex items-center gap-1.5 rounded border border-[var(--color-nucleus-border)] px-2 py-1 text-xs text-[var(--color-nucleus-faint)] transition-colors disabled:opacity-40 ${hover}`}
+      className={`flex items-center gap-1.5 rounded border px-2 py-1 text-xs transition-colors disabled:opacity-40 ${colours}`}
     >
       {children}
     </button>
