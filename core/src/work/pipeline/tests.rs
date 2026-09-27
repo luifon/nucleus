@@ -2836,6 +2836,24 @@ async fn operator_messages_from_an_old_group_are_reported_once_and_marked_final(
 }
 
 #[tokio::test]
+async fn many_old_group_messages_are_reported_in_bounded_messages() {
+    let f = fixture().await;
+    with_plan(&f).await;
+    let group = format!("{}@{}", "120363000000000006", "g.us");
+    for i in 0..150 {
+        inbound_row(&f, "1", &group, &format!("g{i}"), &format!("an old group message number {i} with a few more words"), "text", "operator").await;
+    }
+    tick(&f).await;
+    tick(&f).await;
+    let reports: Vec<String> = outbound(&f).await.into_iter().map(|(_, b)| b).filter(|b| b.contains("no longer use WhatsApp groups")).collect();
+    assert!(reports.len() > 1 && reports.len() <= REPORT_MAX_MESSAGES, "{}", reports.len());
+    assert!(reports.iter().all(|r| r.chars().count() <= REPORT_MAX_CHARS));
+    assert!(reports.last().unwrap().contains("more, see the dashboard"), "{}", reports.last().unwrap());
+    let st = store::inbound_state(&f.ctx.db, &format!("wa:{group}:g149")).await.unwrap().unwrap();
+    assert_eq!(st.state, "failed", "every row is final once the reports are queued");
+}
+
+#[tokio::test]
 async fn a_title_with_an_email_address_blocks_the_pull_request() {
     // The PR title normalizes the issue title (`@` becomes `＠`); the guard
     // reads the raw title as well, so the address is never published.
@@ -2948,18 +2966,117 @@ async fn no_whatsapp_notice_while_the_item_page_is_open() {
     assert!(store::mark_viewed(&f.ctx.db, 1).await.unwrap());
     finish_current(&f, TaskStatus::Done, Some("===PLAN===\n1. do it\n===END PLAN==="), None).await;
     tick(&f).await;
-    assert!(outbound(&f).await.is_empty(), "the page shows the plan; WhatsApp gets nothing");
+    assert!(outbound(&f).await.is_empty(), "the page shows the plan; WhatsApp gets nothing now");
     let m = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().find(|m| m.plan_version == Some(1)).unwrap();
-    assert_eq!(m.wa_state.as_deref(), Some("none"), "the notice is not sent later either");
-    // Viewed more than two minutes ago: notices go out again.
+    assert_eq!((m.wa_state.as_deref(), m.wa_hold.as_deref()), (None, Some("viewed:refinement:1")), "the notice waits");
+    // Still viewed: it keeps waiting.
+    tick(&f).await;
+    assert!(outbound(&f).await.is_empty());
+    // Not viewed for two minutes, and nothing was done about the plan: sent.
+    viewed_long_ago(&f).await;
+    tick(&f).await;
+    let out = outbound(&f).await;
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].1.starts_with("📋 Item #1: plan v1 is ready"), "{out:?}");
+    assert!(!store::mark_viewed(&f.ctx.db, 99).await.unwrap(), "an unknown item");
+}
+
+/// The item page was last viewed longer ago than the viewing window.
+async fn viewed_long_ago(f: &Fixture) {
     let old = (chrono::Utc::now() - chrono::Duration::seconds(VIEWING_WINDOW_SECS + 5)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     sqlx::query("UPDATE items SET last_viewed_at = ?1 WHERE id = 1").bind(old).execute(&f.ctx.db).await.unwrap();
-    reply(&f.ctx, 1, "Split it", "cli").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_notice_whose_event_was_handled_on_the_page_is_never_sent() {
+    // Approved on the page while the notice waited.
+    let f = fixture().await;
+    accept(&f, 1).await;
     tick(&f).await;
-    finish_current(&f, TaskStatus::Done, Some("===PLAN===\n1. do it\n2. test\n===END PLAN==="), None).await;
+    finish_current(&f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
     tick(&f).await;
-    assert!(outbound(&f).await.last().unwrap().1.starts_with("📋 Item #1: plan v2 is ready"));
-    assert!(!store::mark_viewed(&f.ctx.db, 99).await.unwrap(), "an unknown item");
+    store::mark_viewed(&f.ctx.db, 1).await.unwrap();
+    finish_current(&f, TaskStatus::Done, Some("===PLAN===\n1. do it\n===END PLAN==="), None).await;
+    tick(&f).await;
+    approve_plan(&f.ctx, 1, Some(1), "dashboard").await.unwrap();
+    viewed_long_ago(&f).await;
+    tick(&f).await;
+    assert!(outbound(&f).await.is_empty(), "{:?}", outbound(&f).await);
+    let m = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().find(|m| m.plan_version == Some(1)).unwrap();
+    assert_eq!((m.wa_state.as_deref(), m.wa_hold.as_deref()), (Some("none"), Some("obsolete")));
+
+    // A question answered on the page while its notice waited.
+    let f = fixture().await;
+    accept(&f, 1).await;
+    tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
+    tick(&f).await;
+    store::mark_viewed(&f.ctx.db, 1).await.unwrap();
+    finish_current(&f, TaskStatus::Done, Some("Which output format?"), None).await;
+    tick(&f).await;
+    reply(&f.ctx, 1, "JSON", "dashboard").await.unwrap();
+    viewed_long_ago(&f).await;
+    tick(&f).await;
+    assert!(outbound(&f).await.is_empty(), "{:?}", outbound(&f).await);
+}
+
+#[tokio::test]
+async fn a_reopened_pull_request_returns_to_review_for_thirty_days() {
+    let f = fixture().await;
+    to_review(&f).await;
+    f.gh.set("pr view", true, &pr_view("CLOSED", None, "nucleus-bot"), "");
+    review_poll_due(&f).await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::NotMerged);
+    // Still closed: it stays not merged and keeps being read.
+    review_poll_due(&f).await;
+    tick(&f).await;
+    assert_eq!((item1(&f).await.stage(), f.gh.calls_with("pr view")), (Stage::NotMerged, 3));
+    // Reopened: back in review, open again.
+    f.gh.set("pr view", true, &pr_view("OPEN", None, "nucleus-bot"), "");
+    review_poll_due(&f).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.closed_at), (Stage::InReview, None));
+    assert!(store::messages(&f.ctx.db, 1).await.unwrap().iter().any(|m| m.body.contains("was reopened")));
+    // Closed again, then merged: merged.
+    f.gh.set("pr view", true, &pr_view("CLOSED", None, "nucleus-bot"), "");
+    review_poll_due(&f).await;
+    tick(&f).await;
+    f.gh.set("pr view", true, &pr_view("MERGED", Some("2026-09-27T10:00:00Z"), "nucleus-bot"), "");
+    review_poll_due(&f).await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Merged);
+
+    // Closed more than 30 days ago: not read any more.
+    let f = fixture().await;
+    to_review(&f).await;
+    f.gh.set("pr view", true, &pr_view("CLOSED", None, "nucleus-bot"), "");
+    review_poll_due(&f).await;
+    tick(&f).await;
+    let long_ago = (chrono::Utc::now() - chrono::Duration::days(NOT_MERGED_WATCH_DAYS + 1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    sqlx::query("UPDATE items SET closed_at = ?1 WHERE id = 1").bind(long_ago).execute(&f.ctx.db).await.unwrap();
+    f.gh.set("pr view", true, &pr_view("OPEN", None, "nucleus-bot"), "");
+    let reads = f.gh.calls_with("pr view");
+    review_poll_due(&f).await;
+    tick(&f).await;
+    assert_eq!((item1(&f).await.stage(), f.gh.calls_with("pr view")), (Stage::NotMerged, reads));
+}
+
+#[test]
+fn a_long_report_is_split_into_bounded_messages_with_the_rest_counted() {
+    let t = crate::config::WorkTexts::default();
+    let previews: Vec<String> = (0..400).map(|i| format!("\"message number {i} with some words in it\"")).collect();
+    let reports = bounded_reports(&t.group_messages_dropped, &previews);
+    assert_eq!(reports.len(), REPORT_MAX_MESSAGES);
+    assert!(reports.iter().all(|r| r.chars().count() <= REPORT_MAX_CHARS), "{:?}", reports.iter().map(|r| r.chars().count()).collect::<Vec<_>>());
+    let last = reports.last().unwrap();
+    let shown: usize = reports.iter().map(|r| r.matches("\"message number").count()).sum();
+    assert!(last.contains(&format!("and {} more, see the dashboard", 400 - shown)), "{last}");
+    // A short report is one message without a count.
+    let one = bounded_reports(&t.group_messages_dropped, &previews[..3]);
+    assert_eq!(one.len(), 1);
+    assert!(!one[0].contains("more, see the dashboard"));
 }
 
 #[tokio::test]

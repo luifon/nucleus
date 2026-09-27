@@ -761,6 +761,9 @@ pub struct WorkTexts {
     /// The review poll read the pull request as merged (`{pr_url}`).
     /// The draft PR is open and the event's source has no reply channel.
     pub comment_skipped: String,
+    /// The review poll read a pull request closed without a merge as open
+    /// again (`{pr_url}`).
+    pub pr_reopened: String,
     pub pr_merged: String,
     /// The review poll read the pull request as closed without a merge
     /// (`{pr_url}`).
@@ -919,6 +922,7 @@ impl Default for WorkTexts {
                 .into(),
             comment_posted: "💬 PR link posted on the issue".into(),
             comment_skipped: "💬 The event's source has no reply channel, so no PR link was posted. Item #{n} waits for the review.".into(),
+            pr_reopened: "▶️ Item #{n}: the pull request was reopened; it waits for the review again: {pr_url}".into(),
             pr_merged: "✅ Item #{n}: the pull request was merged: {pr_url}".into(),
             pr_not_merged: "⏹ Item #{n}: the pull request was closed without a merge: {pr_url}".into(),
             item_failed: "⚠️ Item #{n} — {title} failed during {failed_in}: {error}\nRetry from the \
@@ -1165,6 +1169,47 @@ struct TomlConfig {
     ports: PortsConfig,
 }
 
+/// Refuse a `nucleus.toml` that still uses the names from before the issue
+/// pipeline was renamed from intake to work (ADR-036). Serde ignores an
+/// unknown table, so an `[intake]` section would leave Work disabled
+/// without a word; accepting both names would keep two names for one
+/// thing. Every `nucleus` process loads settings through [`Settings::load`],
+/// so each one stops with the renames to make.
+pub fn reject_pre_rename_work_config(text: &str) -> Result<()> {
+    let value: toml::Value = match toml::from_str(text) {
+        Ok(v) => v,
+        // A file that does not parse is reported by the real load.
+        Err(_) => return Ok(()),
+    };
+    let mut found = Vec::new();
+    if let Some(intake) = value.get("intake") {
+        found.push("[intake]".to_string());
+        if let Some(t) = intake.as_table() {
+            for (k, v) in t {
+                if v.is_table() || v.as_array().is_some_and(|a| a.iter().all(toml::Value::is_table) && !a.is_empty()) {
+                    found.push(format!("[intake.{k}]"));
+                }
+            }
+        }
+        if intake.get("work_dir").is_some() {
+            found.push("intake.work_dir".into());
+        }
+    }
+    if value.get("work").and_then(|w| w.get("work_dir")).is_some() {
+        found.push("work.work_dir".into());
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "nucleus.toml uses the names from before the issue pipeline was renamed to work ({}). Rename [intake] to \
+         [work], every [intake.*] table to [work.*] (for example [[intake.repos]] to [[work.repos]], [intake.github] \
+         to [work.github], [intake.texts] to [work.texts]) and work_dir to clones_dir, then start again (ADR-036, \
+         \"Amendment: work items after the draft PR\")",
+        found.join(", ")
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct TomlDiscord {
     mention_only_in_channels: bool,
@@ -1175,6 +1220,9 @@ impl Settings {
     pub fn load() -> Result<Self> {
         use figment::providers::Format;
         let _ = dotenvy::dotenv();
+        if let Ok(text) = std::fs::read_to_string("nucleus.toml") {
+            reject_pre_rename_work_config(&text)?;
+        }
 
         let toml: TomlConfig = figment::Figment::new()
             .merge(figment::providers::Toml::file("nucleus.toml"))
@@ -1514,6 +1562,30 @@ mod workspace_root_tests {
     fn relative_root_is_rejected() {
         let err = resolve_workspace_root(Path::new("nucleus"), None).unwrap_err().to_string();
         assert!(err.contains("absolute"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod work_rename_tests {
+    use super::*;
+
+    #[test]
+    fn a_config_with_the_pre_rename_names_is_refused_with_the_renames() {
+        let old = "[intake]\nenabled = true\nwork_dir = \"~/w\"\n\n[intake.github]\ngh_bin = \"gh\"\n\n[[intake.repos]]\nrepo = \"acme/widget\"\n";
+        let e = reject_pre_rename_work_config(old).unwrap_err().to_string();
+        for name in ["[intake]", "[intake.github]", "[intake.repos]", "intake.work_dir"] {
+            assert!(e.contains(name), "{name}: {e}");
+        }
+        assert!(e.contains("Rename [intake] to [work]") && e.contains("[intake.*] table to [work.*]") && e.contains("work_dir to clones_dir"), "{e}");
+        let e = reject_pre_rename_work_config("[work]\nenabled = true\nwork_dir = \"~/w\"\n").unwrap_err().to_string();
+        assert!(e.contains("work.work_dir"), "{e}");
+    }
+
+    #[test]
+    fn the_current_names_and_the_example_are_accepted() {
+        reject_pre_rename_work_config("[work]\nenabled = true\nclones_dir = \"~/w\"\n\n[[work.repos]]\nrepo = \"acme/widget\"\n").unwrap();
+        reject_pre_rename_work_config(include_str!("../../nucleus.toml.example")).unwrap();
+        reject_pre_rename_work_config("").unwrap();
     }
 }
 

@@ -427,6 +427,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             crate::migrate::Migration { version: 9, name: "review stages", step: crate::migrate::Step::Sql(SCHEMA_V9) },
             crate::migrate::Migration { version: 10, name: "note details", step: crate::migrate::Step::Sql(SCHEMA_V10) },
             crate::migrate::Migration { version: 11, name: "last viewed", step: crate::migrate::Step::Sql(SCHEMA_V11) },
+            crate::migrate::Migration { version: 12, name: "deferred notices", step: crate::migrate::Step::Sql(SCHEMA_V12) },
         ],
     )
     .await
@@ -482,8 +483,15 @@ const SCHEMA_V10: &str = "ALTER TABLE item_messages ADD COLUMN details TEXT";
 /// item viewed within the last two minutes.
 const SCHEMA_V11: &str = "ALTER TABLE items ADD COLUMN last_viewed_at TEXT";
 
+/// Why a notice waits instead of going to WhatsApp. `viewed:<stage>:<plan
+/// version>`: the item's page was open; the notice goes out once it has
+/// not been viewed for two minutes, unless the item moved on from that
+/// stage or plan, or the operator wrote after it (then `obsolete`, and
+/// nothing is sent).
+const SCHEMA_V12: &str = "ALTER TABLE item_messages ADD COLUMN wa_hold TEXT";
+
 /// The schema version this code writes.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// True when `pool` (a read-only work.db) has the full schema: the
 /// migration ledger records [`SCHEMA_VERSION`] and the item tables exist.
@@ -888,6 +896,11 @@ pub struct ItemMessage {
     /// A Nucleus note's longer part (its body is one short line), shown
     /// collapsed. `null` for other messages and older notes.
     pub details: Option<String>,
+    /// Why its notice waits (`viewed:<stage>:<plan version>`) or was dropped
+    /// (`obsolete`). Not part of the wire type.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub wa_hold: Option<String>,
 }
 
 /// Longest first line of a Nucleus note; the rest goes to `details`.
@@ -1065,6 +1078,48 @@ pub async fn list_items(pool: &SqlitePool, open_only: bool, limit: i64) -> Resul
         .bind(limit)
         .fetch_all(pool)
         .await?)
+}
+
+/// Items whose pull request was closed without a merge less than `days`
+/// days ago: the review poll still reads them.
+pub async fn not_merged_watch_ids(pool: &SqlitePool, days: i64) -> Result<Vec<i64>> {
+    let since = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    Ok(sqlx::query_scalar("SELECT id FROM items WHERE stage = 'not_merged' AND closed_at > ?1 ORDER BY id")
+        .bind(since)
+        .fetch_all(pool)
+        .await?)
+}
+
+/// Record that notice `message_id` waits: `hold` names why and what it was
+/// about (`viewed:<stage>:<plan version>`).
+pub async fn set_wa_hold(pool: &SqlitePool, message_id: i64, hold: &str) -> Result<()> {
+    sqlx::query("UPDATE item_messages SET wa_hold = ?2 WHERE id = ?1 AND wa_state IS NULL")
+        .bind(message_id)
+        .bind(hold)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A waiting notice no longer applies (the operator acted on its event):
+/// it is not sent.
+pub async fn drop_wa_notice(pool: &SqlitePool, message_id: i64) -> Result<()> {
+    sqlx::query("UPDATE item_messages SET wa_state = 'none', wa_hold = 'obsolete' WHERE id = ?1 AND wa_state IS NULL")
+        .bind(message_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// True when the operator wrote in item `id`'s thread after message
+/// `after`.
+pub async fn operator_wrote_after(pool: &SqlitePool, id: i64, after: i64) -> Result<bool> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_messages WHERE item_id = ?1 AND author = 'operator' AND id > ?2")
+        .bind(id)
+        .bind(after)
+        .fetch_one(pool)
+        .await?;
+    Ok(n > 0)
 }
 
 /// Record that the operator has item `id`'s dashboard page open now.
@@ -1519,7 +1574,7 @@ pub async fn plan_versions(pool: &SqlitePool, id: i64) -> Result<Vec<PlanVersion
 
 pub async fn messages(pool: &SqlitePool, id: i64) -> Result<Vec<ItemMessage>> {
     Ok(sqlx::query_as(
-        "SELECT id, item_id, at, author, via, body, pending_agent, read_by_task, wa_state, notice, plan_version, details
+        "SELECT id, item_id, at, author, via, body, pending_agent, read_by_task, wa_state, notice, plan_version, details, wa_hold
            FROM item_messages WHERE item_id = ?1 ORDER BY id",
     )
     .bind(id)

@@ -561,7 +561,8 @@ JSON-parsed numbers.
   the item's own PR opened by the authenticated account) once per repo
   poll interval and moves it to `merged` or `not_merged` (terminal); a
   failed read never fails the item, and the issue closing, the label or
-  an edit do not move it.
+  an edit do not move it. A `not_merged` item is still read for 30 days:
+  a reopened PR moves it back to `in_review`, a merge to `merged`.
 - Issue text and comments go into briefs only between the nonce data
   markers of `briefs::Fence`; only collaborator comments are included.
 - Before the clone and before every agent task (eval, each refinement turn,
@@ -633,10 +634,15 @@ JSON-parsed numbers.
   secret guard first. The dashboard thread keeps the full text. Notices go
   out only for key events: a plan ready, a hold, a block, a failure, a
   draft PR, and the agent asking a question (once until the operator
-  answers). None goes out for an item whose page was open on the
-  dashboard in the last 2 minutes (`last_viewed_at`, `POST
-  /work/api/viewed`); confirmation questions for WhatsApp decisions still
-  go to WhatsApp. Plans live in `plan_versions` and the plan panel: a
+  answers). While the item's page was open on the dashboard in the last 2
+  minutes (`last_viewed_at`, `POST /work/api/viewed`) a notice waits
+  (`wa_hold`) and goes out once the page has not been viewed for 2
+  minutes, unless the operator acted on its event meanwhile (the stage or
+  plan version changed, or he wrote after it): then it is dropped.
+  Confirmation questions for WhatsApp decisions still go to WhatsApp.
+  Reports about unhandled operator messages are split into messages of at
+  most 1 500 characters, at most 5, the rest counted. A `nucleus.toml`
+  that still has `[intake]` or `work_dir` is refused at start. Plans live in `plan_versions` and the plan panel: a
   refinement reply is stored without its plan, and Nucleus notes are one
   short line plus collapsed `details`.
 - A plan reaches an agent whole or not at all: a proposed plan over

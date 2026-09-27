@@ -207,6 +207,9 @@ pub async fn tick(ctx: &Ctx, force_poll: bool) -> Result<TickReport> {
     }
     let mut ids: Vec<i64> = store::active_item_ids(&ctx.db).await?;
     ids.extend(cleanup_candidates(&ctx.db).await?);
+    // A PR closed without a merge is read again for a while (reopened or
+    // merged later).
+    ids.extend(store::not_merged_watch_ids(&ctx.db, NOT_MERGED_WATCH_DAYS).await?);
     ids.sort_unstable();
     ids.dedup();
     for id in ids {
@@ -524,18 +527,57 @@ async fn report_group_rows(ctx: &Ctx, rows: &[crate::whatsapp_queue::WorkInbound
     let Some((first, _)) = lost.first() else { return Ok(()) };
     let previews: Vec<String> =
         lost.iter().map(|(r, _)| format!("\"{}\"", clip(&publish::plain_line(&r.text, 500), TURN_PREVIEW_CHARS))).collect();
-    let body = fill(&ctx.cfg.texts.group_messages_dropped, &[("messages", &previews.join("; "))]);
-    crate::whatsapp_queue::enqueue_text_once(
-        &ctx.wa,
-        crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM,
-        &body,
-        "work:note",
-        &format!("work:group-dropped:{}", first.id),
-    )
-    .await?;
+    queue_reports(ctx, &ctx.cfg.texts.group_messages_dropped, &previews, &format!("work:group-dropped:{}", first.id)).await?;
     for (row, msg_ref) in &lost {
         store::inbound_receive(&ctx.db, msg_ref, row.id, &row.item_key).await?;
         store::inbound_finish(&ctx.db, msg_ref, "failed", Some("a message from an item's old WhatsApp group; reported to the operator"))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Longest report message about unhandled operator messages.
+pub const REPORT_MAX_CHARS: usize = 1_500;
+/// Most report messages one report sends; the rest is counted in the last.
+pub const REPORT_MAX_MESSAGES: usize = 5;
+
+/// `template` (with `{messages}`) filled with `previews`, split into
+/// messages of at most [`REPORT_MAX_CHARS`] characters, at most
+/// [`REPORT_MAX_MESSAGES`] of them; when the previews do not fit, the last
+/// message ends with "and N more, see the dashboard".
+pub fn bounded_reports(template: &str, previews: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < previews.len() && out.len() < REPORT_MAX_MESSAGES {
+        let last = out.len() + 1 == REPORT_MAX_MESSAGES;
+        let mut j = i;
+        let mut body = String::new();
+        while j < previews.len() {
+            let rest = previews.len() - (j + 1);
+            let mut list = previews[i..=j].join("; ");
+            if last && rest > 0 {
+                list.push_str(&format!("; and {rest} more, see the dashboard"));
+            }
+            let candidate = fill(template, &[("messages", &list)]);
+            // One preview always goes in (a preview is short).
+            if candidate.chars().count() > REPORT_MAX_CHARS && j > i {
+                break;
+            }
+            body = candidate;
+            j += 1;
+        }
+        out.push(body);
+        i = j;
+    }
+    out
+}
+
+/// Queue a report ([`bounded_reports`]) in the operator's DM, each message
+/// keyed from `key`, so a crash before the rows are marked queues none twice.
+async fn queue_reports(ctx: &Ctx, template: &str, previews: &[String], key: &str) -> Result<()> {
+    for (i, body) in bounded_reports(template, previews).iter().enumerate() {
+        let dedup = if i == 0 { key.to_string() } else { format!("{key}:{i}") };
+        crate::whatsapp_queue::enqueue_text_once(&ctx.wa, crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM, body, "work:note", &dedup)
             .await?;
     }
     Ok(())
@@ -858,15 +900,7 @@ async fn report_interrupted(ctx: &Ctx) -> Result<()> {
             .iter()
             .map(|(r, _)| format!("\"{}\"", clip(&publish::plain_line(&r.text, 500), TURN_PREVIEW_CHARS)))
             .collect();
-        let body = fill(&ctx.cfg.texts.interrupted_messages, &[("messages", &previews.join("; "))]);
-        crate::whatsapp_queue::enqueue_text_once(
-            &ctx.wa,
-            crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM,
-            &body,
-            "work:note",
-            &format!("work:interrupted:{}", lost[0].0.id),
-        )
-        .await?;
+        queue_reports(ctx, &ctx.cfg.texts.interrupted_messages, &previews, &format!("work:interrupted:{}", lost[0].0.id)).await?;
     }
     for (row, msg_ref) in &lost {
         store::inbound_receive(&ctx.db, msg_ref, row.id, &row.item_key).await?;
@@ -1786,15 +1820,14 @@ async fn step_item(ctx: &Ctx, item: &Item, r: &mut TickReport) {
             Stage::Refinement => step_refinement(ctx, item).await,
             Stage::Implementation => step_implementation(ctx, item).await,
             Stage::Pr => step_pr(ctx, item).await,
-            Stage::InReview => step_in_review(ctx, item).await,
+            Stage::InReview | Stage::NotMerged => step_in_review(ctx, item).await,
             Stage::Failed
             | Stage::Blocked
             | Stage::Held
             | Stage::Closed
             | Stage::Cancelled
             | Stage::Stale
-            | Stage::Merged
-            | Stage::NotMerged => Ok(()),
+            | Stage::Merged => Ok(()),
         }
     }
     .await;
@@ -2861,31 +2894,51 @@ async fn step_in_review(ctx: &Ctx, item: &Item) -> Result<()> {
         let viewer = ctx.viewer().await?.to_string();
         github::pr_state(&*ctx.gh, &item.repo, &url, &branch, &viewer).await
     };
+    let stage = item.stage();
     let state = match read.await {
         Ok(s) => s,
         Err(e) => {
             let why = format!("reading the pull request's state failed: {e:#}");
             tracing::warn!(item = item.id, why, "work: review poll");
-            store::update(&ctx.db, item.id, Stage::InReview, vec![("error", clip(&why, 1_000).into())]).await?;
+            store::update(&ctx.db, item.id, stage, vec![("error", clip(&why, 1_000).into())]).await?;
             return Ok(());
         }
     };
     let vars = item_vars(ctx, item);
-    let (ev, reason, text) = match state {
-        github::PrState::Open => {
+    let t = &ctx.cfg.texts;
+    let (ev, reason, text) = match (stage, state) {
+        (Stage::InReview, github::PrState::Open) | (Stage::NotMerged, github::PrState::Closed) => {
             if item.error.is_some() {
-                store::update(&ctx.db, item.id, Stage::InReview, vec![("error", Val::Text(None))]).await?;
+                store::update(&ctx.db, item.id, stage, vec![("error", Val::Text(None))]).await?;
             }
             return Ok(());
         }
-        github::PrState::Merged => (StageEvent::PrMerged, "the pull request was merged", &ctx.cfg.texts.pr_merged),
-        github::PrState::Closed => (StageEvent::PrClosed, "the pull request was closed without a merge", &ctx.cfg.texts.pr_not_merged),
+        (Stage::NotMerged, github::PrState::Open) => {
+            // Back in review, unless the event has another open item by now
+            // (a new label): then this item stays as it is.
+            if store::open_item_for_event(&ctx.db, item.event_id).await?.is_some() {
+                tracing::info!(item = item.id, "work: the PR was reopened, but the event has another open item");
+                return Ok(());
+            }
+            (StageEvent::PrReopened, "the pull request was reopened", &t.pr_reopened)
+        }
+        (_, github::PrState::Merged) => (StageEvent::PrMerged, "the pull request was merged", &t.pr_merged),
+        (_, github::PrState::Closed) => (StageEvent::PrClosed, "the pull request was closed without a merge", &t.pr_not_merged),
+        (_, github::PrState::Open) => return Ok(()),
     };
-    if store::advance(&ctx.db, item.id, Stage::InReview, ev, reason, vec![("error", Val::Text(None))]).await? {
+    let mut set = vec![("error", Val::Text(None))];
+    if matches!(ev, StageEvent::PrReopened) {
+        set.push(("closed_at", Val::Text(None)));
+    }
+    if store::advance(&ctx.db, item.id, stage, ev, reason, set).await? {
         note(ctx, item.id, &fill_vars(text, &vars), None).await?;
     }
     Ok(())
 }
+
+/// How long the review poll keeps reading a pull request closed without a
+/// merge, in case it is reopened or merged later.
+pub const NOT_MERGED_WATCH_DAYS: i64 = 30;
 
 // ── WhatsApp surface ─────────────────────────────────────────────────────
 
@@ -3030,17 +3083,33 @@ async fn notice_reason(ctx: &Ctx, text: &str) -> String {
 /// marks the item's surface `dm`.
 async fn flush_whatsapp(ctx: &Ctx, item: &Item) -> Result<()> {
     let mut sent = false;
-    // The operator has the item's page open: the event shows there, and
-    // WhatsApp gets nothing for it.
+    // The operator has the item's page open: the event shows there, and the
+    // notice waits. It goes out once the page has not been viewed for the
+    // window, unless the operator acted on the event meanwhile (the item
+    // left the stage or plan version the notice was about, or he wrote in
+    // the thread after it): then it no longer applies and is dropped.
     let watching = store::viewed_within(&ctx.db, item.id, VIEWING_WINDOW_SECS).await?;
+    let now_key = format!("viewed:{}:{}", item.stage, item.plan_version);
     for m in store::messages(&ctx.db, item.id).await? {
         if m.wa_state.is_some() {
             continue;
         }
-        let Some(notice) = m.notice.as_deref().filter(|n| !n.trim().is_empty() && !watching) else {
+        let Some(notice) = m.notice.as_deref().filter(|n| !n.trim().is_empty()) else {
             store::set_wa_none(&ctx.db, m.id).await?;
             continue;
         };
+        if let Some(hold) = m.wa_hold.as_deref() {
+            if hold != now_key || store::operator_wrote_after(&ctx.db, item.id, m.id).await? {
+                store::drop_wa_notice(&ctx.db, m.id).await?;
+                continue;
+            }
+        }
+        if watching {
+            if m.wa_hold.is_none() {
+                store::set_wa_hold(&ctx.db, m.id, &now_key).await?;
+            }
+            continue;
+        }
         let id = crate::whatsapp_queue::enqueue_text_once(
             &ctx.wa,
             crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM,

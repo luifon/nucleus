@@ -603,6 +603,7 @@ pub(crate) mod tests {
                 notice: None,
                 plan_version: None,
                 details: None,
+                wa_hold: None,
             },
             ItemMessage {
                 id: 2,
@@ -617,6 +618,7 @@ pub(crate) mod tests {
                 notice: None,
                 plan_version: None,
                 details: None,
+                wa_hold: None,
             },
         ];
         let r = refinement_brief(&item, &ev, &d, &thread, 2).unwrap();
@@ -650,6 +652,7 @@ pub(crate) mod tests {
             notice: None,
             plan_version,
             details: None,
+            wa_hold: None,
         }
     }
 

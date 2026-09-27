@@ -119,6 +119,8 @@ pub enum StageEvent {
     PrMerged,
     /// The poll read the item's pull request as closed without a merge.
     PrClosed,
+    /// The poll read a pull request it had seen closed as open again.
+    PrReopened,
     Failed,
     Cancel,
     /// The event was closed at its source (the issue was closed).
@@ -143,6 +145,10 @@ pub fn transition(from: Stage, ev: &StageEvent) -> Result<Stage> {
     use Stage::*;
     use StageEvent as E;
     let to = match (from, ev) {
+        // A pull request closed without a merge can be reopened or merged
+        // later: the review poll keeps reading it for a while.
+        (NotMerged, E::PrReopened) => InReview,
+        (NotMerged, E::PrMerged) => Merged,
         (s, _) if s.is_terminal() => bail!("item is {}; it does not change any more", s.as_str()),
         (Queued, E::EvalStarted) => Eval,
         (Eval, E::EvalSimple) => Implementation,
@@ -396,6 +402,8 @@ mod tests {
         ok(InReview, E::PrMerged, Merged);
         ok(InReview, E::PrClosed, NotMerged);
         ok(InReview, E::Cancel, Cancelled);
+        ok(NotMerged, E::PrReopened, InReview);
+        ok(NotMerged, E::PrMerged, Merged);
         for s in [Queued, Eval, Refinement, Implementation, Pr] {
             ok(s, E::Failed, Failed);
             ok(s, E::Cancel, Cancelled);
@@ -463,11 +471,16 @@ mod tests {
         bad(Pr, E::PrMerged);
         bad(Implementation, E::PrClosed);
         bad(Failed, E::Retry { failed_in: InReview });
-        // Terminal stages never change.
+        // Terminal stages never change, except that a not-merged PR can be
+        // reopened or merged later.
         for s in [Closed, Cancelled, Stale, Merged, NotMerged] {
             assert!(s.is_terminal());
-            for ev in [E::Cancel, E::Failed, E::SourceClosed, E::Stale, E::Retry { failed_in: Eval }, E::PrMerged, E::PrClosed] {
+            for ev in [E::Cancel, E::Failed, E::SourceClosed, E::Stale, E::Retry { failed_in: Eval }, E::PrClosed] {
                 bad(s, ev);
+            }
+            if s != NotMerged {
+                bad(s, E::PrMerged);
+                bad(s, E::PrReopened);
             }
         }
         assert!(!InReview.is_terminal());

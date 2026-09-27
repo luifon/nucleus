@@ -2280,10 +2280,31 @@ operator answers (`store::question_notified`). The new-item,
 implementation-started, released, cancelled and stopped notices and their
 texts were removed; those events stay in the thread. While the operator is
 looking the item page posts `POST /work/api/viewed` every 10 s
-(`items.last_viewed_at`, migration v11), and no notice goes out for an item
-viewed in the last 2 minutes (`VIEWING_WINDOW_SECS`); the event shows on
-the page. Confirmation questions for decisions he makes on WhatsApp still go
-to WhatsApp.
+(`items.last_viewed_at`, migration v11). A notice for an item viewed in
+the last 2 minutes (`VIEWING_WINDOW_SECS`) waits instead of going out
+(`item_messages.wa_hold = viewed:<stage>:<plan version>`, migration v12):
+each tick sends it once the page has not been viewed for 2 minutes, unless
+the operator acted on its event meanwhile, that is the item left the stage
+or plan version the notice was about (a plan approved, an item released,
+retried or cancelled) or he wrote in the thread after it; such a notice is
+dropped (`obsolete`). Confirmation questions for decisions he makes on
+WhatsApp still go to WhatsApp.
+
+### Review fixes
+
+- A `nucleus.toml` that still has `[intake]`, an `[intake.*]` table or
+  `work_dir` is refused when settings load (`reject_pre_rename_work_config`):
+  every `nucleus` process stops with the renames to make. Serde would
+  otherwise ignore the old table and leave Work disabled without a word.
+- A PR closed without a merge can come back: a `not_merged` item is still
+  read for 30 days (`NOT_MERGED_WATCH_DAYS`). Open again moves it back to
+  `in_review` (unless the event has another open item by then), merged moves
+  it to `merged`; after 30 days it is not read any more.
+- The reports about operator messages that were never handled (from old
+  groups, or from an interrupted chat turn) are split into messages of at
+  most 1 500 characters (`REPORT_MAX_CHARS`), at most 5
+  (`REPORT_MAX_MESSAGES`); the last one ends with "and N more, see the
+  dashboard". They are queued before the rows are marked final.
 
 ### Verification of the amendment
 
@@ -2304,7 +2325,11 @@ Rust: `the_legacy_database_is_renamed_once_with_its_write_ahead_log`,
 `whatsapp_gets_only_the_key_events`,
 `no_whatsapp_notice_while_the_item_page_is_open`,
 `a_confirmation_for_a_whatsapp_decision_still_goes_to_whatsapp_while_the_page_is_open`,
-`the_open_item_page_is_recorded_so_whatsapp_waits`. TypeScript: the renamed
+`the_open_item_page_is_recorded_so_whatsapp_waits`, `a_notice_whose_event_was_handled_on_the_page_is_never_sent`,
+`a_config_with_the_pre_rename_names_is_refused_with_the_renames`,
+`a_reopened_pull_request_returns_to_review_for_thirty_days`,
+`a_long_report_is_split_into_bounded_messages_with_the_rest_counted`,
+`many_old_group_messages_are_reported_in_bounded_messages`. TypeScript: the renamed
 tables and pre-rename queue sources (`work.test.ts`,
 `target_policy.test.ts`); the list filters, next-step lines, plan lines,
 note rows, sidebar groups and the `/intake` redirect (`src/lib/work.test.ts`,
