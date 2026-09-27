@@ -36,24 +36,29 @@ type RouteEntry = {
   path: string;
   label: string;
   icon: LucideIcon;
-  group: "primary" | "observability";
+  group: SidebarGroup;
   impl: "scaffolded" | "pending";
 };
 
-// ADR-015 — sidebar route inventory. Each entry becomes a page during
-// Phase 1. Icons mirror the Iconize convention from ADR-014.
-const ROUTES: RouteEntry[] = [
-  { path: "/",          label: "dashboard", icon: LayoutDashboard, group: "primary",       impl: "scaffolded" },
-  { path: "/chat",      label: "chat",      icon: MessageSquare,   group: "primary",       impl: "scaffolded" },
-  { path: "/documents", label: "documents", icon: FolderLock,      group: "primary",       impl: "scaffolded" },
-  { path: "/news",      label: "news",      icon: Newspaper,       group: "primary",       impl: "scaffolded" },
+/** The sidebar's groups, in order: what the operator uses every day, what
+ *  he manages, and what he watches. */
+export type SidebarGroup = "daily" | "manage" | "observability";
+export const SIDEBAR_GROUPS: readonly SidebarGroup[] = ["daily", "manage", "observability"];
+
+// ADR-015 — sidebar route inventory, in sidebar order within each group.
+// Icons mirror the Iconize convention from ADR-014.
+export const ROUTES: RouteEntry[] = [
+  { path: "/",          label: "dashboard", icon: LayoutDashboard, group: "daily",         impl: "scaffolded" },
+  { path: "/chat",      label: "chat",      icon: MessageSquare,   group: "daily",         impl: "scaffolded" },
+  { path: "/work",      label: "work",      icon: Inbox,           group: "daily",         impl: "scaffolded" },
+  { path: "/documents", label: "documents", icon: FolderLock,      group: "daily",         impl: "scaffolded" },
+  { path: "/news",      label: "news",      icon: Newspaper,       group: "daily",         impl: "scaffolded" },
+  { path: "/reminders", label: "reminders", icon: Bell,            group: "manage",        impl: "scaffolded" },
+  { path: "/skills",    label: "skills",    icon: Sparkles,        group: "manage",        impl: "scaffolded" },
+  { path: "/vault",     label: "vault",     icon: Database,        group: "manage",        impl: "scaffolded" },
   { path: "/agents",    label: "agents",    icon: Boxes,           group: "observability", impl: "scaffolded" },
-  { path: "/skills",    label: "skills",    icon: Sparkles,        group: "observability", impl: "scaffolded" },
-  { path: "/reminders", label: "reminders", icon: Bell,            group: "observability", impl: "scaffolded" },
   { path: "/tasks",     label: "tasks",     icon: ListChecks,      group: "observability", impl: "scaffolded" },
-  { path: "/work",    label: "work",    icon: Inbox,           group: "observability", impl: "scaffolded" },
   { path: "/diary",     label: "diary",     icon: BookOpen,        group: "observability", impl: "scaffolded" },
-  { path: "/vault",     label: "vault",     icon: Database,        group: "observability", impl: "scaffolded" },
   { path: "/usage",     label: "usage",     icon: Gauge,           group: "observability", impl: "scaffolded" },
 ];
 
@@ -61,7 +66,12 @@ const ROUTES: RouteEntry[] = [
  *  keeping the query. */
 export function LegacyWorkRedirect() {
   const { search } = useLocation();
-  return <Navigate to={`/work${search}`} replace />;
+  return <Navigate to={legacyWorkTarget(search)} replace />;
+}
+
+/** Where an old `/intake` address goes: the same query under `/work`. */
+export function legacyWorkTarget(search: string): string {
+  return `/work${search}`;
 }
 
 function PendingPage({ label, Icon }: { label: string; Icon: LucideIcon }) {
@@ -135,8 +145,6 @@ export default function App() {
 }
 
 function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const primary = ROUTES.filter((r) => r.group === "primary");
-  const observability = ROUTES.filter((r) => r.group === "observability");
 
   return (
     <nav
@@ -167,9 +175,12 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
       </div>
 
       <div className="flex-1 overflow-y-auto px-2 py-4">
-        <SidebarSection label="surfaces" items={primary} onNavigate={onClose} />
-        <div className="my-4 border-t border-[var(--color-nucleus-border)]" />
-        <SidebarSection label="observability" items={observability} onNavigate={onClose} />
+        {SIDEBAR_GROUPS.map((g, i) => (
+          <div key={g}>
+            {i > 0 && <div className="my-4 border-t border-[var(--color-nucleus-border)]" />}
+            <SidebarSection label={g} items={ROUTES.filter((r) => r.group === g)} onNavigate={onClose} />
+          </div>
+        ))}
       </div>
 
       <div className="border-t border-[var(--color-nucleus-border)] px-4 py-3 text-xs text-[var(--color-nucleus-faint)]">
