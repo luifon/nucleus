@@ -22,11 +22,12 @@ use std::path::Path;
 
 pub const DB_PATH: &str = "memory/chore_state.db";
 
-const MIGRATIONS: &[crate::migrate::Migration] = &[crate::migrate::Migration {
-    version: 1,
-    name: "adr029-chore-state",
-    step: crate::migrate::Step::Sql(
-        "CREATE TABLE IF NOT EXISTS daily_sessions (
+const MIGRATIONS: &[crate::migrate::Migration] = &[
+    crate::migrate::Migration {
+        version: 1,
+        name: "adr029-chore-state",
+        step: crate::migrate::Step::Sql(
+            "CREATE TABLE IF NOT EXISTS daily_sessions (
             key          TEXT PRIMARY KEY,
             session_date TEXT NOT NULL,
             session_id   TEXT NOT NULL
@@ -36,8 +37,19 @@ const MIGRATIONS: &[crate::migrate::Migration] = &[crate::migrate::Migration {
             value      TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )",
-    ),
-}];
+        ),
+    },
+    // ADR-036: the issue pipeline was renamed from intake to work; its
+    // GitHub poll cursors (`intake:github:<repo>`) take the new prefix, so
+    // no poll starts over.
+    crate::migrate::Migration {
+        version: 2,
+        name: "work cursor rename",
+        step: crate::migrate::Step::Sql(
+            "UPDATE OR IGNORE watermarks SET key = 'work:' || substr(key, 8) WHERE key LIKE 'intake:%'",
+        ),
+    },
+];
 
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(DB_PATH)).await?;
@@ -163,6 +175,27 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[tokio::test]
+    async fn a_pre_rename_poll_cursor_keeps_its_value_under_the_work_key() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        // A database at version 1 with a cursor written before the rename.
+        {
+            let pool = crate::db::open(&root.join(DB_PATH)).await.unwrap();
+            crate::migrate::migrate(&pool, &MIGRATIONS[..1]).await.unwrap();
+            sqlx::query("INSERT INTO watermarks (key, value, updated_at) VALUES ('intake:github:acme/widget', '2026-09-20T10:00:00Z', 't')")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO watermarks (key, value, updated_at) VALUES ('news:feed', '7', 't')").execute(&pool).await.unwrap();
+            pool.close().await;
+        }
+        assert_eq!(watermark(&root, "work:github:acme/widget").await.unwrap().as_deref(), Some("2026-09-20T10:00:00Z"));
+        assert_eq!(watermark(&root, "intake:github:acme/widget").await.unwrap(), None);
+        assert_eq!(watermark(&root, "news:feed").await.unwrap().as_deref(), Some("7"), "other keys are untouched");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

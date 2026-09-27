@@ -429,10 +429,12 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
 }
 
 /// The feature was renamed from intake to work (ADR-036): stored keys that
-/// carry the old prefix (the GitHub poll cursors `intake:github:<repo>`)
-/// take the new one, so no poll starts over.
+/// carry the old prefix (the last poll time per repo,
+/// `lastpoll:intake:github:<repo>`) take the new one. The poll cursors
+/// themselves live in chore_state.db, which migrates them the same way.
 const SCHEMA_V8: &str = "
-UPDATE OR IGNORE meta SET key = 'work:' || substr(key, 8) WHERE key LIKE 'intake:%'";
+UPDATE OR IGNORE meta SET key = 'work:' || substr(key, 8) WHERE key LIKE 'intake:%';
+UPDATE OR IGNORE meta SET key = 'lastpoll:work:' || substr(key, 17) WHERE key LIKE 'lastpoll:intake:%'";
 
 /// The schema version this code writes.
 pub const SCHEMA_VERSION: i64 = 8;
@@ -2213,13 +2215,13 @@ pub(crate) mod tests {
         {
             let raw = crate::db::open(&ws.join(LEGACY_DB_PATH)).await.unwrap();
             sqlx::query("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)").execute(&raw).await.unwrap();
-            sqlx::query("INSERT INTO meta (key, value) VALUES ('intake:github:acme/widget', '42')").execute(&raw).await.unwrap();
+            sqlx::query("INSERT INTO meta (key, value) VALUES ('lastpoll:intake:github:acme/widget', '42')").execute(&raw).await.unwrap();
             raw.close().await;
         }
         let pool = open(ws).await.unwrap();
         assert!(!ws.join(LEGACY_DB_PATH).exists());
-        assert_eq!(meta(&pool, "work:github:acme/widget").await.unwrap().as_deref(), Some("42"));
-        assert_eq!(meta(&pool, "intake:github:acme/widget").await.unwrap(), None);
+        assert_eq!(meta(&pool, "lastpoll:work:github:acme/widget").await.unwrap().as_deref(), Some("42"));
+        assert_eq!(meta(&pool, "lastpoll:intake:github:acme/widget").await.unwrap(), None);
     }
 
     #[test]
