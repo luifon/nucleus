@@ -17,6 +17,12 @@ import { ActionButton } from "./parts";
 
 type View = "plan" | "changes";
 
+/** A request to show plan `version`; a new `nonce` repeats it. */
+export interface PlanFocus {
+  version: number;
+  nonce: number;
+}
+
 export default function PlanPanel({
   item,
   versions,
@@ -24,6 +30,7 @@ export default function PlanPanel({
   act,
   defaultVersion,
   defaultView = "plan",
+  focus = null,
 }: {
   item: WorkItem;
   versions: readonly WorkPlanVersion[];
@@ -32,6 +39,8 @@ export default function PlanPanel({
   /** The version shown first; the latest when absent. */
   defaultVersion?: number;
   defaultView?: View;
+  /** A version the conversation asked to show (its "view" link). */
+  focus?: PlanFocus | null;
 }) {
   const latest = versions.length > 0 ? versions[versions.length - 1].version : null;
   const [picked, setPicked] = useState<number | null>(defaultVersion ?? null);
@@ -44,6 +53,16 @@ export default function PlanPanel({
   useEffect(() => {
     if (followLatest.current) setPicked(latest);
   }, [latest]);
+
+  // "view" on a plan line in the conversation: show that version.
+  useEffect(() => {
+    if (!focus) return;
+    followLatest.current = focus.version === latest;
+    setPicked(focus.version);
+    setView("plan");
+    setConfirm(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus?.nonce]);
 
   const idx = versions.findIndex((v) => v.version === (picked ?? latest));
   const shown = idx >= 0 ? versions[idx] : versions[versions.length - 1];

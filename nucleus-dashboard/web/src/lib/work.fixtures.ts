@@ -92,6 +92,8 @@ export function fixtureMessage(id: number, over: Partial<WorkMessage> = {}): Wor
     pending_agent: 0,
     read_by_task: null,
     wa_state: null,
+    plan_version: null,
+    details: null,
     ...over,
   };
 }

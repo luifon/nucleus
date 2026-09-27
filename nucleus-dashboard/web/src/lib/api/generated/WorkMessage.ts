@@ -20,4 +20,16 @@ pending_agent: number, read_by_task: string | null,
  * `null` (its notice is still to be sent), `queued` (the notice is in
  * the outbound queue), or `none` (nothing is sent for it).
  */
-wa_state: string | null, };
+wa_state: string | null,
+/**
+ * The plan version an agent reply proposed. The plan itself lives in
+ * `plan_versions`; the reply is stored without it (replies stored
+ * before that change still carry it between the `── plan vN ──`
+ * lines). The dashboard shows one compact line for it.
+ */
+plan_version: number | null,
+/**
+ * A Nucleus note's longer part (its body is one short line), shown
+ * collapsed. `null` for other messages and older notes.
+ */
+details: string | null, };

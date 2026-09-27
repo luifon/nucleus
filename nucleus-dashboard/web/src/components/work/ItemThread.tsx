@@ -1,5 +1,20 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Send } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  Dot,
+  FileText,
+  GitMerge,
+  GitPullRequest,
+  MessageSquare,
+  OctagonX,
+  Play,
+  Send,
+  ShieldAlert,
+  Square,
+  Wrench,
+  type LucideIcon,
+} from "lucide-react";
 import Markdown from "@/components/Markdown";
 import CanvasBlock, { CanvasFallback } from "@/components/chat/CanvasBlock";
 import {
@@ -24,6 +39,9 @@ import {
   threadAnsweredIds,
   threadBlocks,
   threadOrder,
+  agentReplyParts,
+  noteParts,
+  type NoteKind,
 } from "@/lib/work";
 import { shortTime } from "@/lib/tasks";
 import DecisionBoard, { type BoardActions } from "./DecisionBoard";
@@ -54,6 +72,9 @@ export default function ItemThread({
   post = replyToItem,
   boardActions,
   initialMode = "board",
+  onViewPlan,
+  onApprovePlan,
+  canApprove,
 }: {
   item: WorkItem;
   messages: readonly WorkMessage[];
@@ -70,6 +91,9 @@ export default function ItemThread({
   boardActions?: BoardActions;
   /** Whether the board or the composer shows first (tests). */
   initialMode?: "board" | "composer";
+  onViewPlan?: (version: number) => void;
+  onApprovePlan?: (version: number) => void;
+  canApprove?: (version: number) => boolean;
 }) {
   const ordered = threadOrder(messages);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -159,6 +183,9 @@ export default function ItemThread({
                   blocks={blocks}
                   canvasDisabled={canvasBusy || isTerminal(item.stage)}
                   onCanvasSubmit={(text) => void answerCanvas(text)}
+                  onViewPlan={onViewPlan}
+                  onApprovePlan={onApprovePlan}
+                  canApprove={canApprove}
                 />
               </li>
             ))}
@@ -189,6 +216,9 @@ export function ThreadMessage({
   blocks = NO_BLOCKS,
   canvasDisabled = true,
   onCanvasSubmit = () => {},
+  onViewPlan,
+  onApprovePlan,
+  canApprove = () => false,
 }: {
   message: WorkMessage;
   /** Ids of the canvas blocks a later operator message answered. */
@@ -199,6 +229,11 @@ export function ThreadMessage({
   canvasDisabled?: boolean;
   /** Posts a canvas block's response as the operator's reply. */
   onCanvasSubmit?: (text: string) => void;
+  /** "view" on a plan line: open the plan panel on that version. */
+  onViewPlan?: (version: number) => void;
+  /** "approve" on a plan line; shown only when `canApprove` allows it. */
+  onApprovePlan?: (version: number) => void;
+  canApprove?: (version: number) => boolean;
 }) {
   if (m.author === "operator") {
     const responses = m.body.includes("<canvas-response") ? parseResponses(m.body) : [];
@@ -230,6 +265,9 @@ export function ThreadMessage({
     );
   }
   if (m.author === "agent") {
+    // The plan never appears in the conversation: one compact line names
+    // its version; the plan panel shows it.
+    const { text, planVersion } = agentReplyParts(m);
     return (
       <div data-author="agent">
         <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-widest text-[var(--color-nucleus-faint)] opacity-70">
@@ -237,11 +275,11 @@ export function ThreadMessage({
           <span>·</span>
           <span title={m.at}>{shortTime(m.at)}</span>
         </div>
-        {m.body.includes("<canvas") ? (
+        {text.includes("<canvas") ? (
           // The agent's questions as canvas blocks (ADR-012). Its labels
           // are model text and render as plain text; a choice posts back
           // as a discussion reply, never as a decision.
-          parseMessage(m.body).map((seg, i) =>
+          parseMessage(text).map((seg, i) =>
             seg.kind === "text" ? (
               <Markdown key={i} source={seg.text} />
             ) : seg.kind === "canvas-fallback" ? (
@@ -257,16 +295,88 @@ export function ThreadMessage({
             ),
           )
         ) : (
-          <Markdown source={m.body} />
+          text && <Markdown source={text} />
+        )}
+        {planVersion !== null && (
+          <PlanLine version={planVersion} onView={onViewPlan} onApprove={canApprove(planVersion) ? onApprovePlan : undefined} />
         )}
       </div>
     );
   }
+  return <NoteRow message={m} />;
+}
+
+/** "Plan vN proposed · view · approve" under an agent reply. */
+export function PlanLine({
+  version,
+  onView,
+  onApprove,
+}: {
+  version: number;
+  onView?: (version: number) => void;
+  /** Absent when the item cannot take an approval of this version now. */
+  onApprove?: (version: number) => void;
+}) {
+  const link = "text-[var(--color-nucleus-accent)] hover:underline";
   return (
-    <div data-author="nucleus" className="border-l border-[var(--color-nucleus-border)] pl-2.5 text-[11px] leading-relaxed text-[var(--color-nucleus-faint)]">
-      <span className="uppercase tracking-widest opacity-70">nucleus · </span>
-      <span title={m.at}>{shortTime(m.at)}</span>
-      <div className="whitespace-pre-wrap break-words">{m.body}</div>
+    <div data-plan-line={version} className="mt-1.5 flex flex-wrap items-center gap-x-2 text-xs text-[var(--color-nucleus-faint)]">
+      <FileText size={12} strokeWidth={1.75} className="text-[var(--color-nucleus-accent)]" />
+      <span className="text-[var(--color-nucleus-text)]">Plan v{version} proposed</span>
+      {onView && (
+        <>
+          <span>·</span>
+          <button type="button" className={link} onClick={() => onView(version)}>
+            view
+          </button>
+        </>
+      )}
+      {onApprove && (
+        <>
+          <span>·</span>
+          <button type="button" className={link} onClick={() => onApprove(version)}>
+            approve
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+const NOTE_ICONS: Record<NoteKind, LucideIcon> = {
+  approved: Check,
+  merged: GitMerge,
+  started: Wrench,
+  pr: GitPullRequest,
+  message: MessageSquare,
+  stopped: Square,
+  failed: AlertTriangle,
+  blocked: OctagonX,
+  held: ShieldAlert,
+  released: Play,
+  plan: FileText,
+  note: Dot,
+};
+
+/** A Nucleus note as one timeline row: an icon, one short line, the time;
+ *  the details open on click. */
+export function NoteRow({ message: m }: { message: WorkMessage }) {
+  const { kind, line, details } = noteParts(m);
+  const Icon = NOTE_ICONS[kind];
+  return (
+    <div data-author="nucleus" data-note={kind} className="text-xs text-[var(--color-nucleus-faint)]">
+      <div className="flex items-start gap-2">
+        <Icon size={13} strokeWidth={1.75} className="mt-px shrink-0 text-[var(--color-nucleus-faint)]" />
+        <span className="min-w-0 flex-1 break-words text-[var(--color-nucleus-text)]">{line}</span>
+        <span className="shrink-0 text-[10px]" title={m.at}>
+          {shortTime(m.at)}
+        </span>
+      </div>
+      {details && (
+        <details className="ml-5 mt-1">
+          <summary className="cursor-pointer select-none text-[10px] uppercase tracking-widest hover:text-[var(--color-nucleus-accent)]">details</summary>
+          <div className="mt-1 whitespace-pre-wrap break-words border-l border-[var(--color-nucleus-border)] pl-2.5">{details}</div>
+        </details>
+      )}
     </div>
   );
 }

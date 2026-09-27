@@ -258,12 +258,53 @@ fn eval_text(item: &Item) -> String {
 /// dashboard)` for an older one, so old plans do not use up the history.
 fn history_body(m: &ItemMessage, latest: Option<i64>) -> String {
     let body = m.body.trim();
-    match m.plan_version {
-        Some(v) if m.author == "agent" => {
+    if m.author != "agent" {
+        return match &m.details {
+            Some(d) => format!("{body}\n{}", d.trim()),
+            None => body.to_string(),
+        };
+    }
+    // An earlier reply reaches the agent as a summary, so it does not copy
+    // its length; the plan it carried is named by its version.
+    let (text, plan) = match m.plan_version {
+        Some(v) => {
             let where_ = if latest == Some(v) { "shown in full above" } else { "see the dashboard" };
-            stage::replace_shown_plan(body, &stage::plan_label(v), &format!("(plan v{v}, {where_})"))
+            let mark = format!("(plan v{v}, {where_})");
+            // Replies stored before plans left the thread still carry it.
+            (stage::replace_shown_plan(body, &stage::plan_label(v), ""), Some(mark))
         }
-        _ => body.to_string(),
+        None => (body.to_string(), None),
+    };
+    let summary = reply_summary(text.trim());
+    match plan {
+        Some(mark) if summary.is_empty() => mark,
+        Some(mark) => format!("{summary}\n{mark}"),
+        None => summary,
+    }
+}
+
+/// Longest summary of an earlier agent reply in a refinement brief.
+pub const REPLY_SUMMARY_CHARS: usize = 300;
+
+/// An earlier agent reply as the next turn's brief shows it: its first
+/// paragraph, cut at a word boundary after at most
+/// [`REPLY_SUMMARY_CHARS`] characters, with how long the whole reply was
+/// when anything was left out.
+pub fn reply_summary(text: &str) -> String {
+    let text = text.trim();
+    let para = text.split("\n\n").next().unwrap_or_default().trim();
+    let total = text.chars().count();
+    let head = if para.chars().count() > REPLY_SUMMARY_CHARS {
+        let cut: String = para.chars().take(REPLY_SUMMARY_CHARS).collect();
+        let at = cut.rfind(char::is_whitespace).filter(|i| *i > REPLY_SUMMARY_CHARS / 2).unwrap_or(cut.len());
+        format!("{}…", cut[..at].trim_end())
+    } else {
+        para.to_string()
+    };
+    if head.chars().count() >= total {
+        head
+    } else {
+        format!("{head}\n(summary; the whole reply had {total} characters)")
     }
 }
 
@@ -336,10 +377,15 @@ pub fn refinement_brief(
 You discuss one issue with the operator (the owner of this system) until there is an \
 implementation plan the operator approves. Your working directory is a read-only checkout of \
 {repo} at its default branch; read the code you need.\n\n\
-Your final message is shown to the operator on the dashboard, as you write it; WhatsApp gets a \
-short notice with its first words. Keep it short and concrete. Ask the questions you need \
-answered, one short list at most. Write in the language of the operator's messages (English when \
-there are none).\n\n\
+Your final message is shown to the operator as you write it. Rules for it:\n\
+- At most about 6 short lines, plus the plan block when you propose a plan and one canvas block \
+for a question.\n\
+- Its first line says what you need from the operator: a decision, an answer, or nothing.\n\
+- Write about the task only. Never describe Nucleus, this pipeline, approvals or how messages are \
+read.\n\
+- Never repeat a point already made in the thread.\n\
+- Write plain, literal English: short sentences, no filler.\n\
+- When the answer is a choice, ask it as a canvas option block.\n\n\
 The dashboard can show a question as options the operator clicks. To ask one that way, put a canvas \
 block in your final message, in the format of the dashboard chat (ADR-012): a line \
 <canvas v=\"1\" type=\"TYPE\" id=\"UNIQUE-ID\" title=\"Short title\">, one JSON object, and a line \
@@ -354,9 +400,7 @@ When you have a complete plan, include it once in your final message between a l
 {PLAN_OPEN} and a line {PLAN_CLOSE}. The plan becomes the implementation agent's only brief: \
 make it self-contained (goal, the files and parts to change, the steps, the tests to add or \
 run, what is out of scope). It must be at most {PLAN_LIMIT} characters: Nucleus never cuts a plan, \
-and refuses a longer one. Nucleus labels it plan v{next} and tells the operator how to approve \
-it. Only the operator approves a plan, with a message that Nucleus reads; never state that a plan \
-is approved.\n\n\
+and refuses a longer one. It becomes plan v{next}. Never state that a plan is approved.\n\n\
 {refused}\
 Messages marked \"Operator\" come from the operator. {rules}\n\n\
 {released}\
@@ -558,6 +602,7 @@ pub(crate) mod tests {
                 wa_state: None,
                 notice: None,
                 plan_version: None,
+                details: None,
             },
             ItemMessage {
                 id: 2,
@@ -571,6 +616,7 @@ pub(crate) mod tests {
                 wa_state: None,
                 notice: None,
                 plan_version: None,
+                details: None,
             },
         ];
         let r = refinement_brief(&item, &ev, &d, &thread, 2).unwrap();
@@ -603,6 +649,7 @@ pub(crate) mod tests {
             wa_state: None,
             notice: None,
             plan_version,
+            details: None,
         }
     }
 
@@ -745,6 +792,42 @@ pub(crate) mod tests {
         assert!(!r.contains("OLD-PLAN-TEXT") && r.contains("(plan v1, see the dashboard)"), "{r}");
         assert!(r.contains("(plan v2, shown in full above)"), "{r}");
         assert_eq!(r.matches("LATEST-PLAN").count(), 1, "the latest plan appears once, in its own section");
+    }
+
+    #[test]
+    fn earlier_replies_reach_the_next_turn_as_summaries_and_the_reply_rules_are_stated() {
+        let mut item = test_item();
+        item.plan_draft = Some("LATEST-PLAN".into());
+        item.plan_version = 1;
+        let long = format!("First paragraph of the reply.\n\n{}", "LONG-DETAIL ".repeat(300));
+        // A reply stored without its plan (the plan is in plan_versions).
+        let thread = vec![
+            msg(1, "agent", &long, false, None),
+            msg(2, "agent", "Here is the plan.", false, Some(1)),
+            msg(3, "operator", "go", true, None),
+        ];
+        let r = refinement_brief(&item, &event("x"), &Discussion::default(), &thread, 3).unwrap();
+        assert!(!r.contains("LONG-DETAIL") && r.contains("First paragraph of the reply.\n(summary; the whole reply had"), "{r}");
+        assert!(r.contains("Here is the plan.\n(plan v1, shown in full above)"), "{r}");
+        for rule in [
+            "At most about 6 short lines",
+            "Its first line says what you need from the operator: a decision, an answer, or nothing.",
+            "Never describe Nucleus, this pipeline, approvals or how messages are",
+            "Never repeat a point already made in the thread.",
+            "Write plain, literal English: short sentences, no filler.",
+            "When the answer is a choice, ask it as a canvas option block.",
+        ] {
+            assert!(r.contains(rule), "{rule}");
+        }
+        assert!(!r.contains("tells the operator how to approve"), "no description of approvals");
+    }
+
+    #[test]
+    fn a_short_reply_is_its_own_summary_and_a_long_paragraph_is_cut() {
+        assert_eq!(reply_summary("Two lines.\nStill the first paragraph."), "Two lines.\nStill the first paragraph.");
+        let s = reply_summary(&"word ".repeat(200));
+        assert!(s.ends_with("(summary; the whole reply had 999 characters)"), "{s}");
+        assert!(s.lines().next().unwrap().chars().count() <= REPLY_SUMMARY_CHARS + 1);
     }
 
     #[test]

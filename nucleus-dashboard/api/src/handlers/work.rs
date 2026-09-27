@@ -6,6 +6,7 @@
 //!   POST /work/api/reply {id,text}    — text typed on the item page: read like a WhatsApp message
 //!                                         while the item waits for the operator, discussion otherwise
 //!   POST /work/api/answer {id,question,yes} — Yes or No on the board for the page's open question
+//!   POST /work/api/viewed {id}          — the item page is open (every 10 s); no WhatsApp notice for it meanwhile
 //!   POST /work/api/approve-plan {id,version}
 //!   POST /work/api/cancel {id}
 //!   POST /work/api/retry {id}
@@ -65,6 +66,7 @@ pub fn router(state: Arc<WorkState>) -> Router {
         .route("/detail", get(detail))
         .route("/reply", post(reply))
         .route("/answer", post(answer))
+        .route("/viewed", post(viewed))
         .route("/approve-plan", post(approve_plan))
         .route("/cancel", post(cancel))
         .route("/retry", post(retry))
@@ -431,6 +433,25 @@ async fn release(
     outcome(pipeline::release(&c, req.id, Some(&req.hold), "dashboard").await, &s.workspace_root)
 }
 
+/// The item page is open: record it, so the pipeline sends no WhatsApp
+/// notice for the item while the operator is looking at it
+/// (`pipeline::VIEWING_WINDOW_SECS`).
+async fn viewed(
+    State(s): State<Arc<WorkState>>,
+    headers: HeaderMap,
+    Json(req): Json<WorkItemReq>,
+) -> Result<Json<serde_json::Value>, WorkError> {
+    same_origin(&headers)?;
+    if !s.work.enabled {
+        return Err(WorkError::Conflict("work is disabled ([work] enabled = false)".into()));
+    }
+    let pool = store::open(&s.workspace_root).await.map_err(WorkError::other)?;
+    if !store::mark_viewed(&pool, req.id).await.map_err(WorkError::other)? {
+        return Err(WorkError::NotFound(req.id));
+    }
+    Ok(Json(serde_json::json!({ "viewed": true })))
+}
+
 // ─── errors ────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -722,6 +743,27 @@ mod tests {
         let status = res.status();
         let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn the_open_item_page_is_recorded_so_whatsapp_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        let st = enabled_state(dir.path());
+        let app = router(st.clone());
+        let c = ctx(&st).await.unwrap();
+        let n = hidden_item(&c, "note-v").await;
+        let post = |id: i64| {
+            axum::http::Request::post("/viewed")
+                .header("content-type", "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .body(axum::body::Body::from(format!(r#"{{"id":{id}}}"#)))
+                .unwrap()
+        };
+        assert!(!store::viewed_within(&c.db, n, 120).await.unwrap());
+        assert_eq!(app.clone().oneshot(post(n)).await.unwrap().status(), StatusCode::OK);
+        assert!(store::viewed_within(&c.db, n, 120).await.unwrap());
+        assert_eq!(app.clone().oneshot(post(9_999)).await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

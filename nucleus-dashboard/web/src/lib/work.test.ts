@@ -23,6 +23,10 @@ import {
   enterSends,
   itemFromSearch,
   itemHref,
+  nextStep,
+  stageSince,
+  agentReplyParts,
+  noteParts,
   applyFilter,
   filterFromSearch,
   filterSummary,
@@ -49,6 +53,75 @@ import {
 } from "./work";
 
 const item = fixtureItem;
+
+describe("next step", () => {
+  const at = Date.parse("2026-09-26T12:00:00.000Z");
+  const step = (over: Partial<WorkItem>, since: string | null = null, question: { decision: "cancel" } | null = null) =>
+    nextStep(item(over), { now: at, since, question });
+
+  test("the operator's turn, highlighted", () => {
+    expect(step({ plan_version: 2, plan_draft: "x" })).toEqual({ text: "Your turn: approve plan v2 or reply", tone: "mine" });
+    expect(step({})).toEqual({ text: "Your turn: answer the agent's question", tone: "mine" });
+    expect(step({ stage: "held" }).text).toBe("Your turn: review the hidden content, then release or cancel");
+    expect(step({ stage: "in_review", pr_url: "https://example.invalid/acme/widget/pull/11" })).toEqual({ text: "Your turn: review PR #11", tone: "mine" });
+    expect(step({ plan_version: 2, plan_draft: "x" }, null, { decision: "cancel" }).text).toContain("answer the question below");
+  });
+
+  test("working, with the time in the stage", () => {
+    expect(step({ stage: "eval" })).toEqual({ text: "Working: evaluation", tone: "working" });
+    expect(step({ stage: "implementation" }, "2026-09-26T11:47:00.000Z").text).toBe("Working: implementation, 13 min");
+    expect(step({ stage: "refinement", current_task_id: "t" }).text).toBe("Working: the agent is writing a reply");
+  });
+
+  test("blocked, failed and finished", () => {
+    expect(step({ stage: "blocked", error: "the secret guard found pii-email\nmore" })).toEqual({
+      text: "Blocked: the secret guard found pii-email — retry or cancel",
+      tone: "down",
+    });
+    expect(step({ stage: "failed", failed_stage: "pr", error: "tests failed" }).text).toBe("Failed in pr: tests failed — retry or cancel");
+    expect(step({ stage: "merged" })).toEqual({ text: "Merged", tone: "done" });
+    expect(step({ stage: "not_merged" }).text).toBe("Not merged");
+    expect(step({ stage: "cancelled" }).text).toBe("Cancelled");
+  });
+
+  test("the stage start is the last transition to it", () => {
+    const t = [
+      { to_stage: "refinement", at: "a" },
+      { to_stage: "implementation", at: "b" },
+      { to_stage: "refinement", at: "c" },
+    ];
+    expect(stageSince(t, "refinement")).toBe("c");
+    expect(stageSince(t, "pr")).toBeNull();
+  });
+});
+
+describe("compact thread entries", () => {
+  test("a reply stored without its plan keeps its version; an old one loses the block", () => {
+    expect(agentReplyParts({ body: "Here it is.", plan_version: 2 })).toEqual({ text: "Here it is.", planVersion: 2 });
+    const old = "Better.\n\n── plan v3 ──\n1. step\n2. step\n── end of plan v3 ──\n\nPlan v3 is ready. When it is right…";
+    expect(agentReplyParts({ body: old, plan_version: null })).toEqual({ text: "Better.\n\nPlan v3 is ready. When it is right…", planVersion: 3 });
+    expect(agentReplyParts({ body: "No plan.", plan_version: null })).toEqual({ text: "No plan.", planVersion: null });
+  });
+
+  test("a note is an icon, one line and collapsed details", () => {
+    expect(noteParts({ body: "📬 Draft PR #11 opened · tests passed", details: "https://example.invalid/pull/11\n\nsummary" })).toEqual({
+      kind: "pr",
+      line: "Draft PR #11 opened · tests passed",
+      details: "https://example.invalid/pull/11\n\nsummary",
+    });
+    expect(noteParts({ body: "✅ Plan v2 approved; implementation started.", details: null })).toEqual({
+      kind: "approved",
+      line: "Plan v2 approved; implementation started.",
+      details: null,
+    });
+    // An old note with a long text: its first line, the rest collapsed.
+    const old = noteParts({ body: `⚠️ Item #1 failed: ${"x ".repeat(120)}\nRetry from the dashboard.`, details: null });
+    expect(old.kind).toBe("failed");
+    expect(old.line.length).toBeLessThanOrEqual(161);
+    expect(old.details).toContain("Retry from the dashboard.");
+    expect(noteParts({ body: "plain note", details: null })).toEqual({ kind: "note", line: "plain note", details: null });
+  });
+});
 
 describe("list filters", () => {
   const row = (id: number, stage: WorkItem["stage"], source = "github", repo = "acme/widget") => ({ ...item({ id, stage, repo }), source });
@@ -180,6 +253,8 @@ describe("display", () => {
       pending_agent: 0,
       read_by_task: null,
       wa_state: null,
+      plan_version: null,
+      details: null,
     });
     expect(threadOrder([m(3), m(1), m(2)]).map((x) => x.id)).toEqual([1, 2, 3]);
   });

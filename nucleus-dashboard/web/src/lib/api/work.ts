@@ -111,6 +111,10 @@ export const getWorkDetail = (id: number, signal?: AbortSignal) =>
 export const replyToItem = (id: number, text: string, kind: WorkReplyKind = "text") =>
   jsonPost<WorkReplyResult, WorkReplyReq>("/work/api/reply", { id, text, kind });
 
+/** The item page is open: while it is (called every 10 s), no WhatsApp
+ *  notice goes out for the item. */
+export const markViewed = (id: number) => jsonPost<{ viewed: boolean }, WorkItemReq>("/work/api/viewed", { id });
+
 /** Yes or No to the page's open confirmation question (`question`: its
  *  id). 409 when the question is no longer open. */
 export const answerQuestion = (id: number, question: number, yes: boolean) =>

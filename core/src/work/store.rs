@@ -425,6 +425,8 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             crate::migrate::Migration { version: 7, name: "plan versions", step: crate::migrate::Step::Rust(schema_v7) },
             crate::migrate::Migration { version: 8, name: "work rename", step: crate::migrate::Step::Sql(SCHEMA_V8) },
             crate::migrate::Migration { version: 9, name: "review stages", step: crate::migrate::Step::Sql(SCHEMA_V9) },
+            crate::migrate::Migration { version: 10, name: "note details", step: crate::migrate::Step::Sql(SCHEMA_V10) },
+            crate::migrate::Migration { version: 11, name: "last viewed", step: crate::migrate::Step::Sql(SCHEMA_V11) },
         ],
     )
     .await
@@ -469,8 +471,19 @@ UPDATE items SET stage = 'in_review', closed_at = NULL, updated_at = strftime('%
 DROP TABLE v9_to_review;
 CREATE UNIQUE INDEX idx_items_open_event ON items(event_id) WHERE stage NOT IN ('closed','cancelled','stale','merged','not_merged')";
 
+/// A Nucleus note is one short line (`body`) and its longer part
+/// (`details`, shown collapsed on the dashboard). Older notes keep their
+/// whole text in `body`; the dashboard shows their first line and
+/// collapses the rest.
+const SCHEMA_V10: &str = "ALTER TABLE item_messages ADD COLUMN details TEXT";
+
+/// When the operator last had the item's page open on the dashboard (the
+/// page records it while it polls). No WhatsApp notice goes out for an
+/// item viewed within the last two minutes.
+const SCHEMA_V11: &str = "ALTER TABLE items ADD COLUMN last_viewed_at TEXT";
+
 /// The schema version this code writes.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// True when `pool` (a read-only work.db) has the full schema: the
 /// migration ledger records [`SCHEMA_VERSION`] and the item tables exist.
@@ -866,11 +879,38 @@ pub struct ItemMessage {
     /// WhatsApp DM (never the body). Not part of the dashboard's wire type.
     #[serde(skip)]
     pub notice: Option<String>,
-    /// The plan version an agent reply carried (its plan is in the body
-    /// between the `── plan vN ──` lines). Not part of the wire type: the
-    /// dashboard reads the versions from the detail's `plans`.
-    #[serde(skip)]
+    /// The plan version an agent reply proposed. The plan itself lives in
+    /// `plan_versions`; the reply is stored without it (replies stored
+    /// before that change still carry it between the `── plan vN ──`
+    /// lines). The dashboard shows one compact line for it.
+    #[ts(type = "number | null")]
     pub plan_version: Option<i64>,
+    /// A Nucleus note's longer part (its body is one short line), shown
+    /// collapsed. `null` for other messages and older notes.
+    pub details: Option<String>,
+}
+
+/// Longest first line of a Nucleus note; the rest goes to `details`.
+pub const NOTE_LINE_CHARS: usize = 160;
+
+/// A Nucleus note as one short line and its details: the first line, cut
+/// at a word boundary after at most [`NOTE_LINE_CHARS`] characters, and
+/// everything else (the cut part first).
+pub fn split_note(text: &str) -> (String, Option<String>) {
+    let text = text.trim();
+    let (first, rest) = match text.split_once('\n') {
+        Some((f, r)) => (f.trim_end(), r.trim()),
+        None => (text, ""),
+    };
+    let (line, cut) = if first.chars().count() > NOTE_LINE_CHARS {
+        let head: String = first.chars().take(NOTE_LINE_CHARS).collect();
+        let at = head.rfind(' ').filter(|i| *i > NOTE_LINE_CHARS / 2).unwrap_or(head.len());
+        (format!("{}…", head[..at].trim_end()), first[at..].trim().to_string())
+    } else {
+        (first.to_string(), String::new())
+    };
+    let details = [cut.as_str(), rest].iter().filter(|p| !p.is_empty()).copied().collect::<Vec<_>>().join("\n\n");
+    (line, (!details.is_empty()).then_some(details))
 }
 
 /// One accepted plan version of an item, whole.
@@ -1025,6 +1065,43 @@ pub async fn list_items(pool: &SqlitePool, open_only: bool, limit: i64) -> Resul
         .bind(limit)
         .fetch_all(pool)
         .await?)
+}
+
+/// Record that the operator has item `id`'s dashboard page open now.
+/// Returns false for an unknown item.
+pub async fn mark_viewed(pool: &SqlitePool, id: i64) -> Result<bool> {
+    let res = sqlx::query("UPDATE items SET last_viewed_at = ?2 WHERE id = ?1")
+        .bind(id)
+        .bind(crate::timestamp::now())
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// True when item `id`'s dashboard page was open within the last `secs`
+/// seconds.
+pub async fn viewed_within(pool: &SqlitePool, id: i64, secs: i64) -> Result<bool> {
+    let at: Option<String> =
+        sqlx::query_scalar("SELECT last_viewed_at FROM items WHERE id = ?1").bind(id).fetch_optional(pool).await?.flatten();
+    Ok(at
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+        .is_some_and(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds() < secs))
+}
+
+/// True when a question notice (an agent reply without a plan that sent,
+/// or would have sent, a WhatsApp notice) came after the operator's last
+/// message in item `id`'s thread: the operator was told once and has not
+/// answered yet.
+pub async fn question_notified(pool: &SqlitePool, id: i64) -> Result<bool> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_messages
+          WHERE item_id = ?1 AND author = 'agent' AND plan_version IS NULL AND notice IS NOT NULL
+            AND id > COALESCE((SELECT MAX(id) FROM item_messages WHERE item_id = ?1 AND author = 'operator'), 0)",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
 }
 
 /// The source of every event (`github`, `cli`, …), by event id: the item
@@ -1367,20 +1444,23 @@ async fn insert_message(
     m: &NewMessage<'_>,
     plan_version: Option<i64>,
 ) -> Result<Option<i64>> {
+    // A Nucleus note is stored as one short line and its details.
+    let (body, details) = if m.author == "nucleus" { split_note(m.body) } else { (m.body.to_string(), None) };
     let res = sqlx::query(
-        "INSERT OR IGNORE INTO item_messages (item_id, at, author, via, body, external_ref, pending_agent, wa_state, notice, plan_version)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT OR IGNORE INTO item_messages (item_id, at, author, via, body, external_ref, pending_agent, wa_state, notice, plan_version, details)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )
     .bind(id)
     .bind(crate::timestamp::now())
     .bind(m.author)
     .bind(m.via)
-    .bind(m.body)
+    .bind(&body)
     .bind(m.external_ref)
     .bind(m.pending_agent as i64)
     .bind(if m.notice.is_some() { None } else { Some("none") })
     .bind(&m.notice)
     .bind(plan_version)
+    .bind(&details)
     .execute(&mut **tx)
     .await?;
     Ok((res.rows_affected() == 1).then(|| res.last_insert_rowid()))
@@ -1439,7 +1519,7 @@ pub async fn plan_versions(pool: &SqlitePool, id: i64) -> Result<Vec<PlanVersion
 
 pub async fn messages(pool: &SqlitePool, id: i64) -> Result<Vec<ItemMessage>> {
     Ok(sqlx::query_as(
-        "SELECT id, item_id, at, author, via, body, pending_agent, read_by_task, wa_state, notice, plan_version
+        "SELECT id, item_id, at, author, via, body, pending_agent, read_by_task, wa_state, notice, plan_version, details
            FROM item_messages WHERE item_id = ?1 ORDER BY id",
     )
     .bind(id)
@@ -2276,6 +2356,41 @@ pub(crate) mod tests {
         adopt_legacy_db(ws).unwrap();
         assert_eq!(std::fs::read(ws.join(super::super::WORK_DB_PATH)).unwrap(), b"main");
         assert_eq!(std::fs::read(ws.join("memory/work.db-wal")).unwrap(), b"log");
+    }
+
+    #[test]
+    fn a_note_is_one_short_line_and_its_details() {
+        assert_eq!(split_note("✅ Plan v2 approved."), ("✅ Plan v2 approved.".into(), None));
+        assert_eq!(
+            split_note("📬 Draft PR #11 opened · tests passed\nhttps://example.invalid/pull/11\n\nThe summary."),
+            ("📬 Draft PR #11 opened · tests passed".into(), Some("https://example.invalid/pull/11\n\nThe summary.".into()))
+        );
+        let long = format!("⚠️ Item #1 failed: {}", "error text ".repeat(40));
+        let (line, details) = split_note(&long);
+        assert!(line.chars().count() <= NOTE_LINE_CHARS + 1 && line.ends_with('…'), "{line}");
+        assert!(details.unwrap().ends_with("error text"), "the cut part is kept");
+    }
+
+    #[tokio::test]
+    async fn notes_are_stored_as_a_line_and_details_other_messages_whole() {
+        let (_d, pool) = temp_db().await;
+        let e = issue(1, &["nucleus"], "open");
+        let (ev, _, _) = upsert_event(&pool, &e).await.unwrap();
+        let item = create_item(
+            &pool,
+            &NewItem { event: &ev, repo: "acme/widget", rev_title: "t", rev_body: "b", gate_event_id: "g", label_event_id: None, gate_actor: "a", gate_at: "t" },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for (author, body) in [("nucleus", "Line one\nmore"), ("agent", "Line one\nmore")] {
+            add_message(&pool, item.id, NewMessage { author, via: "pipeline", body, external_ref: None, pending_agent: false, notice: None })
+                .await
+                .unwrap();
+        }
+        let m = messages(&pool, item.id).await.unwrap();
+        assert_eq!((m[0].body.as_str(), m[0].details.as_deref()), ("Line one", Some("more")));
+        assert_eq!((m[1].body.as_str(), m[1].details.as_deref()), ("Line one\nmore", None));
     }
 
     #[tokio::test]

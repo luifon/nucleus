@@ -4,7 +4,7 @@ import { ChevronLeft, ExternalLink, GitBranch, GitPullRequest, RotateCcw, X } fr
 import InlineConfirm from "@/components/InlineConfirm";
 import StatusPill from "@/components/StatusPill";
 import { cancelItem, retryItem, type WorkEvent, type WorkItem } from "@/lib/api";
-import { canCancelItem, canRetry, stageKind, waitingOn } from "@/lib/work";
+import { canCancelItem, canRetry, stageKind, waitingOn, type NextStep } from "@/lib/work";
 import { ActionButton } from "./parts";
 
 // Top of the item page: number, title and stage; the source issue, the
@@ -17,14 +17,18 @@ export default function ItemHeader({
   event,
   busy,
   act,
+  step = null,
 }: {
   item: WorkItem;
   event: WorkEvent;
   busy: boolean;
   act: (fn: () => Promise<WorkItem>) => Promise<boolean>;
+  /** Whose turn it is (`nextStep`); the stage's waiting text when absent. */
+  step?: NextStep | null;
 }) {
   const [confirmCancel, setConfirmCancel] = useState(false);
-  const waiting = waitingOn(item);
+  const waitingText = waitingOn(item);
+  const shown: NextStep | null = step ?? (waitingText ? { text: waitingText, tone: "mine" } : null);
   const retry = canRetry(item);
   const cancel = canCancelItem(item);
 
@@ -79,9 +83,9 @@ export default function ItemHeader({
           {item.classification && <span>{item.classification}</span>}
         </div>
 
-        {(waiting || retry || cancel) && (
+        {(shown || retry || cancel) && (
           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-            {waiting && <span className="min-w-0 flex-1 text-[var(--color-nucleus-accent)]">{waiting}</span>}
+            {shown && <NextStepLine step={shown} />}
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
               {retry && (
                 <ActionButton onClick={() => void act(() => retryItem(item.id))} disabled={busy}>
@@ -129,6 +133,24 @@ export default function ItemHeader({
         />
       )}
     </header>
+  );
+}
+
+/** Whose turn it is, in one line. The operator's turn is highlighted. */
+export function NextStepLine({ step }: { step: NextStep }) {
+  const cls =
+    step.tone === "mine"
+      ? "border border-[var(--color-nucleus-accent)] bg-[color-mix(in_srgb,var(--color-nucleus-accent)_14%,transparent)] px-2 py-1 text-[var(--color-nucleus-accent)]"
+      : step.tone === "down"
+        ? "text-[var(--color-status-down)]"
+        : step.tone === "working"
+          ? "text-[var(--color-status-warn)]"
+          : "text-[var(--color-nucleus-faint)]";
+  return (
+    <span data-next-step={step.tone} className={`min-w-0 flex-1 rounded ${cls}`}>
+      {step.tone === "working" && <span aria-hidden className="mr-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--color-status-warn)] align-middle" />}
+      {step.text}
+    </span>
   );
 }
 

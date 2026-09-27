@@ -326,6 +326,19 @@ async fn inbound_dm(f: &Fixture, msg_id: &str, text: &str) -> i64 {
     inbound_row(f, "dm", "chat", msg_id, text, "text", "operator").await
 }
 
+/// A thread message's whole text: a Nucleus note's line and its details.
+fn full(m: &store::ItemMessage) -> String {
+    match &m.details {
+        Some(d) => format!("{}\n{d}", m.body),
+        None => m.body.clone(),
+    }
+}
+
+/// Every thread message of item #1, whole.
+async fn thread_texts(f: &Fixture) -> Vec<String> {
+    store::messages(&f.ctx.db, 1).await.unwrap().iter().map(full).collect()
+}
+
 async fn outbound(f: &Fixture) -> Vec<(String, String)> {
     sqlx::query_as("SELECT target, body FROM outbound_queue ORDER BY id").fetch_all(&f.ctx.wa).await.unwrap()
 }
@@ -368,7 +381,7 @@ async fn simple_issue_goes_from_work_to_a_draft_pr_and_the_pr_link_on_the_issue(
     finish_current(&f, TaskStatus::Done, Some(&eval_output("simple")), None).await;
     tick(&f).await; // eval → implementation; implementation task started
     let it = item1(&f).await;
-    assert_eq!((it.stage(), it.classification.as_deref(), it.surface.as_str()), (Stage::Implementation, Some("simple"), "dm"));
+    assert_eq!((it.stage(), it.classification.as_deref(), it.surface.as_str()), (Stage::Implementation, Some("simple"), "none"), "no notice yet, so no DM thread");
     let branch = it.branch.clone().unwrap();
     assert_eq!(branch, "nucleus/item-1");
     let imp = tasks::get(&f.ctx.tasks_db, it.current_task_id.as_deref().unwrap(), &Scope::Operator).await.unwrap();
@@ -402,20 +415,22 @@ async fn simple_issue_goes_from_work_to_a_draft_pr_and_the_pr_link_on_the_issue(
     let created = calls.iter().position(|c| c.contains("pr create")).unwrap();
     let commented = calls.iter().position(|c| c.contains("issue comment 1")).unwrap();
     assert!(created < commented, "the link is posted after the PR exists");
-    // WhatsApp got short notices in the DM: implementation started, draft
-    // PR opened. The agent's summary and the thread notes stay on the
-    // dashboard.
+    // WhatsApp got one short notice in the DM: the draft PR opened. The
+    // implementation start, the agent's summary and the thread notes stay
+    // on the dashboard.
     let out = outbound(&f).await;
     let bodies: Vec<&str> = out.iter().map(|(_, b)| b.as_str()).collect();
     assert!(out.iter().all(|(t, _)| t == "dm"), "{out:?}");
     assert_eq!(
         bodies,
-        ["🛠 Item #1: implementation started.", "📬 Item #1: draft PR opened: https://example.invalid/acme/widget/pull/5 (tests: passed)."],
+        ["📬 Item #1: draft PR opened: https://example.invalid/acme/widget/pull/5 (tests: passed)."],
         "no link without NUCLEUS_PUBLIC_URL"
     );
-    let thread: Vec<String> = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().map(|m| m.body).collect();
+    let thread = thread_texts(&f).await;
     assert!(thread.iter().any(|b| b.contains("pull/5") && b.contains("Fixed the typo in README.md. Tests pass.")), "{thread:?}");
     assert!(thread.iter().any(|b| b.contains("The draft PR link is posted on acme/widget#1")), "{thread:?}");
+    let bodies_only: Vec<String> = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().map(|m| m.body).collect();
+    assert!(bodies_only.iter().any(|b| b == "📬 Draft PR #5 opened · tests passed"), "a note is one short line: {bodies_only:?}");
     assert!(!wt.exists(), "the worktree is removed when the item closes");
     let path: Vec<String> = store::transitions(&f.ctx.db, 1).await.unwrap().into_iter().map(|t| t.to_stage).collect();
     assert_eq!(path, ["queued", "eval", "implementation", "pr", "in_review"]);
@@ -525,8 +540,8 @@ async fn the_implementation_summary_stays_on_the_dashboard() {
     let out = outbound(&f).await;
     assert!(out.iter().any(|(_, b)| b.contains("pull/5")), "the PR notice: {out:?}");
     assert!(!out.iter().any(|(_, b)| b.contains("README.md")), "no agent text on WhatsApp: {out:?}");
-    let thread = store::messages(&f.ctx.db, 1).await.unwrap();
-    let pr = thread.iter().map(|m| &m.body).find(|b| b.contains("pull/5")).expect("the PR note");
+    let thread = thread_texts(&f).await;
+    let pr = thread.iter().find(|b| b.contains("pull/5")).expect("the PR note");
     assert!(pr.contains("I changed `README.md` and *one* line (the typo)."), "the thread keeps it as written: {pr}");
 }
 
@@ -538,7 +553,7 @@ async fn complex_issue_is_refined_in_the_dm_until_the_operator_approves_the_late
     finish_current(&f, TaskStatus::Done, Some(&eval_output("feature")), None).await;
     tick(&f).await; // eval → refinement in the DM; first turn started
     let it = item1(&f).await;
-    assert_eq!((it.stage(), it.surface.as_str()), (Stage::Refinement, "dm"));
+    assert_eq!((it.stage(), it.surface.as_str()), (Stage::Refinement, "none"), "no notice for a new item");
     let first = it.current_task_id.clone().expect("the first refinement turn runs without waiting for the operator");
     let groups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'work_group%'")
         .fetch_one(&f.ctx.wa)
@@ -608,7 +623,7 @@ async fn dashboard_replies_reach_the_agent_and_the_whatsapp_thread() {
     tick(&f).await;
     finish_current(&f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
     tick(&f).await;
-    assert_eq!(item1(&f).await.surface, "dm", "the thread runs in the DM");
+    assert_eq!(item1(&f).await.surface, "none", "no notice yet: a new item sends none");
     finish_current(&f, TaskStatus::Done, Some("What should the output format be?"), None).await;
     tick(&f).await;
     assert!(reply(&f.ctx, 1, "   ", "dashboard").await.is_err());
@@ -792,7 +807,7 @@ async fn edits_after_the_label_make_the_item_stale_and_relabeling_starts_a_new_i
     assert_eq!(it.stage(), Stage::Stale);
     assert!(it.stale_reason.as_deref().unwrap().contains("changed after the gate"), "{:?}", it.stale_reason);
     assert_eq!(tasks::get(&f.ctx.tasks_db, &eval, &Scope::Operator).await.unwrap().status, "cancelled");
-    let notes: Vec<String> = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().map(|m| m.body).collect();
+    let notes = thread_texts(&f).await;
     assert!(notes.iter().any(|n| n.contains("stopped") && n.contains("`nucleus` label")), "{notes:?}");
     // The same label event never starts a second item.
     tick(&f).await;
@@ -1577,7 +1592,7 @@ async fn an_issue_with_an_html_comment_is_held_before_any_task_starts() {
     assert!(!body.contains("HTML comment") && !body.contains(".ssh"), "no finding reaches WhatsApp: {body}");
     let code = code_of(&it);
     let thread = store::messages(&f.ctx.db, 1).await.unwrap();
-    let note = &thread.iter().find(|m| m.body.contains("is held")).unwrap().body;
+    let note = &full(thread.iter().find(|m| m.body.contains("is held")).unwrap());
     assert!(note.contains("1 × HTML comment") && note.contains("body 2:1 HTML comment"), "{note}");
     assert!(note.contains("dashboard") && note.contains(&format!("hold {code}")) && note.contains("--hidden"), "{note}");
     tick(&f).await;
@@ -2490,15 +2505,15 @@ async fn a_yes_to_a_question_without_a_whatsapp_timestamp_is_asked_again() {
 #[test]
 fn a_notice_carries_the_item_link_only_when_the_public_url_is_set() {
     let t = crate::config::WorkTexts::default();
-    let with = build_notice(Some("https://dash.example.invalid/"), &t.notice_cancelled, 7, "Fix it", &[]);
-    assert_eq!(with, "⏹ Item #7 cancelled. https://dash.example.invalid/work?item=7");
-    let without = build_notice(None, &t.notice_cancelled, 7, "Fix it", &[]);
-    assert_eq!(without, "⏹ Item #7 cancelled.", "no trailing space, no link");
-    assert_eq!(build_notice(Some("  "), &t.notice_cancelled, 7, "x", &[]), without, "a blank URL is unset");
+    let with = build_notice(Some("https://dash.example.invalid/"), &t.notice_plan_ready, 7, "Fix it", &[]);
+    assert!(with.starts_with("📋 Item #7: plan v{version} is ready") && with.ends_with(" https://dash.example.invalid/work?item=7"), "{with}");
+    let without = build_notice(None, &t.notice_plan_ready, 7, "Fix it", &[]);
+    assert!(without.ends_with("tell me here."), "no trailing space, no link: {without}");
+    assert_eq!(build_notice(Some("  "), &t.notice_plan_ready, 7, "x", &[]), without, "a blank URL is unset");
     // The title is one line and at most 80 characters; a placeholder in it
     // is not filled.
-    let n = build_notice(None, &t.notice_needs_plan, 3, "Fix {link}\nand {reason} ", &[]);
-    assert_eq!(n, "🧭 Item #3 needs a plan: Fix {link} and {reason}. The agent is reading the issue.");
+    let n = build_notice(None, "Item #{n}: {title}. {link}", 3, "Fix {link}\nand {reason} ", &[]);
+    assert_eq!(n, "Item #3: Fix {link} and {reason}.");
     // A confirmation question keeps its words and gets the link.
     let p = decide::Pending {
         item: 4,
@@ -2537,18 +2552,13 @@ fn no_notice_exceeds_600_characters() {
         ("failed_in", "implementation"),
     ];
     for tpl in [
-        &t.notice_needs_plan,
         &t.notice_agent_replied,
         &t.notice_agent_replied_plain,
         &t.notice_plan_ready,
         &t.notice_held,
-        &t.notice_released,
-        &t.notice_implementation_started,
         &t.notice_pr_opened,
         &t.notice_blocked,
         &t.notice_failed,
-        &t.notice_stopped,
-        &t.notice_cancelled,
     ] {
         let n = build_notice(url, tpl, 123_456, &title, &extra);
         assert!(n.chars().count() <= 600, "{} characters: {n}", n.chars().count());
@@ -2586,13 +2596,13 @@ async fn refinement_notices_carry_a_preview_or_the_plan_version_and_the_link() {
     finish_current(&f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
     tick(&f).await;
     let link = "https://dash.example.invalid/work?item=1";
-    assert_eq!(outbound(&f).await.last().unwrap().1, format!("🧭 Item #1 needs a plan: Issue 1. The agent is reading the issue. {link}"));
+    assert!(outbound(&f).await.is_empty(), "no notice for a new item");
     let reply = format!("**Question:** should the output be JSON or CSV? {}", "More context follows here. ".repeat(20));
     finish_current(&f, TaskStatus::Done, Some(&reply), None).await;
     tick(&f).await;
     let n = outbound(&f).await.last().unwrap().1.clone();
-    assert!(n.starts_with("💬 Item #1: the agent replied: \"Question: should the output be JSON or CSV?"), "{n}");
-    assert!(n.contains("…\" Full reply on the dashboard.") && n.ends_with(link), "{n}");
+    assert!(n.starts_with("💬 Item #1: the agent asks: \"Question: should the output be JSON or CSV?"), "{n}");
+    assert!(n.contains("…\" Answer on the dashboard.") && n.ends_with(link), "{n}");
     assert!(n.chars().count() < 600);
     // A reply the secret guard stops: the notice goes without the preview.
     inbound(&f, 1, "m1", "JSON").await;
@@ -2600,7 +2610,7 @@ async fn refinement_notices_carry_a_preview_or_the_plan_version_and_the_link() {
     finish_current(&f, TaskStatus::Done, Some("Use the token FAKE-SECRET-VALUE for the API."), None).await;
     tick(&f).await;
     let n = outbound(&f).await.last().unwrap().1.clone();
-    assert_eq!(n, format!("💬 Item #1: the agent replied. Full reply on the dashboard. {link}"));
+    assert_eq!(n, format!("💬 Item #1: the agent has a question for you on the dashboard. {link}"));
     // A plan: the notice names the version, never the plan text.
     inbound(&f, 1, "m2", "go on").await;
     tick(&f).await;
@@ -2729,7 +2739,7 @@ async fn a_plan_over_the_limit_is_refused_with_a_note_and_the_next_turn_is_told(
     assert!(stopped.body.contains("refused 3 times in a row"), "{}", stopped.body);
     let out = outbound(&f).await;
     assert_eq!(out.len(), before + 1, "the operator is told once: {out:?}");
-    assert!(out.last().unwrap().1.starts_with("💬 Item #1: the agent replied"), "{out:?}");
+    assert!(out.last().unwrap().1.starts_with("💬 Item #1: the agent asks"), "{out:?}");
     // A plan within the limit is accepted and clears the refusal.
     inbound(&f, 1, "m1", "Keep it short").await;
     tick(&f).await;
@@ -2767,14 +2777,14 @@ async fn a_reply_with_an_email_address_gets_no_preview() {
     finish_current(&f, TaskStatus::Done, Some(&reply), None).await;
     tick(&f).await;
     let n = outbound(&f).await.last().unwrap().1.clone();
-    assert_eq!(n, "💬 Item #1: the agent replied. Full reply on the dashboard.", "the normalized form never passes: {n}");
+    assert_eq!(n, "💬 Item #1: the agent has a question for you on the dashboard.", "the normalized form never passes: {n}");
     assert!(!n.contains('＠') && !n.contains("someone"), "{n}");
     // The thread keeps the reply for the dashboard.
     assert!(store::messages(&f.ctx.db, 1).await.unwrap().iter().any(|m| m.body == reply));
 }
 
 #[tokio::test]
-async fn a_title_with_an_email_address_sends_the_fixed_notice() {
+async fn a_title_with_an_email_address_never_reaches_whatsapp() {
     let f = fixture().await;
     let title = format!("Mail {}@{} the report", "someone", "example.invalid");
     live_titled(&f, 1, &title, &["nucleus"], "open", "body", serde_json::json!([labeled(101, "maintainer", "2026-09-20T10:05:00Z")]), None);
@@ -2784,7 +2794,12 @@ async fn a_title_with_an_email_address_sends_the_fixed_notice() {
     tick(&f).await;
     finish_current(&f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
     tick(&f).await;
-    let n = outbound(&f).await.last().unwrap().1.clone();
+    finish_current(&f, TaskStatus::Done, Some("===PLAN===\n1. do it\n===END PLAN==="), None).await;
+    tick(&f).await;
+    let out = outbound(&f).await;
+    assert!(!out.is_empty() && out.iter().all(|(_, n)| !n.contains("someone")), "{out:?}");
+    // A template that names the title gets the fixed text.
+    let n = super::notice(&f.ctx, "Item #{n}: {title}. {link}", &item1(&f).await, &[]).await;
     assert_eq!(n, "Item #1 has an update on the dashboard.", "{n}");
 }
 
@@ -2851,9 +2866,111 @@ async fn a_public_url_the_guard_flags_does_not_replace_the_notice() {
     tick(&f).await;
     finish_current(&f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
     tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some("===PLAN===\n1. do it\n===END PLAN==="), None).await;
+    tick(&f).await;
     let n = outbound(&f).await.last().unwrap().1.clone();
-    assert!(n.starts_with("🧭 Item #1 needs a plan: Issue 1."), "{n}");
+    assert!(n.starts_with("📋 Item #1: plan v1 is ready to approve."), "{n}");
     assert!(n.ends_with("https://FAKE-SECRET-VALUE.example.invalid/work?item=1"), "{n}");
+}
+
+// ── WhatsApp: key events only (ADR-036, "Work items after the draft PR") ──
+
+#[tokio::test]
+async fn whatsapp_gets_only_the_key_events() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
+    tick(&f).await;
+    assert!(outbound(&f).await.is_empty(), "no notice for a new item: {:?}", outbound(&f).await);
+    // The agent asks a question: one notice.
+    finish_current(&f, TaskStatus::Done, Some("Which output format?"), None).await;
+    tick(&f).await;
+    let out = outbound(&f).await;
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].1.starts_with("💬 Item #1: the agent asks: \"Which output format?\""), "{out:?}");
+    // Another question before the operator answers: nothing more.
+    let m = store::messages(&f.ctx.db, 1).await.unwrap();
+    assert_eq!(m.iter().filter(|x| x.author == "agent").count(), 1);
+    // (A turn without an operator message in between: started by a
+    // message that is then removed, as a stand-in for an automatic turn.)
+    reply(&f.ctx, 1, "__nudge__", "cli").await.unwrap();
+    tick(&f).await;
+    sqlx::query("DELETE FROM item_messages WHERE body = '__nudge__'").execute(&f.ctx.db).await.unwrap();
+    finish_current(&f, TaskStatus::Done, Some("And which encoding?"), None).await;
+    tick(&f).await;
+    assert_eq!(outbound(&f).await.len(), 1, "a second question before an answer sends nothing");
+    // He answers; the next question is sent again.
+    reply(&f.ctx, 1, "JSON", "cli").await.unwrap();
+    tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some("UTF-8 or ASCII?"), None).await;
+    tick(&f).await;
+    assert_eq!(outbound(&f).await.len(), 2);
+    // A plan: notice. Approving and implementation starting: none.
+    reply(&f.ctx, 1, "UTF-8", "cli").await.unwrap();
+    tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some("===PLAN===\n1. do it\n===END PLAN==="), None).await;
+    tick(&f).await;
+    assert!(outbound(&f).await.last().unwrap().1.starts_with("📋 Item #1: plan v1 is ready"));
+    approve_plan(&f.ctx, 1, Some(1), "cli").await.unwrap();
+    tick(&f).await;
+    assert_eq!(outbound(&f).await.len(), 3, "no notice for the approval or the implementation start");
+    // Cancelled: none.
+    cancel(&f.ctx, 1, "cli").await.unwrap();
+    tick(&f).await;
+    assert_eq!(outbound(&f).await.len(), 3, "no notice for a cancel");
+    let thread: Vec<String> = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().map(|m| m.body).collect();
+    assert!(thread.iter().any(|b| b.contains("Plan v1 approved")) && thread.iter().any(|b| b.contains("cancelled")), "{thread:?}");
+}
+
+#[tokio::test]
+async fn a_plan_lives_in_its_version_never_in_the_thread() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
+    tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some("Plan below.\n===PLAN===\n1. PLAN-STEP-ONE\n===END PLAN===\nOK?"), None).await;
+    tick(&f).await;
+    let reply = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().find(|m| m.author == "agent").unwrap();
+    assert_eq!((reply.body.as_str(), reply.plan_version), ("Plan below.\n\nOK?", Some(1)));
+    assert_eq!(store::plan_versions(&f.ctx.db, 1).await.unwrap()[0].text, "1. PLAN-STEP-ONE");
+    assert!(!thread_texts(&f).await.iter().any(|b| b.contains("PLAN-STEP-ONE") || b.contains("tell me to approve")));
+}
+
+#[tokio::test]
+async fn no_whatsapp_notice_while_the_item_page_is_open() {
+    let f = fixture().await;
+    accept(&f, 1).await;
+    tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some(&eval_output("complex")), None).await;
+    tick(&f).await;
+    assert!(store::mark_viewed(&f.ctx.db, 1).await.unwrap());
+    finish_current(&f, TaskStatus::Done, Some("===PLAN===\n1. do it\n===END PLAN==="), None).await;
+    tick(&f).await;
+    assert!(outbound(&f).await.is_empty(), "the page shows the plan; WhatsApp gets nothing");
+    let m = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().find(|m| m.plan_version == Some(1)).unwrap();
+    assert_eq!(m.wa_state.as_deref(), Some("none"), "the notice is not sent later either");
+    // Viewed more than two minutes ago: notices go out again.
+    let old = (chrono::Utc::now() - chrono::Duration::seconds(VIEWING_WINDOW_SECS + 5)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    sqlx::query("UPDATE items SET last_viewed_at = ?1 WHERE id = 1").bind(old).execute(&f.ctx.db).await.unwrap();
+    reply(&f.ctx, 1, "Split it", "cli").await.unwrap();
+    tick(&f).await;
+    finish_current(&f, TaskStatus::Done, Some("===PLAN===\n1. do it\n2. test\n===END PLAN==="), None).await;
+    tick(&f).await;
+    assert!(outbound(&f).await.last().unwrap().1.starts_with("📋 Item #1: plan v2 is ready"));
+    assert!(!store::mark_viewed(&f.ctx.db, 99).await.unwrap(), "an unknown item");
+}
+
+#[tokio::test]
+async fn a_confirmation_for_a_whatsapp_decision_still_goes_to_whatsapp_while_the_page_is_open() {
+    let f = fixture().await;
+    with_plan(&f).await;
+    store::mark_viewed(&f.ctx.db, 1).await.unwrap();
+    inbound(&f, 1, "c1", "cancel it").await;
+    tick(&f).await;
+    let out = outbound(&f).await;
+    assert_eq!(out.last().unwrap().1, "Cancel item #1? Answer yes or no.", "{out:?}");
 }
 
 // ── text typed on the dashboard (ADR-036, "The decision board") ──────────
@@ -2874,7 +2991,7 @@ async fn with_plan_v2(f: &Fixture) {
 
 /// Bodies of item #1's thread messages by `author`.
 async fn thread_of(f: &Fixture, author: &str) -> Vec<(String, String)> {
-    store::messages(&f.ctx.db, 1).await.unwrap().into_iter().filter(|m| m.author == author).map(|m| (m.via, m.body)).collect()
+    store::messages(&f.ctx.db, 1).await.unwrap().iter().filter(|m| m.author == author).map(|m| (m.via.clone(), full(m))).collect()
 }
 
 #[tokio::test]
@@ -2892,13 +3009,11 @@ async fn approving_the_plan_typed_on_the_dashboard_approves_the_pending_version(
     assert_eq!(pending_of(&req), vec![(1, vec!["approve_plan".to_string(), "cancel".to_string()], Some(2))]);
     assert!(req.origin.contains("dashboard page of item #1"), "{}", req.origin);
     assert!(thread_of(&f, "operator").await.contains(&("dashboard".into(), "approve the plan".into())));
-    // Nothing answers on WhatsApp; the next tick sends the implementation
-    // notice.
+    // Nothing reaches WhatsApp: not the answer, not the implementation start.
     assert_eq!(outbound(&f).await.len(), wa_before);
     tick(&f).await;
     let out = outbound(&f).await;
-    assert_eq!(out.len(), wa_before + 1, "{out:?}");
-    assert!(out.last().unwrap().1.starts_with("🛠 Item #1: implementation started."), "{out:?}");
+    assert_eq!(out.len(), wa_before, "{out:?}");
 }
 
 #[tokio::test]
@@ -2963,7 +3078,7 @@ async fn discussion_typed_on_the_dashboard_reaches_the_agent() {
     let r = dashboard_message(&f.ctx, 1, "the other one", ReplyKind::Text).await.unwrap();
     let Outcome::Unclear { answer } = r.outcome else { panic!("{:?}", r.outcome) };
     assert!(answer.starts_with("Which plan do you mean?") && answer.contains("approve plan v3"), "{answer}");
-    assert!(thread_of(&f, "nucleus").await.iter().any(|(_, b)| b == &answer));
+    assert!(thread_of(&f, "nucleus").await.iter().any(|(_, b)| b.starts_with("Which plan do you mean?") && b.contains("approve plan v3")));
 }
 
 #[tokio::test]

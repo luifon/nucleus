@@ -629,3 +629,142 @@ export function threadBlocks(messages: readonly Pick<WorkMessage, "author" | "bo
   }
   return out;
 }
+
+// ── the next-step line ──────────────────────────────────────────────────
+
+/** The line under the item header that says whose turn it is. `tone`:
+ *  `mine` (the operator's turn, highlighted), `working`, `down` (blocked,
+ *  failed, stale) or `done`. */
+export interface NextStep {
+  text: string;
+  tone: "mine" | "working" | "down" | "done";
+}
+
+/** `…/pull/11` → `11`, or null. */
+export function prNumber(url: string | null): string | null {
+  const m = url ? /\/pull\/(\d+)\/?$/.exec(url) : null;
+  return m ? m[1] : null;
+}
+
+/** The first line of a reason, at most `max` characters. */
+function oneLine(text: string, max = 120): string {
+  const line = text.trim().split("\n")[0].trim();
+  return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
+}
+
+/** Whose turn it is, from the item's stage and data (never from model
+ *  text). `since` is when the item entered its current stage (the last
+ *  transition to it), for the working time. */
+export function nextStep(
+  item: Pick<WorkItem, "stage" | "plan_version" | "plan_draft" | "current_task_id" | "pr_url" | "error" | "stale_reason" | "failed_stage">,
+  opts: { now: number; since: string | null; question: { decision: WorkDecision } | null },
+): NextStep {
+  if (opts.question && isOpenItem(item.stage)) return { text: "Your turn: answer the question below with Yes or No", tone: "mine" };
+  const minutes = opts.since ? Math.floor((opts.now - Date.parse(opts.since)) / 60_000) : NaN;
+  const took = Number.isFinite(minutes) && minutes >= 1 ? `, ${minutes} min` : "";
+  switch (item.stage) {
+    case "refinement":
+      if (item.current_task_id) return { text: `Working: the agent is writing a reply${took}`, tone: "working" };
+      if (item.plan_version > 0 && item.plan_draft !== null) {
+        return { text: `Your turn: approve plan v${item.plan_version} or reply`, tone: "mine" };
+      }
+      return { text: "Your turn: answer the agent's question", tone: "mine" };
+    case "held":
+      return { text: "Your turn: review the hidden content, then release or cancel", tone: "mine" };
+    case "in_review": {
+      const n = prNumber(item.pr_url);
+      return { text: `Your turn: review ${n ? `PR #${n}` : "the pull request"}`, tone: "mine" };
+    }
+    case "queued":
+      return { text: `Working: preparing${took}`, tone: "working" };
+    case "eval":
+      return { text: `Working: evaluation${took}`, tone: "working" };
+    case "implementation":
+      return { text: `Working: implementation${took}`, tone: "working" };
+    case "pr":
+      return { text: `Working: tests and the draft pull request${took}`, tone: "working" };
+    case "blocked":
+      return { text: `Blocked: ${oneLine(item.error ?? "a check stopped a publishing step")} — retry or cancel`, tone: "down" };
+    case "failed":
+      return { text: `Failed in ${item.failed_stage ?? "?"}: ${oneLine(item.error ?? "a step failed")} — retry or cancel`, tone: "down" };
+    case "stale":
+      return { text: `Stale: ${oneLine(item.stale_reason ?? "the issue changed")}`, tone: "down" };
+    case "merged":
+      return { text: "Merged", tone: "done" };
+    case "not_merged":
+      return { text: "Not merged", tone: "done" };
+    case "cancelled":
+      return { text: "Cancelled", tone: "done" };
+    case "closed":
+      return { text: "Closed", tone: "done" };
+  }
+}
+
+/** When the item entered its current stage: the last transition to it. */
+export function stageSince(transitions: readonly { to_stage: string; at: string }[], stage: WorkStage): string | null {
+  for (let i = transitions.length - 1; i >= 0; i--) if (transitions[i].to_stage === stage) return transitions[i].at;
+  return null;
+}
+
+// ── compact thread entries ──────────────────────────────────────────────
+
+const PLAN_BLOCK = /── plan v(\d+) ──[\s\S]*?── end of plan v\1 ──/;
+
+/** An agent reply without its plan: the text, and the plan version it
+ *  proposed (the message's `plan_version`, or, for a reply stored before
+ *  plans left the thread, the version of the plan block in its text). */
+export function agentReplyParts(m: Pick<WorkMessage, "body" | "plan_version">): { text: string; planVersion: number | null } {
+  const found = PLAN_BLOCK.exec(m.body);
+  const text = (found ? m.body.replace(PLAN_BLOCK, "") : m.body).replace(/\n{3,}/g, "\n\n").trim();
+  return { text, planVersion: m.plan_version ?? (found ? Number(found[1]) : null) };
+}
+
+/** The kind of a Nucleus note, for its icon: from the code-owned text's
+ *  leading symbol. */
+export type NoteKind = "approved" | "started" | "pr" | "message" | "stopped" | "failed" | "blocked" | "held" | "released" | "plan" | "merged" | "note";
+
+const NOTE_SYMBOLS: readonly [string, NoteKind][] = [
+  ["✅", "approved"],
+  ["🛠", "started"],
+  ["📬", "pr"],
+  ["💬", "message"],
+  ["⏹", "stopped"],
+  ["⛔", "stopped"],
+  ["⚠️", "failed"],
+  ["🛑", "blocked"],
+  ["🔍", "held"],
+  ["▶️", "released"],
+  ["🧭", "plan"],
+  ["📋", "plan"],
+];
+
+/** A Nucleus note as one timeline row: its kind (for the icon), one short
+ *  line without the leading symbol, and the rest (collapsed). A note stored
+ *  before notes had details shows its first line; the rest is the details. */
+export function noteParts(m: Pick<WorkMessage, "body" | "details">): { kind: NoteKind; line: string; details: string | null } {
+  let line = m.body.trim();
+  let details = m.details?.trim() || null;
+  if (m.details === null || m.details === undefined) {
+    const [first, ...rest] = line.split("\n");
+    line = first.trim();
+    const more = rest.join("\n").trim();
+    if (line.length > 160) {
+      const cut = line.lastIndexOf(" ", 160);
+      const at = cut > 80 ? cut : 160;
+      details = [line.slice(at).trim(), more].filter(Boolean).join("\n\n") || null;
+      line = `${line.slice(0, at).trimEnd()}…`;
+    } else {
+      details = more || null;
+    }
+  }
+  let kind: NoteKind = "note";
+  for (const [sym, k] of NOTE_SYMBOLS) {
+    if (line.startsWith(sym)) {
+      kind = k;
+      line = line.slice(sym.length).replace(/^️/, "").trim();
+      break;
+    }
+  }
+  if (kind === "approved" && /merged/i.test(line)) kind = "merged";
+  return { kind, line, details };
+}

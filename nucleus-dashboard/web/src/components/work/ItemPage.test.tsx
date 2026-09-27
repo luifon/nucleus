@@ -213,6 +213,54 @@ describe("plan version selector", () => {
   });
 });
 
+describe("the item page reads at a glance", () => {
+  const plans = fixturePlans("# Plan\n\n1. PLAN-STEP-ONE", "# Plan\n\n1. PLAN-STEP-ONE\n2. PLAN-STEP-TWO");
+  const withPlan = fixtureItem({ stage: "refinement", plan_version: 2, plan_draft: "# Plan\n\n1. PLAN-STEP-ONE\n2. PLAN-STEP-TWO" });
+
+  test("the next-step line says whose turn it is, highlighted for the operator", () => {
+    const html = render(<ItemScreen detail={fixtureDetail(withPlan, { plans })} onChange={noop} />);
+    expect(html).toContain('data-next-step="mine"');
+    expect(html).toContain("Your turn: approve plan v2 or reply");
+    const review = render(
+      <ItemScreen detail={fixtureDetail(fixtureItem({ stage: "in_review", pr_url: "https://example.invalid/acme/widget/pull/11" }), { plans })} onChange={noop} />,
+    );
+    expect(review).toContain("Your turn: review PR #11");
+    const working = render(<ItemScreen detail={fixtureDetail(fixtureItem({ stage: "eval" }))} onChange={noop} />);
+    expect(working).toContain('data-next-step="working"');
+    expect(working).toContain("Working: evaluation");
+  });
+
+  test("a plan never appears in the chat: a compact line with view and approve", () => {
+    const messages = [
+      fixtureMessage(1, { author: "agent", body: "Here is v1.", plan_version: 1 }),
+      // Stored before plans left the thread: the block collapses into the line.
+      fixtureMessage(2, { author: "agent", body: "v2.\n\n── plan v2 ──\n1. PLAN-STEP-ONE\n2. PLAN-STEP-TWO\n── end of plan v2 ──" }),
+    ];
+    const html = render(
+      <ItemThread item={withPlan} messages={messages} visible onSent={noop} onViewPlan={noop} onApprovePlan={noop} canApprove={(v) => v === 2} />,
+    );
+    const thread = html.split('data-author="agent"').slice(1).join("");
+    expect(thread).not.toContain("PLAN-STEP");
+    expect(html).toContain('data-plan-line="1"');
+    expect(html).toContain('data-plan-line="2"');
+    const lines = [...html.matchAll(/data-plan-line="(\d)"[\s\S]*?<\/div>/g)].map((m) => buttons(m[0]));
+    expect(lines).toEqual([["view"], ["view", "approve"]]);
+  });
+
+  test("pipeline events are one-line rows with collapsed details", () => {
+    const messages = [
+      fixtureMessage(1, { author: "nucleus", body: "📬 Draft PR #11 opened · tests passed", details: "https://example.invalid/pull/11\n\nSUMMARY-TEXT" }),
+      fixtureMessage(2, { author: "nucleus", body: "✅ Plan v2 approved; implementation started." }),
+    ];
+    const html = render(<ItemThread item={fixtureItem({ stage: "implementation" })} messages={messages} visible onSent={noop} />);
+    expect(html).toContain('data-note="pr"');
+    expect(html).toContain("Draft PR #11 opened · tests passed");
+    expect(html).toMatch(/<details[^>]*><summary[^>]*>details<\/summary>[\s\S]*SUMMARY-TEXT/);
+    expect(html).toContain('data-note="approved"');
+    expect(html).not.toContain("📬");
+  });
+});
+
 describe("list filters", () => {
   const rows = [
     { ...fixtureItem({ id: 1, stage: "refinement" }), source: "github" },

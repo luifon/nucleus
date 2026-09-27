@@ -1,18 +1,20 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { ChevronLeft } from "lucide-react";
 import Tabs from "@/components/Tabs";
 import { useFetch, usePollWhile } from "@/lib/hooks";
-import { getWorkDetail, type WorkDetail, type WorkItem } from "@/lib/api";
-import { isOpenItem, planVersions, threadOrder } from "@/lib/work";
+import { approvePlan, getWorkDetail, markViewed, type WorkDetail, type WorkItem } from "@/lib/api";
+import { canApproveShown, isOpenItem, nextStep, planVersions, stageSince, threadOrder } from "@/lib/work";
 import ItemDetails from "./ItemDetails";
 import ItemHeader from "./ItemHeader";
 import ItemThread from "./ItemThread";
-import PlanPanel from "./PlanPanel";
+import PlanPanel, { type PlanFocus } from "./PlanPanel";
 
 // The item page (`/work?item=<n>`, ADR-036): where the operator reads
 // the plan, discusses it with the refinement agent and decides. The
-// detail is refetched every DETAIL_POLL_MS while the item is not finished.
+// detail is refetched every DETAIL_POLL_MS while the item is not finished,
+// and the page tells the server it is open (VIEWED_PING_MS), so no
+// WhatsApp notice goes out for the item while the operator is looking.
 //
 // Layout: below the xl breakpoint one pane at a time (conversation, plan,
 // details) under a tab strip, so a phone gets the full width for each; at
@@ -20,6 +22,7 @@ import PlanPanel from "./PlanPanel";
 // details on the right.
 
 export const DETAIL_POLL_MS = 10_000;
+export const VIEWED_PING_MS = 10_000;
 
 type Pane = "thread" | "plan" | "details";
 type Side = "plan" | "details";
@@ -28,6 +31,17 @@ export default function ItemView({ itemId, onChange }: { itemId: number; onChang
   const detail = useFetch((signal) => getWorkDetail(itemId, signal), [itemId]);
   const item = detail.data?.item;
   usePollWhile(detail.refetch, !!item && isOpenItem(item.stage), DETAIL_POLL_MS);
+
+  // "The operator is looking": now and every 10 s while the page is open
+  // and visible. A failed ping only means WhatsApp may get a notice.
+  useEffect(() => {
+    const ping = () => {
+      if (typeof document === "undefined" || document.visibilityState === "visible") void markViewed(itemId).catch(() => {});
+    };
+    ping();
+    const t = setInterval(ping, VIEWED_PING_MS);
+    return () => clearInterval(t);
+  }, [itemId]);
 
   if (!detail.data || detail.data.item.id !== itemId) {
     return (
@@ -65,11 +79,14 @@ export function ItemScreen({
   refreshError = null,
   onChange,
   defaultPane,
+  now = Date.now(),
 }: {
   detail: WorkDetail;
   refreshError?: string | null;
   onChange: (item: WorkItem) => void;
   defaultPane?: Pane;
+  /** The clock (tests). */
+  now?: number;
 }) {
   const { item } = detail;
   const versions = planVersions(detail);
@@ -79,7 +96,9 @@ export function ItemScreen({
   const [side, setSide] = useState<Side>(defaultPane === "plan" || defaultPane === "details" ? defaultPane : initialSide);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const now = Date.now();
+  // A "view" in the conversation opens the plan panel on that version.
+  const [focus, setFocus] = useState<PlanFocus | null>(null);
+  const step = nextStep(item, { now, since: stageSince(detail.transitions, item.stage), question: detail.question });
 
   const act = async (fn: () => Promise<WorkItem>): Promise<boolean> => {
     setBusy(true);
@@ -101,10 +120,15 @@ export function ItemScreen({
   };
   const latest = versions.length > 0 ? versions[versions.length - 1].version : null;
   const planLabel = latest !== null ? `plan v${latest}` : "plan";
+  const viewPlan = (version: number) => {
+    setFocus({ version, nonce: Date.now() });
+    choose("plan");
+  };
+  const approve = (version: number) => void act(() => approvePlan(item.id, version));
 
   const sideContent =
     side === "plan" ? (
-      <PlanPanel item={item} versions={versions} busy={busy} act={act} />
+      <PlanPanel item={item} versions={versions} busy={busy} act={act} focus={focus} />
     ) : (
       <div className="min-h-0 flex-1 overflow-y-auto">
         <ItemDetails detail={detail} now={now} busy={busy} act={act} />
@@ -113,7 +137,7 @@ export function ItemScreen({
 
   return (
     <div className="flex h-full min-h-0 flex-col" data-item-id={item.id}>
-      <ItemHeader item={item} event={detail.event} busy={busy} act={act} />
+      <ItemHeader item={item} event={detail.event} busy={busy} act={act} step={step} />
       {(err || refreshError) && (
         <div role="alert" className="shrink-0 border-b border-[var(--color-status-down)] bg-[color-mix(in_srgb,var(--color-status-down)_15%,var(--color-nucleus-surface))] px-4 py-2 text-xs text-[var(--color-status-down)] md:px-5">
           {err ?? `refresh failed: ${refreshError}`}
@@ -135,7 +159,17 @@ export function ItemScreen({
 
       <div className="flex min-h-0 flex-1 xl:grid xl:grid-cols-2">
         <section aria-label="conversation" className={`${pane === "thread" ? "flex" : "hidden"} min-h-0 min-w-0 flex-1 flex-col xl:flex xl:border-r xl:border-[var(--color-nucleus-border)]`}>
-          <ItemThread item={item} messages={messages} visible={pane === "thread"} onSent={onChange} question={detail.question} findings={detail.hidden} />
+          <ItemThread
+            item={item}
+            messages={messages}
+            visible={pane === "thread"}
+            onSent={onChange}
+            question={detail.question}
+            findings={detail.hidden}
+            onViewPlan={viewPlan}
+            onApprovePlan={approve}
+            canApprove={(v) => canApproveShown(item, v) && !busy}
+          />
         </section>
         <section aria-label={side} className={`${pane === "thread" ? "hidden" : "flex"} min-h-0 min-w-0 flex-1 flex-col xl:flex`}>
           <div className="hidden shrink-0 px-2 xl:block">

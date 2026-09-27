@@ -1514,8 +1514,7 @@ async fn approve_plan_caused(ctx: &Ctx, n: i64, version: Option<u32>, via: &str,
         return refuse(format!("Item #{n} changed while approving (a new plan, or the agent started a reply); look at it again."));
     }
     let item = store::item(&ctx.db, n).await?;
-    let notice = notice(ctx, &ctx.cfg.texts.notice_implementation_started, &item, &[]).await;
-    note(ctx, n, &fill_vars(&ctx.cfg.texts.plan_approved, &item_vars(ctx, &item)), Some(notice)).await?;
+    note(ctx, n, &fill_vars(&ctx.cfg.texts.plan_approved, &item_vars(ctx, &item)), None).await?;
     Ok(item)
 }
 
@@ -1594,8 +1593,7 @@ async fn cancel_caused(ctx: &Ctx, n: i64, via: &str, cause: Option<&str>) -> Res
         return refuse(format!("Item #{n} changed while cancelling; look at it again."));
     }
     let item = store::item(&ctx.db, n).await?;
-    let notice = notice(ctx, &ctx.cfg.texts.notice_cancelled, &item, &[]).await;
-    note(ctx, n, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &item)), Some(notice)).await?;
+    note(ctx, n, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &item)), None).await?;
     Ok(item)
 }
 
@@ -1690,8 +1688,7 @@ async fn release_caused(ctx: &Ctx, n: i64, hold: Option<&str>, via: &str, cause:
         return refuse(format!("Item #{n} changed while releasing (held again or stopped); look at it again."));
     }
     let item = store::item(&ctx.db, n).await?;
-    let notice = notice(ctx, &ctx.cfg.texts.notice_released, &item, &[("stage", &item.stage)]).await;
-    note(ctx, n, &fill_item(&ctx.cfg.texts.item_released, &item_vars(ctx, &item), &[("via", via), ("code", &code)]), Some(notice))
+    note(ctx, n, &fill_item(&ctx.cfg.texts.item_released, &item_vars(ctx, &item), &[("via", via), ("code", &code)]), None)
         .await?;
     tracing::info!(item = n, via, "work: held item released");
     Ok(item)
@@ -1870,8 +1867,7 @@ async fn close_by_source(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
     .await?
     {
         let it = store::item(&ctx.db, item.id).await?;
-        let notice = notice(ctx, &ctx.cfg.texts.notice_stopped, &it, &[("reason", &notice_reason(ctx, why).await)]).await;
-        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_closed, &item_vars(ctx, &it)), Some(notice)).await?;
+        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_closed, &item_vars(ctx, &it)), None).await?;
     }
     Ok(())
 }
@@ -1890,8 +1886,7 @@ async fn cancel_by_source(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
     .await?
     {
         let it = store::item(&ctx.db, item.id).await?;
-        let notice = notice(ctx, &ctx.cfg.texts.notice_cancelled, &it, &[]).await;
-        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &it)), Some(notice)).await?;
+        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_cancelled, &item_vars(ctx, &it)), None).await?;
     }
     Ok(())
 }
@@ -1912,8 +1907,7 @@ async fn mark_stale(ctx: &Ctx, item: &Item, why: &str) -> Result<()> {
     {
         tracing::warn!(item = item.id, why, "work: item is stale");
         let it = store::item(&ctx.db, item.id).await?;
-        let notice = notice(ctx, &ctx.cfg.texts.notice_stopped, &it, &[("reason", &notice_reason(ctx, why).await)]).await;
-        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_stale, &item_vars(ctx, &it)), Some(notice)).await?;
+        note(ctx, item.id, &fill_vars(&ctx.cfg.texts.item_stale, &item_vars(ctx, &it)), None).await?;
     }
     Ok(())
 }
@@ -2302,8 +2296,7 @@ async fn step_eval(ctx: &Ctx, item: &Item) -> Result<()> {
                         &item_vars(ctx, &it),
                         &[("ref", &event_ref(&ev)), ("url", ev.url.as_deref().unwrap_or(""))],
                     );
-                    let notice = notice(ctx, &ctx.cfg.texts.notice_implementation_started, &it, &[]).await;
-                    note_once(ctx, item.id, &text, &format!("eval:{id}"), Some(notice)).await?;
+                    note_once(ctx, item.id, &text, &format!("eval:{id}"), None).await?;
                 }
                 return Ok(());
             }
@@ -2316,8 +2309,7 @@ async fn step_eval(ctx: &Ctx, item: &Item) -> Result<()> {
                     &item_vars(ctx, &it),
                     &[("ref", &event_ref(&ev)), ("url", ev.url.as_deref().unwrap_or(""))],
                 );
-                let notice = notice(ctx, &ctx.cfg.texts.notice_needs_plan, &it, &[]).await;
-                note_once(ctx, item.id, &text, &format!("eval:{id}"), Some(notice)).await?;
+                note_once(ctx, item.id, &text, &format!("eval:{id}"), None).await?;
             }
             Ok(())
         }
@@ -2409,7 +2401,7 @@ async fn finish_refinement_turn(ctx: &Ctx, item: &Item, task: &str, result: &str
             let body = stage::replace_shown_plan(&shown, &label, &briefs::refused_plan_placeholder(chars));
             // An automatic turn follows: the operator hears from the next
             // reply. Otherwise he is told now.
-            let notice = if retry { None } else { Some(agent_replied_notice(ctx, item, &body).await) };
+            let notice = if retry { None } else { question_notice(ctx, item, &body).await? };
             let vars = [("chars", chars.to_string()), ("limit", briefs::PLAN_LIMIT.to_string()), ("count", refusals.to_string())];
             let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
             let text = fill(if retry { &t.plan_too_long } else { &t.plan_too_long_stopped }, &vars);
@@ -2421,10 +2413,11 @@ async fn finish_refinement_turn(ctx: &Ctx, item: &Item, task: &str, result: &str
             set.push(("plan_version", next.into()));
             set.push(("plan_refused_chars", Val::Int(None)));
             set.push(("plan_refusals", 0i64.into()));
-            let mut vars = item_vars(ctx, item);
-            vars.retain(|(k, _)| *k != "version");
-            vars.push(("version", next.to_string()));
-            let body = format!("{shown}\n\n{}", fill_vars(&t.approve_hint, &vars));
+            // The plan lives in `plan_versions` and the plan panel; the
+            // thread keeps the reply without it, and the dashboard shows
+            // one compact line for the version (the message's
+            // `plan_version`).
+            let body = stage::replace_shown_plan(&shown, &label, "").trim().to_string();
             let notice = notice(ctx, &t.notice_plan_ready, item, &[("version", &next.to_string())]).await;
             accepted = Some((next, p));
             (body, Some(next), Some(notice), None)
@@ -2432,8 +2425,8 @@ async fn finish_refinement_turn(ctx: &Ctx, item: &Item, task: &str, result: &str
         None => {
             set.push(("plan_refused_chars", Val::Int(None)));
             set.push(("plan_refusals", 0i64.into()));
-            let notice = agent_replied_notice(ctx, item, &shown).await;
-            (shown.clone(), None, Some(notice), None)
+            let notice = question_notice(ctx, item, &shown).await?;
+            (shown.clone(), None, notice, None)
         }
     };
     messages.push((
@@ -2750,7 +2743,7 @@ async fn step_pr(ctx: &Ctx, item: &Item) -> Result<()> {
     note_once(
         ctx,
         item.id,
-        &fill_item(&ctx.cfg.texts.pr_opened, &item_vars(ctx, &it), &[("tests", &tests), ("summary", &summary)]),
+        &fill_item(&ctx.cfg.texts.pr_opened, &item_vars(ctx, &it), &[("tests", &tests), ("summary", &summary), ("pr_number", pr_number(&url))]),
         &format!("pr:{url}"),
         Some(notice),
     )
@@ -2833,6 +2826,16 @@ async fn post_pr_link(ctx: &Ctx, item: &Item, ev: &Event, url: &str, first: &Rev
         note(ctx, item.id, &fill_item(&ctx.cfg.texts.comment_posted, &vars, &[("ref", &event_ref(ev))]), None).await?;
     }
     Ok(())
+}
+
+/// An item whose dashboard page was open this recently (the page records
+/// it every 10 s while open) gets no WhatsApp notice.
+pub const VIEWING_WINDOW_SECS: i64 = 120;
+
+/// The number at the end of a pull request URL (`…/pull/11` → `11`), or
+/// the URL when it has none.
+fn pr_number(url: &str) -> &str {
+    url.trim_end_matches('/').rsplit('/').next().filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).unwrap_or(url)
 }
 
 /// An item in review: read its pull request's state once per poll interval
@@ -2984,6 +2987,16 @@ fn without_canvas_blocks(text: &str) -> String {
 /// and removes formatting, which would hide an address or a key from the
 /// guard's patterns): a hit anywhere in it sends the notice without a
 /// preview. [`notice`] then scans the finished notice.
+/// The notice for a refinement reply that leaves the item waiting for the
+/// operator (the agent asks him something): sent at most once until he
+/// answers, so a second reply before his answer sends nothing.
+async fn question_notice(ctx: &Ctx, item: &Item, reply: &str) -> Result<Option<String>> {
+    if store::question_notified(&ctx.db, item.id).await? {
+        return Ok(None);
+    }
+    Ok(Some(agent_replied_notice(ctx, item, reply).await))
+}
+
 async fn agent_replied_notice(ctx: &Ctx, item: &Item, reply: &str) -> String {
     let t = &ctx.cfg.texts;
     if let Verdict::Hit(cats) = ctx.guard.scan(reply).await {
@@ -3017,11 +3030,14 @@ async fn notice_reason(ctx: &Ctx, text: &str) -> String {
 /// marks the item's surface `dm`.
 async fn flush_whatsapp(ctx: &Ctx, item: &Item) -> Result<()> {
     let mut sent = false;
+    // The operator has the item's page open: the event shows there, and
+    // WhatsApp gets nothing for it.
+    let watching = store::viewed_within(&ctx.db, item.id, VIEWING_WINDOW_SECS).await?;
     for m in store::messages(&ctx.db, item.id).await? {
         if m.wa_state.is_some() {
             continue;
         }
-        let Some(notice) = m.notice.as_deref().filter(|n| !n.trim().is_empty()) else {
+        let Some(notice) = m.notice.as_deref().filter(|n| !n.trim().is_empty() && !watching) else {
             store::set_wa_none(&ctx.db, m.id).await?;
             continue;
         };
