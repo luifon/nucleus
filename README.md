@@ -512,7 +512,7 @@ nucleus/
 - `docs/ADR-032-repo-private-skills-tree.md` — operator-private skills in the gitignored `.nucleus/.claude/skills/`, loaded via `--add-dir`; rejected alternatives
 - `docs/ADR-034-usage-accounting.md` — token and estimated-cost accounting for every Claude Code and Codex session: parsing and dedupe rules, cost-state reconciliation, price table, project and Nucleus attribution, `/usage` surface
 - `docs/ADR-033-turn-engine-and-task-ledger.md` — WhatsApp turn engine (real end of turn, mid-turn messages, ack/progress, quoted replies via the queue, typed input everywhere, outbound idempotency and secret filter) + the background task ledger (`nucleus tasks`, per-chat scopes)
-- `docs/ADR-036-event-intake-and-issue-pipeline.md` — source-agnostic event intake (`nucleus events`, GitHub adapter polled with `gh`) and the issue pipeline: label gate, collaborator-only comments, eval → refinement → implementation → draft PR, short WhatsApp notices with a dashboard link (no per-item groups), the dashboard Intake page
+- `docs/ADR-036-work-items-and-issue-pipeline.md` — work items: source-agnostic events (`nucleus events`, GitHub adapter polled with `gh`) and the issue pipeline: label gate, collaborator-only comments, eval → refinement → implementation → draft PR, short WhatsApp notices with a dashboard link (no per-item groups), the dashboard Work page
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
@@ -584,17 +584,17 @@ EOF
 ./target/release/nucleus tasks cancel <id>
 tmux attach -t nucleus-tasks                        # watch the workers
 
-# Issue pipeline (ADR-036). launchd runs `intake tick` every minute; the DM
+# Issue pipeline (ADR-036). launchd runs `work tick` every minute; the DM
 # session answers "how is item 3 going?" with the read-only commands.
-./target/release/nucleus intake list                # open items (--all for closed)
-./target/release/nucleus intake show 3              # eval, plan, thread, tasks, PR
-./target/release/nucleus intake approve-plan 3 --version 2
-./target/release/nucleus intake approve-comment 3   # or skip-comment / cancel / retry
-./target/release/nucleus intake show 3 --hidden     # a held item: every hidden finding in full, and its hold code
-./target/release/nucleus intake release 3 --hold a1b2c3   # continue with that hold
-./target/release/nucleus intake tick --poll         # poll every repo now and advance items
+./target/release/nucleus work list                # open items (--all for closed)
+./target/release/nucleus work show 3              # eval, plan, thread, tasks, PR
+./target/release/nucleus work approve-plan 3 --version 2
+./target/release/nucleus work approve-comment 3   # or skip-comment / cancel / retry
+./target/release/nucleus work show 3 --hidden     # a held item: every hidden finding in full, and its hold code
+./target/release/nucleus work release 3 --hold a1b2c3   # continue with that hold
+./target/release/nucleus work tick --poll         # poll every repo now and advance items
 ./target/release/nucleus events emit --source homelab --id disk-1 --title "Disk above 90%"
-tail -f memory/intake.log
+tail -f memory/work.log
 
 # Give the WhatsApp DM session context without a message from you (ADR-021/033)
 ./target/release/nucleus session-send --to whatsapp-dm --from main --message "<brief>"

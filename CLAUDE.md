@@ -540,9 +540,9 @@ JSON-parsed numbers.
   `nucleus session-send --to whatsapp-dm`; `session-send` refuses raw tmux
   injection into the `nucleus-whatsapp` and `nucleus-whatsapp-dm` sessions.
 
-## Rule 14 — The issue pipeline (ADR-036)
+## Rule 14 — Work items (ADR-036)
 
-- Sources become events through adapters (`core/src/intake/event.rs`) or
+- Sources become events through adapters (`core/src/work/event.rs`) or
   `nucleus events emit`; the store deduplicates by `(source, external_id)`.
   A new source is a new adapter, not a change to the core.
 - An issue becomes an item only with the configured label, on a repo listed
@@ -552,15 +552,15 @@ JSON-parsed numbers.
 - Agent steps are ADR-033 tasks (`origin = pipeline`) with a working
   directory and a profile (`read-only` for eval and refinement, `code` for
   implementation). Network steps — fetch, push, `gh pr create`,
-  `gh issue comment` — are Nucleus code in `core/src/intake/`, never an
+  `gh issue comment` — are Nucleus code in `core/src/work/`, never an
   agent. Nucleus opens draft PRs only and never merges. After the draft PR
   is open it posts one code-owned comment on the issue with the PR link
-  (`[intake.texts] pr_comment`), without approval, then closes the item.
+  (`[work.texts] pr_comment`), without approval, then closes the item.
   That comment must never carry model output or issue text.
 - Issue text and comments go into briefs only between the nonce data
   markers of `briefs::Fence`; only collaborator comments are included.
 - Before the clone and before every agent task (eval, each refinement turn,
-  implementation), `core/src/intake/hidden.rs` scans the bound issue title,
+  implementation), `core/src/work/hidden.rs` scans the bound issue title,
   body and used collaborator comments for content GitHub's page does not
   show. Markdown structure comes from comrak's GFM syntax tree (code,
   fences, tables, links, images, math, raw HTML nodes, in any container),
@@ -571,10 +571,10 @@ JSON-parsed numbers.
   CommonMark in Markdown text (only references ending in `;`), the WHATWG
   rules in raw HTML nodes (`hidden/charref.rs`, the full named table, the
   attribute-value rule in tags), both for an HTML node of unknown
-  position. A finding moves the item to `held` (`[intake]
+  position. A finding moves the item to `held` (`[work]
   hidden_content_hold`, default true) with the complete findings and raw
   sources stored; no agent runs until the operator releases it or cancels
-  it. Every release names the hold the operator reviewed (`nucleus intake
+  it. Every release names the hold the operator reviewed (`nucleus work
   release <n> --hold <code>` from the terminal, the dashboard's rendered
   fingerprint, or the fingerprint a WhatsApp release was confirmed for); a release
   of an earlier hold is refused, checked again in the transaction that
@@ -592,10 +592,10 @@ JSON-parsed numbers.
   hold fingerprint the list showed. Releases, cancels, decisions from voice
   notes or forwards, and items inferred in the DM while several wait are
   confirmed first (stored in `confirmations`, 15 minutes). Replies are
-  `[intake.texts]` texts; the interpreter's question is cut, stripped of
+  `[work.texts]` texts; the interpreter's question is cut, stripped of
   Markdown and passed through the secret guard. Only the operator's exact
   identity counts, decided by one function (`isOperatorId` in
-  `messaging/whatsapp/src/intake.ts`: his phone digits, a LID listed in
+  `messaging/whatsapp/src/work.ts`: his phone digits, a LID listed in
   `WHATSAPP_OPERATOR_LIDS`, or a LID the connection maps to his phone) for
   the DM gate, approvals, the DM fast paths, the stored `chat` rows
   and the block. Other `WHATSAPP_ALLOWED_DM_JIDS` entries are contacts the
@@ -606,7 +606,7 @@ JSON-parsed numbers.
   minutes of a DM question goes straight to the interpreter; any other DM
   message goes to the DM chat session, which gets a code-built block of
   the waiting decisions (no issue text) with each operator message and runs
-  `nucleus intake interpret-latest` when he asks for one. That command takes
+  `nucleus work interpret-latest` when he asks for one. That command takes
   no text: it interprets the stored DM rows (`item_key = chat`, `sender =
   operator`) that the session's current turn covers, in order, every one,
   each row once, and prints which ones it handled. A message answers only
@@ -620,9 +620,9 @@ JSON-parsed numbers.
   never cancels, approves or releases.
 - Every item's WhatsApp surface is the operator's DM; there are no per-item
   groups (the bot leaves the old ones once at start and then drops their
-  tables). WhatsApp gets only short, code-owned `[intake.texts] notice_*`
+  tables). WhatsApp gets only short, code-owned `[work.texts] notice_*`
   texts through `outbound_queue` (target policy, secret filter), each with
-  the item's dashboard link (`NUCLEUS_PUBLIC_URL/intake?item=<n>`, none when
+  the item's dashboard link (`NUCLEUS_PUBLIC_URL/work?item=<n>`, none when
   unset). Never send a plan, an agent reply, a finding list or another long
   body to WhatsApp; the agent-reply preview (~200 characters) passes the
   secret guard first. The dashboard thread keeps the full text.
@@ -633,14 +633,14 @@ JSON-parsed numbers.
   text. Every accepted version is kept in `plan_versions`.
 - While an item waits on the operator, the dashboard's item page shows a
   decision board of code-derived options (`boardFor` in
-  `nucleus-dashboard/web/src/lib/intake.ts`: approve plan vN, release,
+  `nucleus-dashboard/web/src/lib/work.ts`: approve plan vN, release,
   retry, continue discussing, cancel with a second step), never options
-  from model text. Text typed on the page (`POST /intake/api/reply`,
+  from model text. Text typed on the page (`POST /work/api/reply`,
   `pipeline::dashboard_message`) is the operator's, as his DM is: while the
   item's pending entry is waiting or a question of the page is open, it
   goes through the same interpreter path, limited to that item, with the
   same binding and confirmation rules (questions in scope `dashboard:<n>`,
-  answered by words or `POST /intake/api/answer`, ordered by stored times,
+  answered by words or `POST /work/api/answer`, ordered by stored times,
   never by WhatsApp timestamps). Otherwise it is discussion and no
   interpreter starts. The refinement agent may ask questions as ADR-012
   canvas blocks, never offering approve, release or cancel; a click on one
@@ -648,9 +648,9 @@ JSON-parsed numbers.
   `kind: "canvas"`, and as a second guard any text with a canvas-response
   tag (parsed by `decide::canvas_text` with a real JSON payload, or
   malformed) never reaches the interpreter.
-- Every write to `memory/intake.db` goes through `nucleus_core::intake`.
+- Every write to `memory/work.db` goes through `nucleus_core::work`.
   Nucleus keeps one bare mirror per repo and one clone per item under
-  `[intake] work_dir`, outside this checkout. Nucleus's own git commands
+  `[work] clones_dir`, outside this checkout. Nucleus's own git commands
   run with no global or system config (`GIT_CONFIG_GLOBAL=/dev/null`,
   `GIT_CONFIG_NOSYSTEM=1`), hooks disabled, the mirror's config rewritten,
   an HTTPS remote URL from `nucleus.toml` and gh as the only credential
@@ -664,8 +664,8 @@ JSON-parsed numbers.
   reads the clone; ignore rules come from bounded private copies of each
   `.gitignore`, decided by `git check-ignore --no-index` with the letter-case rule of
   the clone's file system; every directory entry counts against
-  `[intake] import_max_entries` as it is read) under enforced
-  byte and file-count limits (`[intake] import_max_*`), refuses hard links and
+  `[work] import_max_entries` as it is read) under enforced
+  byte and file-count limits (`[work] import_max_*`), refuses hard links and
   special files, keeps base submodules and `.gitmodules` unchanged, and
   installs new objects as one pack. Before pushing, Nucleus reads the remote
   item ref: a commit it already pushed is recorded, an unknown one blocks

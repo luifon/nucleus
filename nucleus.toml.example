@@ -205,18 +205,18 @@ max_runtime_hours = 12
 # failures); the result is not sent again. {reason} = the recorded reason.
 # delivery_failed = "⚠️ Task {id} — {title}: the result message was not confirmed as delivered ({reason}). …"
 
-# ADR-036 event intake and issue pipeline (`nucleus intake`, dashboard
-# /intake). Off unless enabled and at least one repo is listed. An issue enters
+# ADR-036 work items and the issue pipeline (`nucleus work`, dashboard
+# /work). Off unless enabled and at least one repo is listed. An issue enters
 # the pipeline when it carries `label` (only people with triage or write
-# access can set labels). `nucleus intake tick` runs every minute from launchd
-# (tools/launchd/intake-tick.plist.example) and polls each repo every
+# access can set labels). `nucleus work tick` runs every minute from launchd
+# (tools/launchd/work-tick.plist.example) and polls each repo every
 # poll_interval_secs with `gh` (the operator's gh login; no public ingress).
-# work_dir holds one Nucleus-only mirror per repo and one clone per item; it
+# clones_dir holds one Nucleus-only mirror per repo and one clone per item; it
 # must be outside this checkout. The repos name your projects: list them here, in the
 # untracked nucleus.toml, never in a committed file.
-# [intake]
+# [work]
 # enabled = true
-# work_dir = "~/nucleus-work"
+# clones_dir = "~/nucleus-work"
 # label = "nucleus"
 # min_confidence = 0.7          # a "simple" eval below this goes to refinement
 # test_timeout_minutes = 30     # Nucleus's own test run before the draft PR
@@ -237,18 +237,18 @@ max_runtime_hours = 12
 # # Hold an item whose issue title, body or a collaborator comment it uses
 # # has content GitHub's page does not show (HTML comments, invisible
 # # characters, <details>, raw HTML, link definitions, alt text, …). No agent
-# # runs until you release it (`nucleus intake release <n> --hold <code>`, the
+# # runs until you release it (`nucleus work release <n> --hold <code>`, the
 # # dashboard, or telling the bot on WhatsApp, which asks you to confirm) or
 # # cancel it.
 # hidden_content_hold = true
 #
-# [[intake.repos]]
+# [[work.repos]]
 # repo = "owner/repo"
 # test_command = "cargo test --workspace"   # run in the worktree with sh -c
 # # default_branch = "main"                 # default: the remote's HEAD
 # # pr_issue_keyword = "Closes"             # or "Refs" to link without closing
 #
-# [intake.github]
+# [work.github]
 # gh_bin = "/opt/homebrew/bin/gh"   # launchd has no shell PATH (Rule 5)
 # poll_interval_secs = 300
 # collaborator_cache_secs = 3600
@@ -264,11 +264,11 @@ max_runtime_hours = 12
 # what happens (ADR-036, "Operator decisions"). A DM message without an item
 # marker reaches the chat session, which sees the waiting decisions and has
 # the pipeline interpret the message (interpret-latest). There is no
-# [intake.whatsapp] section.
+# [work.whatsapp] section.
 #
 # Operator-facing texts; placeholders are listed in core/src/config.rs
-# (IntakeTexts).
-# [intake.texts]
+# (WorkTexts).
+# [work.texts]
 # approve_hint = "Plan v{version} is ready. When it is right, tell me to approve it, …"
 
 # ADR-027 WhatsApp connection circuit breaker. Defaults are sane; every

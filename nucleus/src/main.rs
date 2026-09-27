@@ -35,8 +35,8 @@ Operator tools:
   session-send          send a message into another agent session
   usage <sub>           token and cost accounting (refresh|report)
   tasks <sub>           background tasks (start|list|status|output|cancel|sweep)
-  intake <sub>          issue pipeline (tick|list|show|reply|approve-plan|…)
-  events <sub>          report and list intake events (emit|list)
+  work <sub>          issue pipeline (tick|list|show|reply|approve-plan|…)
+  events <sub>          report and list pipeline events (emit|list)
 
 Every command accepts --help.
 ";
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     sub.extend(argv.into_iter().skip(1));
 
     // Operator tools print their result on stdout; their logs go to stderr.
-    if matches!(name.as_str(), "tasks" | "session-send" | "session-search" | "intake" | "events") {
+    if matches!(name.as_str(), "tasks" | "session-send" | "session-search" | "work" | "events") {
         nucleus_core::init_tracing_stderr();
     } else {
         nucleus_core::init_tracing();
@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
         "session-send" => nucleus_core::cmd::session_send::run(sub).await,
         "usage" => nucleus_core::cmd::usage::run(sub).await,
         "tasks" => nucleus_core::cmd::tasks::run(sub).await,
-        "intake" => nucleus_core::cmd::intake::run(sub).await,
+        "work" => nucleus_core::cmd::work::run(sub).await,
         "events" => nucleus_core::cmd::events::run(sub).await,
         "-h" | "--help" | "help" => {
             print!("{USAGE}");

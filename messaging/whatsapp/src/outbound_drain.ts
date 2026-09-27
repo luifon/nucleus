@@ -28,7 +28,7 @@
 // `fatal` (the process exits for a launchd respawn). A link close resets the
 // count, so the failures that precede a normal close never cause an exit.
 
-import { waSeconds } from "./intake.js";
+import { waSeconds } from "./work.js";
 import { BufferJSON, type AnyMessageContent, type WAMessage } from "@whiskeysockets/baileys";
 import type { OutboundQueueStore, OutboundRow } from "./db.js";
 import {

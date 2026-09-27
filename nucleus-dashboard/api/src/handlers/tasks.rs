@@ -146,7 +146,7 @@ fn require_same_origin(headers: &HeaderMap) -> Result<(), TasksError> {
 
 /// Why a request is cross-site, or `None` when it is not. Shared by every
 /// mutating dashboard route that follows the ADR-033 §7 threat model (the
-/// Tasks cancel, the Intake actions of ADR-036).
+/// Tasks cancel, the Work actions of ADR-036).
 pub(crate) fn cross_site_reason(headers: &HeaderMap) -> Option<String> {
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         if !matches!(site, "same-origin" | "none") {

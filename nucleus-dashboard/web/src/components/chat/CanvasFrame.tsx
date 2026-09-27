@@ -3,7 +3,7 @@ import { type ReactNode } from "react";
 /**
  * The canvas box (ADR-012): accent border, tinted surface, and a header
  * line with the block's kind, its title and an "answered" marker. Shared
- * by the chat's canvas blocks and the intake decision board. Titles are
+ * by the chat's canvas blocks and the work decision board. Titles are
  * rendered as text, never as HTML.
  */
 export default function CanvasFrame({

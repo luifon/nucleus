@@ -48,7 +48,7 @@ export function parseToml(src: string): Record<string, any> {
   for (let line of lines) {
     line = line.trim();
     if (!line) continue;
-    // [[a.b]] appends a new table to the array a.b ([[intake.repos]]).
+    // [[a.b]] appends a new table to the array a.b ([[work.repos]]).
     const arrayMatch = line.match(/^\[\[([^\]]+)\]\]$/);
     if (arrayMatch) {
       const parts = arrayMatch[1].split(".").map((p) => p.trim());

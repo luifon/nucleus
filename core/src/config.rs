@@ -25,7 +25,7 @@ pub struct Settings {
     pub vault_search: VaultSearchConfig,
     pub vault_check: VaultCheckConfig,
     pub tasks: TasksConfig,
-    pub intake: IntakeConfig,
+    pub work: WorkConfig,
     pub ports: PortsConfig,
 }
 
@@ -620,56 +620,56 @@ impl Default for TasksConfig {
     }
 }
 
-/// Event intake and the issue pipeline (ADR-036). Off unless `enabled` and
+/// Work items and the issue pipeline (ADR-036). Off unless `enabled` and
 /// at least one repo is configured. The repos name the operator's projects,
 /// so they live in the untracked `nucleus.toml`; the committed example uses
 /// placeholders.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct IntakeConfig {
+pub struct WorkConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Where the pipeline keeps its clones and per-item worktrees. Must be
     /// outside the Nucleus checkout. `~/` is expanded.
-    #[serde(default = "default_intake_work_dir")]
-    pub work_dir: String,
+    #[serde(default = "default_work_clones_dir")]
+    pub clones_dir: String,
     /// The label that admits an issue into the pipeline. Only people with
     /// triage or write access can set labels on a GitHub issue, so the label
     /// is the proof that someone accepted the issue.
-    #[serde(default = "default_intake_label")]
+    #[serde(default = "default_work_label")]
     pub label: String,
     /// An eval that says "simple" with a confidence below this value is
     /// treated as complex (it goes to refinement).
-    #[serde(default = "default_intake_min_confidence")]
+    #[serde(default = "default_work_min_confidence")]
     pub min_confidence: f64,
     /// The repo's tests run by Nucleus after the implementation agent
     /// finished are stopped after this many minutes.
-    #[serde(default = "default_intake_test_timeout_minutes")]
+    #[serde(default = "default_work_test_timeout_minutes")]
     pub test_timeout_minutes: u32,
     /// Author and committer of the one commit Nucleus publishes per item.
     /// The agent's own commits, authors and messages are never published.
-    #[serde(default = "default_intake_commit_author_name")]
+    #[serde(default = "default_work_commit_author_name")]
     pub commit_author_name: String,
-    #[serde(default = "default_intake_commit_author_email")]
+    #[serde(default = "default_work_commit_author_email")]
     pub commit_author_email: String,
     /// Limits checked on the agent's clone before any file is read into
     /// git: the number of paths (tracked and untracked, not ignored), each
     /// file's length (a sparse file counts by its length) and the total.
-    #[serde(default = "default_intake_import_max_files")]
+    #[serde(default = "default_work_import_max_files")]
     pub import_max_files: usize,
-    #[serde(default = "default_intake_import_max_file_bytes")]
+    #[serde(default = "default_work_import_max_file_bytes")]
     pub import_max_file_bytes: u64,
-    #[serde(default = "default_intake_import_max_total_bytes")]
+    #[serde(default = "default_work_import_max_total_bytes")]
     pub import_max_total_bytes: u64,
     /// Largest `.gitignore` read (into a private copy) to decide which
     /// untracked files are ignored; counted toward the total.
-    #[serde(default = "default_intake_import_max_ignore_bytes")]
+    #[serde(default = "default_work_import_max_ignore_bytes")]
     pub import_max_ignore_bytes: u64,
     /// Most directory entries the import walk reads (counted as read).
-    #[serde(default = "default_intake_import_max_entries")]
+    #[serde(default = "default_work_import_max_entries")]
     pub import_max_entries: usize,
     /// Largest diff the secret guard reads; a longer diff blocks the item
     /// (it is never cut and passed).
-    #[serde(default = "default_intake_scan_max_bytes")]
+    #[serde(default = "default_work_scan_max_bytes")]
     pub scan_max_bytes: usize,
     /// Hold an item when its issue text or a comment it uses has content
     /// that GitHub's page does not show (an HTML comment, invisible
@@ -678,16 +678,16 @@ pub struct IntakeConfig {
     #[serde(default = "default_true_bool")]
     pub hidden_content_hold: bool,
     #[serde(default)]
-    pub repos: Vec<IntakeRepo>,
+    pub repos: Vec<WorkRepo>,
     #[serde(default)]
-    pub github: IntakeGithubConfig,
+    pub github: WorkGithubConfig,
     #[serde(default)]
-    pub texts: IntakeTexts,
+    pub texts: WorkTexts,
 }
 
-/// One repository the pipeline works on (`[[intake.repos]]`).
+/// One repository the pipeline works on (`[[work.repos]]`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct IntakeRepo {
+pub struct WorkRepo {
     /// `owner/name` on GitHub.
     pub repo: String,
     /// The branch pull requests target. Default: the remote's HEAD branch.
@@ -700,33 +700,33 @@ pub struct IntakeRepo {
     pub test_command: Option<String>,
     /// Keyword that links the pull request to the issue in the PR body
     /// (`Closes` closes the issue when the PR is merged; `Refs` only links).
-    #[serde(default = "default_intake_issue_keyword")]
+    #[serde(default = "default_work_issue_keyword")]
     pub pr_issue_keyword: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct IntakeGithubConfig {
+pub struct WorkGithubConfig {
     /// The `gh` binary. launchd has no shell PATH (Rule 5); an absolute
     /// path or a PATH in the plist is needed there.
-    #[serde(default = "default_intake_gh_bin")]
+    #[serde(default = "default_work_gh_bin")]
     pub gh_bin: String,
     /// Seconds between two polls of the same repo. The tick runs every
     /// minute; it polls only when this much time has passed.
-    #[serde(default = "default_intake_poll_interval_secs")]
+    #[serde(default = "default_work_poll_interval_secs")]
     pub poll_interval_secs: u64,
     /// How long a collaborator check is reused.
-    #[serde(default = "default_intake_collaborator_cache_secs")]
+    #[serde(default = "default_work_collaborator_cache_secs")]
     pub collaborator_cache_secs: u64,
     /// Upper bound on pages (100 issues each) read in one poll.
-    #[serde(default = "default_intake_max_pages")]
+    #[serde(default = "default_work_max_pages")]
     pub max_pages: u32,
     /// The URL Nucleus fetches from and pushes to; `{repo}` is replaced by
     /// `owner/name`. Nucleus never reads a remote URL from a clone.
-    #[serde(default = "default_intake_remote_url")]
+    #[serde(default = "default_work_remote_url")]
     pub remote_url: String,
 }
 
-/// Operator-facing texts of the pipeline (`[intake.texts]`), all written by
+/// Operator-facing texts of the pipeline (`[work.texts]`), all written by
 /// code, never by a model. The thread texts (`refinement_opened` …
 /// `comment_posted`, `item_*`) are Nucleus's messages in the item's thread on
 /// the dashboard; WhatsApp gets only the short `notice_*` texts. Placeholders: `{n}` item number, `{title}`,
@@ -748,7 +748,7 @@ pub struct IntakeGithubConfig {
 /// entries.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
-pub struct IntakeTexts {
+pub struct WorkTexts {
     pub refinement_opened: String,
     pub simple_started: String,
     pub approve_hint: String,
@@ -832,7 +832,7 @@ pub struct IntakeTexts {
     /// First line of the block the DM chat session gets with every operator
     /// message while decisions wait; the pending lines follow.
     pub chat_block_header: String,
-    /// Last line of that block: when the session runs `nucleus intake
+    /// Last line of that block: when the session runs `nucleus work
     /// interpret-latest` (`{handled}`: the line it ends its turn with when
     /// the pipeline handled the message).
     pub chat_block_instruction: String,
@@ -864,7 +864,7 @@ pub struct IntakeTexts {
     // Every WhatsApp message the pipeline sends about an item is one of these:
     // one line, code-owned, never a plan, an agent reply or a finding list.
     // `{link}` is the item's dashboard page (`NUCLEUS_PUBLIC_URL` +
-    // `/intake?item=<n>`), empty when NUCLEUS_PUBLIC_URL is unset; `{title}`
+    // `/work?item=<n>`), empty when NUCLEUS_PUBLIC_URL is unset; `{title}`
     // is the issue title on one line, at most 80 characters.
     /// A new item needs a plan (refinement starts).
     pub notice_needs_plan: String,
@@ -905,7 +905,7 @@ pub struct IntakeTexts {
     pub group_messages_dropped: String,
 }
 
-impl Default for IntakeTexts {
+impl Default for WorkTexts {
     fn default() -> Self {
         Self {
             refinement_opened: "🧭 Item #{n} — {title} ({ref}) needs a plan before implementation \
@@ -922,7 +922,7 @@ impl Default for IntakeTexts {
                 .into(),
             comment_posted: "💬 The draft PR link is posted on {ref}. Item #{n} is closed.".into(),
             item_failed: "⚠️ Item #{n} — {title} failed during {failed_in}: {error}\nRetry from the \
-                          dashboard (Intake page) or with `nucleus intake retry {n}`."
+                          dashboard (Work page) or with `nucleus work retry {n}`."
                 .into(),
             item_cancelled: "⏹ Item #{n} — {title} cancelled.".into(),
             item_closed: "Item #{n} — {title} is closed: {error}".into(),
@@ -931,12 +931,12 @@ impl Default for IntakeTexts {
                          starts a new item."
                 .into(),
             item_blocked: "🛑 Item #{n} — {title} is blocked: {error}. Nothing was published. Fix the \
-                           cause, then retry with `nucleus intake retry {n}` or on the dashboard, or \
+                           cause, then retry with `nucleus work retry {n}` or on the dashboard, or \
                            cancel the item."
                 .into(),
             item_held: "🔍 Item #{n} — {title} is held (hold {code}): the issue text has content that \
                         GitHub's page does not show ({kinds}). No agent runs until you decide.\n{findings}\nRead \
-                        every finding in full on the dashboard (Intake page) or with `nucleus intake show {n} \
+                        every finding in full on the dashboard (Work page) or with `nucleus work show {n} \
                         --hidden`. Then tell me to release the item (the agent reads the content as data) or to cancel \
                         it. I ask you to confirm a release before it runs."
                 .into(),
@@ -960,7 +960,7 @@ impl Default for IntakeTexts {
             wait_stage: "in the {stage} stage, nothing is waiting for you".into(),
             option_approve_plan: "approve plan v{version}: implementation starts from that plan".into(),
             option_release: "release it: the agent continues and reads the hidden content as data. Read the \
-                             findings first on the dashboard or with `nucleus intake show {n} --hidden`."
+                             findings first on the dashboard or with `nucleus work show {n} --hidden`."
                 .into(),
             option_cancel: "cancel it: the item stops and nothing more is done for it".into(),
             option_discuss: "write what should change: the refinement agent reads it and answers".into(),
@@ -983,7 +983,7 @@ impl Default for IntakeTexts {
                 .into(),
             chat_block_instruction: "If the operator's message asks for one of these decisions in any words \
                                      (approve, go ahead, release, cancel, ...), do not decide or answer it yourself: \
-                                     run `./target/release/nucleus intake interpret-latest` and follow its output. \
+                                     run `./target/release/nucleus work interpret-latest` and follow its output. \
                                      When it prints HANDLED, do exactly what its output says (usually: end your turn \
                                      with only this line: {handled}). Otherwise answer normally."
                 .into(),
@@ -1028,106 +1028,106 @@ impl Default for IntakeTexts {
     }
 }
 
-fn default_intake_work_dir() -> String {
+fn default_work_clones_dir() -> String {
     "~/nucleus-work".into()
 }
-fn default_intake_label() -> String {
+fn default_work_label() -> String {
     "nucleus".into()
 }
-fn default_intake_min_confidence() -> f64 {
+fn default_work_min_confidence() -> f64 {
     0.7
 }
-fn default_intake_test_timeout_minutes() -> u32 {
+fn default_work_test_timeout_minutes() -> u32 {
     30
 }
-fn default_intake_commit_author_name() -> String {
+fn default_work_commit_author_name() -> String {
     "Nucleus issue pipeline".into()
 }
-fn default_intake_commit_author_email() -> String {
-    "nucleus-intake@localhost".into()
+fn default_work_commit_author_email() -> String {
+    "nucleus-work@localhost".into()
 }
-fn default_intake_import_max_files() -> usize {
+fn default_work_import_max_files() -> usize {
     20_000
 }
-fn default_intake_import_max_file_bytes() -> u64 {
+fn default_work_import_max_file_bytes() -> u64 {
     10 * 1024 * 1024
 }
-fn default_intake_import_max_total_bytes() -> u64 {
+fn default_work_import_max_total_bytes() -> u64 {
     200 * 1024 * 1024
 }
-fn default_intake_import_max_ignore_bytes() -> u64 {
+fn default_work_import_max_ignore_bytes() -> u64 {
     1024 * 1024
 }
-fn default_intake_import_max_entries() -> usize {
+fn default_work_import_max_entries() -> usize {
     1_000_000
 }
-fn default_intake_scan_max_bytes() -> usize {
+fn default_work_scan_max_bytes() -> usize {
     16 * 1024 * 1024
 }
-fn default_intake_issue_keyword() -> String {
+fn default_work_issue_keyword() -> String {
     "Closes".into()
 }
-fn default_intake_gh_bin() -> String {
+fn default_work_gh_bin() -> String {
     "gh".into()
 }
-fn default_intake_poll_interval_secs() -> u64 {
+fn default_work_poll_interval_secs() -> u64 {
     300
 }
-fn default_intake_collaborator_cache_secs() -> u64 {
+fn default_work_collaborator_cache_secs() -> u64 {
     3600
 }
-fn default_intake_max_pages() -> u32 {
+fn default_work_max_pages() -> u32 {
     10
 }
-fn default_intake_remote_url() -> String {
+fn default_work_remote_url() -> String {
     "https://github.com/{repo}.git".into()
 }
 
-impl Default for IntakeConfig {
+impl Default for WorkConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            work_dir: default_intake_work_dir(),
-            label: default_intake_label(),
-            min_confidence: default_intake_min_confidence(),
-            test_timeout_minutes: default_intake_test_timeout_minutes(),
-            commit_author_name: default_intake_commit_author_name(),
-            commit_author_email: default_intake_commit_author_email(),
-            import_max_files: default_intake_import_max_files(),
-            import_max_file_bytes: default_intake_import_max_file_bytes(),
-            import_max_total_bytes: default_intake_import_max_total_bytes(),
-            import_max_ignore_bytes: default_intake_import_max_ignore_bytes(),
-            import_max_entries: default_intake_import_max_entries(),
-            scan_max_bytes: default_intake_scan_max_bytes(),
+            clones_dir: default_work_clones_dir(),
+            label: default_work_label(),
+            min_confidence: default_work_min_confidence(),
+            test_timeout_minutes: default_work_test_timeout_minutes(),
+            commit_author_name: default_work_commit_author_name(),
+            commit_author_email: default_work_commit_author_email(),
+            import_max_files: default_work_import_max_files(),
+            import_max_file_bytes: default_work_import_max_file_bytes(),
+            import_max_total_bytes: default_work_import_max_total_bytes(),
+            import_max_ignore_bytes: default_work_import_max_ignore_bytes(),
+            import_max_entries: default_work_import_max_entries(),
+            scan_max_bytes: default_work_scan_max_bytes(),
             hidden_content_hold: true,
             repos: vec![],
-            github: IntakeGithubConfig::default(),
-            texts: IntakeTexts::default(),
+            github: WorkGithubConfig::default(),
+            texts: WorkTexts::default(),
         }
     }
 }
 
-impl Default for IntakeGithubConfig {
+impl Default for WorkGithubConfig {
     fn default() -> Self {
         Self {
-            gh_bin: default_intake_gh_bin(),
-            poll_interval_secs: default_intake_poll_interval_secs(),
-            collaborator_cache_secs: default_intake_collaborator_cache_secs(),
-            max_pages: default_intake_max_pages(),
-            remote_url: default_intake_remote_url(),
+            gh_bin: default_work_gh_bin(),
+            poll_interval_secs: default_work_poll_interval_secs(),
+            collaborator_cache_secs: default_work_collaborator_cache_secs(),
+            max_pages: default_work_max_pages(),
+            remote_url: default_work_remote_url(),
         }
     }
 }
 
-impl IntakeConfig {
+impl WorkConfig {
     /// The configured repo `owner/name`, compared case-insensitively.
-    pub fn repo(&self, name: &str) -> Option<&IntakeRepo> {
+    pub fn repo(&self, name: &str) -> Option<&WorkRepo> {
         self.repos.iter().find(|r| r.repo.eq_ignore_ascii_case(name.trim()))
     }
 
-    /// `work_dir` with `~/` expanded.
-    pub fn work_dir_path(&self) -> PathBuf {
-        expand_home(&self.work_dir)
+    /// `clones_dir` with `~/` expanded.
+    pub fn clones_dir_path(&self) -> PathBuf {
+        expand_home(&self.clones_dir)
     }
 }
 
@@ -1166,7 +1166,7 @@ struct TomlConfig {
     #[serde(default)]
     tasks: TasksConfig,
     #[serde(default)]
-    intake: IntakeConfig,
+    work: WorkConfig,
     ports: PortsConfig,
 }
 
@@ -1230,7 +1230,7 @@ impl Settings {
             vault_search: toml.vault_search,
             vault_check: toml.vault_check,
             tasks: toml.tasks,
-            intake: toml.intake,
+            work: toml.work,
             ports: toml.ports,
         })
     }

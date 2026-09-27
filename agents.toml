@@ -153,15 +153,15 @@ log_path      = "memory/reminders.log"
 diary_key     = "reminders"
 
 [[agent]]
-name          = "intake-tick"
+name          = "work-tick"
 class         = "infra"
 launch        = "launchd-cron"
 runtime       = "rust"
-launchd_label = "dev.nucleus.intake-tick"
+launchd_label = "dev.nucleus.work-tick"
 # ADR-036 issue pipeline driver (StartInterval 60 in the plist). It drives no
 # session itself: its agent steps are task workers (the `tasks` agent).
 schedule      = "* * * * *"
-log_path      = "memory/intake.log"
+log_path      = "memory/work.log"
 
 # ── ephemeral (on-demand, spawned by reminders-tick) ──
 
@@ -197,11 +197,11 @@ runtime       = "rust"
 tmux_session  = "nucleus-tasks"
 
 [[agent]]
-name          = "intake-interpreter"
+name          = "work-interpreter"
 class         = "ephemeral"
 launch        = "on-demand"
 runtime       = "rust"
 # ADR-036: reads each operator WhatsApp message about the issue pipeline in a
-# one-shot session with no tools, started by `nucleus intake tick`. It only
+# one-shot session with no tools, started by `nucleus work tick`. It only
 # classifies the message; code decides what happens.
-tmux_session  = "nucleus-intake"
+tmux_session  = "nucleus-work"

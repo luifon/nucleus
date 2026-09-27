@@ -126,7 +126,7 @@ impl SessionProfile {
     }
 
     /// One-shot with no tools at all: a model reads the message and answers
-    /// in text, and can do nothing else (ADR-036, the intake interpreter).
+    /// in text, and can do nothing else (ADR-036, the work interpreter).
     /// No built-in tool (`--tools ""`), no MCP server, no skill, no
     /// `--add-dir`, no `--allowed-tools`, and `dontAsk` in place of the
     /// configured permission mode, so a tool call that got through anyway

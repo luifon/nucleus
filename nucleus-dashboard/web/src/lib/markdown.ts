@@ -1,4 +1,4 @@
-// A small Markdown parser for agent output on the dashboard (the intake
+// A small Markdown parser for agent output on the dashboard (the work
 // plan and thread, ADR-036). It covers what the agents write: ATX
 // headings, paragraphs, bullet / numbered / task lists with nesting,
 // fenced code, block quotes, tables, rules, and inline code, bold,

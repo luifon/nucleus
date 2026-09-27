@@ -1,0 +1,133 @@
+// Synthetic work records for tests (the repo is public: no real values).
+
+import type { WorkDetail, WorkEvent, WorkItem, WorkMessage, WorkQuestion, WorkReplyResult } from "@/lib/api/work";
+
+export function fixtureItem(over: Partial<WorkItem> = {}): WorkItem {
+  return {
+    id: 4,
+    event_id: 1,
+    repo: "acme/widget",
+    title: "Fix typo",
+    stage: "refinement",
+    failed_stage: null,
+    error: null,
+    classification: "complex",
+    eval_json: null,
+    plan_draft: null,
+    plan_version: 0,
+    approved_plan: null,
+    approved_version: null,
+    approved_at: null,
+    approved_via: null,
+    branch: null,
+    worktree: null,
+    base_ref: null,
+    impl_summary: null,
+    tests_status: null,
+    tests_output: null,
+    pr_url: null,
+    comment_state: "none",
+    comment_url: null,
+    comment_op: null,
+    surface: "dm",
+    current_task_id: null,
+    last_task_id: null,
+    step_errors: 0,
+    created_at: "2026-09-24T10:00:00.000Z",
+    updated_at: "2026-09-24T10:00:00.000Z",
+    closed_at: null,
+    head_sha: null,
+    rev_title: "Fix typo",
+    rev_body: "body",
+    revision_hash: null,
+    gate_event_id: "labeled:1",
+    label_event_id: "labeled:1",
+    gate_actor: "maintainer",
+    gate_at: "2026-09-24T09:00:00.000Z",
+    stale_reason: null,
+    base_sha: null,
+    pushed_sha: null,
+    hold_stage: null,
+    hold_json: null,
+    hold_hash: null,
+    held_at: null,
+    released_hash: null,
+    released_at: null,
+    released_via: null,
+    ...over,
+  };
+}
+
+export function fixtureEvent(over: Partial<WorkEvent> = {}): WorkEvent {
+  return {
+    id: 1,
+    source: "github",
+    external_id: "acme/widget#12",
+    project: "acme/widget",
+    kind: "issue",
+    title: "Fix typo",
+    body: "The README says teh.",
+    author: "reporter",
+    labels: ["nucleus"],
+    url: "https://example.invalid/acme/widget/issues/12",
+    state: "open",
+    created_at: "2026-09-24T08:00:00.000Z",
+    updated_at: "2026-09-24T08:00:00.000Z",
+    accepted: true,
+    first_seen_at: "2026-09-24T08:00:00.000Z",
+    last_seen_at: "2026-09-24T08:00:00.000Z",
+    gate_note: null,
+    ...over,
+  };
+}
+
+export function fixtureMessage(id: number, over: Partial<WorkMessage> = {}): WorkMessage {
+  return {
+    id,
+    item_id: 4,
+    at: "2026-09-24T10:05:00.000Z",
+    author: "agent",
+    via: "pipeline",
+    body: "message",
+    pending_agent: 0,
+    read_by_task: null,
+    wa_state: null,
+    ...over,
+  };
+}
+
+export function fixtureDetail(item: WorkItem = fixtureItem(), over: Partial<WorkDetail> = {}): WorkDetail {
+  return {
+    item,
+    event: fixtureEvent(),
+    eval: null,
+    hidden: [],
+    hidden_sources: [],
+    plans: [],
+    messages: [],
+    tasks: [],
+    transitions: [],
+    question: null,
+    ...over,
+  };
+}
+
+export function fixturePlans(...texts: string[]): WorkDetail["plans"] {
+  return texts.map((text, k) => ({ version: k + 1, text, at: `2026-09-24T10:${String(10 + k * 10).padStart(2, "0")}:00.000Z` }));
+}
+
+export function fixtureReplyResult(over: Partial<WorkReplyResult> = {}): WorkReplyResult {
+  return { item: fixtureItem(), outcome: "discussion", decision: null, reaches_agent: true, note: null, ...over };
+}
+
+export function fixtureQuestion(over: Partial<WorkQuestion> = {}): WorkQuestion {
+  return {
+    id: 9,
+    decision: "cancel",
+    plan_version: null,
+    hold_hash: null,
+    question: "Cancel item #4? Answer yes or no.",
+    expires_at: "2026-09-24T10:20:00.000Z",
+    ...over,
+  };
+}

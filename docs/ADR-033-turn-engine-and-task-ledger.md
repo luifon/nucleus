@@ -11,9 +11,9 @@ typed-prompt limit.
 **Amended by [[ADR-036]] (2026-09-24):** tasks.db v5 adds a per-task working
 directory (`workdir`) and tool profile (`profile`: `agentic`, `read-only`,
 `code`), set only by in-process producers (the issue pipeline), never by
-`nucleus tasks start`; the WhatsApp target policy accepts the intake groups
+`nucleus tasks start`; the WhatsApp target policy accepts the work groups
 the bot created and has not left (through the drain only); the DM chat
-session gets the read-only `nucleus intake list|show|cancel` commands.
+session gets the read-only `nucleus work list|show|cancel` commands.
 
 **Builds on / changes:**
 - [[ADR-005b]] — the WhatsApp DM conversational path is replaced by the turn

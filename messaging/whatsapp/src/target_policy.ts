@@ -76,7 +76,20 @@ export function isOperatorDm(target: string, config: TargetConfig): boolean {
  *  other replies in the chat that wrote) are not operator-only: they go to
  *  the allowed contact who wrote. */
 export function isOperatorOnly(target: string, source: string): boolean {
-  return target === "dm" || /^intake(:|$)/.test(source) || source === "reminders" || source === "vault-check";
+  return target === "dm" || isWorkSource(source) || source === "reminders" || source === "vault-check";
+}
+
+/** A queue source of the work pipeline (ADR-036): `work` or `work:*`, and
+ *  `intake` or `intake:*` for rows queued before the feature was renamed
+ *  from intake to work. */
+export function isWorkSource(source: string): boolean {
+  return /^(work|intake)(:|$)/.test(source);
+}
+
+/** A work queue source with the pre-rename prefix replaced: `intake:4`
+ *  reads as `work:4`. Other sources are returned unchanged. */
+export function workSource(source: string): string {
+  return source.replace(/^intake(?=:|$)/, "work");
 }
 
 /** The operator's DM chat for the `dm` shorthand: the most recently active

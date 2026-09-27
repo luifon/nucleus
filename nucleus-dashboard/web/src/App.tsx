@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Routes, Route, NavLink, useLocation } from "react-router-dom";
+import { Routes, Route, NavLink, Navigate, useLocation } from "react-router-dom";
 import {
   LayoutDashboard,
   MessageSquare,
@@ -29,7 +29,7 @@ import ChatPage from "./pages/ChatPage";
 import DocumentsPage from "./pages/DocumentsPage";
 import UsagePage from "./pages/UsagePage";
 import TasksPage from "./pages/TasksPage";
-import IntakePage from "./pages/IntakePage";
+import WorkPage from "./pages/WorkPage";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 
 type RouteEntry = {
@@ -51,11 +51,18 @@ const ROUTES: RouteEntry[] = [
   { path: "/skills",    label: "skills",    icon: Sparkles,        group: "observability", impl: "scaffolded" },
   { path: "/reminders", label: "reminders", icon: Bell,            group: "observability", impl: "scaffolded" },
   { path: "/tasks",     label: "tasks",     icon: ListChecks,      group: "observability", impl: "scaffolded" },
-  { path: "/intake",    label: "intake",    icon: Inbox,           group: "observability", impl: "scaffolded" },
+  { path: "/work",    label: "work",    icon: Inbox,           group: "observability", impl: "scaffolded" },
   { path: "/diary",     label: "diary",     icon: BookOpen,        group: "observability", impl: "scaffolded" },
   { path: "/vault",     label: "vault",     icon: Database,        group: "observability", impl: "scaffolded" },
   { path: "/usage",     label: "usage",     icon: Gauge,           group: "observability", impl: "scaffolded" },
 ];
+
+/** `/intake?item=n` (the page's address before the rename) → `/work?item=n`,
+ *  keeping the query. */
+export function LegacyWorkRedirect() {
+  const { search } = useLocation();
+  return <Navigate to={`/work${search}`} replace />;
+}
 
 function PendingPage({ label, Icon }: { label: string; Icon: LucideIcon }) {
   return (
@@ -106,7 +113,10 @@ export default function App() {
               <Route path="/diary" element={<DiaryPage />} />
               <Route path="/reminders" element={<RemindersPage />} />
               <Route path="/tasks" element={<TasksPage />} />
-              <Route path="/intake" element={<IntakePage />} />
+              <Route path="/work" element={<WorkPage />} />
+              {/* The page was /intake before the rename; WhatsApp notices sent
+                  before it still link there. */}
+              <Route path="/intake" element={<LegacyWorkRedirect />} />
               <Route path="/agents" element={<AgentsPage />} />
               <Route path="/vault" element={<VaultPage />} />
               <Route path="/vault/:tab" element={<VaultPage />} />

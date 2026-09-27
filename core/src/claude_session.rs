@@ -299,7 +299,7 @@ pub struct SpawnOptions {
     /// issue pipeline's worktrees, ADR-036) sets it to the Nucleus workspace
     /// root, so nothing of Nucleus is written into that repository.
     pub state_root: Option<PathBuf>,
-    /// A session with no tools at all (ADR-036, the intake interpreter):
+    /// A session with no tools at all (ADR-036, the work interpreter):
     /// `--tools ""` (no built-in tool), `--strict-mcp-config` without a
     /// config (no MCP server), `--disable-slash-commands` (no skill), no
     /// `--add-dir` (the operator-private tree included) and no

@@ -1,4 +1,4 @@
-// Line diff for the intake plan panel (ADR-036): which lines of a plan
+// Line diff for the work plan panel (ADR-036): which lines of a plan
 // version were added or removed relative to the version before it. A
 // longest-common-subsequence table over lines; plans are at most a few
 // hundred lines, so the O(n·m) table is small.

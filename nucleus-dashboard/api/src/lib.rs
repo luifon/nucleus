@@ -217,21 +217,21 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     });
     app = app.nest("/tasks/api", handlers::tasks::router(tasks_state));
 
-    // Intake (ADR-036) — the issue pipeline's items. intake.db and tasks.db
+    // Work (ADR-036) — the issue pipeline's items. work.db and tasks.db
     // are read per request and tolerated missing. Text typed on an item page
     // is read by the same one-shot interpreter as the operator's WhatsApp
     // messages while the item waits for him.
-    let intake_state = Arc::new(handlers::intake::IntakeState {
+    let work_state = Arc::new(handlers::work::WorkState {
         workspace_root: workspace_root.clone(),
-        intake: settings.intake.clone(),
+        work: settings.work.clone(),
         tasks: settings.tasks.clone(),
         public_url: settings.public_urls.nucleus.clone(),
-        interpreter: Arc::new(nucleus_core::intake::decide::SessionInterpreter {
+        interpreter: Arc::new(nucleus_core::work::decide::SessionInterpreter {
             workspace_root: workspace_root.clone(),
             claude: settings.claude.clone(),
         }),
     });
-    app = app.nest("/intake/api", handlers::intake::router(intake_state));
+    app = app.nest("/work/api", handlers::work::router(work_state));
 
     // Diary router — per ADR-004, every bot writes to
     // memory/diaries/<agent>/<YYYY-MM-DD>.md.

@@ -70,8 +70,8 @@ every six months.
    *Extended by [[ADR-036]] (2026-09-24):* a second queue table in
    whatsapp.db, `intake_group_requests` (the issue pipeline asks the bot to
    create or leave an item's group), and two bot-owned tables Rust only
-   reads, `intake_groups` and `intake_inbound`. `memory/intake.db` is
-   written only through `nucleus_core::intake`, under the same one-program
+   reads, `intake_groups` and `work_inbound`. `memory/work.db` is
+   written only through `nucleus_core::work`, under the same one-program
    rule as `tasks.db` below.
    *Clarified by [[ADR-033]] and [[ADR-035]] (2026-09-24):* the writer is
    one program, not one OS process. A command that sessions, workers and

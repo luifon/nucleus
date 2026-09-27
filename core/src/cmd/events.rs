@@ -1,4 +1,4 @@
-//! `nucleus events` — the generic event intake for scripts (ADR-036).
+//! `nucleus events` — the generic event recorder for scripts (ADR-036).
 //!
 //! A script that watches something (a homelab alert, a mailbox) reports it
 //! as an event in the common record; the store deduplicates by
@@ -13,16 +13,16 @@
 //!   nucleus events list
 
 use crate::caller::{self, Role};
-use crate::intake::event::NewEvent;
-use crate::intake::pipeline::{self, Ctx};
-use crate::intake::store;
+use crate::work::event::NewEvent;
+use crate::work::pipeline::{self, Ctx};
+use crate::work::store;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "events", about = "Report and list intake events (ADR-036)")]
+#[command(name = "events", about = "Report and list pipeline events (ADR-036)")]
 struct Cli {
     #[arg(long, global = true)]
     workspace_root: Option<PathBuf>,

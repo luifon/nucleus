@@ -12,7 +12,9 @@ import {
   enqueueRefusal,
   GroupAllowlist,
   isOperatorOnly,
+  isWorkSource,
   pickOperatorDm,
+  workSource,
   resolveQueuedTarget,
   resolveTarget,
   type TargetConfig,
@@ -49,16 +51,16 @@ test("operator-only messages reach only the operator; replies stay in the writer
   assert.equal(pickOperatorDm([otherChat], isOpSync, OP), `${OP}@s.whatsapp.net`, "falls back to the phone JID");
   const q = (target: string, source: string, operatorDm = () => pickOperatorDm(recency, isOpSync, OP), isOperator = isOp) =>
     resolveQueuedTarget({ target, source, config: both, groups, operatorDm, operatorPhone: OP, isOperator });
-  assert.equal(await q("dm", "intake:ask"), opChat);
+  assert.equal(await q("dm", "work:ask"), opChat);
   // A pipeline message addressed to the other contact's chat is refused.
-  assert.equal(await q(otherChat, "intake:3"), null);
+  assert.equal(await q(otherChat, "work:3"), null);
   assert.equal(await q(otherChat, "reminders"), null);
   // A chat-engine reply to the other contact goes to that contact.
   assert.equal(await q(otherChat, "chat-reply"), otherChat);
   // A reminder to whatsapp-dm (the first allowlist entry) reaches the operator.
   assert.equal(await q(OP, "reminders"), `${OP}@s.whatsapp.net`);
   // A LID the live check no longer accepts: `dm` falls back to the phone.
-  assert.equal(await q("dm", "intake:ask", () => opChat, async (j) => j.startsWith(`${OP}@`)), `${OP}@s.whatsapp.net`);
+  assert.equal(await q("dm", "work:ask", () => opChat, async (j) => j.startsWith(`${OP}@`)), `${OP}@s.whatsapp.net`);
   // A task result for an operator LID chat not in the lists: delivered when
   // the live check accepts it, redirected to the operator's phone otherwise.
   const mappedChat = `${["22222", "3333344444"].join("")}@lid`;
@@ -85,7 +87,7 @@ test("operator-only messages reach only the operator; replies stay in the writer
   staleCalls.length = 0;
   const staleOnly = await resolveQueuedTarget({
     target: opChat,
-    source: "intake:ask",
+    source: "work:ask",
     config: both,
     groups,
     operatorDm: () => null,
@@ -113,6 +115,19 @@ test("operator-only messages reach only the operator; replies stay in the writer
   assert.equal(staleCalls.length, 0);
   assert.equal(isOperatorOnly("dm", "chat-reply"), true);
   assert.equal(isOperatorOnly(otherChat, "chat-reply"), false);
+});
+
+test("work rows are operator-only under the new and the pre-rename source names", () => {
+  const otherChat = ["55119", "66666666"].join("") + "@s.whatsapp.net";
+  for (const source of ["work", "work:4", "work:ask", "intake", "intake:4", "intake:note"]) {
+    assert.equal(isOperatorOnly(otherChat, source), true, source);
+    assert.equal(isWorkSource(source), true, source);
+  }
+  for (const source of ["workshop", "intakes", "chat-reply", "task:1"]) assert.equal(isWorkSource(source), false, source);
+  assert.equal(workSource("intake:4"), "work:4");
+  assert.equal(workSource("intake"), "work");
+  assert.equal(workSource("intakes:4"), "intakes:4");
+  assert.equal(workSource("work:ask"), "work:ask");
 });
 
 test("an operator LID is a sendable DM; another LID is not", () => {

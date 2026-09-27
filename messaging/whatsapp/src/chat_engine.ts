@@ -165,10 +165,10 @@ export interface EngineDeps {
 }
 
 /** The final text a DM chat session ends its turn with after `nucleus
- *  intake interpret-latest` printed HANDLED: the issue pipeline already
+ *  work interpret-latest` printed HANDLED: the issue pipeline already
  *  answered the operator, so the turn sends no reply. Mirrors
- *  `pipeline::INTAKE_HANDLED` in core/src/intake/pipeline.rs. */
-export const INTAKE_HANDLED = "[handled by the issue pipeline]";
+ *  `pipeline::WORK_HANDLED` in core/src/work/pipeline.rs. */
+export const WORK_HANDLED = "[handled by the issue pipeline]";
 
 export interface InboundMessage {
   chatId: string;
@@ -178,7 +178,7 @@ export interface InboundMessage {
   waMsgId: string | null;
   /** BufferJSON-encoded {key, message} for quoting the reply. */
   quotedJson: string | null;
-  /** A code-owned block typed after the message (the ADR-036 list of intake
+  /** A code-owned block typed after the message (the ADR-036 list of work
    *  decisions, for the operator's DM only), or "" / absent for none. */
   context?: string;
 }
@@ -212,7 +212,7 @@ export function neutralizeMarkers(text: string): string {
 }
 
 /** The payload typed for an operator message, with an optional code-owned
- *  context block after it (the ADR-036 intake decision list). Pure except
+ *  context block after it (the ADR-036 work decision list). Pure except
  *  the clock. */
 export function operatorPayload(chatId: string, ref: string, text: string, kind: "text" | "voice", context = ""): string {
   const header =
@@ -738,7 +738,7 @@ class ChatActor {
     }
 
     // ADR-036: the issue pipeline answered this message itself.
-    if (open.kind === "operator" && finalText.trim() === INTAKE_HANDLED) {
+    if (open.kind === "operator" && finalText.trim() === WORK_HANDLED) {
       this.e.turns.endTurn(open.id, { status: "silent", replyChars: 0, pendingBg });
       this.answered(open.refs);
       return;

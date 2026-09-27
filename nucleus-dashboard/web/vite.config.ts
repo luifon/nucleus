@@ -21,7 +21,7 @@ export default defineConfig({
       "/api": "http://localhost:8092",
       "/chat/api": "http://localhost:8092",
       "/tasks/api": "http://localhost:8092",
-      "/intake/api": "http://localhost:8092",
+      "/work/api": "http://localhost:8092",
       "/skills/api": "http://localhost:8092",
     },
   },

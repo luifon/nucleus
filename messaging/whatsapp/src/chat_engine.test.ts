@@ -17,7 +17,7 @@ import {
   clip,
   DEFAULT_TEXTS,
   extractRefs,
-  INTAKE_HANDLED,
+  WORK_HANDLED,
   MAX_CONTEXT_CHARS,
   neutralizeMarkers,
   readNew,
@@ -146,17 +146,17 @@ const msg = (text: string, id: string) => ({
 });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-test("the intake decision block follows the operator's message; a turn the pipeline handled sends no reply", async () => {
+test("the work decision block follows the operator's message; a turn the pipeline handled sends no reply", async () => {
   const block = "[Issue pipeline: decisions waiting for the operator.]\n- item #1: plan v1 is waiting for your approval.";
   let session: FakeSession | null = null;
   const t = setup(
     async (s, payload) => {
       session = s;
       s.prompt(payload);
-      // The session ran `nucleus intake interpret-latest`, which printed
+      // The session ran `nucleus work interpret-latest`, which printed
       // HANDLED; it ends its turn with the line it was given.
       s.tool("t1");
-      s.say(INTAKE_HANDLED, "end_turn");
+      s.say(WORK_HANDLED, "end_turn");
       s.end();
     },
   );
@@ -173,12 +173,12 @@ test("the intake decision block follows the operator's message; a turn the pipel
 test("the handled line counts only as the whole final text", async () => {
   const t = setup(async (s, payload) => {
     s.prompt(payload);
-    s.say(`Done. ${INTAKE_HANDLED}`, "end_turn");
+    s.say(`Done. ${WORK_HANDLED}`, "end_turn");
     s.end();
   });
   t.engine.receive(msg("hello", "H2"));
   await t.until(() => t.sent().some((m) => m.source === "chat-reply"));
-  assert.equal(t.sent().find((m) => m.source === "chat-reply")!.body, `Done. ${INTAKE_HANDLED}`);
+  assert.equal(t.sent().find((m) => m.source === "chat-reply")!.body, `Done. ${WORK_HANDLED}`);
 });
 
 test("extractRefs counts only marker lines; clip", () => {

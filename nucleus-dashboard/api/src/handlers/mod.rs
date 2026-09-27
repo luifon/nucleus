@@ -3,7 +3,7 @@ pub mod chat;
 pub mod dashboard;
 pub mod diary;
 pub mod documents;
-pub mod intake;
+pub mod work;
 pub mod news;
 pub mod reminders;
 pub mod skills;
