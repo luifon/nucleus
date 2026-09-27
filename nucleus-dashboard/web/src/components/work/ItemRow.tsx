@@ -10,11 +10,22 @@ import { shortTime } from "@/lib/tasks";
 // to the item page (`/work?item=<n>`), where every action lives.
 // `compact` is the narrow form of the list column beside an open item.
 
-export default function ItemRow({ item, selected = false, compact = false }: { item: WorkItem; selected?: boolean; compact?: boolean }) {
+export default function ItemRow({
+  item,
+  selected = false,
+  compact = false,
+  search = null,
+}: {
+  item: WorkItem;
+  selected?: boolean;
+  compact?: boolean;
+  /** The list's query: the link keeps its filters. */
+  search?: URLSearchParams | null;
+}) {
   const waiting = waitingOn(item);
   return (
     <Link
-      to={itemHref(item.id)}
+      to={itemHref(item.id, search)}
       aria-current={selected ? "page" : undefined}
       className={[
         "flex items-start gap-2 rounded border transition-colors",

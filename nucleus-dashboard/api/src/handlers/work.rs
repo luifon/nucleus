@@ -119,6 +119,18 @@ struct WorkQuestion {
     expires_at: String,
 }
 
+/// One row of the item list: the item, and the kind of source its event
+/// came from (`github`, `cli`, …), which the list's source filter groups
+/// by together with the repo.
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
+struct WorkListItem {
+    #[serde(flatten)]
+    #[ts(flatten)]
+    item: Item,
+    source: String,
+}
+
 #[derive(Deserialize)]
 struct ListQ {
     all: Option<bool>,
@@ -240,10 +252,15 @@ async fn read_pool(s: &WorkState) -> Option<sqlx::SqlitePool> {
     store::schema_ready(&pool).await.then_some(pool)
 }
 
-async fn list(State(s): State<Arc<WorkState>>, Query(q): Query<ListQ>) -> Result<Json<Vec<Item>>, WorkError> {
+async fn list(State(s): State<Arc<WorkState>>, Query(q): Query<ListQ>) -> Result<Json<Vec<WorkListItem>>, WorkError> {
     let Some(pool) = read_pool(&s).await else { return Ok(Json(vec![])) };
     let rows = store::list_items(&pool, !q.all.unwrap_or(true), 300).await.map_err(WorkError::other)?;
-    Ok(Json(rows))
+    let sources = store::event_sources(&pool).await.map_err(WorkError::other)?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|item| WorkListItem { source: sources.get(&item.event_id).cloned().unwrap_or_default(), item })
+            .collect(),
+    ))
 }
 
 async fn detail(State(s): State<Arc<WorkState>>, Query(q): Query<DetailQ>) -> Result<Json<WorkDetail>, WorkError> {

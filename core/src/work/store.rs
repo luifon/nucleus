@@ -1027,6 +1027,13 @@ pub async fn list_items(pool: &SqlitePool, open_only: bool, limit: i64) -> Resul
         .await?)
 }
 
+/// The source of every event (`github`, `cli`, …), by event id: the item
+/// list's source filter.
+pub async fn event_sources(pool: &SqlitePool) -> Result<std::collections::HashMap<i64, String>> {
+    let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, source FROM events").fetch_all(pool).await?;
+    Ok(rows.into_iter().collect())
+}
+
 /// A column value for [`advance`] / [`update`].
 #[derive(Debug, Clone)]
 pub enum Val {

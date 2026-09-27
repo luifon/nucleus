@@ -205,8 +205,121 @@ export function isTerminal(stage: WorkStage): boolean {
 
 /** The deep link to an item's page (`/work?item=<n>`), which the
  *  WhatsApp notices carry. */
-export function itemHref(id: number): string {
-  return `/work?item=${id}`;
+export function itemHref(id: number, search: URLSearchParams | null = null): string {
+  const p = new URLSearchParams(search ?? undefined);
+  p.set("item", String(id));
+  // `item` first: the address WhatsApp notices use.
+  const rest = [...p.entries()].filter(([k]) => k !== "item");
+  const tail = rest.map(([k, v]) => `&${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("");
+  return `/work?item=${id}${tail}`;
+}
+
+// ── list filters ────────────────────────────────────────────────────────
+//
+// The list filters by status (a group of stages) and by source (the kind
+// of source an item's event came from, with its repo). Both selections are
+// kept in the URL query (`status=open,in_review`, `source=github:acme/x`),
+// so a reload or a link keeps them.
+
+export type StatusFilter = "open" | "in_review" | "merged" | "not_merged" | "cancelled" | "stale";
+
+export const STATUS_FILTERS: readonly { value: StatusFilter; label: string }[] = [
+  { value: "open", label: "Open" },
+  { value: "in_review", label: "In review" },
+  { value: "merged", label: "Merged" },
+  { value: "not_merged", label: "Not merged" },
+  { value: "cancelled", label: "Cancelled" },
+  { value: "stale", label: "Stale" },
+];
+
+export const DEFAULT_STATUS: readonly StatusFilter[] = ["open", "in_review"];
+
+/** The status group of a stage. `closed` (closed at its source before a
+ *  pull request existed) counts as cancelled: no work reached review. */
+export function statusFilterOf(stage: WorkStage): StatusFilter {
+  switch (stage) {
+    case "in_review":
+      return "in_review";
+    case "merged":
+      return "merged";
+    case "not_merged":
+      return "not_merged";
+    case "cancelled":
+    case "closed":
+      return "cancelled";
+    case "stale":
+      return "stale";
+    default:
+      return "open";
+  }
+}
+
+/** The source filter's key for an item: `<source>:<repo>`. */
+export function sourceKey(item: { source: string; repo: string }): string {
+  return `${item.source}:${item.repo}`;
+}
+
+/** One entry per source and repo the items have, sorted: a GitHub repo
+ *  shows as its `owner/name`, another kind of source as `<source> · <repo>`. */
+export function sourceOptions(items: readonly { source: string; repo: string }[]): { value: string; label: string }[] {
+  const seen = new Map<string, string>();
+  for (const i of items) {
+    const key = sourceKey(i);
+    if (!seen.has(key)) seen.set(key, i.source === "github" ? i.repo : `${i.source} · ${i.repo}`);
+  }
+  return [...seen.entries()].map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label));
+}
+
+/** The list's filter: `null` means no filter (every value). */
+export interface ListFilter {
+  status: StatusFilter[] | null;
+  source: string[] | null;
+}
+
+/** The filter a URL query holds. No `status`: the default (Open and In
+ *  review); `status=all`: every status. No `source`: every source. */
+export function filterFromSearch(params: URLSearchParams): ListFilter {
+  const raw = params.get("status");
+  const known = new Set<string>(STATUS_FILTERS.map((s) => s.value));
+  const status =
+    raw === null
+      ? [...DEFAULT_STATUS]
+      : raw === "all"
+        ? null
+        : raw.split(",").filter((s): s is StatusFilter => known.has(s));
+  const src = params.get("source");
+  const source = src === null || src === "" ? null : src.split(",").filter((s) => s !== "");
+  return { status, source };
+}
+
+/** `params` with the filter written into it; other keys (`item`) stay. */
+export function filterToSearch(params: URLSearchParams, filter: ListFilter): URLSearchParams {
+  const p = new URLSearchParams(params);
+  const isDefault =
+    filter.status !== null &&
+    filter.status.length === DEFAULT_STATUS.length &&
+    DEFAULT_STATUS.every((s) => filter.status!.includes(s));
+  if (isDefault) p.delete("status");
+  else p.set("status", filter.status === null || filter.status.length === 0 ? "all" : filter.status.join(","));
+  if (filter.source === null || filter.source.length === 0) p.delete("source");
+  else p.set("source", filter.source.join(","));
+  return p;
+}
+
+/** The items the filter lets through. */
+export function applyFilter<T extends { stage: WorkStage; source: string; repo: string }>(items: readonly T[], filter: ListFilter): T[] {
+  return items.filter(
+    (i) =>
+      (filter.status === null || filter.status.includes(statusFilterOf(i.stage))) &&
+      (filter.source === null || filter.source.includes(sourceKey(i))),
+  );
+}
+
+/** The dropdown's summary: the labels when two or fewer are chosen. */
+export function filterSummary(labels: readonly string[], total: number, allLabel = "all"): string {
+  if (labels.length === 0 || labels.length === total) return allLabel;
+  if (labels.length <= 2) return labels.join(", ");
+  return `${labels.length} of ${total}`;
 }
 
 /** The item a `/work` URL opens: a positive integer `item` parameter,

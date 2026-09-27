@@ -7,7 +7,7 @@ import { describe, expect, test } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { ReactElement } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import WorkPage from "@/pages/WorkPage";
+import WorkPage, { ListFilters } from "@/pages/WorkPage";
 import type { WorkItem } from "@/lib/api";
 import { fixtureDetail, fixtureItem, fixtureMessage, fixturePlans, fixtureQuestion } from "@/lib/work.fixtures";
 import { ItemScreen } from "./ItemView";
@@ -52,7 +52,9 @@ describe("deep link", () => {
   test("/work without an item is the list", () => {
     const html = page("/work");
     expect(html).not.toContain("data-item-id");
-    expect(html).toContain("issue pipeline");
+    expect(html).toContain("work items");
+    expect(html).toContain('aria-label="filters"');
+    expect(html).toContain("Open, In review");
   });
 
   test("an invalid item parameter falls back to the list", () => {
@@ -208,6 +210,32 @@ describe("plan version selector", () => {
 
   test("with no versions the panel says so", () => {
     expect(panel({ versions: [] })).toContain("no plan yet");
+  });
+});
+
+describe("list filters", () => {
+  const rows = [
+    { ...fixtureItem({ id: 1, stage: "refinement" }), source: "github" },
+    { ...fixtureItem({ id: 2, stage: "merged", repo: "acme/gadget" }), source: "github" },
+  ];
+
+  test("the status dropdown lists every choice with its count and marks the selection", () => {
+    const html = render(
+      <ListFilters items={rows} filter={{ status: ["open", "in_review"], source: null }} onChange={noop} initialOpen="status" />,
+    );
+    const b = buttons(html);
+    for (const label of ["Open1", "In review0", "Merged1", "Not merged0", "Cancelled0", "Stale0"]) expect(b).toContain(label);
+    expect(b).toContain("statusOpen, In review");
+    expect(b).toContain("sourceall");
+  });
+
+  test("the source dropdown has one entry per repo", () => {
+    const html = render(<ListFilters items={rows} filter={{ status: null, source: ["github:acme/gadget"] }} onChange={noop} initialOpen="source" />);
+    const b = buttons(html);
+    expect(b).toContain("acme/gadget");
+    expect(b).toContain("acme/widget");
+    expect(b).toContain("sourceacme/gadget");
+    expect(b).toContain("statusall");
   });
 });
 

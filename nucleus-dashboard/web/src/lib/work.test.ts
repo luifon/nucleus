@@ -22,6 +22,14 @@ import {
   composerPlaceholder,
   enterSends,
   itemFromSearch,
+  itemHref,
+  applyFilter,
+  filterFromSearch,
+  filterSummary,
+  filterToSearch,
+  sourceOptions,
+  statusFilterOf,
+  type ListFilter,
   planStatus,
   planVersions,
   sendReply,
@@ -41,6 +49,75 @@ import {
 } from "./work";
 
 const item = fixtureItem;
+
+describe("list filters", () => {
+  const row = (id: number, stage: WorkItem["stage"], source = "github", repo = "acme/widget") => ({ ...item({ id, stage, repo }), source });
+  const rows = [
+    row(1, "refinement"),
+    row(2, "in_review"),
+    row(3, "merged"),
+    row(4, "not_merged"),
+    row(5, "cancelled"),
+    row(6, "closed"),
+    row(7, "stale"),
+    row(8, "held", "github", "acme/gadget"),
+    row(9, "failed", "cli", "acme/widget"),
+  ];
+  const ids = (f: ListFilter) => applyFilter(rows, f).map((r) => r.id);
+
+  test("each stage belongs to one status choice", () => {
+    expect(rows.map((r) => statusFilterOf(r.stage))).toEqual([
+      "open", "in_review", "merged", "not_merged", "cancelled", "cancelled", "stale", "open", "open",
+    ]);
+  });
+
+  test("the default is Open and In review, every source", () => {
+    const f = filterFromSearch(new URLSearchParams(""));
+    expect(f).toEqual({ status: ["open", "in_review"], source: null });
+    expect(ids(f)).toEqual([1, 2, 8, 9]);
+  });
+
+  test("status and source combine; all means no filter", () => {
+    expect(ids({ status: ["merged", "not_merged"], source: null })).toEqual([3, 4]);
+    expect(ids({ status: null, source: ["github:acme/gadget", "cli:acme/widget"] })).toEqual([8, 9]);
+    expect(ids({ status: ["open"], source: ["github:acme/widget"] })).toEqual([1]);
+    expect(ids({ status: null, source: null })).toHaveLength(rows.length);
+  });
+
+  test("the sources come from the items: one per source and repo, labelled", () => {
+    expect(sourceOptions(rows)).toEqual([
+      { value: "github:acme/gadget", label: "acme/gadget" },
+      { value: "github:acme/widget", label: "acme/widget" },
+      { value: "cli:acme/widget", label: "cli · acme/widget" },
+    ]);
+  });
+
+  test("both selections live in the URL query and survive a round trip", () => {
+    const base = new URLSearchParams("item=4");
+    const f: ListFilter = { status: ["merged"], source: ["github:acme/widget"] };
+    const p = filterToSearch(base, f);
+    expect(p.get("item")).toBe("4");
+    expect(p.get("status")).toBe("merged");
+    expect(p.get("source")).toBe("github:acme/widget");
+    expect(filterFromSearch(p)).toEqual(f);
+    // The default leaves no status key; "all" is written explicitly.
+    expect(filterToSearch(base, { status: ["in_review", "open"], source: null }).toString()).toBe("item=4");
+    expect(filterToSearch(base, { status: null, source: null }).get("status")).toBe("all");
+    expect(filterFromSearch(new URLSearchParams("status=all")).status).toBeNull();
+    expect(filterFromSearch(new URLSearchParams("status=open,bogus")).status).toEqual(["open"]);
+  });
+
+  test("an item link keeps the filters, with the item first", () => {
+    expect(itemHref(4)).toBe("/work?item=4");
+    expect(itemHref(4, new URLSearchParams("status=merged&item=2"))).toBe("/work?item=4&status=merged");
+  });
+
+  test("the summary names up to two choices", () => {
+    expect(filterSummary(["Open", "In review"], 6)).toBe("Open, In review");
+    expect(filterSummary([], 6)).toBe("all");
+    expect(filterSummary(["A", "B", "C"], 6)).toBe("3 of 6");
+  });
+});
 
 describe("plan approval", () => {
   test("needs a plan and no running turn", () => {

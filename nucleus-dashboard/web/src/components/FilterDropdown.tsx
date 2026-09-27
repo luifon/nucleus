@@ -12,14 +12,20 @@ export default function FilterDropdown({
   selected,
   onChange,
   allLabel = "all",
+  summary: summaryOverride,
+  initialOpen = false,
 }: {
   label: string;
   options: Option[];
   selected: string[];
   onChange: (next: string[]) => void;
   allLabel?: string;
+  /** Text on the button; "N of M" by default. */
+  summary?: string;
+  /** Open from the start (tests, screenshots). */
+  initialOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(initialOpen);
   const wrap = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -29,16 +35,24 @@ export default function FilterDropdown({
         setOpen(false);
       }
     };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
     document.addEventListener("mousedown", onDocClick);
-    return () => document.removeEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
   }, [open]);
 
   const summary =
-    selected.length === 0
+    summaryOverride ??
+    (selected.length === 0
       ? allLabel
       : selected.length === options.length
         ? allLabel
-        : `${selected.length} of ${options.length}`;
+        : `${selected.length} of ${options.length}`);
 
   const toggle = (v: string) => {
     const next = selected.includes(v) ? selected.filter((s) => s !== v) : [...selected, v];
@@ -48,6 +62,9 @@ export default function FilterDropdown({
   return (
     <div ref={wrap} className="relative">
       <button
+        type="button"
+        aria-haspopup="listbox"
+        aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
         className="flex items-center gap-2 rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] px-2.5 py-1 text-xs text-[var(--color-nucleus-text)] hover:border-[var(--color-nucleus-accent)]"
       >

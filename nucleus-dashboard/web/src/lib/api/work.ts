@@ -86,10 +86,14 @@ export type WorkReplyResult = Omit<WorkReplyResultWire, "item" | "outcome" | "de
   decision: WorkDecision | null;
 };
 
+/** A row of the item list: the item and its event's source kind
+ *  (`github`, `cli`, …). */
+export type WorkListItem = WorkItem & { source: string };
+
 /** Newest first. `all: false` leaves out closed and cancelled items, and
  *  stale items a newer item of the same issue replaced. */
 export const listWorkItems = (opts: { all?: boolean } = {}, signal?: AbortSignal) =>
-  jsonGet<WorkItem[]>(`/work/api/list${qs({ all: opts.all ?? true })}`, signal);
+  jsonGet<WorkListItem[]>(`/work/api/list${qs({ all: opts.all ?? true })}`, signal);
 
 export const getWorkDetail = (id: number, signal?: AbortSignal) =>
   jsonGet<WorkDetail>(`/work/api/detail${qs({ id })}`, signal);
