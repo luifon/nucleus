@@ -32,6 +32,17 @@ run_script "$CHECK"
 assert_eq "$RC" 0
 assert_not_contains "$OUT" "caddy"
 
+test_case "a plist with no template here (another project) is not checked"
+setup_sandbox
+add_job discord
+add_job other-project
+job_set other-project lwcr "$LWCR_LINE"
+rm "$REPO/tools/launchd/other-project.plist.example"
+run_script "$CHECK" --repair
+assert_eq "$RC" 0
+assert_not_contains "$OUT" "other-project"
+assert_contains "$OUT" "job check: 1 pass / 0 warn / 0 fail"
+
 test_case "job not loaded: FAIL"
 setup_sandbox
 add_job discord
@@ -114,14 +125,14 @@ assert_contains "$OUT" "PASS  no nucleus code-signature crash report"
 test_case "--start selects jobs by StartInterval <= 60 from the plist"
 setup_sandbox
 add_job reminders-tick 60
-add_job intake-tick 30
+add_job work-tick 30
 add_job gmail-metabolism 3600
 add_job discord
 run_script "$CHECK" --start
 assert_eq "$RC" 0
 kicks="$(log_of launchctl | grep kickstart)"
 assert_contains "$kicks" "dev.nucleus.reminders-tick"
-assert_contains "$kicks" "dev.nucleus.intake-tick"
+assert_contains "$kicks" "dev.nucleus.work-tick"
 assert_not_contains "$kicks" "gmail-metabolism"
 assert_not_contains "$kicks" "discord"
 assert_not_contains "$kicks" "-k"

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Check that the installed Nucleus launchd jobs can start.
 #
-# Jobs: every ${PREFIX}.*.plist in ~/Library/LaunchAgents except caddy.
+# Jobs: every ${PREFIX}.*.plist in ~/Library/LaunchAgents that has a template
+# in tools/launchd/ (<service>.plist.example), except caddy.
 # PREFIX is NUCLEUS_LAUNCHD_PREFIX from .env (default dev.nucleus), read the
 # way install.sh reads it.
 #
@@ -23,7 +24,7 @@
 #                  wait for a running run to end, start the job with
 #                  `launchctl kickstart` (no -k) and check that it ran and
 #                  exited 0, or is still running at the timeout. A reminders
-#                  tick sends only reminders that are already due and an intake
+#                  tick sends only reminders that are already due and a work
 #                  tick only polls, so an early run has no other effect.
 #
 # Without flags the script only reads state.
@@ -100,6 +101,9 @@ for plist in "$AGENTS_DIR/${PREFIX}".*.plist; do
   [ -f "$plist" ] || continue
   label="$(basename "$plist" .plist)"
   [ "$label" = "${PREFIX}.caddy" ] && continue
+  # Only Nucleus's own jobs: other projects may install plists under the
+  # same prefix, run other programs, and have no template here.
+  [ -f "$SCRIPT_DIR/${label#"${PREFIX}".}.plist.example" ] || continue
   LABELS+=("$label")
 done
 if [ ${#LABELS[@]} -eq 0 ]; then
