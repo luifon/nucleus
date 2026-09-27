@@ -32,6 +32,7 @@ import {
   holdCode,
   markRanges,
   canRetry,
+  isOpenItem,
   isWorking,
   stageKind,
   surfaceLabel,
@@ -307,7 +308,18 @@ describe("decision board", () => {
   });
 
   test("finished items show neither the board nor the composer", () => {
-    for (const stage of ["closed", "cancelled", "stale"] as const) expect(boardFor(item({ stage }))).toEqual({ kind: "closed" });
+    for (const stage of ["closed", "cancelled", "stale", "merged", "not_merged"] as const) {
+      expect(boardFor(item({ stage }))).toEqual({ kind: "closed" });
+      expect(isOpenItem(stage)).toBe(false);
+    }
+  });
+
+  test("an item in review waits for the PR review and stays open", () => {
+    const b = boardFor(item({ stage: "in_review", pr_url: "https://example.invalid/acme/widget/pull/11" }));
+    expect(b.kind === "board" && b.title).toContain("waits for your review");
+    expect(isOpenItem("in_review")).toBe(true);
+    expect(stageKind(item({ stage: "merged" }))).toBe("ok");
+    expect(stageKind(item({ stage: "not_merged" }))).toBe("idle");
   });
 
   test("the board comes back when what it offers changes", () => {

@@ -278,7 +278,13 @@ async fn render_show(db: &sqlx::SqlitePool, n: i64, json: bool, label: &str, hid
         writeln!(out, "tests: {t}")?;
     }
     if let Some(u) = &it.pr_url {
-        writeln!(out, "draft PR: {u}")?;
+        let review = match it.stage.as_str() {
+            "in_review" => " (waiting for review)",
+            "merged" => " (merged)",
+            "not_merged" => " (closed without a merge)",
+            _ => "",
+        };
+        writeln!(out, "draft PR: {u}{review}")?;
     }
     if it.comment_state != "none" {
         writeln!(out, "pull request link on the issue: {}", it.comment_state)?;

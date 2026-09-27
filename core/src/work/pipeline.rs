@@ -229,7 +229,8 @@ pub async fn tick(ctx: &Ctx, force_poll: bool) -> Result<TickReport> {
         if let Err(e) = flush_whatsapp(ctx, &item).await {
             r.errors.push(format!("#{id} WhatsApp delivery: {e:#}"));
         }
-        if item.stage().is_terminal() {
+        // The clone is not needed once the draft PR is open.
+        if item.stage().is_terminal() || item.stage() == Stage::InReview {
             if let Err(e) = cleanup(ctx, &item).await {
                 r.errors.push(format!("#{id} cleanup: {e:#}"));
             }
@@ -1768,7 +1769,9 @@ async fn step_item(ctx: &Ctx, item: &Item, r: &mut TickReport) {
         // removed (at every stage), or the text the item is bound to
         // edited. The stored event is what the last poll saw; the live
         // source is read again before every irreversible step.
-        if !item.stage().is_terminal() {
+        // An item in review is past every write: only its pull request's
+        // state moves it (the issue closes when the PR merges).
+        if !item.stage().is_terminal() && item.stage() != Stage::InReview {
             let ev = store::event(&ctx.db, item.event_id).await?;
             if ev.state == "closed" {
                 return close_by_source(ctx, item, "the issue was closed at its source").await;
@@ -1786,7 +1789,15 @@ async fn step_item(ctx: &Ctx, item: &Item, r: &mut TickReport) {
             Stage::Refinement => step_refinement(ctx, item).await,
             Stage::Implementation => step_implementation(ctx, item).await,
             Stage::Pr => step_pr(ctx, item).await,
-            Stage::Failed | Stage::Blocked | Stage::Held | Stage::Closed | Stage::Cancelled | Stage::Stale => Ok(()),
+            Stage::InReview => step_in_review(ctx, item).await,
+            Stage::Failed
+            | Stage::Blocked
+            | Stage::Held
+            | Stage::Closed
+            | Stage::Cancelled
+            | Stage::Stale
+            | Stage::Merged
+            | Stage::NotMerged => Ok(()),
         }
     }
     .await;
@@ -2768,10 +2779,7 @@ async fn post_pr_link(ctx: &Ctx, item: &Item, ev: &Event, url: &str, first: &Rev
         )
         .await?;
         if moved {
-            let mut v = vars.clone();
-            v.retain(|(k, _)| *k != "error");
-            let why = "the draft PR is open; the event's source has no reply channel";
-            note(ctx, item.id, &fill_item(&ctx.cfg.texts.item_closed, &v, &[("error", why)]), None).await?;
+            note(ctx, item.id, &fill_vars(&ctx.cfg.texts.comment_skipped, &vars), None).await?;
         }
         return Ok(());
     };
@@ -2823,6 +2831,55 @@ async fn post_pr_link(ctx: &Ctx, item: &Item, ev: &Event, url: &str, first: &Rev
     .await?
     {
         note(ctx, item.id, &fill_item(&ctx.cfg.texts.comment_posted, &vars, &[("ref", &event_ref(ev))]), None).await?;
+    }
+    Ok(())
+}
+
+/// An item in review: read its pull request's state once per poll interval
+/// of its repo (`gh pr view`, the pinned `gh`, the pull request Nucleus
+/// opened as the account it acts as) and move the item to `merged` or
+/// `not_merged`. A failed read leaves the item in review with the error
+/// recorded; it never fails the item.
+async fn step_in_review(ctx: &Ctx, item: &Item) -> Result<()> {
+    let key = format!("prpoll:{}", item.id);
+    let interval = ctx.cfg.github.poll_interval_secs.max(30) as i64;
+    if let Some(t) = store::meta(&ctx.db, &key).await? {
+        if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&t) {
+            if (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds() < interval {
+                return Ok(());
+            }
+        }
+    }
+    store::set_meta(&ctx.db, &key, &crate::timestamp::now()).await?;
+    let (Some(url), Some(branch)) = (item.pr_url.clone(), item.branch.clone()) else {
+        return Ok(());
+    };
+    let read = async {
+        let viewer = ctx.viewer().await?.to_string();
+        github::pr_state(&*ctx.gh, &item.repo, &url, &branch, &viewer).await
+    };
+    let state = match read.await {
+        Ok(s) => s,
+        Err(e) => {
+            let why = format!("reading the pull request's state failed: {e:#}");
+            tracing::warn!(item = item.id, why, "work: review poll");
+            store::update(&ctx.db, item.id, Stage::InReview, vec![("error", clip(&why, 1_000).into())]).await?;
+            return Ok(());
+        }
+    };
+    let vars = item_vars(ctx, item);
+    let (ev, reason, text) = match state {
+        github::PrState::Open => {
+            if item.error.is_some() {
+                store::update(&ctx.db, item.id, Stage::InReview, vec![("error", Val::Text(None))]).await?;
+            }
+            return Ok(());
+        }
+        github::PrState::Merged => (StageEvent::PrMerged, "the pull request was merged", &ctx.cfg.texts.pr_merged),
+        github::PrState::Closed => (StageEvent::PrClosed, "the pull request was closed without a merge", &ctx.cfg.texts.pr_not_merged),
+    };
+    if store::advance(&ctx.db, item.id, Stage::InReview, ev, reason, vec![("error", Val::Text(None))]).await? {
+        note(ctx, item.id, &fill_vars(text, &vars), None).await?;
     }
     Ok(())
 }
@@ -2986,16 +3043,17 @@ async fn flush_whatsapp(ctx: &Ctx, item: &Item) -> Result<()> {
 }
 
 async fn cleanup_candidates(db: &SqlitePool) -> Result<Vec<i64>> {
-    Ok(sqlx::query_scalar(
-        "SELECT id FROM items WHERE stage IN ('closed','cancelled','stale')
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT id FROM items WHERE stage IN {}
             AND (worktree IS NOT NULL
                  OR EXISTS (SELECT 1 FROM item_messages m WHERE m.item_id = items.id AND m.wa_state IS NULL))",
-    )
+        Stage::terminal_sql()
+    ))
     .fetch_all(db)
     .await?)
 }
 
-/// A closed, cancelled or stale item: remove its clone.
+/// A finished item, or one in review: remove its clone.
 async fn cleanup(ctx: &Ctx, item: &Item) -> Result<()> {
     if let Some(wt) = item.worktree.as_deref().map(PathBuf::from) {
         git::remove_clone(&wt)?;

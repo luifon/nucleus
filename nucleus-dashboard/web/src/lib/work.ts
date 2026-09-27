@@ -19,12 +19,16 @@ import type {
 import { answeredIds, describeResponse, parseMessage, type CanvasBlockData, type ParsedResponse } from "@/lib/canvas";
 
 /** The stages in pipeline order, for the stage track. */
-export const STAGE_TRACK: readonly WorkStage[] = ["queued", "eval", "refinement", "implementation", "pr", "closed"];
+export const STAGE_TRACK: readonly WorkStage[] = ["queued", "eval", "refinement", "implementation", "pr", "in_review", "merged"];
+
+/** Finished: nothing changes any more. `stale` is finished (only a new
+ *  label starts new work). */
+export const TERMINAL_STAGES: readonly WorkStage[] = ["merged", "not_merged", "closed", "cancelled", "stale"];
 
 /** Not finished: the pipeline still works on it or waits for the
  *  operator. `stale` is finished (only a new label starts new work). */
 export function isOpenItem(stage: WorkStage): boolean {
-  return stage !== "closed" && stage !== "cancelled" && stage !== "stale";
+  return !TERMINAL_STAGES.includes(stage);
 }
 
 /** Stages where an agent or Nucleus is working and the list should refresh. */
@@ -43,10 +47,15 @@ export function stageKind(item: Pick<WorkItem, "stage" | "pr_url" | "current_tas
     case "blocked":
     case "stale":
       return "down";
+    case "merged":
+      return "ok";
     case "closed":
       return item.pr_url ? "ok" : "idle";
     case "cancelled":
+    case "not_merged":
       return "idle";
+    case "in_review":
+      return "warn";
     case "held":
       return "warn";
     case "refinement":
@@ -65,6 +74,7 @@ export function waitingOn(item: WorkItem): string | null {
   if (item.stage === "blocked") return "blocked by the secret guard — fix, then retry or cancel";
   if (item.stage === "stale") return "stale — the issue changed; add the label again for a new item";
   if (item.stage === "held") return "held — the issue has content GitHub's page does not show; review, then release or cancel";
+  if (item.stage === "in_review") return "the draft PR waits for your review";
   return null;
 }
 
@@ -373,7 +383,11 @@ export function boardFor(
     case "closed":
     case "cancelled":
     case "stale":
+    case "merged":
+    case "not_merged":
       return { kind: "closed" };
+    case "in_review":
+      return { kind: "board", title: "The draft PR waits for your review on GitHub.", options: [WRITE] };
     case "refinement":
       if (item.current_task_id) return { kind: "board", title: workingStatus(item), options: [WRITE] };
       if (item.plan_version > 0 && item.plan_draft !== null) {

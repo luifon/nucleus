@@ -759,6 +759,13 @@ pub struct WorkTexts {
     pub pr_opened: String,
     /// The pull request link was posted on the issue; the item is closed.
     pub comment_posted: String,
+    /// The review poll read the pull request as merged (`{pr_url}`).
+    /// The draft PR is open and the event's source has no reply channel.
+    pub comment_skipped: String,
+    pub pr_merged: String,
+    /// The review poll read the pull request as closed without a merge
+    /// (`{pr_url}`).
+    pub pr_not_merged: String,
     pub item_failed: String,
     pub item_cancelled: String,
     pub item_closed: String,
@@ -920,7 +927,10 @@ impl Default for WorkTexts {
             plan_approved: "✅ Plan v{version} of item #{n} approved; implementation started.".into(),
             pr_opened: "📬 Draft PR for item #{n} — {title}: {pr_url}\nTests: {tests}\n\nThe agent's summary:\n{summary}"
                 .into(),
-            comment_posted: "💬 The draft PR link is posted on {ref}. Item #{n} is closed.".into(),
+            comment_posted: "💬 The draft PR link is posted on {ref}. Item #{n} waits for the review.".into(),
+            comment_skipped: "💬 The event's source has no reply channel, so no PR link was posted. Item #{n} waits for the review.".into(),
+            pr_merged: "✅ Item #{n}: the pull request was merged: {pr_url}".into(),
+            pr_not_merged: "⏹ Item #{n}: the pull request was closed without a merge: {pr_url}".into(),
             item_failed: "⚠️ Item #{n} — {title} failed during {failed_in}: {error}\nRetry from the \
                           dashboard (Work page) or with `nucleus work retry {n}`."
                 .into(),

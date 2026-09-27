@@ -92,6 +92,7 @@ case "$*" in
   "api user") echo '{{"login":"nucleus-it"}}' ;;
   "pr create"*) echo 'https://example.invalid/acme/widget/pull/1' ;;
   "issue comment"*) echo 'https://example.invalid/acme/widget/issues/1#issuecomment-1' ;;
+  "pr view"*) echo '{{"url":"https://example.invalid/acme/widget/pull/1","state":"OPEN","mergedAt":null,"author":{{"login":"nucleus-it"}},"headRefName":"nucleus/item-1"}}' ;;
   *) echo "fake gh: unexpected: $*" >&2; exit 1 ;;
 esac
 "#,
@@ -176,7 +177,7 @@ async fn issue_to_draft_pr_with_real_agents() {
     let item = loop {
         tick(ws);
         if let Ok(it) = nucleus_core::work::store::item(&db, 1).await {
-            if matches!(it.stage.as_str(), "failed" | "blocked" | "closed" | "cancelled" | "stale" | "refinement") {
+            if matches!(it.stage.as_str(), "failed" | "blocked" | "in_review" | "closed" | "cancelled" | "stale" | "refinement") {
                 break it;
             }
         }
@@ -199,7 +200,7 @@ async fn issue_to_draft_pr_with_real_agents() {
     for m in nucleus_core::work::store::messages(&db, 1).await.unwrap() {
         println!("[{} {}] {}", m.author, m.via, m.body.replace('\n', " "));
     }
-    assert_eq!((item.stage.as_str(), item.comment_state.as_str()), ("closed", "posted"), "item: {item:?}");
+    assert_eq!((item.stage.as_str(), item.comment_state.as_str()), ("in_review", "posted"), "item: {item:?}");
     assert_eq!(item.classification.as_deref(), Some("simple"));
     assert_eq!(item.tests_status.as_deref(), Some("passed"));
     assert_eq!(item.pr_url.as_deref(), Some("https://example.invalid/acme/widget/pull/1"));

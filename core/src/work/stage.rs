@@ -18,8 +18,17 @@ pub enum Stage {
     /// The implementation agent runs, then Nucleus runs the tests.
     Implementation,
     /// Nucleus pushes the branch, opens the draft pull request and posts
-    /// its link on the issue; the item then closes.
+    /// its link on the issue; the item then waits for the review.
     Pr,
+    /// The draft pull request is open and waits for a review; the poll
+    /// reads its state at the repo's poll interval.
+    InReview,
+    /// The pull request was merged. Terminal.
+    Merged,
+    /// The pull request was closed without being merged. Terminal.
+    NotMerged,
+    /// Closed at its source before a pull request existed (the issue was
+    /// closed), or closed before the review stages existed.
     Closed,
     /// A step failed; `nucleus work retry` or the dashboard resumes it.
     Failed,
@@ -40,12 +49,15 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Stage; 11] = [
+    pub const ALL: [Stage; 14] = [
         Stage::Queued,
         Stage::Eval,
         Stage::Refinement,
         Stage::Implementation,
         Stage::Pr,
+        Stage::InReview,
+        Stage::Merged,
+        Stage::NotMerged,
         Stage::Closed,
         Stage::Failed,
         Stage::Cancelled,
@@ -61,6 +73,9 @@ impl Stage {
             Stage::Refinement => "refinement",
             Stage::Implementation => "implementation",
             Stage::Pr => "pr",
+            Stage::InReview => "in_review",
+            Stage::Merged => "merged",
+            Stage::NotMerged => "not_merged",
             Stage::Closed => "closed",
             Stage::Failed => "failed",
             Stage::Cancelled => "cancelled",
@@ -76,7 +91,14 @@ impl Stage {
 
     /// No further work and no retry.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Stage::Closed | Stage::Cancelled | Stage::Stale)
+        matches!(self, Stage::Closed | Stage::Cancelled | Stage::Stale | Stage::Merged | Stage::NotMerged)
+    }
+
+    /// The terminal stages as an SQL list: `('merged','not_merged',...)`.
+    pub fn terminal_sql() -> String {
+        let names: Vec<String> =
+            Stage::ALL.into_iter().filter(|s| s.is_terminal()).map(|s| format!("'{}'", s.as_str())).collect();
+        format!("({})", names.join(","))
     }
 }
 
@@ -93,6 +115,10 @@ pub enum StageEvent {
     /// The pull request stage ended: the draft PR is open and its link is
     /// posted on the issue (or the source has no reply channel).
     Finished,
+    /// The poll read the item's pull request as merged.
+    PrMerged,
+    /// The poll read the item's pull request as closed without a merge.
+    PrClosed,
     Failed,
     Cancel,
     /// The event was closed at its source (the issue was closed).
@@ -123,7 +149,13 @@ pub fn transition(from: Stage, ev: &StageEvent) -> Result<Stage> {
         (Eval, E::EvalNeedsPlan) => Refinement,
         (Refinement, E::PlanApproved) => Implementation,
         (Implementation, E::ImplementationDone) => Pr,
-        (Pr, E::Finished) => Closed,
+        (Pr, E::Finished) => InReview,
+        (InReview, E::PrMerged) => Merged,
+        (InReview, E::PrClosed) => NotMerged,
+        // The work is done: only the pull request's state and the operator
+        // (cancel) move an item in review.
+        (InReview, E::Cancel) => Cancelled,
+        (InReview, e) => bail!("{e:?} does not apply to an item in review"),
         (Failed, E::Failed) => bail!("item already failed"),
         (Queued | Eval | Refinement | Implementation | Pr, E::Blocked) => Blocked,
         (Blocked, E::Retry { failed_in: Queued | Eval }) => Queued,
@@ -138,7 +170,9 @@ pub fn transition(from: Stage, ev: &StageEvent) -> Result<Stage> {
             // An eval is run again from the start.
             Queued | Eval => Queued,
             Refinement | Implementation | Pr | Held => *failed_in,
-            Closed | Failed | Cancelled | Stale | Blocked => bail!("nothing to retry in stage {}", failed_in.as_str()),
+            Closed | Failed | Cancelled | Stale | Blocked | InReview | Merged | NotMerged => {
+                bail!("nothing to retry in stage {}", failed_in.as_str())
+            }
         },
         (s, e) => bail!("{e:?} does not apply to an item in the {} stage", s.as_str()),
     };
@@ -358,7 +392,10 @@ mod tests {
         ok(Eval, E::EvalNeedsPlan, Refinement);
         ok(Refinement, E::PlanApproved, Implementation);
         ok(Implementation, E::ImplementationDone, Pr);
-        ok(Pr, E::Finished, Closed);
+        ok(Pr, E::Finished, InReview);
+        ok(InReview, E::PrMerged, Merged);
+        ok(InReview, E::PrClosed, NotMerged);
+        ok(InReview, E::Cancel, Cancelled);
         for s in [Queued, Eval, Refinement, Implementation, Pr] {
             ok(s, E::Failed, Failed);
             ok(s, E::Cancel, Cancelled);
@@ -418,12 +455,23 @@ mod tests {
         bad(Refinement, E::Release { held_in: Refinement });
         bad(Held, E::Release { held_in: Pr });
         bad(Held, E::PlanApproved);
+        // An item in review moves only on its pull request (or a cancel):
+        // the issue closing, the label or an edit do not change it.
+        for ev in [E::SourceClosed, E::Stale, E::Failed, E::Blocked, E::Hold, E::Finished, E::Retry { failed_in: Pr }] {
+            bad(InReview, ev);
+        }
+        bad(Pr, E::PrMerged);
+        bad(Implementation, E::PrClosed);
+        bad(Failed, E::Retry { failed_in: InReview });
         // Terminal stages never change.
-        for s in [Closed, Cancelled, Stale] {
-            for ev in [E::Cancel, E::Failed, E::SourceClosed, E::Stale, E::Retry { failed_in: Eval }] {
+        for s in [Closed, Cancelled, Stale, Merged, NotMerged] {
+            assert!(s.is_terminal());
+            for ev in [E::Cancel, E::Failed, E::SourceClosed, E::Stale, E::Retry { failed_in: Eval }, E::PrMerged, E::PrClosed] {
                 bad(s, ev);
             }
         }
+        assert!(!InReview.is_terminal());
+        assert_eq!(Stage::terminal_sql(), "('merged','not_merged','closed','cancelled','stale')");
     }
 
     fn eval_text(class: &str, conf: f64, size: &str, schema: bool) -> String {

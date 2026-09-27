@@ -669,7 +669,7 @@ mod tests {
         let app = router(st.clone());
         let c = ctx(&st).await.unwrap();
         let n = hidden_item(&c, "note-r").await;
-        for stage in ["queued", "eval", "refinement", "implementation", "pr", "blocked", "failed", "closed", "cancelled", "stale"] {
+        for stage in ["queued", "eval", "refinement", "implementation", "pr", "in_review", "blocked", "failed", "closed", "merged", "not_merged", "cancelled", "stale"] {
             sqlx::query("UPDATE items SET stage = ?2 WHERE id = ?1").bind(n).bind(stage).execute(&c.db).await.unwrap();
             let (status, body) = post_reply(&app, n, &format!("a note in {stage}")).await;
             assert_eq!(status, StatusCode::OK, "{stage}: {body}");

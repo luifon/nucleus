@@ -154,6 +154,7 @@ async fn fixture() -> Fixture {
     gh.on("collaborators/", false, "", "gh: Not Found (HTTP 404)");
     gh.on("pr create", true, "https://example.invalid/acme/widget/pull/5\n", "");
     gh.on("issue comment", true, "https://example.invalid/acme/widget/issues/1#issuecomment-9\n", "");
+    gh.on("pr view", true, &pr_view("OPEN", None, "nucleus-bot"), "");
     let ctx = Ctx {
         ws: ws.clone(),
         cfg,
@@ -382,7 +383,7 @@ async fn simple_issue_goes_from_work_to_a_draft_pr_and_the_pr_link_on_the_issue(
     // issue, with no approval → closed; cleanup
     tick(&f).await;
     let it = item1(&f).await;
-    assert_eq!((it.stage(), it.tests_status.as_deref()), (Stage::Closed, Some("passed")));
+    assert_eq!((it.stage(), it.tests_status.as_deref()), (Stage::InReview, Some("passed")));
     assert_eq!(it.pr_url.as_deref(), Some("https://example.invalid/acme/widget/pull/5"));
     assert_eq!(it.comment_state, "posted");
     sh(&f.remote, &format!("git rev-parse --verify -q refs/heads/{branch}"));
@@ -417,10 +418,99 @@ async fn simple_issue_goes_from_work_to_a_draft_pr_and_the_pr_link_on_the_issue(
     assert!(thread.iter().any(|b| b.contains("The draft PR link is posted on acme/widget#1")), "{thread:?}");
     assert!(!wt.exists(), "the worktree is removed when the item closes");
     let path: Vec<String> = store::transitions(&f.ctx.db, 1).await.unwrap().into_iter().map(|t| t.to_stage).collect();
-    assert_eq!(path, ["queued", "eval", "implementation", "pr", "closed"]);
+    assert_eq!(path, ["queued", "eval", "implementation", "pr", "in_review"]);
     // A later tick posts nothing more.
     tick(&f).await;
     assert_eq!(f.gh.calls_with("issue comment"), 1);
+}
+
+/// `gh pr view --json url,state,mergedAt,author,headRefName` for item #1's
+/// pull request.
+fn pr_view(state: &str, merged_at: Option<&str>, author: &str) -> String {
+    serde_json::json!({ "url": "https://example.invalid/acme/widget/pull/5", "state": state, "mergedAt": merged_at,
+        "author": { "login": author }, "headRefName": "nucleus/item-1" })
+    .to_string()
+}
+
+/// Make the next tick read the pull request's state again (the review poll
+/// runs once per poll interval).
+async fn review_poll_due(f: &Fixture) {
+    sqlx::query("DELETE FROM meta WHERE key LIKE 'prpoll:%'").execute(&f.ctx.db).await.unwrap();
+}
+
+/// Item #1 through a simple eval to an open draft PR (in review).
+async fn to_review(f: &Fixture) {
+    accept(f, 1).await;
+    to_implementation(f).await;
+    tick(f).await;
+    std::fs::write(PathBuf::from(item1(f).await.worktree.unwrap()).join("README.md"), "hello\n").unwrap();
+    finish_current(f, TaskStatus::Done, Some("done"), None).await;
+    tick(f).await;
+    assert_eq!(item1(f).await.stage(), Stage::InReview);
+}
+
+#[tokio::test]
+async fn an_item_in_review_follows_its_pull_request_to_merged() {
+    let f = fixture().await;
+    to_review(&f).await;
+    assert_eq!(f.gh.calls_with("pr view"), 1, "read once when the item enters review");
+    // Within the poll interval nothing is read.
+    tick(&f).await;
+    assert_eq!(f.gh.calls_with("pr view"), 1);
+    // The issue closes when the PR merges: an item in review ignores it.
+    poll_again(&f, 1, &["nucleus"], "closed", "body", "closed").await;
+    review_poll_due(&f).await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::InReview);
+    // Merged: terminal.
+    f.gh.set("pr view", true, &pr_view("MERGED", Some("2026-09-26T12:00:00Z"), "nucleus-bot"), "");
+    review_poll_due(&f).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.closed_at.is_some()), (Stage::Merged, true));
+    let path: Vec<String> = store::transitions(&f.ctx.db, 1).await.unwrap().into_iter().map(|t| t.to_stage).collect();
+    assert_eq!(path.last().map(String::as_str), Some("merged"));
+    assert!(store::messages(&f.ctx.db, 1).await.unwrap().iter().any(|m| m.body.contains("the pull request was merged")));
+    review_poll_due(&f).await;
+    tick(&f).await;
+    assert_eq!(f.gh.calls_with("pr view"), 3, "a merged item is not read again");
+}
+
+#[tokio::test]
+async fn a_closed_pull_request_ends_not_merged_and_a_bad_answer_changes_nothing() {
+    let f = fixture().await;
+    to_review(&f).await;
+    // A pull request opened by another account, or a failed read: the item
+    // stays in review with the error recorded; it never fails.
+    for (ok, out) in [(true, pr_view("CLOSED", None, "intruder")), (false, String::new())] {
+        f.gh.set("pr view", ok, &out, "gh: HTTP 502");
+        review_poll_due(&f).await;
+        tick(&f).await;
+        let it = item1(&f).await;
+        assert_eq!(it.stage(), Stage::InReview);
+        assert!(it.error.unwrap().contains("reading the pull request's state failed"));
+    }
+    f.gh.set("pr view", true, &pr_view("CLOSED", None, "nucleus-bot"), "");
+    review_poll_due(&f).await;
+    tick(&f).await;
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.error), (Stage::NotMerged, None));
+}
+
+#[tokio::test]
+async fn a_closed_item_with_a_pull_request_is_migrated_to_review_and_settled_by_the_poll() {
+    let f = fixture().await;
+    to_review(&f).await;
+    // As a version before the review stages left it.
+    sqlx::query("UPDATE items SET stage = 'closed', closed_at = 't' WHERE id = 1").execute(&f.ctx.db).await.unwrap();
+    sqlx::query("DELETE FROM schema_migrations WHERE version = 9").execute(&f.ctx.db).await.unwrap();
+    drop(store::open(&f.ctx.ws).await.unwrap());
+    let it = item1(&f).await;
+    assert_eq!((it.stage(), it.closed_at), (Stage::InReview, None));
+    f.gh.set("pr view", true, &pr_view("MERGED", Some("2026-09-26T12:00:00Z"), "nucleus-bot"), "");
+    review_poll_due(&f).await;
+    tick(&f).await;
+    assert_eq!(item1(&f).await.stage(), Stage::Merged);
 }
 
 #[tokio::test]
@@ -1146,7 +1236,7 @@ async fn only_one_code_owned_commit_is_published() {
     finish_current(&f, TaskStatus::Done, Some("done"), None).await;
     tick(&f).await;
     let it = item1(&f).await;
-    assert_eq!(it.stage(), Stage::Closed, "{:?}", it.error);
+    assert_eq!(it.stage(), Stage::InReview, "{:?}", it.error);
     let branch = it.branch.unwrap();
     assert_eq!(remote_git(&f, &["rev-list", "--count", &format!("main..{branch}")]).trim(), "1", "one commit");
     let log = remote_git(&f, &["log", "--format=%an|%ae|%cn|%ce|%B", &branch]);
@@ -1214,7 +1304,7 @@ async fn a_change_during_the_scan_stops_the_push() {
     assert!(it.error.unwrap().contains("changed while Nucleus prepared push"));
     assert!(!remote_has(&f, "nucleus/item-1") && f.gh.calls_with("pr create") == 0);
     tick(&f).await;
-    assert_eq!(item1(&f).await.stage(), Stage::Closed);
+    assert_eq!(item1(&f).await.stage(), Stage::InReview);
     assert!(remote_has(&f, "nucleus/item-1"));
 
     // The body edited during the scan: the item goes stale, nothing pushed.
@@ -1384,7 +1474,7 @@ async fn a_push_before_a_crash_is_recognized_and_not_repeated() {
     // The next tick finds the commit at the remote, records it, and goes on.
     tick(&f).await;
     let it = item1(&f).await;
-    assert_eq!((it.stage(), it.pushed_sha.as_deref()), (Stage::Closed, Some(sha.as_str())));
+    assert_eq!((it.stage(), it.pushed_sha.as_deref()), (Stage::InReview, Some(sha.as_str())));
     assert_eq!(f.gh.calls_with("pr create"), 1);
 }
 
@@ -1411,7 +1501,7 @@ async fn forged_markers_and_foreign_pull_requests_are_ignored() {
     let it = item1(&f).await;
     assert_eq!(it.pr_url.as_deref(), Some("https://example.invalid/acme/widget/pull/5"), "Nucleus opened its own PR");
     assert_eq!(f.gh.calls_with("pr create"), 1);
-    assert_eq!((it.stage(), it.comment_state.as_str()), (Stage::Closed, "posted"));
+    assert_eq!((it.stage(), it.comment_state.as_str()), (Stage::InReview, "posted"));
     assert_eq!(f.gh.calls_with("issue comment 1"), 1, "the PR link was posted");
     let op = it.comment_op.unwrap();
     assert_eq!(op.len(), 32, "a 128-bit operation id");

@@ -519,6 +519,38 @@ pub async fn find_pr(gh: &dyn GhRunner, repo: &str, branch: &str, author: &str) 
     }))
 }
 
+/// Where a pull request stands, as the review poll reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Merged,
+    /// Closed without a merge.
+    Closed,
+}
+
+/// The state of the item's own pull request `url`: `gh pr view <url>
+/// --json url,state,mergedAt,author,headRefName`. The answer must be that
+/// pull request (the same URL and head branch) and opened by `author` (the
+/// account Nucleus acts as); anything else is an error, and the item stays
+/// in review.
+pub async fn pr_state(gh: &dyn GhRunner, repo: &str, url: &str, branch: &str, author: &str) -> Result<PrState> {
+    let v = gh_json(gh, args(&["pr", "view", url, "--repo", repo, "--json", "url,state,mergedAt,author,headRefName"])).await?;
+    if v["url"].as_str() != Some(url) || v["headRefName"].as_str() != Some(branch) {
+        bail!("gh pr view {url} answered for another pull request");
+    }
+    if author.is_empty() || !v["author"]["login"].as_str().is_some_and(|l| l.eq_ignore_ascii_case(author)) {
+        bail!("pull request {url} was not opened by the account Nucleus acts as");
+    }
+    let merged = v["mergedAt"].as_str().is_some_and(|s| !s.is_empty());
+    Ok(match v["state"].as_str().unwrap_or_default() {
+        "MERGED" => PrState::Merged,
+        "CLOSED" if merged => PrState::Merged,
+        "CLOSED" => PrState::Closed,
+        "OPEN" => PrState::Open,
+        other => bail!("pull request {url} has an unknown state {other:?}"),
+    })
+}
+
 /// Open a DRAFT pull request. Never merges; never marks it ready.
 pub async fn create_draft_pr(
     gh: &dyn GhRunner,

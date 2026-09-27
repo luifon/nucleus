@@ -397,8 +397,11 @@ pub fn adopt_legacy_db(workspace_root: &Path) -> Result<()> {
     }
     for suffix in ["-wal", "-shm"] {
         let from = PathBuf::from(format!("{}{suffix}", old.display()));
-        if from.exists() {
-            std::fs::rename(&from, format!("{}{suffix}", new.display())).with_context(|| format!("renaming {}", from.display()))?;
+        match std::fs::rename(&from, format!("{}{suffix}", new.display())) {
+            Ok(()) => {}
+            // No such file: nothing to move (a closed database removes it).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("renaming {}", from.display()))),
         }
     }
     std::fs::rename(&old, &new).with_context(|| format!("renaming {} to {}", old.display(), new.display()))?;
@@ -421,6 +424,7 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
             crate::migrate::Migration { version: 6, name: "whatsapp notices", step: crate::migrate::Step::Sql(SCHEMA_V6) },
             crate::migrate::Migration { version: 7, name: "plan versions", step: crate::migrate::Step::Rust(schema_v7) },
             crate::migrate::Migration { version: 8, name: "work rename", step: crate::migrate::Step::Sql(SCHEMA_V8) },
+            crate::migrate::Migration { version: 9, name: "review stages", step: crate::migrate::Step::Sql(SCHEMA_V9) },
         ],
     )
     .await
@@ -436,8 +440,37 @@ const SCHEMA_V8: &str = "
 UPDATE OR IGNORE meta SET key = 'work:' || substr(key, 8) WHERE key LIKE 'intake:%';
 UPDATE OR IGNORE meta SET key = 'lastpoll:work:' || substr(key, 17) WHERE key LIKE 'lastpoll:intake:%'";
 
+/// The stages after the draft pull request (ADR-036, "Work items after the
+/// draft PR"): `in_review` (the draft PR is open), then `merged` or
+/// `not_merged` (terminal). An item with a PR used to go to `closed`
+/// straight away.
+///
+/// - The unique index of open items per event is rebuilt with the new
+///   terminal stages, so a merged item does not count as open.
+/// - A `closed` item with a `pr_url` goes to `in_review` (logged): the
+///   migration cannot read GitHub, so the first poll settles it as merged,
+///   not merged, or still in review. Only the newest such item of an event
+///   moves, and only when the event has no other open item, so the index
+///   holds.
+const SCHEMA_V9: &str = "
+DROP INDEX IF EXISTS idx_items_open_event;
+CREATE TEMP TABLE v9_to_review AS
+    SELECT i.id FROM items i
+     WHERE i.stage = 'closed' AND i.pr_url IS NOT NULL
+       AND i.id = (SELECT MAX(x.id) FROM items x WHERE x.event_id = i.event_id AND x.stage = 'closed' AND x.pr_url IS NOT NULL)
+       AND NOT EXISTS (SELECT 1 FROM items o WHERE o.event_id = i.event_id AND o.id <> i.id
+                          AND o.stage NOT IN ('closed','cancelled','stale'));
+INSERT INTO item_transitions (item_id, at, from_stage, to_stage, reason)
+    SELECT id, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'closed', 'in_review',
+           'migrated: an item with a draft PR waits for its review, and the next poll reads the PR state'
+      FROM v9_to_review;
+UPDATE items SET stage = 'in_review', closed_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE id IN (SELECT id FROM v9_to_review);
+DROP TABLE v9_to_review;
+CREATE UNIQUE INDEX idx_items_open_event ON items(event_id) WHERE stage NOT IN ('closed','cancelled','stale','merged','not_merged')";
+
 /// The schema version this code writes.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// True when `pool` (a read-only work.db) has the full schema: the
 /// migration ledger records [`SCHEMA_VERSION`] and the item tables exist.
@@ -634,8 +667,9 @@ pub async fn gate_candidates(pool: &SqlitePool, source: &str, projects: &[String
         "SELECT {EVENT_COLUMNS} FROM events e
           WHERE source = ?1 AND accepted = 1 AND state = 'open'
             AND (gate_checked_at IS NULL OR gate_checked_at < COALESCE(changed_at, last_seen_at))
-            AND NOT EXISTS (SELECT 1 FROM items i WHERE i.event_id = e.id AND i.stage NOT IN ('closed','cancelled','stale'))
-          ORDER BY id"
+            AND NOT EXISTS (SELECT 1 FROM items i WHERE i.event_id = e.id AND i.stage NOT IN {terminal})
+          ORDER BY id",
+        terminal = Stage::terminal_sql()
     ))
     .bind(source)
     .fetch_all(pool)
@@ -955,7 +989,7 @@ pub async fn item(pool: &SqlitePool, id: i64) -> Result<Item> {
 /// The event's open item (not closed, cancelled or stale), if any.
 pub async fn open_item_for_event(pool: &SqlitePool, event_id: i64) -> Result<Option<Item>> {
     Ok(sqlx::query_as(&format!(
-        "SELECT {ITEM_COLUMNS} FROM items WHERE event_id = ?1 AND stage NOT IN ('closed','cancelled','stale')"
+        "SELECT {ITEM_COLUMNS} FROM items WHERE event_id = ?1 AND stage NOT IN {terminal}", terminal = Stage::terminal_sql()
     ))
     .bind(event_id)
     .fetch_optional(pool)
@@ -970,9 +1004,9 @@ pub async fn items_for_event(pool: &SqlitePool, event_id: i64) -> Result<Vec<Ite
         .await?)
 }
 
-/// Ids of the items a tick advances (not closed, cancelled or stale).
+/// Ids of the items a tick advances (not in a terminal stage).
 pub async fn active_item_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
-    Ok(sqlx::query_scalar("SELECT id FROM items WHERE stage NOT IN ('closed','cancelled','stale') ORDER BY id")
+    Ok(sqlx::query_scalar(&format!("SELECT id FROM items WHERE stage NOT IN {} ORDER BY id", Stage::terminal_sql()))
         .fetch_all(pool)
         .await?)
 }
@@ -982,7 +1016,7 @@ pub async fn active_item_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
 /// waits for the operator until then).
 pub async fn list_items(pool: &SqlitePool, open_only: bool, limit: i64) -> Result<Vec<Item>> {
     let filter = if open_only {
-        "WHERE stage NOT IN ('closed','cancelled') AND NOT (stage = 'stale' AND EXISTS \
+        "WHERE stage NOT IN ('closed','cancelled','merged','not_merged') AND NOT (stage = 'stale' AND EXISTS \
          (SELECT 1 FROM items b WHERE b.event_id = items.event_id AND b.id > items.id))"
     } else {
         ""
