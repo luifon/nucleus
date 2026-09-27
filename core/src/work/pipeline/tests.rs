@@ -428,7 +428,7 @@ async fn simple_issue_goes_from_work_to_a_draft_pr_and_the_pr_link_on_the_issue(
     );
     let thread = thread_texts(&f).await;
     assert!(thread.iter().any(|b| b.contains("pull/5") && b.contains("Fixed the typo in README.md. Tests pass.")), "{thread:?}");
-    assert!(thread.iter().any(|b| b.contains("The draft PR link is posted on acme/widget#1")), "{thread:?}");
+    assert!(thread.iter().any(|b| b == "💬 PR link posted on the issue"), "{thread:?}");
     let bodies_only: Vec<String> = store::messages(&f.ctx.db, 1).await.unwrap().into_iter().map(|m| m.body).collect();
     assert!(bodies_only.iter().any(|b| b == "📬 Draft PR #5 opened · tests passed"), "a note is one short line: {bodies_only:?}");
     assert!(!wt.exists(), "the worktree is removed when the item closes");

@@ -1,8 +1,8 @@
 import { Link } from "react-router-dom";
 import { ChevronRight, Clock, GitPullRequest } from "lucide-react";
-import StatusPill from "@/components/StatusPill";
+import { StageBadge } from "./parts";
 import { type WorkItem } from "@/lib/api";
-import { itemHref, stageKind, waitingOn } from "@/lib/work";
+import { itemHref, waitingOn } from "@/lib/work";
 import { shortTime } from "@/lib/tasks";
 
 // One row per pipeline item: number, title, stage; below it the repo, the
@@ -41,7 +41,7 @@ export default function ItemRow({
           <div className={`min-w-0 flex-1 truncate text-[var(--color-nucleus-text)] ${compact ? "text-xs" : "text-sm"}`} title={item.title}>
             {item.title}
           </div>
-          <StatusPill kind={stageKind(item)}>{item.stage.toUpperCase()}</StatusPill>
+          <StageBadge item={item} />
         </div>
         <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-[var(--color-nucleus-faint)]">
           {!compact && <span className="rounded border border-[var(--color-nucleus-border)] px-1.5 py-px text-[10px]">{item.repo}</span>}

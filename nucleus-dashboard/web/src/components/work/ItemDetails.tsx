@@ -4,7 +4,7 @@ import InlineConfirm from "@/components/InlineConfirm";
 import Markdown from "@/components/Markdown";
 import StatusPill from "@/components/StatusPill";
 import { releaseItem, type WorkDetail, type WorkItem } from "@/lib/api";
-import { canRelease, findingKindLabel, findingPlace, holdCode, markRanges, surfaceLabel } from "@/lib/work";
+import { canRelease, findingKindLabel, findingPlace, holdCode, markRanges, stageLabel, surfaceLabel } from "@/lib/work";
 import { clockTime, shortId, shortTime, taskDuration, taskStatusKind } from "@/lib/tasks";
 import { ActionButton, Field, Pre } from "./parts";
 
@@ -202,7 +202,7 @@ export default function ItemDetails({
                 {clockTime(t.at)}
               </span>
               <span className="shrink-0 text-[var(--color-nucleus-accent)]">
-                {t.from_stage ?? "—"} → {t.to_stage}
+                {t.from_stage ? stageLabel(t.from_stage) : "—"} → {stageLabel(t.to_stage)}
               </span>
               <span className="min-w-0 basis-full break-words text-[var(--color-nucleus-text)] sm:basis-auto sm:flex-1">{t.reason}</span>
             </li>

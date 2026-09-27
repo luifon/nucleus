@@ -12,6 +12,7 @@ import type { WorkItem } from "@/lib/api";
 import { fixtureDetail, fixtureItem, fixtureMessage, fixturePlans, fixtureQuestion } from "@/lib/work.fixtures";
 import { ItemScreen } from "./ItemView";
 import DecisionBoard from "./DecisionBoard";
+import ItemRow from "./ItemRow";
 import ItemThread, { Composer } from "./ItemThread";
 import PlanPanel from "./PlanPanel";
 import { planVersions } from "@/lib/work";
@@ -213,6 +214,33 @@ describe("plan version selector", () => {
   });
 });
 
+describe("plain labels and the review links", () => {
+  test("stages show plain labels in the header and the list rows", () => {
+    const review = fixtureItem({ stage: "in_review", pr_url: "https://example.invalid/acme/widget/pull/11" });
+    const html = render(<ItemScreen detail={fixtureDetail(review)} onChange={noop} />);
+    expect(html).toMatch(/data-stage="in_review"[^>]*>In review</);
+    expect(html).not.toContain("IN_REVIEW");
+    const row = render(<ItemRow item={fixtureItem({ stage: "pr" })} />);
+    expect(row).toMatch(/data-stage="pr"[^>]*>Opening PR</);
+  });
+
+  test("an item in review offers its PR on GitHub first, in a new tab", () => {
+    const review = fixtureItem({ stage: "in_review", pr_url: "https://example.invalid/acme/widget/pull/11" });
+    const html = render(<ItemThread item={review} messages={[]} visible onSent={noop} />);
+    expect([...html.matchAll(/data-option="(\w+)"/g)].map((m) => m[1])).toEqual(["open_pr", "write"]);
+    expect(html).toMatch(/<a href="https:\/\/example\.invalid\/acme\/widget\/pull\/11" target="_blank" rel="noreferrer"[^>]*data-option="open_pr"/);
+    expect(html).toContain("Open PR #11 on GitHub");
+  });
+
+  test("the PR-link note is one line, also for a note stored as a sentence", () => {
+    const old = fixtureMessage(1, { author: "nucleus", body: "💬 The draft PR link is posted on acme/widget#12. Item #4 waits for the review." });
+    const now = fixtureMessage(2, { author: "nucleus", body: "💬 PR link posted on the issue" });
+    const html = render(<ItemThread item={fixtureItem({ stage: "in_review" })} messages={[old, now]} visible onSent={noop} />);
+    expect(html.match(/PR link posted on the issue/g)).toHaveLength(2);
+    expect(html).not.toContain("waits for the review");
+  });
+});
+
 describe("the item page reads at a glance", () => {
   const plans = fixturePlans("# Plan\n\n1. PLAN-STEP-ONE", "# Plan\n\n1. PLAN-STEP-ONE\n2. PLAN-STEP-TWO");
   const withPlan = fixtureItem({ stage: "refinement", plan_version: 2, plan_draft: "# Plan\n\n1. PLAN-STEP-ONE\n2. PLAN-STEP-TWO" });
@@ -254,7 +282,8 @@ describe("the item page reads at a glance", () => {
     ];
     const html = render(<ItemThread item={fixtureItem({ stage: "implementation" })} messages={messages} visible onSent={noop} />);
     expect(html).toContain('data-note="pr"');
-    expect(html).toContain("Draft PR #11 opened · tests passed");
+    // The PR number is a link to the PR, in a new tab.
+    expect(html).toMatch(/Draft PR <a href="https:\/\/example\.invalid\/pull\/11" target="_blank" rel="noreferrer"[^>]*>#11<\/a> opened · tests passed/);
     expect(html).toMatch(/<details[^>]*><summary[^>]*>details<\/summary>[\s\S]*SUMMARY-TEXT/);
     expect(html).toContain('data-note="approved"');
     expect(html).not.toContain("📬");

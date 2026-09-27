@@ -30,6 +30,7 @@ import { parseMessage, parseResponses, type CanvasBlockData } from "@/lib/canvas
 import {
   boardFor,
   boardKey,
+  stageLabel,
   canvasAnswerText,
   composerHint,
   composerPlaceholder,
@@ -41,6 +42,8 @@ import {
   threadOrder,
   agentReplyParts,
   noteParts,
+  prNumberLink,
+  detailsPrUrl,
   type NoteKind,
 } from "@/lib/work";
 import { shortTime } from "@/lib/tasks";
@@ -129,7 +132,7 @@ export default function ItemThread({
   if (board.kind === "closed") {
     bottom = (
       <div className="shrink-0 border-t border-[var(--color-nucleus-border)] px-4 py-2.5 text-xs text-[var(--color-nucleus-faint)] md:px-5">
-        item {item.stage}: the conversation is closed
+        {stageLabel(item.stage)}: the conversation is closed
       </div>
     );
   } else if (question || (board.kind === "board" && mode === "board")) {
@@ -186,6 +189,7 @@ export default function ItemThread({
                   onViewPlan={onViewPlan}
                   onApprovePlan={onApprovePlan}
                   canApprove={canApprove}
+                  prUrl={item.pr_url}
                 />
               </li>
             ))}
@@ -219,6 +223,7 @@ export function ThreadMessage({
   onViewPlan,
   onApprovePlan,
   canApprove = () => false,
+  prUrl = null,
 }: {
   message: WorkMessage;
   /** Ids of the canvas blocks a later operator message answered. */
@@ -234,6 +239,8 @@ export function ThreadMessage({
   /** "approve" on a plan line; shown only when `canApprove` allows it. */
   onApprovePlan?: (version: number) => void;
   canApprove?: (version: number) => boolean;
+  /** The item's PR URL, for a note that names the PR. */
+  prUrl?: string | null;
 }) {
   if (m.author === "operator") {
     const responses = m.body.includes("<canvas-response") ? parseResponses(m.body) : [];
@@ -303,7 +310,7 @@ export function ThreadMessage({
       </div>
     );
   }
-  return <NoteRow message={m} />;
+  return <NoteRow message={m} prUrl={prUrl} />;
 }
 
 /** "Plan vN proposed · view · approve" under an agent reply. */
@@ -359,14 +366,28 @@ const NOTE_ICONS: Record<NoteKind, LucideIcon> = {
 
 /** A Nucleus note as one timeline row: an icon, one short line, the time;
  *  the details open on click. */
-export function NoteRow({ message: m }: { message: WorkMessage }) {
+export function NoteRow({ message: m, prUrl = null }: { message: WorkMessage; /** The item's PR, for a note that names it. */ prUrl?: string | null }) {
   const { kind, line, details } = noteParts(m);
   const Icon = NOTE_ICONS[kind];
+  // "Draft PR #11 opened": the number links to the PR.
+  const pr = kind === "pr" ? prNumberLink(line, detailsPrUrl(details) ?? prUrl) : null;
   return (
     <div data-author="nucleus" data-note={kind} className="text-xs text-[var(--color-nucleus-faint)]">
       <div className="flex items-start gap-2">
         <Icon size={13} strokeWidth={1.75} className="mt-px shrink-0 text-[var(--color-nucleus-faint)]" />
-        <span className="min-w-0 flex-1 break-words text-[var(--color-nucleus-text)]">{line}</span>
+        <span className="min-w-0 flex-1 break-words text-[var(--color-nucleus-text)]">
+          {pr ? (
+            <>
+              {pr.before}
+              <a href={pr.href} target="_blank" rel="noreferrer" className="text-[var(--color-nucleus-accent)] hover:underline">
+                {pr.label}
+              </a>
+              {pr.after}
+            </>
+          ) : (
+            line
+          )}
+        </span>
         <span className="shrink-0 text-[10px]" title={m.at}>
           {shortTime(m.at)}
         </span>

@@ -2,10 +2,9 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { ChevronLeft, ExternalLink, GitBranch, GitPullRequest, RotateCcw, X } from "lucide-react";
 import InlineConfirm from "@/components/InlineConfirm";
-import StatusPill from "@/components/StatusPill";
 import { cancelItem, retryItem, type WorkEvent, type WorkItem } from "@/lib/api";
-import { canCancelItem, canRetry, stageKind, waitingOn, type NextStep } from "@/lib/work";
-import { ActionButton } from "./parts";
+import { canCancelItem, canRetry, waitingOn, type NextStep } from "@/lib/work";
+import { ActionButton, StageBadge } from "./parts";
 
 // Top of the item page: number, title and stage; the source issue, the
 // pull request, the branch and the test result; what the operator is
@@ -48,7 +47,7 @@ export default function ItemHeader({
             <span className="break-words">{item.title}</span>
           </h1>
           <span className="shrink-0 pt-0.5">
-            <StatusPill kind={stageKind(item)}>{item.stage.toUpperCase()}</StatusPill>
+            <StageBadge item={item} />
           </span>
         </div>
 

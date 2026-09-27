@@ -24,6 +24,7 @@ import {
   itemFromSearch,
   itemHref,
   nextStep,
+  stageLabel,
   stageSince,
   agentReplyParts,
   noteParts,
@@ -53,6 +54,20 @@ import {
 } from "./work";
 
 const item = fixtureItem;
+
+describe("stage labels", () => {
+  test("every stage has a plain label", () => {
+    const labels = ["queued", "eval", "refinement", "held", "implementation", "pr", "in_review", "merged", "not_merged", "blocked", "failed", "cancelled", "stale"].map(stageLabel);
+    expect(labels).toEqual([
+      "Queued", "Evaluation", "Refinement", "Held", "Implementation", "Opening PR", "In review", "Merged", "Not merged", "Blocked", "Failed", "Cancelled", "Stale",
+    ]);
+  });
+
+  test("an in-review board without a PR URL offers only Write a message", () => {
+    const b = boardFor(item({ stage: "in_review", pr_url: null }));
+    expect(b.kind === "board" && b.options.map((o) => o.key)).toEqual(["write"]);
+  });
+});
 
 describe("next step", () => {
   const at = Date.parse("2026-09-26T12:00:00.000Z");

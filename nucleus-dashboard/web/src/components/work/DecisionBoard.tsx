@@ -80,7 +80,7 @@ export default function DecisionBoard({
   const [highlight, setHighlight] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  const refs = useRef<(HTMLButtonElement | HTMLAnchorElement | null)[]>([]);
   const mounted = useRef(false);
 
   const board = boardFor(item);
@@ -126,6 +126,10 @@ export default function DecisionBoard({
       case "cancel":
         setError(null);
         return setStep("cancel");
+      case "open_pr":
+        // Enter on the link option (a click follows the link itself).
+        if (o.href) window.open(o.href, "_blank", "noopener,noreferrer");
+        return;
       case "discuss":
       case "write":
         return onWrite();
@@ -181,31 +185,22 @@ export default function DecisionBoard({
                 : o.tone === "accent"
                   ? "text-[var(--color-nucleus-accent)]"
                   : "text-[var(--color-nucleus-text)]";
-            return (
-              <button
-                key={o.key}
-                ref={(el) => {
-                  refs.current[i] = el;
-                }}
-                type="button"
-                role="option"
-                aria-selected={on}
-                tabIndex={on ? 0 : -1}
-                data-option={o.key}
-                disabled={busy}
-                onClick={() => {
-                  setHighlight(i);
-                  select(o);
-                }}
-                onMouseEnter={() => setHighlight(i)}
-                onFocus={() => setHighlight(i)}
-                className={[
-                  "flex min-h-[2.5rem] w-full items-baseline gap-2 rounded border px-2.5 py-2 text-left text-sm transition-colors focus:outline-none disabled:opacity-50",
-                  on
-                    ? "border-[var(--color-nucleus-accent)] bg-[color-mix(in_srgb,var(--color-nucleus-accent)_10%,transparent)]"
-                    : "border-transparent hover:border-[var(--color-nucleus-border)]",
-                ].join(" ")}
-              >
+            const common = {
+              role: "option",
+              "aria-selected": on,
+              tabIndex: on ? 0 : -1,
+              "data-option": o.key,
+              onMouseEnter: () => setHighlight(i),
+              onFocus: () => setHighlight(i),
+              className: [
+                "flex min-h-[2.5rem] w-full items-baseline gap-2 rounded border px-2.5 py-2 text-left text-sm transition-colors focus:outline-none disabled:opacity-50",
+                on
+                  ? "border-[var(--color-nucleus-accent)] bg-[color-mix(in_srgb,var(--color-nucleus-accent)_10%,transparent)]"
+                  : "border-transparent hover:border-[var(--color-nucleus-border)]",
+              ].join(" "),
+            };
+            const content = (
+              <>
                 <span aria-hidden className="w-3 shrink-0 text-[var(--color-nucleus-accent)]">
                   {on ? "❯" : ""}
                 </span>
@@ -214,6 +209,38 @@ export default function DecisionBoard({
                   <span className={tone}>{o.label}</span>
                   {o.hint && <span className="ml-2 text-xs text-[var(--color-nucleus-faint)]">{o.hint}</span>}
                 </span>
+              </>
+            );
+            // A link option (the item's PR) is a real link: a tap or a
+            // click opens it in a new tab; Enter opens it the same way.
+            return o.href ? (
+              <a
+                key={o.key}
+                ref={(el) => {
+                  refs.current[i] = el;
+                }}
+                href={o.href}
+                target="_blank"
+                rel="noreferrer"
+                {...common}
+              >
+                {content}
+              </a>
+            ) : (
+              <button
+                key={o.key}
+                ref={(el) => {
+                  refs.current[i] = el;
+                }}
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  setHighlight(i);
+                  select(o);
+                }}
+                {...common}
+              >
+                {content}
               </button>
             );
           })}

@@ -25,6 +25,42 @@ export const STAGE_TRACK: readonly WorkStage[] = ["queued", "eval", "refinement"
  *  label starts new work). */
 export const TERMINAL_STAGES: readonly WorkStage[] = ["merged", "not_merged", "closed", "cancelled", "stale"];
 
+/** A stage as the operator reads it. */
+export function stageLabel(stage: string): string {
+  switch (stage) {
+    case "queued":
+      return "Queued";
+    case "eval":
+      return "Evaluation";
+    case "refinement":
+      return "Refinement";
+    case "held":
+      return "Held";
+    case "implementation":
+      return "Implementation";
+    case "pr":
+      return "Opening PR";
+    case "in_review":
+      return "In review";
+    case "merged":
+      return "Merged";
+    case "not_merged":
+      return "Not merged";
+    case "blocked":
+      return "Blocked";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Cancelled";
+    case "stale":
+      return "Stale";
+    case "closed":
+      return "Closed";
+    default:
+      return stage;
+  }
+}
+
 /** Not finished: the pipeline still works on it or waits for the
  *  operator. `stale` is finished (only a new label starts new work). */
 export function isOpenItem(stage: WorkStage): boolean {
@@ -442,7 +478,7 @@ export function decisionDone(d: WorkDecision | null): string {
 // authority: every option calls an explicit route that refuses what the
 // item cannot take.
 
-export type BoardOptionKey = "approve" | "release" | "retry" | "discuss" | "cancel" | "write" | "yes" | "no";
+export type BoardOptionKey = "approve" | "release" | "retry" | "discuss" | "cancel" | "write" | "yes" | "no" | "open_pr";
 
 export interface BoardOption {
   key: BoardOptionKey;
@@ -451,6 +487,8 @@ export interface BoardOption {
   hint?: string;
   /** `down` for a destructive choice. */
   tone?: "accent" | "down";
+  /** A link: the option opens this URL in a new tab. */
+  href?: string;
 }
 
 /** What the bottom of the conversation shows for an item:
@@ -490,7 +528,7 @@ export function workingStatus(item: Pick<WorkItem, "stage" | "plan_version">): s
 
 /** The board for an item, from its stage and data. */
 export function boardFor(
-  item: Pick<WorkItem, "id" | "stage" | "plan_version" | "plan_draft" | "current_task_id" | "hold_hash" | "failed_stage">,
+  item: Pick<WorkItem, "id" | "stage" | "plan_version" | "plan_draft" | "current_task_id" | "hold_hash" | "failed_stage" | "pr_url">,
 ): Board {
   switch (item.stage) {
     case "closed":
@@ -499,8 +537,13 @@ export function boardFor(
     case "merged":
     case "not_merged":
       return { kind: "closed" };
-    case "in_review":
-      return { kind: "board", title: "The draft PR waits for your review on GitHub.", options: [WRITE] };
+    case "in_review": {
+      const n = prNumber(item.pr_url);
+      const open: BoardOption[] = item.pr_url
+        ? [{ key: "open_pr", label: n ? `Open PR #${n} on GitHub` : "Open the PR on GitHub", hint: "opens in a new tab", tone: "accent", href: item.pr_url }]
+        : [];
+      return { kind: "board", title: "The draft PR waits for your review on GitHub.", options: [...open, WRITE] };
+    }
     case "refinement":
       if (item.current_task_id) return { kind: "board", title: workingStatus(item), options: [WRITE] };
       if (item.plan_version > 0 && item.plan_draft !== null) {
@@ -766,5 +809,22 @@ export function noteParts(m: Pick<WorkMessage, "body" | "details">): { kind: Not
     }
   }
   if (kind === "approved" && /merged/i.test(line)) kind = "merged";
+  // The PR-link note was a sentence before it became one line.
+  if (/^The draft PR link is posted on /.test(line)) line = "PR link posted on the issue";
   return { kind, line, details };
+}
+
+/** A note line split so that `PR #n` can be a link to `url` (the PR the
+ *  note is about): the text before, the `#n` part, the text after. `null`
+ *  when the line names no PR number or there is no URL for it. */
+export function prNumberLink(line: string, url: string | null): { before: string; label: string; after: string; href: string } | null {
+  const m = /#(\d+)/.exec(line);
+  if (!m || !url || prNumber(url) !== m[1]) return null;
+  return { before: line.slice(0, m.index), label: m[0], after: line.slice(m.index + m[0].length), href: url };
+}
+
+/** The pull request URL a note's details start with, if any. */
+export function detailsPrUrl(details: string | null): string | null {
+  const m = details ? /https?:\/\/\S+\/pull\/\d+/.exec(details) : null;
+  return m ? m[0] : null;
 }

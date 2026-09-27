@@ -1,4 +1,7 @@
 import { type ReactNode } from "react";
+import type { StatusKind } from "@/components/StatusPill";
+import type { WorkItem } from "@/lib/api";
+import { stageKind, stageLabel } from "@/lib/work";
 
 // Small shared pieces of the work item page.
 
@@ -29,6 +32,23 @@ export function ActionButton({
     >
       {children}
     </button>
+  );
+}
+
+const STAGE_COLOR: Record<StatusKind, string> = {
+  ok: "text-[var(--color-status-ok)]",
+  warn: "text-[var(--color-status-warn)]",
+  down: "text-[var(--color-status-down)]",
+  idle: "text-[var(--color-nucleus-faint)]",
+};
+
+/** An item's stage as a plain label ("In review"), coloured by its kind
+ *  (`stageKind`): the operator reads words, not code names. */
+export function StageBadge({ item }: { item: Pick<WorkItem, "stage" | "pr_url" | "current_task_id"> }) {
+  return (
+    <span data-stage={item.stage} className={`whitespace-nowrap rounded border border-current px-1.5 py-px text-[11px] ${STAGE_COLOR[stageKind(item)]}`}>
+      {stageLabel(item.stage)}
+    </span>
   );
 }
 

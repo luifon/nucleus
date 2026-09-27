@@ -917,7 +917,7 @@ impl Default for WorkTexts {
             plan_approved: "✅ Plan v{version} approved; implementation started.".into(),
             pr_opened: "📬 Draft PR #{pr_number} opened · tests {tests}\n{pr_url}\n\nThe agent's summary:\n{summary}"
                 .into(),
-            comment_posted: "💬 The draft PR link is posted on {ref}. Item #{n} waits for the review.".into(),
+            comment_posted: "💬 PR link posted on the issue".into(),
             comment_skipped: "💬 The event's source has no reply channel, so no PR link was posted. Item #{n} waits for the review.".into(),
             pr_merged: "✅ Item #{n}: the pull request was merged: {pr_url}".into(),
             pr_not_merged: "⏹ Item #{n}: the pull request was closed without a merge: {pr_url}".into(),
