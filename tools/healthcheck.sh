@@ -76,6 +76,19 @@ for l in $PERIODIC; do
   else WARN "$l — loaded, last exit $st (check ~/Library/Logs or memory/logs/$l*)"; fi
 done
 
+# Read-only job check (tools/launchd/README.md): every installed job is loaded
+# and has no LWCR flags. Its FAIL lines are reported here as FAIL.
+HEAD "launchd — job state (tools/launchd/check.sh)"
+job_out="$(./tools/launchd/check.sh 2>&1)"; job_rc=$?
+job_fails="$(printf '%s\n' "$job_out" | sed -n 's/^[[:space:]]*FAIL[[:space:]]*//p')"
+if [ -n "$job_fails" ]; then
+  while IFS= read -r line; do FAIL "$line"; done <<< "$job_fails"
+elif [ "$job_rc" -ne 0 ]; then
+  FAIL "tools/launchd/check.sh exited $job_rc: $(printf '%s\n' "$job_out" | tail -1)"
+else
+  PASS "$(printf '%s\n' "$job_out" | tail -1)"
+fi
+
 # --- voice dictation (ADR/memory: Hammerspoon + nucleus-dictate) --------
 HEAD "voice dictation (⌥-Space push-to-talk)"
 if pgrep -qf "Hammerspoon.app"; then PASS "Hammerspoon running"; else FAIL "Hammerspoon NOT running (login item) — dictation dead"; fi

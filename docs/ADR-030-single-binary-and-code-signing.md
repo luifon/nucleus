@@ -97,6 +97,23 @@ identifier rather than on file contents, the grant survives rebuilds.
   Setting that from a script needs the login keychain password, so it stays
   manual. If builds ever need to be unattended, move the identity to a dedicated
   keychain whose password lives in `.env` and unlock it in `tools/build.sh`.
+- **The binary is signed as a copy and installed with `mv`.** Cargo hard-links
+  `target/release/nucleus` to `target/release/deps/nucleus-<hash>`, and
+  `codesign --force` rewrites that file in place. In September 2026 macOS then
+  stopped the jobs at launch with `SIGKILL (Code Signature Invalid)`,
+  termination reason `CODESIGNING` / `Launch Constraint Violation`: a signed
+  file changed in place no longer matches its signature, and the change also
+  affects the running processes of the old file. `tools/build.sh` therefore
+  builds with the `install-build` Cargo profile (`inherits = "release"`,
+  output in `target/install-build/`, which no job runs; cargo reserves the name
+  `install`), copies the binary to a temporary file in `target/release/`, signs and verifies the copy, and moves it over
+  `target/release/nucleus`. A failed signature leaves the installed binary
+  unchanged. After each install the script deletes every other entry in
+  `target/release/`, so that directory holds only the installed binary and no
+  later `cargo build --release` output shares a file with it. It then runs
+  `tools/launchd/check.sh --since <build start> --repair --start`
+  (`tools/launchd/README.md`), which reports code-signature crash reports and
+  jobs that launchd no longer starts.
 - The certificate is machine-local. Another machine building Nucleus needs its
   own identity and its own grant.
 - Services still run as separate processes under separate launchd jobs. Only the
