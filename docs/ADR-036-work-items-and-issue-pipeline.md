@@ -9,7 +9,7 @@ operator decisions in plain words and the pull request link comment without appr
 "Amendment: operator decisions in plain words"), amended to remove per-item WhatsApp groups, send short
 notices with a dashboard link and pass plans whole (2026-09-26, see "Amendment: no WhatsApp groups, short
 notices, whole plans"), amended with the dashboard's decision board and dashboard text through the
-interpreter (2026-09-26, see "Amendment: the decision board"); live verification pending (real `gh` against the configured repos, the interpreter on
+interpreter (2026-09-26, see "Amendment: the decision board"), renamed to work and amended with the stages after the draft PR, list filters, a readable item page and key-event WhatsApp notices (2026-09-26, see "Amendment: work items after the draft PR"); live verification pending (real `gh` against the configured repos, the interpreter on
 real messages, the one-time group leave on the live account).
 
 **Builds on / changes:**
@@ -2184,6 +2184,132 @@ stage, Continue discussing and Back to options, the cancel second step, the
 question step, the keyboard selection, canvas blocks in agent replies with
 the answered state and plain-text labels. Not verified here: the interpreter
 on real dashboard text.
+
+## Amendment: work items after the draft PR (2026-09-26)
+
+### The rename
+
+The feature is called Work and an item is a work item. The module
+`core/src/intake/` became `core/src/work/`, the command `nucleus intake`
+became `nucleus work` (`nucleus events` keeps its name), `[intake]` became
+`[work]` with `work_dir` renamed to `clones_dir`, the dashboard page moved
+to `/work` (API `/work/api`), the WhatsApp module to `work.ts`, the launchd
+job to `work-tick` (log `memory/work.log`), the interpreter agent to
+`work-interpreter` in the tmux session `nucleus-work`, and this ADR to its
+current file name. The GitHub label, the branch names `nucleus/item-<n>`
+and the item numbers are unchanged. The upgrade keeps every record:
+
+- `memory/intake.db` is renamed to `memory/work.db` on the first open
+  (`store::adopt_legacy_db`), under an exclusive lock, the `-wal` and `-shm`
+  files first and the main file last, so an interrupted rename is finished
+  by the next open. Migration v8 moves the `lastpoll:` keys; chore_state.db
+  migration v2 moves the GitHub poll cursors (`intake:github:<repo>` →
+  `work:github:<repo>`), so no poll starts over.
+- whatsapp.db's `intake_inbound` and `intake_chat_block` are renamed to
+  `work_inbound` and `work_chat_block` by whichever of Rust and the bot opens
+  the database first, in one `BEGIN IMMEDIATE` transaction that checks
+  again inside it.
+- Queue rows with the `intake` / `intake:*` sources (queued before the
+  upgrade) stay operator-only and still route a quoted reply
+  (`isWorkSource`, `workSource` in `target_policy.ts`).
+- GitHub comments and PR bodies with the `nucleus-intake:` marker are still
+  Nucleus's own; an earlier PR-link comment is found under either prefix.
+- `/intake?item=n` redirects to `/work?item=n` for WhatsApp links sent
+  before.
+
+### Stages after the draft PR
+
+An item used to close as soon as its draft PR was open and the link
+posted, while the work was not finished. Three stages follow `pr`:
+`in_review` (the draft PR is open), then `merged` or `not_merged`
+(terminal). Each tick reads an in-review item's PR state once per repo poll
+interval (`github::pr_state`: `gh pr view <url> --json
+url,state,mergedAt,author,headRefName` with the pinned `gh`; the answer must
+be the item's own PR by URL and head branch, opened by the account Nucleus
+acts as). A failed or foreign answer records the error and leaves the item
+in review; it never fails it. An item in review ignores the issue closing
+(a merged PR closes the issue), the label and edits: only its PR state, or a
+cancel, moves it. Its clone is removed when it enters review. Migration v9
+rebuilds the unique open-item index with the new terminal stages and moves
+`closed` items that have a `pr_url` to `in_review` (the newest per event,
+when no other item of the event is open); the first poll settles them.
+
+### Item list filters
+
+The open/all tabs became two multi-select dropdowns (the dashboard's
+`FilterDropdown`). Status: Open (queued, eval, refinement, held,
+implementation, pr, blocked, failed), In review, Merged, Not merged,
+Cancelled (an item closed at its source before a PR counts here), Stale;
+the default is Open and In review. Source: one entry per source kind and
+repo, built from the items (list rows carry their event's `source`), so a
+new kind of source appears without a code change; the default is all. Both
+selections live in the URL query (`status=`, `source=`), and item links keep
+them.
+
+### A readable item page
+
+- A next-step line under the header says whose turn it is, computed by code
+  (`nextStep`): "Your turn: approve plan v2 or reply", "Your turn: answer
+  the agent's question", "Your turn: review the hidden content, then
+  release or cancel", "Your turn: review PR #11", "Working: implementation,
+  13 min", "Blocked: <reason> — retry or cancel", "Merged". The operator's
+  turn is highlighted.
+- Plans never appear in the chat. A refinement reply is stored without its
+  plan (the plan is in `plan_versions`), with its `plan_version`, and the
+  conversation shows one line "Plan vN proposed · view · approve": view
+  opens the plan panel on that version, approve is the board's action.
+  Replies stored before show the same line in place of their plan block.
+- A Nucleus note is one short line (`body`) and its details (a new
+  `details` column, migration v10), shown as a timeline row: an icon, the
+  line, the time, and the details collapsed. Older notes show their first
+  line with the rest collapsed.
+- The refinement brief sets reply rules: at most about 6 short lines plus
+  the plan and one canvas block; the first line says what the agent needs
+  (a decision, an answer, or nothing); nothing about Nucleus, the pipeline,
+  approvals or how messages are read; no repeated points; plain, literal
+  English; choices asked as canvas option blocks. Earlier agent replies
+  reach the next turn as summaries (their first paragraph, cut at 300
+  characters, with the whole length), so a turn does not copy their length.
+
+### WhatsApp gets key events only
+
+Notices go out only for a plan ready for approval, an item held for hidden
+content, an item blocked or failed, a draft PR opened, and the agent asking
+a question (a refinement reply without a plan), at most once until the
+operator answers (`store::question_notified`). The new-item,
+implementation-started, released, cancelled and stopped notices and their
+texts were removed; those events stay in the thread. While the operator is
+looking the item page posts `POST /work/api/viewed` every 10 s
+(`items.last_viewed_at`, migration v11), and no notice goes out for an item
+viewed in the last 2 minutes (`VIEWING_WINDOW_SECS`); the event shows on
+the page. Confirmation questions for decisions he makes on WhatsApp still go
+to WhatsApp.
+
+### Verification of the amendment
+
+Rust: `the_legacy_database_is_renamed_once_with_its_write_ahead_log`,
+`an_interrupted_rename_is_finished_without_losing_the_log`,
+`opening_a_legacy_database_keeps_its_rows_and_moves_the_poll_cursor`,
+`a_pre_rename_poll_cursor_keeps_its_value_under_the_work_key`,
+`the_legacy_work_tables_are_renamed_once_with_their_rows`,
+`a_comment_posted_before_the_rename_is_found_and_not_posted_again`;
+`transitions_follow_the_pipeline`, `transitions_refuse_what_does_not_apply`,
+`an_item_in_review_follows_its_pull_request_to_merged`,
+`a_closed_pull_request_ends_not_merged_and_a_bad_answer_changes_nothing`,
+`a_closed_item_with_a_pull_request_is_migrated_to_review_and_settled_by_the_poll`;
+`a_plan_lives_in_its_version_never_in_the_thread`,
+`a_note_is_one_short_line_and_its_details`,
+`notes_are_stored_as_a_line_and_details_other_messages_whole`,
+`earlier_replies_reach_the_next_turn_as_summaries_and_the_reply_rules_are_stated`;
+`whatsapp_gets_only_the_key_events`,
+`no_whatsapp_notice_while_the_item_page_is_open`,
+`a_confirmation_for_a_whatsapp_decision_still_goes_to_whatsapp_while_the_page_is_open`,
+`the_open_item_page_is_recorded_so_whatsapp_waits`. TypeScript: the renamed
+tables and pre-rename queue sources (`work.test.ts`,
+`target_policy.test.ts`); the list filters, next-step lines, plan lines,
+note rows, sidebar groups and the `/intake` redirect (`src/lib/work.test.ts`,
+`ItemPage.test.tsx`, `App.test.tsx`). Not verified here: `gh pr view`
+against the configured repos.
 
 ## Rejected alternatives
 

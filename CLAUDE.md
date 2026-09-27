@@ -555,8 +555,13 @@ JSON-parsed numbers.
   `gh issue comment` — are Nucleus code in `core/src/work/`, never an
   agent. Nucleus opens draft PRs only and never merges. After the draft PR
   is open it posts one code-owned comment on the issue with the PR link
-  (`[work.texts] pr_comment`), without approval, then closes the item.
-  That comment must never carry model output or issue text.
+  (`[work.texts] pr_comment`), without approval, and the item goes to
+  `in_review`. That comment must never carry model output or issue text.
+  The poll reads an in-review item's PR state (`gh pr view`, pinned gh,
+  the item's own PR opened by the authenticated account) once per repo
+  poll interval and moves it to `merged` or `not_merged` (terminal); a
+  failed read never fails the item, and the issue closing, the label or
+  an edit do not move it.
 - Issue text and comments go into briefs only between the nonce data
   markers of `briefs::Fence`; only collaborator comments are included.
 - Before the clone and before every agent task (eval, each refinement turn,
@@ -625,7 +630,15 @@ JSON-parsed numbers.
   the item's dashboard link (`NUCLEUS_PUBLIC_URL/work?item=<n>`, none when
   unset). Never send a plan, an agent reply, a finding list or another long
   body to WhatsApp; the agent-reply preview (~200 characters) passes the
-  secret guard first. The dashboard thread keeps the full text.
+  secret guard first. The dashboard thread keeps the full text. Notices go
+  out only for key events: a plan ready, a hold, a block, a failure, a
+  draft PR, and the agent asking a question (once until the operator
+  answers). None goes out for an item whose page was open on the
+  dashboard in the last 2 minutes (`last_viewed_at`, `POST
+  /work/api/viewed`); confirmation questions for WhatsApp decisions still
+  go to WhatsApp. Plans live in `plan_versions` and the plan panel: a
+  refinement reply is stored without its plan, and Nucleus notes are one
+  short line plus collapsed `details`.
 - A plan reaches an agent whole or not at all: a proposed plan over
   `briefs::PLAN_LIMIT` never becomes a version (the agent is asked to
   shorten it), briefs carry the latest or approved plan whole, and a brief
