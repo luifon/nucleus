@@ -15,7 +15,7 @@ brain is your existing Claude subscription — no separate API billing.
 | **Discord bot** (Jerry Lewis) | DM or @-mention → wakes Claude → replies with per-channel session continuity. Slash commands: `/status`, `/news`, `/remember`, `/forget`. |
 | **WhatsApp bot** (Alfred) | Self-only group, voice memos transcribed locally via whisper.cpp, brain-dump classified and routed (TODOs → tasks, facts → memory, etc.). Iron-tight allowlist scoping. |
 | **News pipeline** | 09:00 + 19:00 feed pull (HN, lobste.rs, Simon Willison, Pragmatic Engineer, Latent Space, Julia Evans) → freshness and duplicate filtering → Claude ranks each item against a prose profile of the reader you keep in your vault → `news.json` for the macOS notch widget. Votes (with an optional reason) and click-throughs come back through the widget's outboxes; the fetcher keeps downvoted items out of the day's brief, and the votes feed a monthly profile review. Nothing is posted to Discord. See ADR-031. |
-| **nucleus-dashboard** | Single operator app subsuming dashboard widgets, chat against your PARA vault, the public news API, and every admin surface (agents, skills, diary, reminders, vault writes, usage) at `nucleus.<your-domain>`. See ADR-015/016/034. |
+| **nucleus-dashboard** | Single operator app subsuming dashboard widgets, chat against your PARA vault, the public news API, and every admin surface (work items, agents, skills, diary, reminders, vault writes, usage) at `nucleus.<your-domain>`. The Work page is where you read, discuss and decide work items. See ADR-015/016/034/036. |
 | **Distiller** | Single daily 4am pass (consolidated per ADR-016; absorbed the old preference learner) that promotes diary observations to long-term memory (PROMOTE / MERGE / ARCHIVE / DROP, Mem0-style ops). |
 | **Reminders** | Ask either bot "remind me at 16:45 about dentist" → Claude schedules via the `reminders` CLI. Once-per-minute polling delivers to one or more channels (`discord-home`, `whatsapp-dm` via the bot-drained outbound queue, `calendar`). Supports `--at` (one-shot) and `--cron` (recurring) with pause/resume + per-channel retry. |
 | **Work** | Issues labeled for Nucleus on the configured repos become work items: a read-only eval agent classifies them; complex ones are discussed with you on the dashboard's Work page until you approve a plan; an implementation agent works in a separate clone per item; Nucleus pushes, opens a draft PR and posts the PR link on the issue, and the item stays in review until the PR is merged or closed. It never merges. WhatsApp gets short notices for key events only. See ADR-036. |
@@ -588,12 +588,13 @@ EOF
 ./target/release/nucleus tasks cancel <id>
 tmux attach -t nucleus-tasks                        # watch the workers
 
-# Issue pipeline (ADR-036). launchd runs `work tick` every minute; the DM
-# session answers "how is item 3 going?" with the read-only commands.
-./target/release/nucleus work list                # open items (--all for closed)
+# Work items (ADR-036). launchd runs `work tick` every minute. You read, discuss
+# and decide on the dashboard's /work page; WhatsApp gets short notices for key
+# events, and the DM session answers "how is item 3 going?" read-only.
+./target/release/nucleus work list                # open and in-review items (--all for every item)
 ./target/release/nucleus work show 3              # eval, plan, thread, tasks, PR
 ./target/release/nucleus work approve-plan 3 --version 2
-./target/release/nucleus work approve-comment 3   # or skip-comment / cancel / retry
+./target/release/nucleus work cancel 3            # or retry 3 for a failed or blocked item
 ./target/release/nucleus work show 3 --hidden     # a held item: every hidden finding in full, and its hold code
 ./target/release/nucleus work release 3 --hold a1b2c3   # continue with that hold
 ./target/release/nucleus work tick --poll         # poll every repo now and advance items
