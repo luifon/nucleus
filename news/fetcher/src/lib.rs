@@ -13,7 +13,7 @@
 mod canonical;
 mod feed;
 mod rank;
-mod store;
+pub mod store;
 mod widget;
 
 use anyhow::{Context, Result};
@@ -227,6 +227,7 @@ async fn pipeline(
             Duration::hours(SURFACE_WINDOW_HOURS),
         )
         .await?,
+        |r| &r.event_slug,
     );
     diag.items_surfaced = surfaced.len();
 
@@ -347,23 +348,23 @@ async fn write_brief(
 /// six rows apart reads as two separate stories. Each event keeps the position
 /// of its highest-scoring item; the rest of its items follow immediately, in
 /// the order they already had.
-fn group_same_event_adjacent(rows: Vec<store::SurfacedRow>) -> Vec<store::SurfacedRow> {
-    let mut out: Vec<store::SurfacedRow> = Vec::with_capacity(rows.len());
-    let mut placed = vec![false; rows.len()];
-    for i in 0..rows.len() {
-        if placed[i] {
+pub fn group_same_event_adjacent<T>(rows: Vec<T>, event: impl Fn(&T) -> &str) -> Vec<T> {
+    let slugs: Vec<String> = rows.iter().map(|r| event(r).to_string()).collect();
+    let mut slots: Vec<Option<T>> = rows.into_iter().map(Some).collect();
+    let mut out: Vec<T> = Vec::with_capacity(slots.len());
+    for i in 0..slots.len() {
+        let Some(row) = slots[i].take() else {
+            continue;
+        };
+        out.push(row);
+        if slugs[i].is_empty() {
             continue;
         }
-        placed[i] = true;
-        let slug = rows[i].event_slug.clone();
-        out.push(rows[i].clone());
-        if slug.is_empty() {
-            continue;
-        }
-        for (j, row) in rows.iter().enumerate().skip(i + 1) {
-            if !placed[j] && row.event_slug == slug {
-                placed[j] = true;
-                out.push(row.clone());
+        for j in i + 1..slots.len() {
+            if slugs[j] == slugs[i] {
+                if let Some(same_event) = slots[j].take() {
+                    out.push(same_event);
+                }
             }
         }
     }
@@ -587,7 +588,7 @@ mod tests {
             surfaced("rubygems-b", 0.50, "rubygems-agent-attack", 0),
         ];
         assert_eq!(
-            ids(&group_same_event_adjacent(rows)),
+            ids(&group_same_event_adjacent(rows, |r| &r.event_slug)),
             ["homebrew", "rubygems-a", "rubygems-b", "fde", "openrouter"],
         );
     }
@@ -599,7 +600,7 @@ mod tests {
             surfaced("b", 0.8, "two", 0),
             surfaced("c", 0.7, "three", 0),
         ];
-        let grouped = group_same_event_adjacent(rows.clone());
+        let grouped = group_same_event_adjacent(rows.clone(), |r| &r.event_slug);
         assert_eq!(ids(&grouped), ["a", "b", "c"]);
         assert_eq!(grouped.len(), rows.len(), "nothing is collapsed by slug");
     }
@@ -612,7 +613,7 @@ mod tests {
             surfaced("b", 0.8, "real", 0),
             surfaced("c", 0.7, "", 0),
         ];
-        assert_eq!(ids(&group_same_event_adjacent(rows)), ["a", "b", "c"]);
+        assert_eq!(ids(&group_same_event_adjacent(rows, |r| &r.event_slug)), ["a", "b", "c"]);
     }
 
     #[tokio::test]

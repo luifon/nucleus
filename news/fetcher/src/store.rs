@@ -414,7 +414,7 @@ pub async fn save_rankings(
 /// item, sometimes stamped in the same second as the vote it annotates — and
 /// rows are inserted in outbox-file order, so the later entry in the file
 /// wins, which is the order the reader clicked in.
-const LATEST_VOTE_SQL: &str = r#"
+pub const LATEST_VOTE_SQL: &str = r#"
     SELECT item_id, vote, reason_key, note
       FROM (SELECT v.item_id, v.vote, v.reason_key, v.note,
                    ROW_NUMBER() OVER (PARTITION BY v.item_id
@@ -660,6 +660,35 @@ pub enum BriefFallback {
     Empty,
 }
 
+/// Whether a stored brief may still be shown, judged from the item ids it was
+/// written from (`briefs.item_ids`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BriefStanding {
+    /// None of its items has been downvoted since.
+    Current,
+    /// It was written from an item the reader has since downvoted.
+    NamesDownvoted,
+    /// It predates `briefs.item_ids`, or the column can't be read, so there is
+    /// no way to check it.
+    Unverifiable,
+}
+
+async fn brief_standing(pool: &SqlitePool, item_ids: Option<&str>) -> Result<BriefStanding> {
+    let Some(raw) = item_ids else {
+        return Ok(BriefStanding::Unverifiable);
+    };
+    let Ok(ids) = serde_json::from_str::<Vec<String>>(raw) else {
+        tracing::warn!("briefs.item_ids is not a JSON array of ids — treating the brief as unverifiable");
+        return Ok(BriefStanding::Unverifiable);
+    };
+    let downvoted = downvoted_item_ids(pool).await?;
+    Ok(if ids.iter().any(|id| downvoted.contains(id)) {
+        BriefStanding::NamesDownvoted
+    } else {
+        BriefStanding::Current
+    })
+}
+
 /// The fallback for a run whose brief call failed.
 ///
 /// A stale sentence beats an empty one, but only while it is still true. A
@@ -674,16 +703,44 @@ pub async fn last_reusable_brief(pool: &SqlitePool) -> Result<BriefFallback> {
     let Some((text, item_ids)) = row else {
         return Ok(BriefFallback::Empty);
     };
-    let Some(ids) = item_ids else {
-        tracing::warn!("the last brief predates input tracking — not reusing it");
-        return Ok(BriefFallback::Blocked);
-    };
-    let ids: Vec<String> = serde_json::from_str(&ids).unwrap_or_default();
-    let downvoted = downvoted_item_ids(pool).await?;
-    if ids.iter().any(|id| downvoted.contains(id)) {
-        return Ok(BriefFallback::Blocked);
+    match brief_standing(pool, item_ids.as_deref()).await? {
+        BriefStanding::Current => Ok(BriefFallback::Reuse(text)),
+        BriefStanding::NamesDownvoted => Ok(BriefFallback::Blocked),
+        BriefStanding::Unverifiable => {
+            tracing::warn!("the last brief can't be checked against downvotes — not reusing it");
+            Ok(BriefFallback::Blocked)
+        }
     }
-    Ok(BriefFallback::Reuse(text))
+}
+
+/// The last brief written on one fetch day, for the dashboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayBrief {
+    pub run_id: String,
+    pub created_at: String,
+    pub text: String,
+    pub standing: BriefStanding,
+}
+
+/// The last brief written on `fetch_date`, judged against today's votes.
+///
+/// `fetch_date` is the UTC date `items.fetch_date` holds, and `briefs.created_at`
+/// is a UTC stamp, so the brief and the items of one day share one clock. A day
+/// whose runs all reused an earlier brief or shipped none has no row here.
+pub async fn brief_for_fetch_date(pool: &SqlitePool, fetch_date: &str) -> Result<Option<DayBrief>> {
+    let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT run_id, created_at, text, item_ids FROM briefs
+          WHERE substr(created_at, 1, 10) = ?1
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(fetch_date)
+    .fetch_optional(pool)
+    .await?;
+    let Some((run_id, created_at, text, item_ids)) = row else {
+        return Ok(None);
+    };
+    let standing = brief_standing(pool, item_ids.as_deref()).await?;
+    Ok(Some(DayBrief { run_id, created_at, text, standing }))
 }
 
 /// A migrated, seeded news DB in a temp dir, for tests that need real SQL
@@ -879,6 +936,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(last_reusable_brief(&f.pool).await.unwrap(), BriefFallback::Blocked);
+    }
+
+    #[tokio::test]
+    async fn a_brief_whose_item_ids_cannot_be_read_is_not_reused() {
+        let f = fixture().await;
+        sqlx::query("INSERT INTO fetcher_runs (run_id, started_at) VALUES ('r1', '2026-09-13T09:00:00.000Z')")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO briefs (run_id, created_at, text, item_ids) VALUES ('r1', ?1, 'old', 'not json')")
+            .bind(timestamp::now())
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(last_reusable_brief(&f.pool).await.unwrap(), BriefFallback::Blocked);
+    }
+
+    async fn brief_at(pool: &SqlitePool, run_id: &str, created_at: &str, text: &str, item_ids: Option<&str>) {
+        sqlx::query("INSERT INTO fetcher_runs (run_id, started_at) VALUES (?1, ?2)")
+            .bind(run_id)
+            .bind(created_at)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO briefs (run_id, created_at, text, item_ids) VALUES (?1, ?2, ?3, ?4)")
+            .bind(run_id)
+            .bind(created_at)
+            .bind(text)
+            .bind(item_ids)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_day_brief_is_the_last_one_written_on_that_utc_date() {
+        let f = fixture().await;
+        add_item(&f.pool, "i1").await;
+        brief_at(&f.pool, "r0", "2026-09-12T22:00:00.000Z", "previous day", Some(r#"["i1"]"#)).await;
+        brief_at(&f.pool, "r1", "2026-09-13T12:00:00.000Z", "morning", Some(r#"["i1"]"#)).await;
+        brief_at(&f.pool, "r2", "2026-09-13T22:00:00.000Z", "evening", Some(r#"["i1"]"#)).await;
+
+        let day = brief_for_fetch_date(&f.pool, "2026-09-13").await.unwrap().unwrap();
+        assert_eq!((day.run_id.as_str(), day.text.as_str()), ("r2", "evening"));
+        assert_eq!(day.standing, BriefStanding::Current);
+        assert_eq!(brief_for_fetch_date(&f.pool, "2026-09-14").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_day_brief_reports_a_since_downvoted_input_and_an_unverifiable_one() {
+        let f = fixture().await;
+        add_item(&f.pool, "i1").await;
+        brief_at(&f.pool, "r1", "2026-09-13T12:00:00.000Z", "names i1", Some(r#"["i1"]"#)).await;
+        brief_at(&f.pool, "r2", "2026-09-12T12:00:00.000Z", "untracked", None).await;
+        insert_vote(&f.pool, &vote("v1", "i1", -1, "2026-09-13T13:00:00Z", None)).await.unwrap();
+
+        let day = brief_for_fetch_date(&f.pool, "2026-09-13").await.unwrap().unwrap();
+        assert_eq!(day.standing, BriefStanding::NamesDownvoted);
+        let old = brief_for_fetch_date(&f.pool, "2026-09-12").await.unwrap().unwrap();
+        assert_eq!(old.standing, BriefStanding::Unverifiable);
     }
 
     #[tokio::test]

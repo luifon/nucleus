@@ -52,6 +52,7 @@ ts-rs = { version = "12", features = ["serde-compat"] }
 
 nucleus-core = { path = "core" }
 reminders = { path = "chores/reminders" }
+news-fetcher = { path = "news/fetcher" }
 
 [profile.release]
 lto = "thin"

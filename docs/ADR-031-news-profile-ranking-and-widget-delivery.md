@@ -398,3 +398,48 @@ profile: the profile expresses taste, this expresses an absolute exclusion.
 The committed template ships the key empty; the operator's real pattern lives
 in their private `nucleus.toml`, so no personal topic preference lands in the
 public repo.
+
+## Addendum 2026-09-28: the dashboard gets the widget's signals
+
+The 2026-09-13 addendum added vote reasons, opens and brief rules to the
+widget only. The dashboard news page kept a plain up/down vote, did not
+record opens and did not show the brief, so a downvote cast there could not
+say why and an item read there stayed unread everywhere. The dashboard now
+follows the same rules, through the fetcher's own code.
+
+- **One implementation.** The dashboard API depends on the `news-fetcher`
+  crate and calls `store::insert_vote`, `store::insert_open` and
+  `LATEST_VOTE_SQL`, so both surfaces store votes and opens the same way and
+  agree on which vote row is the effective one. `store` is now a public
+  module for that reason.
+- **Reasons.** `POST /news/api/vote` takes an optional `reason` and `note`.
+  The widget stores an unknown key as NULL because its outbox can come from an
+  older build; the dashboard route has one client and refuses instead: a
+  reason only on a downvote and only from `VOTE_REASONS`, a note only with
+  `other`, `other` only with a note of at most `MAX_VOTE_NOTE_CHARS`. The page
+  shows the widget's chip strip after a downvote, the reason as a chip, and
+  `why?` on a downvote without one.
+- **Opens.** `POST /news/api/open` records `origin = "dashboard"` when the
+  title or article link is clicked or middle-clicked, and only for one of the
+  item's own links. A link opened from the browser's context menu is not seen.
+  Opens still feed nothing but the read mark and the monthly review.
+- **Brief.** `GET /news/api/brief?fetch_date=` returns the last brief written
+  on that UTC date with its standing: `current`, `names_downvoted` (written
+  from an item downvoted since) or `unverifiable` (no readable
+  `briefs.item_ids`). The page shows a brief the widget would no longer show
+  faded, with the reason, because the page is also the record of past days.
+  `last_reusable_brief` shares that check, and now also refuses to reuse a
+  brief whose `item_ids` cannot be parsed; before, a parse failure counted as
+  "no items" and the brief was reused.
+- **Events.** `group_same_event_adjacent` is generic and public. The item
+  list comes back grouped, and the page places each event's items in the
+  section of its best-scored item, so a low-scored write-up is not split from
+  its story into another section.
+- **Order of writes.** The server stamps a vote when the request arrives, and
+  the latest stamp wins. The page therefore sends its writes one at a time in
+  click order, so a reason picked right after a downvote cannot be stored
+  before that downvote and cleared by it. The strip closes only after the
+  reason is stored; a failed save keeps the typed note.
+- **Vote range.** The vote route refuses a value other than -1, 0 or 1. It
+  used to store the sign of any integer, so `-2` became a downvote; the widget
+  ingest already skipped such entries.

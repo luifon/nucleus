@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 nucleus-core = { workspace = true }
 reminders = { workspace = true }
+news-fetcher = { workspace = true }
 
 tokio = { workspace = true }
 axum = { workspace = true }

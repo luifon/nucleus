@@ -1666,6 +1666,7 @@ dependencies = [
  "bollard",
  "chrono",
  "futures",
+ "news-fetcher",
  "nucleus-core",
  "reminders",
  "reqwest",

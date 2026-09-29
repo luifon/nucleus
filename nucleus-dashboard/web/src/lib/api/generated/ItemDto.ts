@@ -15,4 +15,17 @@ stale: number,
  * none. Votes supersede rather than accumulate (ADR-031), so this is a
  * state, not a tally.
  */
-vote: number, };
+vote: number,
+/**
+ * The reason on the effective vote, one of the fetcher's `VOTE_REASONS`.
+ * A reason is its own vote row, so a later vote without one clears it.
+ */
+vote_reason: string | null,
+/**
+ * Free text on an `other` reason.
+ */
+vote_note: string | null,
+/**
+ * The reader has opened the item, from the widget or from here.
+ */
+opened: boolean, };
