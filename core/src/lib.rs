@@ -32,6 +32,7 @@ pub mod health;
 pub mod work;
 pub mod memory;
 pub mod migrate;
+pub mod ntfy;
 pub mod proc_tree;
 pub mod runlog;
 pub mod secret_filter;

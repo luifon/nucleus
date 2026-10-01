@@ -185,6 +185,8 @@ reminders due                                                                  #
 
 `--channels` accepts a comma-separated list. Validated against the known channel set (`discord-home`, `alfred`, `braindump`) — unknown channels fail fast.
 
+*Amended 2026-09-30:* the current set is `discord-home`, `whatsapp-dm`, `calendar` (ADR-007) and `ntfy` (ADR-037); `KNOWN_CHANNELS` in `chores/reminders/src/store.rs` is the source of truth.
+
 `--at` and `--cron` are mutually exclusive. `--at` implies `one_shot = 1` and produces a cron expression that matches that single date+time (used purely for the ticker's uniform code path).
 
 `list` shows the reminder's next fire time (computed) so it's easy to verify a cron is doing what you meant before it fires.

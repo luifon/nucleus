@@ -1298,6 +1298,25 @@ async fn deliver(
             Ok(format!("whatsapp-queue#{}", queue_id))
         }
         store::CHANNEL_CALENDAR => deliver_calendar(settings, workspace_root, r).await,
+        store::CHANNEL_NTFY => {
+            let cfg = settings.ntfy.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "channel {:?} requires NUCLEUS_NTFY_URL, NUCLEUS_NTFY_TOPIC and NUCLEUS_NTFY_TOKEN",
+                    channel
+                )
+            })?;
+            let default_title = format!("Reminder #{}", r.id);
+            let title = r.title.as_deref().filter(|t| !t.trim().is_empty()).unwrap_or(&default_title);
+            let n = nucleus_core::ntfy::Notification {
+                title: Some(title),
+                message: &r.body,
+                priority: Some(nucleus_core::ntfy::Priority::High),
+                tags: &["bell"],
+                click: None,
+            };
+            let id = nucleus_core::ntfy::publish(cfg, workspace_root, &n).await?;
+            Ok(format!("ntfy#{}", id))
+        }
         other => bail!("unknown channel {:?}", other),
     }
 }

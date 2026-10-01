@@ -13,6 +13,9 @@ pub struct Settings {
     pub claude: ClaudeConfig,
     pub discord: DiscordConfig,
     pub whatsapp: WhatsAppConfig,
+    /// Push notifications (ADR-037); `None` unless `NUCLEUS_NTFY_URL`,
+    /// `NUCLEUS_NTFY_TOPIC` and `NUCLEUS_NTFY_TOKEN` are all set.
+    pub ntfy: Option<crate::ntfy::NtfyConfig>,
     pub obsidian: ObsidianConfig,
     pub diary: DiaryConfig,
     pub distiller: DistillerConfig,
@@ -1261,6 +1264,7 @@ impl Settings {
             claude: toml.claude,
             discord,
             whatsapp,
+            ntfy: crate::ntfy::NtfyConfig::from_env(),
             obsidian: toml.obsidian,
             diary: toml.diary,
             distiller: toml.distiller,

@@ -21,6 +21,8 @@
 //!                       in memory/whatsapp.db)
 //!   - "calendar"      → Google Calendar event via JARVIS + Claude.ai
 //!                       Calendar MCP (ADR-007)
+//!   - "ntfy"          → push notification to the operator's phone through
+//!                       the ntfy server in NUCLEUS_NTFY_URL (ADR-037)
 //!
 //! Brain-dump group routing is NOT exposed as a reminder channel: the
 //! brain-dump pipeline owns that surface (capture-only). Reminders go
@@ -41,11 +43,15 @@ pub const CHANNEL_DISCORD_HOME: &str = "discord-home";
 pub const CHANNEL_WHATSAPP_DM: &str = "whatsapp-dm";
 /// Calendar event delivery via JARVIS + Claude.ai Calendar MCP (ADR-007).
 pub const CHANNEL_CALENDAR: &str = "calendar";
+/// Push notification through ntfy (ADR-037). Unavailable unless the three
+/// NUCLEUS_NTFY_* variables are set.
+pub const CHANNEL_NTFY: &str = "ntfy";
 
 pub const KNOWN_CHANNELS: &[&str] = &[
     CHANNEL_DISCORD_HOME,
     CHANNEL_WHATSAPP_DM,
     CHANNEL_CALENDAR,
+    CHANNEL_NTFY,
 ];
 
 /// Per-channel retry budget before marking the channel `failed` for this fire.

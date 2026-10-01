@@ -334,9 +334,15 @@ Supported `--channels` values:
   on `--channels calendar` create one event per fire — fine for
   occasional recurrence, wrong for "every weekday" (you'd flood the
   calendar). Prefer `discord-home` or `whatsapp-dm` for those.
+- `ntfy` — push notification to the operator's phone through the ntfy
+  server in `NUCLEUS_NTFY_URL` (ADR-037), on the topic in
+  `NUCLEUS_NTFY_TOPIC`, with the publish-only token in
+  `NUCLEUS_NTFY_TOKEN`. Arrives as a phone notification with high
+  priority, not a chat message. Unavailable unless all three are set.
 
 Pick the channels based on where the user asked. "Remind me on
-WhatsApp" → `whatsapp-dm`. No default to WhatsApp — Discord is the
+WhatsApp" → `whatsapp-dm`. "Push it to my phone" / "notify me on
+ntfy" → `ntfy`. No default to WhatsApp — Discord is the
 safe default for
 unattended delivery, since the WhatsApp app is on the user's phone and
 could be muted/inactive. "Schedule X" / "put X on my calendar" /
