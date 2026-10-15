@@ -9,8 +9,6 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   waitForTuiReady,
-  lastNTurns,
-  buildPrimingPreamble,
   msUntilNext4am,
   extractLastAssistantText,
   lastPromptRow,
@@ -38,7 +36,6 @@ import {
   TYPE_ECHO_WAIT_MS,
   type TypingIo,
   paneAwaitingChoice,
-  Turn,
 } from "./claude_session.js";
 
 const execAsync = promisify(exec);
@@ -109,82 +106,6 @@ test("waitForTuiReady auto-dismisses the resume-from-summary picker", async () =
   } finally {
     await tmuxKill(session);
   }
-});
-
-test("lastNTurns filters tool entries, system injections, and date preamble", () => {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), "nucleus-ts-last-n-"));
-  const file = path.join(tmp, "transcript.jsonl");
-  try {
-    const lines = [
-      `{"type":"permission-mode","permissionMode":"auto"}`,
-      `{"type":"file-history-snapshot","messageId":"abc"}`,
-      // System-injected user turn — must be skipped.
-      `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<ide_opened_file>some log</ide_opened_file>"}]}}`,
-      // Date-preamble wrapped real user message.
-      `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[context: today is 2026-05-23 (Sat), local 09:00 BRT]\\n\\nhello there"}]}}`,
-      // Assistant thinking + tool_use → ignored (no text block).
-      `{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"…"},{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}`,
-      // Tool result tagged role:user → must be skipped.
-      `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}`,
-      // Assistant text reply.
-      `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi! how can I help?"}]}}`,
-      // User message with string-form content.
-      `{"type":"user","message":{"role":"user","content":"second user message"}}`,
-      // Assistant reply combining thinking + text.
-      `{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"…"},{"type":"text","text":"second assistant reply"}]}}`,
-    ];
-    writeFileSync(file, lines.join("\n"));
-    const turns = lastNTurns(file, 10);
-    assert.equal(turns.length, 4);
-    assert.deepEqual(turns[0], { role: "user", text: "hello there" });
-    assert.deepEqual(turns[1], { role: "assistant", text: "hi! how can I help?" });
-    assert.deepEqual(turns[2], { role: "user", text: "second user message" });
-    assert.deepEqual(turns[3], { role: "assistant", text: "second assistant reply" });
-  } finally {
-    rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-test("lastNTurns caps at n and missing files return empty", () => {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), "nucleus-ts-cap-"));
-  try {
-    const file = path.join(tmp, "t.jsonl");
-    const lines: string[] = [];
-    for (let i = 0; i < 15; i++) {
-      lines.push(
-        `{"type":"user","message":{"role":"user","content":"u${i}"}}`,
-      );
-      lines.push(
-        `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a${i}"}]}}`,
-      );
-    }
-    writeFileSync(file, lines.join("\n"));
-    const turns = lastNTurns(file, 10);
-    assert.equal(turns.length, 10);
-    assert.equal(turns[0].text, "u10");
-    assert.equal(turns[9].text, "a14");
-
-    const missing = lastNTurns(path.join(tmp, "nope.jsonl"), 10);
-    assert.equal(missing.length, 0);
-  } finally {
-    rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-test("buildPrimingPreamble orders summary then replay then closing line", () => {
-  const replay: Turn[] = [
-    { role: "user", text: "hello" },
-    { role: "assistant", text: "hi there" },
-  ];
-  const out = buildPrimingPreamble("- did X\n- decided Y", replay);
-  const summaryIdx = out.indexOf("- did X");
-  const userIdx = out.indexOf("USER: hello");
-  const asstIdx = out.indexOf("ASSISTANT: hi there");
-  const closingIdx = out.indexOf("End of priming");
-  assert.ok(summaryIdx >= 0 && userIdx >= 0 && asstIdx >= 0 && closingIdx >= 0);
-  assert.ok(summaryIdx < userIdx);
-  assert.ok(userIdx < asstIdx);
-  assert.ok(asstIdx < closingIdx);
 });
 
 test("msUntilNext4am wraps correctly", () => {

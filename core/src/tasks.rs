@@ -1360,8 +1360,12 @@ async fn on_event(pool: &SqlitePool, task: &Task, ev: TrackEvent) -> Result<Opti
         TrackEvent::Progress { text } => {
             add_event(pool, &task.id, "progress", &clip(&text, 2_000)).await?;
         }
-        TrackEvent::BgStarted { id } => {
+        TrackEvent::BgStarted { id, .. } => {
             add_event(pool, &task.id, "background", &format!("background command {id} started")).await?;
+        }
+        TrackEvent::BgNeverStarted { id } => {
+            add_event(pool, &task.id, "background", &format!("background command {id} was refused and never started"))
+                .await?;
         }
         TrackEvent::TurnEnd { final_text, pending_bg } if pending_bg > 0 => {
             // The model ended its turn while background work runs; the next

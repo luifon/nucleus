@@ -90,7 +90,7 @@ function setup() {
     clearInterval(timer);
     await engine.shutdown();
   };
-  return { engine, turns, sent, until, transcript, stop, ws };
+  return { engine, turns, sessions: store, sent, until, transcript, stop, ws };
 }
 
 after(() => {
@@ -204,3 +204,55 @@ test(
     }
   },
 );
+
+test(
+  "real session: the daily compaction resumes a closed session, compacts it in place and keeps its id",
+  { skip: !ENABLED, timeout: 20 * 60_000 },
+  async () => {
+    const t = setup();
+    try {
+      // Enough turns for the compaction's threshold.
+      for (let i = 1; i <= 10; i++) {
+        t.engine.receive(msg(`Reply with only the word OK${i}.`, `C${i}`));
+        await t.until(`reply ${i}`, () => t.sent().filter((m) => m.source === "chat-reply").length === i, 180_000);
+      }
+      const before = t.sessions.lookup(CHAT);
+      assert.ok(before);
+      // Close the window, as the idle reaper does before 04:00.
+      await t.engine.shutdown();
+      assert.ok(!windows(TMUX).some((w) => w.startsWith("5511")), "no chat window left");
+
+      const diary: Array<[string, string]> = [];
+      const stats = await t.engine.compactAll((k, b) => diary.push([k, b]), 25 * 60_000);
+      console.log("[it] compaction stats:", JSON.stringify(stats), "diary keys:", diary.map(([k]) => k));
+      assert.deepEqual(stats, { considered: 1, compacted: 1, skipped: 0, failed: 0 });
+      assert.equal(t.sessions.lookup(CHAT), before, "the session id does not change");
+      assert.ok(!windows(TMUX).some((w) => w.startsWith("5511")), "the resumed window is closed again");
+      const tr = t.transcript();
+      const boundary = tr.filter((r) => r.type === "system" && r.subtype === "compact_boundary");
+      assert.equal(boundary.length, 1, "one compaction in the transcript");
+      assert.equal(boundary[0].compactMetadata?.trigger, "manual");
+      assert.ok(diary.some(([k]) => k === `daily_compact ${CHAT}`), "the summary went to the diary");
+      // Nothing reached WhatsApp besides the ten replies and acknowledgements.
+      const notAck = () => t.sent().filter((m) => m.source !== "chat-ack");
+      assert.equal(notAck().length, 10, JSON.stringify(t.sent()));
+
+      // The next message is answered by a normal turn of the same session.
+      t.engine.receive(msg("Reply with only the word AFTER.", "C11"));
+      await t.until("reply after compaction", () => t.sent().filter((m) => m.source === "chat-reply").length === 11, 180_000);
+      await new Promise((r) => setTimeout(r, 3_000));
+      const sent = notAck();
+      assert.equal(sent.length, 11, JSON.stringify(t.sent()));
+      assert.match(sent[10].body, /AFTER/);
+      assert.equal(t.sessions.lookup(CHAT), before);
+      assert.equal(t.turns.unanswered(CHAT).length, 0);
+    } finally {
+      await t.stop();
+    }
+  },
+);
+
+function windows(session: string): string[] {
+  const r = spawnSync("tmux", ["list-windows", "-t", session, "-F", "#{window_name}"], { encoding: "utf8" });
+  return r.status === 0 ? r.stdout.split("\n").filter(Boolean) : [];
+}

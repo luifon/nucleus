@@ -509,7 +509,7 @@ nucleus/
 - `docs/ADR-022-concurrent-browser-automation.md` — Playwright MCP isolated contexts + shared storage state; `tools/playwright-auth/` owns logins
 - `docs/ADR-023-session-search.md` — FTS5 transcript retrieval between T1 and T2, junk-session gate + pruning (`session-search` CLI)
 - `docs/ADR-024-reminder-condition-watchers.md` — cheap script gates on reminder fires; model only on state change (`--condition`)
-- `docs/ADR-025-pre-rotation-memory-flush.md` — persist-before-recycle DURABLE section in the rotation ask
+- `docs/ADR-025-pre-rotation-memory-flush.md` — the 04:00 job compacts each chat session in place (`/compact`, same session id) after a summary turn whose DURABLE section is the memory flush; the compaction lock that makes the 04:00 restart wait
 - `docs/ADR-026-heartbeat.md` — HEARTBEAT.md checklist sweep + reply-gated silent fires
 - `docs/ADR-027-adapter-circuit-breaker.md` — WhatsApp connection supervisor: close-reason taxonomy, backoff ladder, open-circuit alerts (proposed)
 - `docs/ADR-035-vault-search-and-vault-check.md` — FTS5 vault search (`vault-search` CLI, dashboard search, credential exclusions) and the weekly deterministic `vault-check` report

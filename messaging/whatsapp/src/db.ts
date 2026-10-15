@@ -22,6 +22,31 @@ export function addColumnsIfMissing(
   }
 }
 
+/** chat_turns.pending_bg (a count of running background commands copied
+ *  onto every turn that ended while they ran) is replaced by
+ *  chat_background. A chat whose turns still count running commands gets
+ *  one `running` row without a description, so the next restart sweep
+ *  reports it once; then the column is dropped. One transaction. */
+function migratePendingBackground(db: DatabaseSync): void {
+  const cols = (db.prepare(`PRAGMA table_info(chat_turns)`).all() as Array<{ name: string }>).map((r) => r.name);
+  if (!cols.includes("pending_bg")) return;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(`
+      INSERT OR IGNORE INTO chat_background (id, chat_id, pool, session_id, turn_id, quote_ref, description, started_at, state)
+      SELECT 'legacy:' || t.id, t.chat_id, t.pool, t.session_id, t.id, t.quote_ref, NULL, t.started_at, 'running'
+        FROM chat_turns t
+       WHERE t.pending_bg > 0
+         AND t.started_at = (SELECT MAX(u.started_at) FROM chat_turns u WHERE u.chat_id = t.chat_id AND u.pending_bg > 0);
+      ALTER TABLE chat_turns DROP COLUMN pending_bg;
+    `);
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
 export class ChatSessionStore {
   private db: DatabaseSync;
 
@@ -224,6 +249,28 @@ export class ChatSessionStore {
       );
       CREATE INDEX IF NOT EXISTS idx_chat_turns_chat_started
         ON chat_turns(chat_id, started_at DESC);
+
+      -- ADR-033: one row per background command a chat session started
+      -- (id = the tool_use id). turn_id: the turn that started it;
+      -- quote_ref: the operator message its result quotes; description:
+      -- what the tool call says it runs. state: running → finished (its
+      -- completion notice arrived) | never_started (its tool result was an
+      -- error) | lost (its session stopped first; the operator got one
+      -- note).
+      CREATE TABLE IF NOT EXISTS chat_background (
+        id          TEXT PRIMARY KEY,
+        chat_id     TEXT NOT NULL,
+        pool        TEXT NOT NULL,
+        session_id  TEXT,
+        turn_id     TEXT,
+        quote_ref   TEXT,
+        description TEXT,
+        started_at  TEXT NOT NULL,
+        ended_at    TEXT,
+        state       TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_background_state
+        ON chat_background(state, chat_id);
     `);
     // ADR-027 amendment: the disconnect error's message and data.
     addColumnsIfMissing(this.db, "connection_events", [["detail", "detail TEXT"]]);
@@ -281,11 +328,10 @@ export class ChatSessionStore {
       // The operator message an autonomous turn answers (a background
       // command it started finished), so a restart can report the turn.
       ["quote_ref", "quote_ref TEXT"],
-      // Background commands still running when the turn ended.
-      ["pending_bg", "pending_bg INTEGER"],
       // 1 when an operator message of the turn arrived as pasted content.
       ["pasted_input", "pasted_input INTEGER NOT NULL DEFAULT 0"],
     ]);
+    migratePendingBackground(this.db);
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_dedup
         ON outbound_queue(dedup_key) WHERE dedup_key IS NOT NULL;
@@ -316,6 +362,16 @@ export class ChatSessionStore {
       .prepare("SELECT chat_id FROM chat_sessions ORDER BY last_active DESC")
       .all() as Array<{ chat_id: string }>;
     return rows.find((r) => match(r.chat_id))?.chat_id ?? null;
+  }
+
+  /** Every stored chat session, most recently active first. */
+  list(): Array<{ chatId: string; sessionId: string }> {
+    return (
+      this.db.prepare("SELECT chat_id, session_id FROM chat_sessions ORDER BY last_active DESC").all() as Array<{
+        chat_id: string;
+        session_id: string;
+      }>
+    ).map((r) => ({ chatId: r.chat_id, sessionId: r.session_id }));
   }
 
   lookup(chatId: string): string | null {

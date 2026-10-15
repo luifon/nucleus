@@ -8,7 +8,7 @@
 import { spawn, exec } from "node:child_process";
 import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
-import { readFileSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -407,7 +407,7 @@ export function projectDirName(dir: string): string {
   return dir.replace(/[^A-Za-z0-9]/g, "-");
 }
 
-function transcriptPathFor(workspaceRoot: string, sessionId: string): string {
+export function transcriptPathFor(workspaceRoot: string, sessionId: string): string {
   const encoded = projectDirName(workspaceRoot);
   return path.join(os.homedir(), ".claude", "projects", encoded, `${sessionId}.jsonl`);
 }
@@ -1476,38 +1476,39 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ---- daily rotation helpers (TS mirror of nucleus_core::claude_session) ----
+// ---- daily compaction helpers (TS mirror of nucleus_core::claude_session) ----
 
-export type TurnRole = "user" | "assistant";
-
-export interface Turn {
-  role: TurnRole;
-  text: string;
-}
-
-export interface RotationStats {
+/** One pass of the daily compaction (ADR-025). Mirror of core's
+ *  `CompactionStats`. */
+export interface CompactionStats {
   considered: number;
-  rotated: number;
+  compacted: number;
   skipped: number;
   failed: number;
 }
 
-/** Two labeled sections (ADR-025): SUMMARY feeds tomorrow's priming as
- *  before; DURABLE is the memory flush — observations worth keeping beyond
- *  tomorrow that never made it into the diary. Split by splitRotationReply;
- *  a reply that ignores the format degrades to summary-only (pre-ADR-025
- *  behavior). Mirror of core/src/claude_session.rs::SUMMARY_PROMPT. */
+/** The slash command the daily compaction types into the session. */
+export const COMPACT_COMMAND = "/compact";
+
+/** A session with fewer turns since its last compaction is not compacted. */
+export const COMPACT_MIN_TURNS = 10;
+
+/** The turn the daily compaction asks for before `/compact` (ADR-025): two
+ *  labeled sections. SUMMARY goes to the diary; DURABLE is the memory
+ *  flush — observations worth keeping that never made it into the diary.
+ *  Split by splitRotationReply; a reply that ignores the format becomes a
+ *  summary only. Mirror of core/src/claude_session.rs::SUMMARY_PROMPT. */
 export const SUMMARY_PROMPT =
-  "This session rotates now. Reply with exactly two sections and no other text:\n" +
+  "This session is compacted now. Reply with exactly two sections and no other text:\n" +
   "SUMMARY:\n" +
-  "5-10 bullets for tomorrow's session — ongoing tasks, decisions made, " +
-  "key facts about the user, anything a fresh assistant would need to know.\n" +
+  "5-10 bullets for the diary — ongoing tasks, decisions made, " +
+  "key facts about the user, open threads.\n" +
   "DURABLE:\n" +
-  "Bullets for observations worth keeping beyond tomorrow that are NOT yet " +
+  "Bullets for observations worth keeping beyond today that are NOT yet " +
   "recorded anywhere: decisions, corrections, recurring user preferences, " +
   "unresolved threads. Write none if everything durable is already recorded.";
 
-/** Split the rotation reply into summary + durable. The DURABLE header is
+/** Split the summary reply into summary + durable. The DURABLE header is
  *  matched line-anchored (last occurrence wins); a missing header, empty
  *  body, or literal "none" yields durable: null. Mirror of
  *  core/src/claude_session.rs::split_rotation_reply; shared vectors in
@@ -1542,116 +1543,20 @@ export function splitRotationReply(reply: string): { summary: string; durable: s
   return { summary, durable };
 }
 
-const SYSTEM_INJECTED_PREFIXES = [
-  "<ide_opened_file>",
-  "<ide_diagnostics>",
-  "<system-reminder>",
-  "<command-message>",
-  "<command-name>",
-  "<command-args>",
-  "<local-command-",
-];
-
-function isSystemInjectedUserTurn(text: string): boolean {
-  const t = text.trimStart();
-  return SYSTEM_INJECTED_PREFIXES.some((p) => t.startsWith(p));
-}
-
-function stripDatePreamble(s: string): string {
-  const TAG = "[context: today is ";
-  if (s.startsWith(TAG)) {
-    const idx = s.indexOf("]\n\n");
-    if (idx >= 0) return s.slice(idx + 3);
-  }
-  return s;
-}
-
-/** Read the last `n` user/assistant text turns from a Claude transcript
- *  JSONL. TS mirror of `nucleus_core::claude_session::last_n_turns`.
- *  Same filters: drop tool_use/tool_result/thinking blocks, drop
- *  Claude-Code-injected `<…>` user turns, strip the date preamble. */
-export function lastNTurns(transcriptPath: string, n: number): Turn[] {
-  let raw: string;
-  try {
-    raw = readFileSync(transcriptPath, "utf8");
-  } catch {
-    return [];
-  }
-  const turns: Turn[] = [];
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let obj: any;
-    try {
-      obj = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    const kind = obj.type;
-    let role: TurnRole;
-    if (kind === "user") role = "user";
-    else if (kind === "assistant") role = "assistant";
-    else continue;
-    const content = obj.message?.content;
-    if (content === undefined || content === null) continue;
-    const parts: string[] = [];
-    if (typeof content === "string") {
-      parts.push(content);
-    } else if (Array.isArray(content)) {
-      for (const item of content) {
-        if (item && item.type === "text" && typeof item.text === "string") {
-          parts.push(item.text);
-        }
-      }
-    }
-    if (parts.length === 0) continue;
-    let text = parts.join("\n");
-    if (role === "user" && isSystemInjectedUserTurn(text)) continue;
-    text = stripDatePreamble(text).trim();
-    if (!text) continue;
-    turns.push({ role, text });
-  }
-  return turns.length > n ? turns.slice(turns.length - n) : turns;
-}
-
-/** Construct the first message a freshly-rotated session sees. TS mirror
- *  of `build_priming_preamble`. */
-export function buildPrimingPreamble(summary: string, replay: Turn[]): string {
-  const lines: string[] = [];
-  lines.push("[Yesterday's session summary, for context]");
-  lines.push(summary.trim());
-  lines.push("");
-  lines.push("[Recent conversation, replayed for continuity]");
-  for (const turn of replay) {
-    const label = turn.role === "user" ? "USER" : "ASSISTANT";
-    lines.push(`${label}: ${turn.text.trim()}`);
-    lines.push("");
-  }
-  lines.push(
-    "[End of priming. The user has not sent a new message yet — " +
-      "acknowledge briefly that you have the context and stand by.]",
-  );
-  return lines.join("\n");
-}
-
-/** Sleep until the next 04:00 in NUCLEUS_TZ (falling back to TZ, then
- *  UTC). Used by index.ts to gate the daily rotation tick.
+/** Milliseconds from `now` until the next daily compaction: the next 04:00
+ *  in NUCLEUS_TZ (then TZ, then UTC). Mirror of core's
+ *  `duration_until_next_compaction`.
  *
- *  Testing override: setting NUCLEUS_ROTATION_TEST_DELAY_SECONDS to a
- *  positive integer short-circuits the 4am math and sleeps that many
- *  seconds instead — lets us validate rotation end-to-end without
- *  waiting until 4am. Leave unset in production. */
-export async function sleepUntilNext4am(): Promise<void> {
-  const override = process.env.NUCLEUS_ROTATION_TEST_DELAY_SECONDS;
+ *  Testing override: NUCLEUS_COMPACTION_TEST_DELAY_SECONDS=<n> (a positive
+ *  integer) makes it n seconds, to run the compaction end to end without
+ *  waiting for 04:00. Leave it unset in production. */
+export function msUntilNextCompaction(now: Date = new Date()): number {
+  const override = process.env.NUCLEUS_COMPACTION_TEST_DELAY_SECONDS;
   if (override) {
     const secs = Number.parseInt(override, 10);
-    if (Number.isFinite(secs) && secs > 0) {
-      await sleep(secs * 1000);
-      return;
-    }
+    if (Number.isFinite(secs) && secs > 0) return secs * 1000;
   }
-  const delayMs = msUntilNext4am(new Date(), resolveTz());
-  await sleep(delayMs);
+  return msUntilNext4am(now, resolveTz());
 }
 
 export function resolveTz(): string {

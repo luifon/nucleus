@@ -15,9 +15,17 @@
 # Secret-free by design: labels derive from agents.toml (ADR-016 single
 # source of truth), paths from $HOME / .env at runtime (Rule 1).
 #
+# The bots compact their chat sessions at 04:00 too (ADR-025), the same
+# minute this job runs, and a compaction takes minutes. Each bot holds
+# memory/compaction/<agent>.lock (pid=…, started=<unix secs>) while it
+# compacts, taken one minute before 04:00. This job first waits until no
+# live lock is left: a lock whose pid is dead, or that is older than
+# COMPACTION_MAX_AGE_SECS, is stale and ignored. It waits at most that long.
+#
 # Usage:  ./tools/restart-bots.sh [--dry-run] [--force]
 #   --dry-run  print what would happen, change nothing
-#   --force    restart even when a delivery queue is mid-drain
+#   --force    restart even when a delivery queue is mid-drain or a bot is
+#              compacting its sessions
 # Exit 0 if every targeted service came back, 1 otherwise.
 
 set -uo pipefail
@@ -66,6 +74,54 @@ whatsapp_busy() {
   n="$(sqlite3 "$db" "select count(*) from outbound_queue where status='pending';" 2>/dev/null || echo 0)"
   [ "${n:-0}" -gt 0 ]
 }
+
+# --- compaction guard ------------------------------------------------------
+# Same bound as COMPACTION_LOCK_MAX_AGE in core/src/compaction_lock.rs and
+# messaging/whatsapp/src/compaction_lock.ts.
+COMPACTION_MAX_AGE_SECS=2700
+COMPACTION_LOCK_DIR="memory/compaction"
+
+# Agents whose compaction lock is live, space-separated (empty = none).
+live_compactions() {
+  local now f pid started out=""
+  now="$(date +%s)"
+  for f in "$COMPACTION_LOCK_DIR"/*.lock; do
+    [ -f "$f" ] || continue
+    pid="$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' "$f")"
+    started="$(sed -n 's/^started=\([0-9][0-9]*\)$/\1/p' "$f")"
+    [ -n "$pid" ] && [ -n "$started" ] || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    [ $((now - started)) -le "$COMPACTION_MAX_AGE_SECS" ] || continue
+    out="$out $(basename "$f" .lock)"
+  done
+  printf '%s' "${out# }"
+}
+
+wait_for_compactions() {
+  local deadline active
+  deadline=$(( $(date +%s) + COMPACTION_MAX_AGE_SECS ))
+  active="$(live_compactions)"
+  [ -n "$active" ] || return 0
+  log "WAIT  session compaction running ($active) — waiting up to ${COMPACTION_MAX_AGE_SECS}s"
+  while [ -n "$active" ]; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "WAIT  compaction still running ($active) after ${COMPACTION_MAX_AGE_SECS}s — restarting anyway"
+      return 0
+    fi
+    sleep 10
+    active="$(live_compactions)"
+  done
+  log "WAIT  compaction finished"
+}
+
+if [ "$FORCE" -eq 0 ]; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    active="$(live_compactions)"
+    [ -z "$active" ] || log "DRY   would wait for the session compaction ($active)"
+  else
+    wait_for_compactions
+  fi
+fi
 
 rc=0 done_n=0 skipped_n=0
 for label in $TARGETS; do

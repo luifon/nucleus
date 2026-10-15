@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use nucleus_core::{
-    claude_session::{AskOptions, SessionPool},
+    claude_session::{AskOptions, SessionPool, StoredSession},
     config::Settings,
     db, diary,
     session_profile::{self, ProfileContext},
@@ -403,6 +403,18 @@ async fn lookup_session(pool: &SqlitePool, channel_id: u64) -> Result<Option<Str
     Ok(row.map(|(s,)| s))
 }
 
+/// Every stored channel session, for the daily compaction.
+async fn stored_sessions(pool: &SqlitePool) -> Result<Vec<StoredSession>> {
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT channel_id, session_id, last_active FROM channel_sessions")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(channel, session, last_active)| StoredSession::new(channel, session, &last_active))
+        .collect())
+}
+
 async fn save_session(pool: &SqlitePool, channel_id: u64, session_id: &str, is_new: bool) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     if is_new {
@@ -519,32 +531,32 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
         });
     }
 
-    // Background task: daily 04:00 local rotation. Summarize each active
-    // chat session, write the summary to today's diary, spawn a fresh
-    // session primed with the summary + last 10 turns, persist the new
-    // session-id back to channel_sessions. Keeps user-facing ask() calls
-    // from ever hitting the in-line "Resume from summary?" compaction.
+    // Background task: daily 04:00 compaction (ADR-025). Every channel
+    // session in channel_sessions that was active in the last 24 h is
+    // compacted in place: the summary turn goes to the diary, then
+    // `/compact` runs in the same session (same session id). The lock under
+    // memory/compaction/ makes tools/restart-bots.sh, which runs at the same
+    // minute, wait.
     {
         let sessions = sessions.clone();
         let db_pool = pool.clone();
+        let root = workspace_root.clone();
         tokio::spawn(async move {
             loop {
-                nucleus_core::claude_session::sleep_until_next_4am().await;
-                let pool_for_cb = db_pool.clone();
+                let _lock = nucleus_core::compaction_lock::wait_for_daily_compaction(&root, AGENT_NAME).await;
+                let stored = match stored_sessions(&db_pool).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("discord: daily compaction: reading channel_sessions failed: {e:#}");
+                        continue;
+                    }
+                };
                 let stats = sessions
-                    .daily_rotate("discord", move |chat_key, new_session_id| {
-                        let pool_for_cb = pool_for_cb.clone();
-                        async move {
-                            let channel_id: u64 = chat_key
-                                .parse()
-                                .context("rotation callback: parse channel_id")?;
-                            save_session(&pool_for_cb, channel_id, &new_session_id, true).await
-                        }
-                    })
+                    .daily_compact(AGENT_NAME, stored, nucleus_core::compaction_lock::DAILY_COMPACTION_BUDGET)
                     .await;
                 tracing::info!(
-                    "discord: daily rotation done — considered={} rotated={} skipped={} failed={}",
-                    stats.considered, stats.rotated, stats.skipped, stats.failed
+                    "discord: daily compaction done — considered={} compacted={} skipped={} failed={}",
+                    stats.considered, stats.compacted, stats.skipped, stats.failed
                 );
             }
         });

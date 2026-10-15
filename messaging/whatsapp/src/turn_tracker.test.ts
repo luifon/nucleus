@@ -2,14 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { TurnTracker } from "./turn_tracker.js";
+import { TurnTracker, turnsSinceCompaction } from "./turn_tracker.js";
 
 const vectors = JSON.parse(
   readFileSync(
     path.join(import.meta.dirname, "../../../core/testdata/turn_tracker_vectors.json"),
     "utf8",
   ),
-) as { cases: Array<{ name: string; records: unknown[]; events: unknown[] }> };
+) as { cases: Array<{ name: string; records: unknown[]; events: unknown[]; turns_since_compaction?: number }> };
 
 test("TurnTracker matches the shared turn-tracker vectors", () => {
   assert.ok(vectors.cases.length > 0);
@@ -20,6 +20,9 @@ test("TurnTracker matches the shared turn-tracker vectors", () => {
     const cut = Math.floor(jsonl.length / 2);
     const got = [...t.feed(jsonl.slice(0, cut)), ...t.feed(jsonl.slice(cut))];
     assert.deepEqual(got, c.events, c.name);
+    if (c.turns_since_compaction !== undefined) {
+      assert.equal(turnsSinceCompaction(jsonl), c.turns_since_compaction, c.name);
+    }
   }
 });
 

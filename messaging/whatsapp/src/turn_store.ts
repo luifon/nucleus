@@ -14,8 +14,12 @@
 //   session started it, e.g. a background command finished), context (an
 //   attributed agent message), foreign (typed by something else, e.g. the
 //   operator through `tmux attach`). quote_ref: the operator message the
-//   turn's reply quotes. pending_bg: background commands still running when
-//   the turn ended.
+//   turn's reply quotes.
+// chat_background — one row per background command a session started:
+//     running → finished | never_started | lost
+//   `lost` means its session stopped before it finished (a restart, the
+//   window died, the transcript was replaced); the operator gets one note
+//   per operator message whose commands were lost, listing them.
 // seen_messages — WhatsApp message ids the bot started handling (inbound
 //   dedup): received → handled. A message recorded as received but never
 //   handled (the bot stopped in between) is handled again when WhatsApp
@@ -28,6 +32,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
+import { fill } from "./texts.js";
 
 export type InboundStatus =
   | "received"
@@ -70,13 +75,54 @@ export interface InboxRow {
   enqueuedAt: string;
 }
 
-/** One restart note the boot sweep queued. */
+/** One note the boot sweep (or a stopped session) queued. */
 export interface InterruptedItem {
   kind: "turn" | "message" | "background";
+  /** The interrupted turn; for background notes the turn that started the
+   *  first listed command. */
   turnId: string | null;
   chatId: string;
   quote: InboundRow | null;
   outboundId: number;
+  /** Background notes: the ids of the commands the note lists. */
+  commands?: string[];
+}
+
+export type BackgroundState = "running" | "finished" | "never_started" | "lost";
+
+export interface BackgroundRow {
+  id: string;
+  chatId: string;
+  pool: string;
+  sessionId: string | null;
+  turnId: string | null;
+  quoteRef: string | null;
+  description: string | null;
+  startedAt: string;
+  endedAt: string | null;
+  state: BackgroundState;
+}
+
+/** The texts of the notes about lost background commands. */
+export interface BackgroundTexts {
+  /** {commands} */
+  backgroundLost: string;
+  backgroundUnnamed: string;
+}
+
+function toBackground(r: any): BackgroundRow {
+  return {
+    id: r.id,
+    chatId: r.chat_id,
+    pool: r.pool,
+    sessionId: r.session_id ?? null,
+    turnId: r.turn_id ?? null,
+    quoteRef: r.quote_ref ?? null,
+    description: r.description ?? null,
+    startedAt: r.started_at,
+    endedAt: r.ended_at ?? null,
+    state: r.state,
+  };
 }
 
 const PREVIEW_CHARS = 500;
@@ -340,32 +386,152 @@ export class TurnStore {
       finalOutboundId?: number | null;
       replyChars?: number | null;
       error?: string | null;
-      pendingBg?: number | null;
     },
   ): void {
     this.db
       .prepare(
         `UPDATE chat_turns
             SET status = ?, ended_at = ?, final_outbound_id = COALESCE(?, final_outbound_id),
-                reply_chars = COALESCE(?, reply_chars), error = COALESCE(?, error),
-                pending_bg = COALESCE(?, pending_bg)
+                reply_chars = COALESCE(?, reply_chars), error = COALESCE(?, error)
           WHERE id = ? AND status = 'running'`,
       )
-      .run(
-        e.status,
-        now(),
-        e.finalOutboundId ?? null,
-        e.replyChars ?? null,
-        e.error ?? null,
-        e.pendingBg ?? null,
-        id,
-      );
+      .run(e.status, now(), e.finalOutboundId ?? null, e.replyChars ?? null, e.error ?? null, id);
   }
 
-  /** The background commands of `chatId`'s turns finished (a later turn
-   *  answered them): nothing is owed any more. */
-  clearPendingBackground(chatId: string): void {
-    this.db.prepare(`UPDATE chat_turns SET pending_bg = 0 WHERE chat_id = ? AND pending_bg > 0`).run(chatId);
+  /** The most recent activity of `chatId` (a message received or a turn
+   *  started) and the pool it ran in; null when the chat has neither. */
+  chatActivity(chatId: string): { at: string; pool: string } | null {
+    const row = this.db
+      .prepare(
+        `SELECT at, pool FROM (
+            SELECT started_at AS at, pool FROM chat_turns WHERE chat_id = ?
+            UNION ALL
+            SELECT received_at AS at, pool FROM chat_inbound WHERE chat_id = ?
+          ) ORDER BY at DESC LIMIT 1`,
+      )
+      .get(chatId, chatId) as { at: string; pool: string } | undefined;
+    return row ?? null;
+  }
+
+  // ── background commands ──
+
+  /** A session started background command `id`. A second start of the
+   *  same id changes nothing. */
+  startBackground(b: {
+    id: string;
+    chatId: string;
+    pool: string;
+    sessionId: string;
+    turnId: string | null;
+    quoteRef: string | null;
+    description: string | null;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO chat_background
+           (id, chat_id, pool, session_id, turn_id, quote_ref, description, started_at, state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running')`,
+      )
+      .run(b.id, b.chatId, b.pool, b.sessionId, b.turnId, b.quoteRef, b.description, now());
+  }
+
+  /** Close a running command: its completion notice arrived (`finished`) or
+   *  its tool result was an error (`never_started`). Returns the closed row,
+   *  or null when no running command has this id. */
+  endBackground(id: string, state: "finished" | "never_started"): BackgroundRow | null {
+    const r = this.db
+      .prepare(
+        `UPDATE chat_background SET state = ?, ended_at = ?
+          WHERE id = ? AND state = 'running'
+          RETURNING *`,
+      )
+      .get(state, now(), id);
+    return r ? toBackground(r) : null;
+  }
+
+  getBackground(id: string): BackgroundRow | null {
+    const r = this.db.prepare(`SELECT * FROM chat_background WHERE id = ?`).get(id);
+    return r ? toBackground(r) : null;
+  }
+
+  /** Running background commands of `chatId`, oldest first. */
+  runningBackground(chatId: string): BackgroundRow[] {
+    return (
+      this.db
+        .prepare(`SELECT * FROM chat_background WHERE chat_id = ? AND state = 'running' ORDER BY started_at, rowid`)
+        .all(chatId) as any[]
+    ).map(toBackground);
+  }
+
+  /** The session of `chatId` stopped (its window died or was closed, or its
+   *  transcript was replaced): its running background commands cannot
+   *  report any more. Each becomes `lost`, and the notes are queued in the
+   *  same transaction (see `queueLostBackground`). */
+  loseBackground(
+    chatId: string,
+    texts: BackgroundTexts,
+    format: (s: string) => string,
+    noted: ReadonlySet<string> = new Set(),
+  ): InterruptedItem[] {
+    return this.tx(() => {
+      const rows = this.runningBackground(chatId);
+      return this.queueLostBackground(rows, texts, format, noted);
+    });
+  }
+
+  /** Mark `rows` lost and queue the notes: one per operator message whose
+   *  commands were lost (or one per chat for commands that quote none),
+   *  quoting that message and listing every lost command of it. The
+   *  delivery key is the first command's id, so a note is never queued
+   *  twice. Call inside a transaction. */
+  private queueLostBackground(
+    rows: BackgroundRow[],
+    texts: BackgroundTexts,
+    format: (s: string) => string,
+    noted: ReadonlySet<string> = new Set(),
+  ): InterruptedItem[] {
+    const groups = new Map<string, BackgroundRow[]>();
+    for (const r of rows) {
+      const key = `${r.chatId}\u0000${r.quoteRef ?? ""}`;
+      groups.set(key, [...(groups.get(key) ?? []), r]);
+    }
+    const items: InterruptedItem[] = [];
+    const ts = now();
+    const mark = this.db.prepare(`UPDATE chat_background SET state = 'lost', ended_at = ? WHERE id = ? AND state = 'running'`);
+    for (const group of groups.values()) {
+      const first = group[0];
+      // The message already has a note from the same sweep (its turn was
+      // interrupted): the commands are lost without a second note.
+      if (first.quoteRef && noted.has(first.quoteRef)) {
+        for (const r of group) mark.run(ts, r.id);
+        continue;
+      }
+      const quote = first.quoteRef ? this.getInbound(first.quoteRef) : null;
+      const commands = group.map((r) => `• ${r.description ?? texts.backgroundUnnamed}`).join("\n");
+      const id = this.enqueueNote(
+        first.chatId,
+        format(fill(texts.backgroundLost, { commands })),
+        quote,
+        `interrupted:background:${first.id}`,
+      );
+      for (const r of group) mark.run(ts, r.id);
+      items.push({ kind: "background", turnId: first.turnId, chatId: first.chatId, quote, outboundId: id, commands: group.map((r) => r.id) });
+    }
+    return items;
+  }
+
+  /** Queue one note in outbound_queue under delivery key `key`; a second
+   *  call with the same key returns the first row's id. */
+  private enqueueNote(chatId: string, body: string, quote: InboundRow | null, key: string): number {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO outbound_queue
+           (target, body, source, enqueued_at, status, attempts, kind, quoted_json, dedup_key)
+         VALUES (?, ?, 'chat-interrupted', ?, 'pending', 0, 'text', ?, ?)`,
+      )
+      .run(chatId, body, now(), quote?.quotedJson ?? null, key);
+    const row = this.db.prepare(`SELECT id FROM outbound_queue WHERE dedup_key = ?`).get(key) as { id: number };
+    return row.id;
   }
 
   inboundOfTurn(turnId: string): InboundRow[] {
@@ -381,27 +547,17 @@ export class TurnStore {
    *  and the boot wipe kills their sessions, so each is interrupted. One
    *  note is queued per running turn that owes a reply (an operator turn
    *  with open messages, or an autonomous turn answering a background
-   *  command), per message no turn had read yet, and per chat whose last
-   *  turn left background commands running. The state changes and the
-   *  outbound rows are one transaction, and every note has a unique
-   *  delivery key, so a crash can neither lose a note nor send it twice.
-   *  No automatic resume. */
-  sweepInterrupted(notes: { interrupted: string; backgroundLost: string }, format: (s: string) => string): InterruptedItem[] {
+   *  command), per message no turn had read yet, and per operator message
+   *  whose background commands were still running (one note listing them;
+   *  none when that message already got an interrupted note). The state
+   *  changes and the outbound rows are one transaction, and every note has a
+   *  unique delivery key, so a crash can neither lose a note nor send it
+   *  twice. No automatic resume. */
+  sweepInterrupted(notes: { interrupted: string } & BackgroundTexts, format: (s: string) => string): InterruptedItem[] {
     return this.tx(() => {
       const items: InterruptedItem[] = [];
-      const enqueue = (chatId: string, body: string, quote: InboundRow | null, key: string): number => {
-        this.db
-          .prepare(
-            `INSERT OR IGNORE INTO outbound_queue
-               (target, body, source, enqueued_at, status, attempts, kind, quoted_json, dedup_key)
-             VALUES (?, ?, 'chat-interrupted', ?, 'pending', 0, 'text', ?, ?)`,
-          )
-          .run(chatId, format(body), now(), quote?.quotedJson ?? null, key);
-        const row = this.db.prepare(`SELECT id FROM outbound_queue WHERE dedup_key = ?`).get(key) as {
-          id: number;
-        };
-        return row.id;
-      };
+      const enqueue = (chatId: string, body: string, quote: InboundRow | null, key: string): number =>
+        this.enqueueNote(chatId, format(body), quote, key);
 
       const turns = this.db
         .prepare(`SELECT id, chat_id, kind, quote_ref FROM chat_turns WHERE status = 'running'`)
@@ -415,6 +571,7 @@ export class TurnStore {
         const owesReply = open.length > 0 || (t.kind === "autonomous" && quote !== null);
         // A context or foreign turn owes nobody a reply: no note.
         if (!owesReply) continue;
+        if (quote) covered.add(quote.ref);
         const id = enqueue(t.chat_id, notes.interrupted, quote, `interrupted:turn:${t.id}`);
         items.push({ kind: "turn", turnId: t.id, chatId: t.chat_id, quote, outboundId: id });
       }
@@ -424,19 +581,16 @@ export class TurnStore {
         .map(toInbound)
         .filter((i) => !covered.has(i.ref));
       for (const i of loose) {
+        covered.add(i.ref);
         const id = enqueue(i.chatId, notes.interrupted, i, `interrupted:message:${i.ref}`);
         items.push({ kind: "message", turnId: null, chatId: i.chatId, quote: i, outboundId: id });
       }
-      // A turn that ended while background commands ran promised a later
-      // result; the restart killed those commands with the session.
-      const waiting = this.db
-        .prepare(`SELECT id, chat_id, quote_ref FROM chat_turns WHERE pending_bg > 0 AND status != 'running'`)
-        .all() as Array<{ id: string; chat_id: string; quote_ref: string | null }>;
-      for (const t of waiting) {
-        const quote = t.quote_ref ? this.getInbound(t.quote_ref) : null;
-        const id = enqueue(t.chat_id, notes.backgroundLost, quote, `interrupted:background:${t.id}`);
-        items.push({ kind: "background", turnId: t.id, chatId: t.chat_id, quote, outboundId: id });
-      }
+      // Background commands still running promised a later result; the
+      // restart killed them with their sessions.
+      const running = (
+        this.db.prepare(`SELECT * FROM chat_background WHERE state = 'running' ORDER BY started_at, rowid`).all() as any[]
+      ).map(toBackground);
+      items.push(...this.queueLostBackground(running, notes, format, covered));
 
       const ts = now();
       this.db
@@ -445,7 +599,6 @@ export class TurnStore {
             WHERE status = 'running'`,
         )
         .run(ts);
-      this.db.prepare(`UPDATE chat_turns SET pending_bg = 0 WHERE pending_bg > 0`).run();
       this.db
         .prepare(
           `UPDATE chat_inbound SET status = 'interrupted', error = 'bot restarted before the reply'

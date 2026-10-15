@@ -15,7 +15,11 @@ export interface BotTexts {
   /** Put before a progress message. */
   progressPrefix: string;
   interrupted: string;
+  /** Background commands whose session stopped before they finished:
+   *  {commands} is one line per command ("• " + its description). */
   backgroundLost: string;
+  /** Stands for a background command without a description. */
+  backgroundUnnamed: string;
   sessionDied: string;
   noFinal: string;
   noAnswer: string;
@@ -106,7 +110,8 @@ export const DEFAULT_TEXTS: BotTexts = {
   progressPrefix: "↻ Progress: ",
   interrupted: "⚠️ Interrupted: the bot restarted before the reply. Not resumed — send it again if you still want it.",
   backgroundLost:
-    "⚠️ The bot restarted while a background command was running; its result will not arrive. Send the request again if you still want it.",
+    "⚠️ The session stopped while this background work was running, so its result will not arrive:\n{commands}\nSend the request again if you still want it.",
+  backgroundUnnamed: "a background command",
   sessionDied: "⚠️ The session closed before replying. Send it again if you still want it.",
   noFinal: "⚠️ The session ended its turn without a reply.",
   noAnswer: "⚠️ No answer arrived within the safety limit. Send it again if you still want it.",

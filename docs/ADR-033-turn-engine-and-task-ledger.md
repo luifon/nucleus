@@ -67,8 +67,9 @@ One actor per chat owns that chat's Claude session and follows its transcript
 with a `TurnTracker` (`turn_tracker.ts`, mirror of `core/src/turn_tracker.rs`).
 The tracker turns transcript records into events: prompt accepted, input
 absorbed mid-turn, intermediate text before a tool call, background command
-started or finished, turn ended. The records it relies on were verified on
-Claude Code 2.1.281 with a live session:
+started, finished or never started, session compacted, turn ended. The
+records it relies on were verified on Claude Code 2.1.281 with a live session
+(the compaction and slash-command records on 2.1.300, 2026-10-15):
 
 | Record | Meaning |
 |---|---|
@@ -78,6 +79,14 @@ Claude Code 2.1.281 with a live session:
 | `assistant` records sharing `message.id` | one message split per content block; `stop_reason: tool_use` = more steps follow |
 | `system` `turn_duration` | the turn is over |
 | `user` with `origin.kind = "task-notification"` | a turn the session starts itself when a background command finishes |
+| `user` `tool_result` with `is_error: true` for a background call | the call was refused (permission classifier, operator) and never started |
+| `system` `compact_boundary`, then `user` with `isCompactSummary` / `isVisibleInTranscriptOnly` | the context was compacted (`/compact` or the automatic compaction); the summary record is not a prompt, and no `turn_duration` follows a compaction outside a turn |
+| `user` with a slash command line and no `origin`, then `<command-name>…` and `<local-command-stdout>…` records | a slash command typed into the session; a local command writes no `turn_duration`, so these are not prompts |
+
+A compaction inside a running turn leaves the turn open; it ends on its own
+`turn_duration`. Before 2026-10-15 the compaction summary opened a turn that
+never ended, and six hours later the ceiling sent the operator a note for a
+turn that had no operator message.
 
 Rules the engine enforces in code:
 
@@ -85,6 +94,9 @@ Rules the engine enforces in code:
    arrives. Text written before a tool call is never the answer. There is no
    short timeout. `turn_ceiling_hours` (default 6) is a safety stop: past it the
    engine sends a note, interrupts the session with Escape and closes the turn.
+   A turn that owes nobody a reply (no operator message and no autonomous
+   quote: a context or foreign turn) is only closed and logged at the
+   ceiling: no note, no Escape.
    A message that no turn ever read (its prompt record never appeared) gets
    the same limit on its own and is reported, so nothing waits forever.
 2. **Acknowledgement.** When an operator message has had no answer for
@@ -116,8 +128,27 @@ Rules the engine enforces in code:
    later turn started by the completion notice is delivered too, quoting the
    same operator message. A completion notice that an open turn absorbs is
    answered by that turn and does not set the quote of a later turn. The turn
-   row records the quoted message (`quote_ref`) and the background commands
-   still running at its end (`pending_bg`), so a restart can report them (§5).
+   row records the quoted message (`quote_ref`). Each background command is
+   its own `chat_background` row (id = the tool_use id): the chat, the turn
+   that started it, the operator message it quotes, the description from the
+   tool call (its `description`, else the first line of its `command`, at
+   most 120 characters), the start time and a state: `running`, then
+   `finished` (its completion notice arrived), `never_started` (its tool
+   result was an error) or `lost` (its session stopped first). A command is
+   lost when its session window closes or dies, when the session is
+   relaunched on the fallback model, when the transcript is replaced, and at
+   a restart (§5). Lost commands get one note per operator message, quoting
+   it and listing each command (`[whatsapp.texts] background_lost`,
+   `{commands}` = one `• <description>` line per command,
+   `background_unnamed` when a command has no description), so several
+   commands of one request are one note. The idle reaper does not close a
+   session while one of its commands runs (one older than the turn ceiling
+   no longer counts). Until 2026-10-15 the turn row instead carried a count
+   (`pending_bg`) that was copied onto every later turn while a command
+   seemed to run, and a refused command never left the count: one refused
+   command produced five identical restart notes. The column is dropped; a
+   chat whose turns still counted commands got one `running` row without a
+   description at the upgrade.
 7. **Turn kinds.** `operator` (read at least one operator message; delivered),
    `autonomous` (started by the session itself; delivered), `context` (read
    only agent messages; silent), `foreign` (no marker, for example text the
@@ -172,9 +203,14 @@ look like a marker or an envelope header get a `> ` prefix; agent message
 bodies have every line prefixed (§2), so neither can carry a marker line and
 turn a silent context turn into a reply.
 
-The daily 04:00 rotation and the idle reaper moved from `SessionPool` into the
-engine. A chat that is busy at 04:00 is skipped that day. `SessionPool` is
-deleted from the TypeScript side (hard cut).
+The daily 04:00 job and the idle reaper moved from `SessionPool` into the
+engine. Since 2026-10-15 the daily job compacts each stored chat session in
+place (`compactAll`, ADR-025): every chat in `chat_sessions` active in the
+last 24 h, including chats whose session is closed or that have no actor
+since the process started; it waits (bounded) for a running turn, holds new
+messages in the queue, resumes a closed session, and types `/compact` into
+the same session. `SessionPool` is deleted from the TypeScript side (hard
+cut).
 
 ### 2. Typed input for every prompt
 
@@ -383,8 +419,9 @@ this: a session id recorded as a worker or a chat session is treated as one.
 records it only after the spawn succeeded, replacing the chat's earlier
 token in the same transaction: one valid token per chat. A failed spawn
 leaves nothing valid; closing the session (idle reap, recovery, shutdown)
-revokes the token; a rotation makes the new session's token the only valid
-one when it takes over. Every token is cleared at bot start.
+revokes the token; the daily compaction keeps an open session and its token,
+and a session it resumes gets a new token like any resume. Every token is
+cleared at bot start.
 
 **`tasks run`** is internal. `tasks start` stores the SHA-256 of a one-time
 run token on the queued task and passes the token to the detached worker on
@@ -481,8 +518,8 @@ between finishing and delivering does not lose the result.
   `session-send --to whatsapp-dm`). A `session_inbox` row carries the sender
   and the body; the bot builds the envelope. `dedup_key` makes a producer's
   retry idempotent. Rust reads `task_scopes` and `chat_sessions` (caller
-  detection). `chat_turns`, `chat_inbound`, `seen_messages` and
-  `task_scopes` are written by TypeScript only.
+  detection). `chat_turns`, `chat_inbound`, `chat_background`,
+  `seen_messages` and `task_scopes` are written by TypeScript only.
 
 ### 5. Restart handling
 
@@ -490,8 +527,10 @@ At boot the bot marks every running turn and every unanswered operator
 message as `interrupted` and queues one note per item, quoting the operator's
 message: one per running turn that owes a reply (an operator turn with open
 messages, or an autonomous turn answering a background command, found by its
-`quote_ref`), one per message that no turn had read yet, and one per chat
-whose last turn left background commands running (the restart killed them).
+`quote_ref`), one per message that no turn had read yet, and one per
+operator message whose background commands were still `running` (the restart
+killed them), listing them (§1 rule 6). A command whose message already got
+an interrupted note in the same sweep is marked lost without a second note.
 The state changes and the outbound rows are one transaction, and every note
 has a unique key, so a crash can neither lose a note nor send it twice. It
 does not resume anything. The task scope tokens are cleared (every DM session
@@ -601,7 +640,11 @@ and a redacted message says how many values were withheld.
   messages, background continuation, silent context turn, forged marker in a
   context payload, duplicate delivery, task scope token, retry ordering with
   the full text, absorbed completion notice, transcript reset, infrastructure
-  banner, dead window, restart sweep with all note kinds); outbound drain
+  banner, dead window, restart sweep with all note kinds, a silent ceiling
+  for a turn that owes no reply, background rows started/finished/refused/
+  lost with one note per operator message, the `pending_bg` migration, the
+  daily compaction with an open, a closed and a busy session, a failed
+  resume and a compaction that never finishes); outbound drain
   (timeout without duplicate, message-id reuse, server acknowledgement, quote
   validation, secret filter); secret filter rules; typed-input helpers
   (surrogate pairs, env prefix); tasks ledger (scopes, enums and limits,
@@ -610,7 +653,7 @@ and a redacted message says how many values were withheld.
   transcript replacement); caller detection and CLI authorization;
   `session-send` sender and hop derivation; dashboard cancel guards;
   caller-origin shared vectors (Rust and TypeScript); credential-shape
-  shared vectors; scope-token lifecycle (rotation, close, failed spawn);
+  shared vectors; scope-token lifecycle (compaction, close, failed spawn);
   inbound dedup states; brain-dump replies through the queue; confirmed
   WhatsApp delivery, redrive only of rows that never reached the socket, and
   the given-up delivery with its single note ("server accepted, client saw

@@ -189,7 +189,7 @@ pub async fn run(_args: Vec<std::ffi::OsString>) -> Result<()> {
     match init_chat(&workspace_root, &settings, &vault_root).await {
         Ok(state) => {
             let state = Arc::new(state);
-            spawn_daily_rotation(state.clone());
+            spawn_daily_compaction(state.clone());
             app = app.nest("/chat/api", handlers::chat::router(state));
         }
         Err(e) => {
@@ -408,36 +408,41 @@ async fn init_chat(
     })
 }
 
-fn spawn_daily_rotation(state: Arc<handlers::chat::ChatState>) {
+/// Daily 04:00 compaction (ADR-025) of the vault chats' sessions: every
+/// chat in obsidian_chats with a session, active in the last 24 h, is
+/// compacted in place (same session id). The lock under memory/compaction/
+/// makes tools/restart-bots.sh, which restarts the dashboard at the same
+/// minute, wait.
+fn spawn_daily_compaction(state: Arc<handlers::chat::ChatState>) {
     tokio::spawn(async move {
         loop {
-            nucleus_core::claude_session::sleep_until_next_4am().await;
-            let pool = state.pool.clone();
+            let _lock =
+                nucleus_core::compaction_lock::wait_for_daily_compaction(&state.workspace_root, "chat").await;
+            let rows: Vec<(String, String, String)> = match sqlx::query_as(
+                "SELECT id, claude_session_id, last_active FROM obsidian_chats \
+                 WHERE claude_session_id IS NOT NULL",
+            )
+            .fetch_all(&state.pool)
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("chat: daily compaction: reading obsidian_chats failed: {e:#}");
+                    continue;
+                }
+            };
+            let stored = rows
+                .into_iter()
+                .map(|(id, session, last_active)| claude_session::StoredSession::new(id, session, &last_active))
+                .collect();
             let stats = state
                 .sessions
-                .daily_rotate("chat", move |chat_key, new_session_id| {
-                    let pool = pool.clone();
-                    async move {
-                        let now = chrono::Utc::now().to_rfc3339();
-                        sqlx::query(
-                            "UPDATE obsidian_chats \
-                             SET claude_session_id = ?1, last_active = ?2 \
-                             WHERE id = ?3",
-                        )
-                        .bind(&new_session_id)
-                        .bind(&now)
-                        .bind(&chat_key)
-                        .execute(&pool)
-                        .await
-                        .map(|_| ())
-                        .context("rotation: update obsidian_chats")
-                    }
-                })
+                .daily_compact("chat", stored, nucleus_core::compaction_lock::DAILY_COMPACTION_BUDGET)
                 .await;
             tracing::info!(
-                "chat: daily rotation — considered={} rotated={} skipped={} failed={}",
+                "chat: daily compaction — considered={} compacted={} skipped={} failed={}",
                 stats.considered,
-                stats.rotated,
+                stats.compacted,
                 stats.skipped,
                 stats.failed
             );

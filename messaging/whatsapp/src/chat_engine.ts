@@ -11,7 +11,9 @@
 // - A turn's answer is its FINAL text, taken when the turn ends
 //   (`turn_duration`). Text written before a tool call is progress, never the
 //   answer. There is no short timeout; `ceilingMs` is a safety stop measured
-//   in hours.
+//   in hours. A turn that owes a reply is reported and interrupted there; a
+//   turn that owes nobody a reply (context, foreign) is closed with a log
+//   line only.
 // - Every turn that read an operator message gets exactly one final reply,
 //   through the outbound queue, quoting the operator's first message of that
 //   turn. A turn the session starts itself (a background command finished)
@@ -23,6 +25,15 @@
 //   per `progressIntervalMs`, only when it is new. The outbound drain's
 //   secret filter withholds a progress message that names a secret or an
 //   identifier.
+// - Every background command is a `chat_background` row: started when the
+//   tool call appears, closed by its completion notice or by an error
+//   result (it never started). Commands still running when their session
+//   stops are reported once (TurnStore.loseBackground / sweepInterrupted).
+// - Once a day (`compactAll`, ADR-025) every chat session active in the
+//   last 24 h with at least COMPACT_MIN_TURNS turns since its last
+//   compaction is compacted in place: the summary turn writes the diary
+//   entries, then `/compact` is typed into the same session. The session id
+//   does not change and no new session is spawned.
 //
 // Messages are found again in the transcript by a marker line typed with
 // each payload: `[WhatsApp — chat <id> — ref:wa-…]` for operator messages,
@@ -37,23 +48,24 @@ import { promises as fs } from "node:fs";
 import {
   Session,
   WedgedInputError,
+  COMPACT_COMMAND,
+  COMPACT_MIN_TURNS,
   MAX_TYPED_INPUT_BYTES,
   MAX_TYPED_PROMPT_BYTES,
   arrivedPasted,
-  buildPrimingPreamble,
   classifyInfraReply,
   fallbackModel,
-  lastNTurns,
   paneAwaitingChoice,
   sanitizeForTyping,
   splitRotationReply,
   SUMMARY_PROMPT,
+  transcriptPathFor,
   withDatePreamble,
-  type RotationStats,
+  type CompactionStats,
   type SpawnOptions,
   type SubmitResult,
 } from "./claude_session.js";
-import { TurnTracker, type TrackEvent } from "./turn_tracker.js";
+import { TurnTracker, turnsSinceCompaction, type TrackEvent } from "./turn_tracker.js";
 import type { InboundRow, TurnKind, TurnStore } from "./turn_store.js";
 
 import { DEFAULT_TEXTS, fill, type BotTexts } from "./texts.js";
@@ -125,7 +137,22 @@ export interface Outbox {
 export interface SessionMap {
   lookup(chatId: string): string | null;
   save(chatId: string, sessionId: string, isNew: boolean): void;
+  /** Every stored chat session (the daily compaction walks these). */
+  list(): Array<{ chatId: string; sessionId: string }>;
 }
+
+const DAY_MS = 24 * 60 * 60_000;
+
+/** Upper bounds of the daily compaction's steps for one chat. Each is also
+ *  cut to what is left of the pass's budget. */
+export const COMPACTION_STEPS = {
+  /** Waiting for the running turn and the queued messages to finish. */
+  busyWaitMs: 10 * 60_000,
+  /** The summary turn. */
+  summaryMs: 5 * 60_000,
+  /** `/compact`, until its compact_boundary record appears. */
+  compactMs: 10 * 60_000,
+};
 
 export interface EngineLog {
   info(obj: object, msg: string): void;
@@ -159,9 +186,14 @@ export interface EngineDeps {
   log: EngineLog;
   onOperatorReply?: (info: ReplyInfo) => void;
   spawn?: (opts: SpawnOptions) => Promise<EngineSession>;
+  /** The transcript path of a stored session that is not open (default:
+   *  Claude Code's path, `transcriptPathFor`). */
+  transcriptPath?: (workspaceRoot: string, sessionId: string) => string;
   now?: () => number;
   /** Delay before an API-error retry (tests shorten it). */
   apiRetryDelayMs?: number;
+  /** Poll interval of the daily compaction's waits (tests shorten it). */
+  compactionPollMs?: number;
 }
 
 /** The final text a DM chat session ends its turn with after `nucleus
@@ -298,15 +330,15 @@ class ChatActor {
   private following = false;
   open: OpenTurn | null = null;
   lastActive: number;
-  rotating = false;
+  /** The daily compaction owns the session: nothing is typed and the
+   *  transcript is not followed; new messages wait in the queue. */
+  compacting = false;
   /** An infrastructure retry is in progress: nothing else is typed until its
    *  messages are back in the session. */
   private recovering = false;
   private ackOutstanding = false;
   /** Refs this actor typed, by kind. Only these count as markers. */
   private issued = new Map<string, "operator" | "context">();
-  /** Background command id → operator ref that started it. */
-  private bgOrigin = new Map<string, string | null>();
   private pendingQuoteRef: string | null = null;
   private lastPresence = 0;
   private operatorTurns = 0;
@@ -440,18 +472,22 @@ class ChatActor {
     else this.e.turns.revokeTaskScopes(this.chatId);
   }
 
-  private async ensureSession(): Promise<EngineSession> {
+  /** The chat's session: the open one, else the stored one resumed, else a
+   *  fresh one. `resumeOnly`: never spawn a fresh session (the daily
+   *  compaction must not replace the session it compacts). */
+  private async ensureSession(resumeOnly = false): Promise<EngineSession> {
     if (this.session) return this.session;
     if (this.spawning) return this.spawning;
     this.spawning = (async () => {
       const resume = this.e.sessions.lookup(this.chatId) ?? undefined;
+      if (resumeOnly && !resume) throw new Error("no stored session to resume");
       const spawn = this.e.spawn ?? ((o: SpawnOptions) => Session.spawn(o));
       let s: EngineSession;
       let first = this.spawnOptions(resume);
       try {
         s = await spawn(first.opts);
       } catch (err) {
-        if (!resume) throw err;
+        if (!resume || resumeOnly) throw err;
         // The recorded session no longer boots (transcript gone, picker we do
         // not handle). Start a fresh one rather than failing every message.
         this.e.log.warn({ chatId: this.chatId, err: (err as Error).message }, "chat: resume failed — spawning fresh");
@@ -486,7 +522,7 @@ class ChatActor {
     if (this.pumping) return;
     this.pumping = true;
     try {
-      while (this.queue.length > 0 && !this.rotating && !this.recovering) {
+      while (this.queue.length > 0 && !this.compacting && !this.recovering) {
         const item = this.queue[0];
         let err: string | null = null;
         let submitted: SubmitResult | null = null;
@@ -535,12 +571,28 @@ class ChatActor {
     while (this.pumping) await new Promise((r) => setTimeout(r, 50));
   }
 
-  private async dropSession(): Promise<void> {
+  /** Close the session. `noted`: operator messages that already got a note
+   *  about this stop; their lost background commands get no second one. */
+  private async dropSession(noted: ReadonlySet<string> = new Set()): Promise<void> {
     const s = this.session;
     this.session = null;
     this.activateScope(null);
     this.tracker = new TurnTracker();
     if (s) await s.close().catch(() => {});
+    this.loseBackground("session closed", noted);
+  }
+
+  /** The session's running background commands can no longer report (it
+   *  closed, was relaunched, or its transcript was replaced): mark them
+   *  lost and queue the notes (one per operator message, listing them;
+   *  none for a message in `noted`). */
+  private loseBackground(why: string, noted: ReadonlySet<string> = new Set()): void {
+    for (const item of this.e.turns.loseBackground(this.chatId, this.texts, this.e.format, noted)) {
+      this.e.log.warn(
+        { chatId: this.chatId, commands: item.commands, ref: item.quote?.ref ?? null, why },
+        "chat: background commands lost — note queued",
+      );
+    }
   }
 
   // ── output ──
@@ -566,7 +618,7 @@ class ChatActor {
   // ── transcript following ──
 
   async follow(): Promise<void> {
-    if (this.following || this.rotating || this.recovering || !this.session) return;
+    if (this.following || this.compacting || this.recovering || !this.session) return;
     this.following = true;
     try {
       const s = this.session;
@@ -602,7 +654,8 @@ class ChatActor {
       this.send(this.texts.transcriptReset, waiting[0].quotedJson, "chat-note");
       for (const p of waiting) this.e.turns.markInboundFailed(p.ref, "transcript reset");
     }
-    this.bgOrigin.clear();
+    // The reset note already covers the waiting messages' work.
+    this.loseBackground("transcript reset", new Set(waiting.map((p) => p.ref)));
     this.pendingQuoteRef = null;
     this.ackOutstanding = false;
     await this.followFromEnd(s);
@@ -624,14 +677,30 @@ class ChatActor {
         if (this.open) this.open.latestProgress = ev.text;
         break;
       case "bg_started":
-        this.bgOrigin.set(ev.id, this.open?.refs[0] ?? this.open?.quoteRef ?? null);
+        this.e.turns.startBackground({
+          id: ev.id,
+          chatId: this.chatId,
+          pool: this.pool.name,
+          sessionId: s.sessionId,
+          turnId: this.open?.id ?? null,
+          quoteRef: this.open?.refs[0] ?? this.open?.quoteRef ?? null,
+          description: ev.description,
+        });
         break;
-      case "bg_finished":
+      case "bg_finished": {
+        const row = this.e.turns.endBackground(ev.id, "finished");
         // Only a completion notice that starts a turn of its own stages the
         // quote for that turn. A notice absorbed into an open turn is
         // answered by that turn.
-        if (!this.open) this.pendingQuoteRef = this.bgOrigin.get(ev.id) ?? null;
-        this.bgOrigin.delete(ev.id);
+        if (!this.open) this.pendingQuoteRef = row?.quoteRef ?? null;
+        break;
+      }
+      case "bg_never_started":
+        this.e.turns.endBackground(ev.id, "never_started");
+        this.e.log.info({ chatId: this.chatId, id: ev.id }, "chat: background command refused — it never started");
+        break;
+      case "compacted":
+        this.e.log.info({ chatId: this.chatId, trigger: ev.trigger, turnOpen: this.open !== null }, "chat: session compacted");
         break;
       case "turn_end":
         this.endTurn(ev.final_text, ev.pending_bg, s);
@@ -699,7 +768,6 @@ class ChatActor {
     this.open = null;
     if (!open) return;
     this.lastActive = this.now();
-    if (pendingBg === 0) this.e.turns.clearPendingBackground(this.chatId);
     if (open.abandoned) {
       // Reported and closed at the ceiling. Messages the turn read after that
       // still get its final text, so nothing typed later goes unanswered.
@@ -723,10 +791,10 @@ class ChatActor {
     if (finalText === null) {
       if (open.kind === "operator") {
         const id = this.send(this.texts.noFinal, quote?.quotedJson ?? null, "chat-note");
-        this.e.turns.endTurn(open.id, { status: "failed", finalOutboundId: id, error: "no final text", pendingBg });
+        this.e.turns.endTurn(open.id, { status: "failed", finalOutboundId: id, error: "no final text" });
         this.answered(open.refs);
       } else {
-        this.e.turns.endTurn(open.id, { status: "silent", pendingBg });
+        this.e.turns.endTurn(open.id, { status: "silent" });
       }
       return;
     }
@@ -739,13 +807,13 @@ class ChatActor {
 
     // ADR-036: the issue pipeline answered this message itself.
     if (open.kind === "operator" && finalText.trim() === WORK_HANDLED) {
-      this.e.turns.endTurn(open.id, { status: "silent", replyChars: 0, pendingBg });
+      this.e.turns.endTurn(open.id, { status: "silent", replyChars: 0 });
       this.answered(open.refs);
       return;
     }
 
     const id = this.send(finalText, quote?.quotedJson ?? null, "chat-reply");
-    this.e.turns.endTurn(open.id, { status: "done", finalOutboundId: id, replyChars: finalText.length, pendingBg });
+    this.e.turns.endTurn(open.id, { status: "done", finalOutboundId: id, replyChars: finalText.length });
     this.answered(open.refs);
     this.e.log.info(
       {
@@ -799,7 +867,11 @@ class ChatActor {
           await this.pumpIdle();
           if (infra === "model-unavailable" && this.session) {
             await this.session.respawnOnFallback(fallbackModel()).catch(() => this.dropSession());
-            if (this.session) await this.followFromEnd(this.session);
+            if (this.session) {
+              // The relaunch killed the window and its background commands.
+              this.loseBackground("relaunched on the fallback model");
+              await this.followFromEnd(this.session);
+            }
           } else {
             await new Promise((r) => setTimeout(r, this.e.apiRetryDelayMs ?? 10_000));
           }
@@ -886,8 +958,17 @@ class ChatActor {
         this.send(`${this.texts.progressPrefix}${clip(open.latestProgress, cfg.progressMaxChars)}`, null, "chat-progress");
         this.e.turns.bumpProgress(open.id);
       }
-      // Safety ceiling.
-      if (t - open.startedAt > cfg.ceilingMs) {
+      // Safety ceiling. A turn that owes nobody a reply (no operator message
+      // and no autonomous quote: a context or foreign turn, for example one a
+      // stray record opened) is closed with a log line: no note, no Escape.
+      if (t - open.startedAt > cfg.ceilingMs && open.refs.length === 0 && open.quoteRef === null) {
+        this.open = null;
+        this.e.turns.endTurn(open.id, { status: "failed", error: "safety ceiling (owed no reply; closed silently)" });
+        this.e.log.warn(
+          { chatId: this.chatId, turn: open.id.slice(0, 8), kind: open.kind },
+          "chat: turn that owes no reply passed the safety ceiling — closed without a note",
+        );
+      } else if (t - open.startedAt > cfg.ceilingMs) {
         open.abandoned = true;
         const quote = open.refs.length ? this.e.turns.getInbound(open.refs[0]) : null;
         const hours = String(Math.round(cfg.ceilingMs / 3_600_000));
@@ -897,8 +978,8 @@ class ChatActor {
         this.e.log.warn({ chatId: this.chatId, turn: open.id.slice(0, 8) }, "chat: turn passed the safety ceiling — interrupting");
         await this.session?.sendKey("Escape").catch(() => {});
       }
-      // Permission prompt stall.
-      if (this.session && t - this.lastPaneCheck >= 15_000) {
+      // Permission prompt stall (only for a turn the ceiling left open).
+      if (this.open === open && !open.abandoned && this.session && t - this.lastPaneCheck >= 15_000) {
         this.lastPaneCheck = t;
         const pane = await this.session.capturePane();
         if (paneAwaitingChoice(pane)) {
@@ -926,60 +1007,150 @@ class ChatActor {
           for (const p of pending) this.e.turns.markInboundFailed(p.ref, "session window died");
         }
         this.ackOutstanding = false;
-        await this.dropSession();
+        // The note above covers these messages; their lost background
+        // commands get no second note.
+        await this.dropSession(new Set(pending.map((p) => p.ref)));
       }
     }
 
     if (this.open || unanswered.length > 0 || this.queue.length > 0) this.presence("composing");
   }
 
-  // ── rotation (ADR-016 capability, moved from SessionPool) ──
+  // ── daily compaction (ADR-025) ──
 
-  async rotate(diaryAppend: (key: string, body: string) => void): Promise<"rotated" | "skipped"> {
-    const s = this.session;
-    if (!s || this.busy()) return "skipped";
-    if (this.lastActive < this.now() - 24 * 60 * 60_000) return "skipped";
-    const turns = lastNTurns(s.transcriptPath, 100);
-    if (turns.length < 10) return "skipped";
-    this.rotating = true;
+  /** Compact this chat's stored session in place. Skipped when the chat had
+   *  no activity (a message or a turn) in the last 24 h, or when the session
+   *  has fewer than COMPACT_MIN_TURNS turns since its last compaction.
+   *  Otherwise: wait until no turn runs and nothing is queued (bounded),
+   *  resume the stored session if it is closed (never a fresh one), run the
+   *  summary turn and write its diary entries, type `/compact` and wait for
+   *  its compact_boundary record, then follow the transcript from its end so
+   *  none of these records become turns. The session id does not change. A
+   *  session that was closed before is closed again unless a message is
+   *  waiting. Messages that arrive meanwhile wait in the queue. Throws on a
+   *  failure; the session is left as it was (a timed-out `/compact` is
+   *  cancelled with Escape). `deadline` (epoch ms) caps every step. */
+  async compact(diaryAppend: (key: string, body: string) => void, deadline: number): Promise<"compacted" | "skipped"> {
+    const stored = this.e.sessions.lookup(this.chatId);
+    if (!stored) return "skipped";
+    const activity = this.e.turns.chatActivity(this.chatId);
+    if (!activity || Date.parse(activity.at) < this.now() - DAY_MS) return "skipped";
+    const transcript =
+      this.session?.transcriptPath ?? (this.e.transcriptPath ?? transcriptPathFor)(this.pool.workspaceRoot, stored);
+    const turns = turnsSinceCompaction(await fs.readFile(transcript, "utf8").catch(() => ""));
+    if (turns < COMPACT_MIN_TURNS) return "skipped";
+
+    const poll = this.e.compactionPollMs ?? 1_000;
+    const step = (max: number, what: string): number => {
+      const left = Math.min(max, deadline - Date.now());
+      if (left <= 0) throw new Error(`the compaction's time budget ran out before ${what}`);
+      return left;
+    };
+    // Wait for the running turn, the queued input and the running background
+    // commands; tick() keeps following the transcript meanwhile. A command
+    // still running would report into records the compaction skips (the
+    // tracker is restarted at the end), so the chat waits for it.
+    const busyMs = step(COMPACTION_STEPS.busyWaitMs, "the chat became idle");
+    const busyUntil = Date.now() + busyMs;
+    while (this.busy() || this.spawning || this.compacting || this.backgroundRunning()) {
+      if (Date.now() >= busyUntil) {
+        const what = this.backgroundRunning() ? "a background command was still running" : "the chat was still busy";
+        throw new Error(`${what} after ${Math.round(busyMs / 1000)} s`);
+      }
+      await new Promise((r) => setTimeout(r, poll));
+    }
+    // Set in the same synchronous step as the last busy() check: a message
+    // that arrives from here on waits in the queue.
+    this.compacting = true;
+    let wasOpen = this.session !== null;
+    // Something was typed into the session: on a failure it may still be
+    // running (a summary turn past its timeout, a /compact).
+    let typed = false;
     try {
-      const reply = await s.ask(SUMMARY_PROMPT, { maxWaitMs: 300_000, quiescentMs: 5_000, awaitTurnComplete: true });
+      if (this.session && !(await this.session.isAlive())) {
+        // A dead window is dropped and the stored session resumed.
+        await this.dropSession();
+        wasOpen = false;
+      }
+      const s = await this.ensureSession(true);
+      typed = true;
+      const reply = await s.ask(SUMMARY_PROMPT, {
+        maxWaitMs: step(COMPACTION_STEPS.summaryMs, "the summary turn"),
+        quiescentMs: 5_000,
+        awaitTurnComplete: true,
+      });
       const { summary, durable } = splitRotationReply(reply);
-      diaryAppend(`daily_rotate ${this.chatId}`, `Session rotated. Yesterday's summary:\n\n${summary.trim()}`);
+      diaryAppend(`daily_compact ${this.chatId}`, `Summary before the daily compaction:\n\n${summary.trim()}`);
       if (durable !== null) {
-        diaryAppend(`memory_flush ${this.chatId}`, `Durable observations flushed at rotation:\n\n${durable}`);
+        diaryAppend(`memory_flush ${this.chatId}`, `Durable observations flushed before the compaction:\n\n${durable}`);
       }
-      const spawn = this.e.spawn ?? ((o: SpawnOptions) => Session.spawn(o));
-      const next = this.spawnOptions(undefined);
-      const fresh = await spawn({ ...next.opts, windowName: undefined });
-      try {
-        await fresh.ask(buildPrimingPreamble(summary, turns.slice(-10)), {
-          maxWaitMs: 300_000,
-          quiescentMs: 5_000,
-          awaitTurnComplete: true,
-        });
-        this.e.sessions.save(this.chatId, fresh.sessionId, true);
-      } catch (e) {
-        await fresh.close().catch(() => {});
-        throw e;
+      await this.runCompact(s, step(COMPACTION_STEPS.compactMs, "/compact"), poll);
+      this.e.log.info({ chatId: this.chatId, sessionId: s.sessionId.slice(0, 8), turns, resumed: !wasOpen }, "chat: session compacted in place");
+      return "compacted";
+    } catch (e) {
+      // Stop what may still run, so the next message starts a turn of its
+      // own instead of being absorbed by a turn the tracker no longer
+      // follows. One Escape only: a second one in a row opens Claude Code's
+      // message-rewind list.
+      if (typed && this.session && (await this.session.isAlive())) {
+        await this.session.sendKey("Escape").catch(() => {});
       }
-      this.session = fresh;
-      // The old session's token stops working with the swap.
-      this.activateScope(next.scope);
-      await this.followFromEnd(fresh);
-      await s.close().catch(() => {});
-      return "rotated";
+      throw e;
     } finally {
-      this.rotating = false;
+      // None of the records the summary turn and /compact wrote may become
+      // a turn.
+      if (this.session) await this.followFromEnd(this.session);
+      if (!wasOpen && this.session && this.queue.length === 0) await this.dropSession();
+      this.compacting = false;
       void this.pump();
     }
   }
 
+  /** Type `/compact` and wait until the transcript records its
+   *  compact_boundary. On timeout it throws; the caller's Escape cancels
+   *  the compaction. */
+  private async runCompact(s: EngineSession, timeoutMs: number, poll: number): Promise<void> {
+    // The summary turn may still be writing its last records; a command typed
+    // into a busy session is queued instead of run.
+    let offset = await settledSize(s.transcriptPath);
+    await s.submit(COMPACT_COMMAND, { marker: COMPACT_COMMAND });
+    const tracker = new TurnTracker();
+    const decoder = new TextDecoder("utf-8");
+    const until = Date.now() + timeoutMs;
+    for (;;) {
+      const r = await readNew(s.transcriptPath, offset, null);
+      if (r.kind === "replaced") throw new Error("the transcript was replaced during /compact");
+      if (r.kind === "data") {
+        offset += r.data.length;
+        if (tracker.feed(decoder.decode(r.data, { stream: true })).some((ev) => ev.type === "compacted")) return;
+      }
+      if (Date.now() >= until) {
+        throw new Error(`/compact wrote no compact_boundary within ${Math.round(timeoutMs / 1000)} s`);
+      }
+      if (!(await s.isAlive())) throw new Error("the session window closed during /compact");
+      await new Promise((r) => setTimeout(r, poll));
+    }
+  }
+
   async closeIfIdle(idleMs: number): Promise<boolean> {
-    if (!this.session || this.busy() || this.rotating) return false;
+    if (!this.session || this.busy() || this.compacting) return false;
     if (this.lastActive >= this.now() - idleMs) return false;
+    // Closing the window would kill a background command that can still
+    // report.
+    if (this.backgroundRunning()) return false;
     await this.dropSession();
     return true;
+  }
+
+  /** A background command of this chat's open session is running. One
+   *  started longer ago than the turn ceiling no longer counts, so a
+   *  completion notice that never came cannot hold the session forever. */
+  private backgroundRunning(): boolean {
+    if (!this.session) return false;
+    const t = this.now();
+    return this.e.turns
+      .runningBackground(this.chatId)
+      .some((b) => Date.parse(b.startedAt) > t - this.e.cfg.ceilingMs);
   }
 
   async shutdown(): Promise<void> {
@@ -1038,17 +1209,31 @@ export class ChatEngine {
     }
   }
 
-  async rotateAll(diaryAppend: (key: string, body: string) => void): Promise<RotationStats> {
-    const stats: RotationStats = { considered: 0, rotated: 0, skipped: 0, failed: 0 };
-    for (const a of this.actors.values()) {
+  /** The daily compaction (ADR-025): every chat in the stored session map,
+   *  one at a time, including chats whose session is closed or that have no
+   *  actor since this process started (see ChatActor.compact). A chat's
+   *  pool is that of its live actor, else of its latest message or turn. A
+   *  failure is logged and written to the diary and the pass goes on; the
+   *  operator is not messaged. No chat is started after `budgetMs`. */
+  async compactAll(diaryAppend: (key: string, body: string) => void, budgetMs: number): Promise<CompactionStats> {
+    const stats: CompactionStats = { considered: 0, compacted: 0, skipped: 0, failed: 0 };
+    const deadline = Date.now() + budgetMs;
+    for (const { chatId } of this.deps.sessions.list()) {
       stats.considered++;
+      const pool = this.actors.get(chatId)?.pool.name ?? this.deps.turns.chatActivity(chatId)?.pool;
+      if (!pool || !this.pools[pool]) {
+        stats.skipped++;
+        continue;
+      }
       try {
-        const r = await a.rotate(diaryAppend);
-        if (r === "rotated") stats.rotated++;
+        const r = await this.actor(chatId, pool).compact(diaryAppend, deadline);
+        if (r === "compacted") stats.compacted++;
         else stats.skipped++;
       } catch (e) {
         stats.failed++;
-        diaryAppend(`daily_rotate ${a.chatId}`, `rotation failed: ${(e as Error).message}`);
+        const err = (e as Error).message;
+        this.deps.log.warn({ chatId, err }, "chat: daily compaction failed — the session stays as it was");
+        diaryAppend(`daily_compact ${chatId}`, `compaction failed: ${err}`);
       }
     }
     return stats;

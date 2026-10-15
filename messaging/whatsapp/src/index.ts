@@ -20,7 +20,7 @@ import path from "node:path";
 import fs from "node:fs";
 
 import { loadConfig, normalizeSenderId, type Config } from "./config.js";
-import { sleepUntilNext4am } from "./claude_session.js";
+import { DAILY_COMPACTION_BUDGET_MS, waitForDailyCompaction } from "./compaction_lock.js";
 import { ChatEngine } from "./chat_engine.js";
 import { InboundGate, TurnStore } from "./turn_store.js";
 import { fill, type BotTexts } from "./texts.js";
@@ -448,12 +448,9 @@ async function main() {
   // per item, quoting the operator's message — state change and notes in
   // one transaction. No automatic resume.
   const turnStore = new TurnStore(config.dbPath);
-  for (const item of turnStore.sweepInterrupted(
-    { interrupted: texts.interrupted, backgroundLost: texts.backgroundLost },
-    formatReply,
-  )) {
+  for (const item of turnStore.sweepInterrupted(texts, formatReply)) {
     log.warn(
-      { chatId: item.chatId, kind: item.kind, turn: item.turnId, ref: item.quote?.ref, outbound: item.outboundId },
+      { chatId: item.chatId, kind: item.kind, turn: item.turnId, ref: item.quote?.ref, outbound: item.outboundId, commands: item.commands },
       "whatsapp: interrupted by restart — note queued",
     );
   }
@@ -572,17 +569,25 @@ async function main() {
     }
   }, 30 * 60 * 1000);
 
-  // Background daily 04:00 rotation (ADR-016 capability): summarize each
-  // idle active chat into the diary, spawn a fresh primed session, persist
-  // the new session id. A chat that is busy at 04:00 is skipped that day.
+  // Daily 04:00 compaction (ADR-025): each stored chat session active in the
+  // last 24 h is compacted in place (summary turn into the diary, then
+  // `/compact` in the same session). The lock under memory/compaction/
+  // makes tools/restart-bots.sh, which runs at the same minute, wait.
   (async () => {
     while (true) {
-      await sleepUntilNext4am();
+      const lock = await waitForDailyCompaction(config.workspaceRoot, "whatsapp", (e) =>
+        log.warn({ err: e.message }, "whatsapp: compaction lock not written"),
+      );
       try {
-        const stats = await engine.rotateAll((key, body) => diaryAppendEntry(config.diaryRoot, key, body));
-        log.info({ stats }, "whatsapp: daily rotation done");
+        const stats = await engine.compactAll(
+          (key, body) => diaryAppendEntry(config.diaryRoot, key, body),
+          DAILY_COMPACTION_BUDGET_MS,
+        );
+        log.info({ stats }, "whatsapp: daily compaction done");
       } catch (e) {
-        log.error({ err: (e as Error).message }, "whatsapp: daily rotation crashed");
+        log.error({ err: (e as Error).message }, "whatsapp: daily compaction crashed");
+      } finally {
+        lock?.release();
       }
     }
   })();

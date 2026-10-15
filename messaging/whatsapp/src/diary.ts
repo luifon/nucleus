@@ -58,7 +58,7 @@ export function record(
 }
 
 /** Append a context + summary without a tagged-bullet line. Used by the
- *  daily rotation, where the summary IS the body — duplicating it as a
+ *  daily compaction, where the summary IS the body — duplicating it as a
  *  tag bullet would just be noise. */
 export function appendEntry(
   diaryRoot: string,

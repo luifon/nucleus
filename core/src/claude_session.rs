@@ -782,6 +782,51 @@ impl Session {
         self.last_submit.as_ref()
     }
 
+    /// Send one Escape (stop the running turn or compaction) and wait until
+    /// the transcript is quiet. Only one: a second Escape in a row opens
+    /// Claude Code's message-rewind list.
+    pub async fn interrupt(&mut self) {
+        let _ = send_keys(&self.tmux_target, "Escape").await;
+        self.cursor = wait_for_transcript_quiet(&self.transcript_path, Duration::from_secs(3))
+            .await
+            .unwrap_or(self.cursor);
+    }
+
+    /// Type `/compact` into the session and wait until the transcript
+    /// records its compact_boundary (the daily compaction, ADR-025). The
+    /// command is typed as it is, without the date preamble. On timeout the
+    /// call fails and the compaction may still run; the caller stops it with
+    /// [`Self::interrupt`]. The session id does not change.
+    pub async fn compact(&mut self, timeout: Duration) -> Result<()> {
+        // The previous turn may still be writing its last records; a command
+        // typed into a busy session is queued instead of run.
+        let from = wait_for_transcript_quiet(&self.transcript_path, Duration::from_secs(3))
+            .await
+            .unwrap_or(self.cursor);
+        let submitted = type_and_submit_verified(
+            &self.tmux_target,
+            COMPACT_COMMAND,
+            Some((self.transcript_path.as_path(), from)),
+        )
+        .await;
+        if let Err(e) = submitted {
+            if format!("{e:#}").contains("input wedged") {
+                let _ = Command::new("tmux")
+                    .args(["kill-window", "-t", &self.tmux_target])
+                    .output()
+                    .await;
+            }
+            return Err(e).context("type /compact");
+        }
+        if !wait_for_compaction(&self.transcript_path, from, timeout).await {
+            anyhow::bail!("/compact wrote no compact_boundary within {} s", timeout.as_secs());
+        }
+        self.cursor = wait_for_transcript_quiet(&self.transcript_path, Duration::from_secs(3))
+            .await
+            .unwrap_or(self.cursor);
+        Ok(())
+    }
+
     /// True while the underlying tmux window still exists. A window can die
     /// without the pool noticing (claude crash, manual kill, `claude update`
     /// swapping the binary, operator cleanup) — callers must check before
@@ -917,21 +962,10 @@ impl SessionPool {
     /// Send `message` on behalf of `chat_key`. Spawns a session if one isn't
     /// already live for that key. If `resume_session_id` is supplied AND no
     /// live session exists, the spawned session resumes that prior conversation.
-    pub async fn ask(
-        &self,
-        chat_key: &str,
-        message: &str,
-        resume_session_id: Option<String>,
-        ask_opts: AskOptions,
-    ) -> Result<AskResult> {
-        let t0 = Instant::now();
-        let mut resume_session_id = resume_session_id;
-        let mut was_cold = false;
-
-        // Phase 1 — claim/fetch this chat's slot (brief map write), then
-        // serialize on the slot's own mutex. Other chat keys proceed in
-        // parallel.
-        let (slot_arc, mut guard) = loop {
+    /// Claim/fetch `chat_key`'s slot (brief map write), then serialize on the
+    /// slot's own mutex. Other chat keys proceed in parallel.
+    async fn claim_slot(&self, chat_key: &str) -> (Arc<Mutex<Slot>>, tokio::sync::OwnedMutexGuard<Slot>) {
+        loop {
             let slot_arc = {
                 let mut entries = self.entries.write().await;
                 entries
@@ -952,10 +986,56 @@ impl SessionPool {
             // fresh slot.
             let current = self.entries.read().await.get(chat_key).cloned();
             match current {
-                Some(c) if Arc::ptr_eq(&c, &slot_arc) => break (slot_arc, guard),
+                Some(c) if Arc::ptr_eq(&c, &slot_arc) => return (slot_arc, guard),
                 _ => continue,
             }
-        };
+        }
+    }
+
+    /// Unlink `slot_arc` from the map when it is still `chat_key`'s slot.
+    async fn unlink_slot(&self, chat_key: &str, slot_arc: &Arc<Mutex<Slot>>) {
+        let mut entries = self.entries.write().await;
+        if let Some(cur) = entries.get(chat_key) {
+            if Arc::ptr_eq(cur, slot_arc) {
+                entries.remove(chat_key);
+            }
+        }
+    }
+
+    /// How this pool spawns `chat_key`'s session (resuming `resume` when set).
+    fn spawn_options(&self, chat_key: &str, resume: Option<String>) -> SpawnOptions {
+        SpawnOptions {
+            workspace_root: self.config.workspace_root.clone(),
+            append_system_prompt: self.config.append_system_prompt.clone(),
+            permission_mode: self.config.permission_mode,
+            disallowed_tools: self.config.disallowed_tools.clone(),
+            allowed_tools: self.config.allowed_tools.clone(),
+            add_dirs: self.config.add_dirs.clone(),
+            tmux_session: self.config.tmux_session.clone(),
+            window_name: Some(sanitize_window_name(chat_key)),
+            // 20s is too tight for a cold `claude` boot under load.
+            ready_timeout: Duration::from_secs(60),
+            resume_session_id: resume,
+            agent_label: self.config.agent_label.clone(),
+            env: vec![],
+            state_root: None,
+            no_tools: false,
+        }
+    }
+
+    pub async fn ask(
+        &self,
+        chat_key: &str,
+        message: &str,
+        resume_session_id: Option<String>,
+        ask_opts: AskOptions,
+    ) -> Result<AskResult> {
+        let t0 = Instant::now();
+        let mut resume_session_id = resume_session_id;
+        let mut was_cold = false;
+
+        // Phase 1 — claim this chat's slot.
+        let (slot_arc, mut guard) = self.claim_slot(chat_key).await;
 
         // Phase 2 — dead-window detection, under the slot lock (the old
         // read-check-then-write-remove dance had a TOCTOU window). A pooled
@@ -972,26 +1052,7 @@ impl SessionPool {
 
         // Phase 3 — spawn if needed, holding ONLY the slot mutex.
         if guard.session.is_none() {
-            let window_name = sanitize_window_name(chat_key);
-            let spawned = Session::spawn(SpawnOptions {
-                workspace_root: self.config.workspace_root.clone(),
-                append_system_prompt: self.config.append_system_prompt.clone(),
-                permission_mode: self.config.permission_mode,
-                disallowed_tools: self.config.disallowed_tools.clone(),
-                allowed_tools: self.config.allowed_tools.clone(),
-                add_dirs: self.config.add_dirs.clone(),
-                tmux_session: self.config.tmux_session.clone(),
-                window_name: Some(window_name),
-                // 20s is too tight for a cold `claude` boot under load —
-                // the same lesson the WhatsApp rotation path learned.
-                ready_timeout: Duration::from_secs(60),
-                resume_session_id: resume_session_id.clone(),
-                agent_label: self.config.agent_label.clone(),
-                env: vec![],
-                state_root: None,
-                no_tools: false,
-            })
-            .await;
+            let spawned = Session::spawn(self.spawn_options(chat_key, resume_session_id.clone())).await;
             match spawned {
                 Ok(s) => {
                     guard.session = Some(s);
@@ -999,14 +1060,11 @@ impl SessionPool {
                 }
                 Err(e) => {
                     // Unlink the empty slot (only if the map still holds
-                    // THIS one) so the next ask retries a clean spawn.
+                    // THIS one) so the next ask retries a clean spawn. The
+                    // slot stays locked until it is unlinked, so an ask
+                    // parked on it re-claims a fresh slot.
+                    self.unlink_slot(chat_key, &slot_arc).await;
                     drop(guard);
-                    let mut entries = self.entries.write().await;
-                    if let Some(cur) = entries.get(chat_key) {
-                        if Arc::ptr_eq(cur, &slot_arc) {
-                            entries.remove(chat_key);
-                        }
-                    }
                     return Err(e);
                 }
             }
@@ -1075,69 +1133,52 @@ impl SessionPool {
         Ok(reaped)
     }
 
-    /// Roll every active per-chat session forward by one day: ask each one
-    /// to summarize itself, append the summary to the agent's daily diary,
-    /// spawn a fresh session primed with the summary + last 10 turns, and
-    /// hand the new session-id back to the caller so it can persist the
-    /// new chat-key → session-id mapping.
+    /// The daily compaction (ADR-025): compact every stored chat session in
+    /// place, one chat at a time. `stored` is the caller's session map (every
+    /// chat, not only the live slots), so a chat whose session was reaped, or
+    /// that no ask has touched since the process started, is compacted too.
+    /// For each chat:
     ///
-    /// Motivation: long-lived sessions eventually hit the "Resume from
-    /// summary?" picker on resume, whose in-line compaction blows past our
-    /// 20s TUI-ready timeout. Doing the compaction offline at 4am keeps
-    /// every user-facing ask() out of that path.
+    /// - skipped when its `last_active` is unknown or more than 24 h old, or
+    ///   when its transcript has fewer than [`COMPACT_MIN_TURNS`] turns since
+    ///   the last compaction
+    ///   ([`crate::turn_tracker::turns_since_compaction`]);
+    /// - waits for the chat's slot (an ask in progress holds it), at most
+    ///   [`COMPACTION_BUSY_WAIT`]; an ask that arrives meanwhile waits on the
+    ///   slot until the compaction is done;
+    /// - resumes the stored session id when no live session exists (never a
+    ///   fresh session), runs the summary turn ([`SUMMARY_PROMPT`]), writes
+    ///   the `daily_compact <chat>` and `memory_flush <chat>` diary entries,
+    ///   and [`Session::compact`]s the session;
+    /// - closes a session it resumed again and leaves no slot for it, so the
+    ///   next ask resumes it as before; a live session stays live and its
+    ///   `last_active` is not changed (the idle reaper behaves as before).
     ///
-    /// Chats are processed sequentially (one at a time per pool) — three
-    /// minutes of summarization + spawn cost across a handful of chats is
-    /// fine at 4am, and serialization avoids hammering the tmux server.
-    ///
-    /// Skips:
-    /// - Chats whose `last_active` is more than 24h old (the idle reaper
-    ///   will close them; no continuity worth preserving).
-    /// - Chats with fewer than 10 text turns on the transcript (too small
-    ///   to be worth rotating).
-    ///
-    /// Failure handling: a per-chat failure is recorded in the agent's
-    /// diary with an Observation tag and the rotation moves on. The old
-    /// session stays in place; the auto-dismiss picker safety net handles
-    /// the picker if it appears before tomorrow's rotation retries.
-    ///
-    /// `db_update_session_id` receives `(chat_key, new_session_id)` once
-    /// the new session is fully primed and ready. Order it so a partial
-    /// rotation leaves either the old or new session id valid in your DB,
-    /// never a dangling one (we close the old window only after the
-    /// callback succeeds).
-    pub async fn daily_rotate<F, Fut>(
+    /// The session id does not change and nothing is written to the caller's
+    /// map. A failure is recorded in the agent's diary and the pass goes on;
+    /// the session stays as it was; nobody is messaged. No chat is started
+    /// after `budget`, and each step's timeout is cut to what is left of it.
+    pub async fn daily_compact(
         &self,
         agent_name: &str,
-        mut db_update_session_id: F,
-    ) -> RotationStats
-    where
-        F: FnMut(String, String) -> Fut,
-        Fut: std::future::Future<Output = Result<()>>,
-    {
-        let mut stats = RotationStats::default();
-        let keys: Vec<(String, Arc<Mutex<Slot>>)> = {
-            let entries = self.entries.read().await;
-            entries
-                .iter()
-                .map(|(k, e)| (k.clone(), e.clone()))
-                .collect()
-        };
-        for (chat_key, entry_arc) in keys {
+        stored: Vec<StoredSession>,
+        budget: Duration,
+    ) -> CompactionStats {
+        let deadline = Instant::now() + budget;
+        let mut stats = CompactionStats::default();
+        for s in stored {
             stats.considered += 1;
-            match self
-                .rotate_one(&chat_key, &entry_arc, agent_name, &mut db_update_session_id)
-                .await
-            {
-                Ok(RotateOutcome::Rotated) => stats.rotated += 1,
-                Ok(RotateOutcome::Skipped) => stats.skipped += 1,
+            match self.compact_one(&s, agent_name, deadline).await {
+                Ok(true) => stats.compacted += 1,
+                Ok(false) => stats.skipped += 1,
                 Err(e) => {
                     stats.failed += 1;
+                    tracing::warn!(chat = %s.chat_key, "daily compaction failed: {e:#}");
                     let _ = crate::diary::record_observation(
                         &self.config.workspace_root,
                         agent_name,
-                        &format!("daily_rotate {}", chat_key),
-                        &format!("rotation failed: {e:#}"),
+                        &format!("daily_compact {}", s.chat_key),
+                        &format!("compaction failed: {e:#}"),
                         crate::diary::Tag::Observation,
                     );
                 }
@@ -1146,124 +1187,110 @@ impl SessionPool {
         stats
     }
 
-    async fn rotate_one<F, Fut>(
-        &self,
-        chat_key: &str,
-        entry_arc: &Arc<Mutex<Slot>>,
-        agent_name: &str,
-        db_update_session_id: &mut F,
-    ) -> Result<RotateOutcome>
-    where
-        F: FnMut(String, String) -> Fut,
-        Fut: std::future::Future<Output = Result<()>>,
-    {
-        let mut guard = entry_arc.lock().await;
-
-        // Skip cold chats — the idle reaper will close them and there's no
-        // user continuity worth preserving. Empty slots (spawn pending or
-        // failed) have nothing to rotate.
-        if guard.last_active.elapsed() > Duration::from_secs(24 * 60 * 60) {
-            return Ok(RotateOutcome::Skipped);
+    /// One chat of [`Self::daily_compact`]. `Ok(false)` = skipped.
+    async fn compact_one(&self, s: &StoredSession, agent_name: &str, deadline: Instant) -> Result<bool> {
+        let active = s
+            .last_active
+            .is_some_and(|t| chrono::Utc::now() - t <= chrono::Duration::hours(24));
+        if !active {
+            return Ok(false);
         }
-        let Some(old_session) = guard.session.as_mut() else {
-            return Ok(RotateOutcome::Skipped);
+        let transcript = transcript_path_for(&self.config.workspace_root, &s.session_id);
+        let text = tokio::fs::read(&transcript)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        let turns = tokio::task::spawn_blocking(move || crate::turn_tracker::turns_since_compaction(&text))
+            .await
+            .unwrap_or(0);
+        if turns < COMPACT_MIN_TURNS {
+            return Ok(false);
+        }
+        let step = |max: Duration, what: &str| -> Result<Duration> {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                anyhow::bail!("the compaction's time budget ran out before {what}");
+            }
+            Ok(max.min(left))
         };
 
-        let transcript_path = old_session.transcript_path().to_path_buf();
-        let turns = last_n_turns_async(&transcript_path, 100).await;
-        if turns.len() < 10 {
-            return Ok(RotateOutcome::Skipped);
-        }
-        let replay: Vec<Turn> = turns.iter().rev().take(10).rev().cloned().collect();
-
-        // Step 1: ask the old session to summarize itself. Generous timeout
-        // — no user is waiting and the model needs to read the whole
-        // transcript. If this triggers the picker, the existing auto-dismiss
-        // path handles it.
-        let summary = old_session
-            .ask(SUMMARY_PROMPT, AskOptions {
-                max_wait: Duration::from_secs(300),
-                quiescent_window: Duration::from_secs(5),
-                await_turn_complete: false,
-            })
+        let busy = step(COMPACTION_BUSY_WAIT, "the chat became idle")?;
+        let (slot_arc, mut guard) = tokio::time::timeout(busy, self.claim_slot(&s.chat_key))
             .await
-            .context("daily_rotate: summary ask failed")?;
-        // ADR-025 memory flush: the same ask carries a DURABLE section for
-        // observations not yet recorded anywhere; a format-ignoring reply
-        // degrades to summary-only (pre-flush behavior).
-        let (summary, durable) = split_rotation_reply(&summary);
+            .map_err(|_| anyhow::anyhow!("the chat was still busy after {} s", busy.as_secs()))?;
+        let mut resumed = false;
+        let live = match &guard.session {
+            Some(sess) => sess.is_alive().await,
+            None => false,
+        };
+        if !live {
+            // A dead window is dropped; the stored id is resumed, as ask does.
+            if let Some(dead) = guard.session.take() {
+                let _ = dead.close().await;
+            }
+            match Session::spawn(self.spawn_options(&s.chat_key, Some(s.session_id.clone()))).await {
+                Ok(sess) => {
+                    guard.session = Some(sess);
+                    resumed = true;
+                }
+                Err(e) => {
+                    self.unlink_slot(&s.chat_key, &slot_arc).await;
+                    drop(guard);
+                    return Err(e).context("resume the stored session");
+                }
+            }
+        }
 
-        // Step 2: append the summary to today's diary, plus a distinct
-        // flush entry when the session surfaced durable observations —
-        // labeled so the distiller sees it as promotion-grade input.
-        let entry = crate::diary::Entry::now(
-            format!("daily_rotate {}", chat_key),
-            format!("Session rotated. Yesterday's summary:\n\n{}", summary.trim()),
-        );
-        let _ = crate::diary::append(&self.config.workspace_root, agent_name, &entry);
-        if let Some(durable) = &durable {
+        let result: Result<()> = async {
+            let session = guard.session.as_mut().expect("session ensured above");
+            let reply = session
+                .ask(SUMMARY_PROMPT, AskOptions {
+                    max_wait: step(COMPACTION_SUMMARY_WAIT, "the summary turn")?,
+                    quiescent_window: Duration::from_secs(5),
+                    await_turn_complete: true,
+                })
+                .await
+                .context("summary turn")?;
+            // ADR-025 memory flush: a DURABLE section becomes its own entry; a
+            // reply that ignores the format is a summary only.
+            let (summary, durable) = split_rotation_reply(&reply);
+            let root = &self.config.workspace_root;
             let entry = crate::diary::Entry::now(
-                format!("memory_flush {}", chat_key),
-                format!("Durable observations flushed at rotation:\n\n{}", durable),
+                format!("daily_compact {}", s.chat_key),
+                format!("Summary before the daily compaction:\n\n{}", summary.trim()),
             );
-            let _ = crate::diary::append(&self.config.workspace_root, agent_name, &entry);
+            let _ = crate::diary::append(root, agent_name, &entry);
+            if let Some(durable) = &durable {
+                let entry = crate::diary::Entry::now(
+                    format!("memory_flush {}", s.chat_key),
+                    format!("Durable observations flushed before the compaction:\n\n{durable}"),
+                );
+                let _ = crate::diary::append(root, agent_name, &entry);
+            }
+            session.compact(step(COMPACTION_COMPACT_WAIT, "/compact")?).await
         }
+        .await;
 
-        // Step 3: spawn a brand-new session (no --resume, fresh UUID).
-        // Window name derived from the new UUID so it doesn't collide with
-        // the still-alive old window — we'll kill the old one after the DB
-        // update succeeds.
-        let new_session = Session::spawn(SpawnOptions {
-            workspace_root: self.config.workspace_root.clone(),
-            append_system_prompt: self.config.append_system_prompt.clone(),
-            permission_mode: self.config.permission_mode,
-            disallowed_tools: self.config.disallowed_tools.clone(),
-            allowed_tools: self.config.allowed_tools.clone(),
-            add_dirs: self.config.add_dirs.clone(),
-            tmux_session: self.config.tmux_session.clone(),
-            window_name: None,
-            ready_timeout: Duration::from_secs(60),
-            resume_session_id: None,
-            agent_label: self.config.agent_label.clone(),
-            env: vec![],
-            state_root: None,
-            no_tools: false,
+        // Stop what may still run (a summary turn past its timeout, a
+        // /compact that did not finish) before an ask can type into it.
+        if result.is_err() {
+            if let Some(session) = guard.session.as_mut() {
+                if session.is_alive().await {
+                    session.interrupt().await;
+                }
+            }
+        }
+        if resumed {
+            if let Some(sess) = guard.session.take() {
+                let _ = sess.close().await;
+            }
+            self.unlink_slot(&s.chat_key, &slot_arc).await;
+            drop(guard);
+        }
+        result.map(|()| {
+            tracing::info!(chat = %s.chat_key, turns, resumed, "session compacted in place");
+            true
         })
-        .await
-        .context("daily_rotate: spawn new session")?;
-        let new_session_id = new_session.session_id.clone();
-
-        // Step 4: prime the new session with the summary + last 10 turns.
-        // If priming fails we tear down the new session so we don't orphan it.
-        let priming = build_priming_preamble(&summary, &replay);
-        let mut new_session = new_session;
-        if let Err(e) = new_session
-            .ask(&priming, AskOptions {
-                max_wait: Duration::from_secs(300),
-                quiescent_window: Duration::from_secs(5),
-                await_turn_complete: false,
-            })
-            .await
-        {
-            let _ = new_session.close().await;
-            return Err(e).context("daily_rotate: prime new session");
-        }
-
-        // Step 5: hand the new session-id to the caller so the DB row is
-        // updated BEFORE we close the old session. If this fails we tear
-        // down the new session — old one stays the source of truth.
-        if let Err(e) = db_update_session_id(chat_key.to_string(), new_session_id.clone()).await {
-            let _ = new_session.close().await;
-            return Err(e).context("daily_rotate: db update");
-        }
-
-        // Step 6: swap in the new session, then close the old one.
-        if let Some(old_session) = guard.session.replace(new_session) {
-            let _ = old_session.close().await;
-        }
-        guard.last_active = Instant::now();
-
-        Ok(RotateOutcome::Rotated)
     }
 
     /// Close every session and tear down the tmux session. Waits for any
@@ -1287,39 +1314,99 @@ impl SessionPool {
     }
 }
 
-/// Outcome of rotating a single chat. Aggregated into [`RotationStats`].
-enum RotateOutcome {
-    Rotated,
-    Skipped,
+/// One chat session as the caller's database stores it (the input of
+/// [`SessionPool::daily_compact`]).
+#[derive(Debug, Clone)]
+pub struct StoredSession {
+    pub chat_key: String,
+    pub session_id: String,
+    /// When the chat was last active; `None` (unknown) skips the chat.
+    pub last_active: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Roll-up from one [`SessionPool::daily_rotate`] pass. Callers log this
-/// for observability — the counts answer "did the 4am tick do anything?"
-#[derive(Debug, Default)]
-pub struct RotationStats {
+impl StoredSession {
+    /// From the stored strings; `last_active` is RFC 3339 (unparsable =
+    /// unknown).
+    pub fn new(chat_key: String, session_id: String, last_active: &str) -> Self {
+        let last_active = chrono::DateTime::parse_from_rfc3339(last_active)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc));
+        Self { chat_key, session_id, last_active }
+    }
+}
+
+/// Roll-up from one [`SessionPool::daily_compact`] pass. Callers log it.
+/// Mirror of the WhatsApp bot's `CompactionStats`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CompactionStats {
     pub considered: usize,
-    pub rotated: usize,
+    pub compacted: usize,
     pub skipped: usize,
     pub failed: usize,
 }
 
-/// The deterministic prompt the old session is given before being closed.
-/// Two labeled sections (ADR-025): SUMMARY feeds tomorrow's priming as
-/// before; DURABLE is the memory flush — observations worth keeping beyond
-/// tomorrow that never made it into the diary. Split by
-/// [`split_rotation_reply`]; a reply that ignores the format degrades to
-/// summary-only, which is exactly the pre-ADR-025 behavior.
+/// The slash command the daily compaction types into the session.
+pub const COMPACT_COMMAND: &str = "/compact";
+
+/// A session with fewer turns since its last compaction is not compacted.
+pub const COMPACT_MIN_TURNS: usize = 10;
+
+/// Longest wait for the chat's slot (an ask in progress) before compacting.
+pub const COMPACTION_BUSY_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// Longest summary turn.
+pub const COMPACTION_SUMMARY_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// Longest wait for `/compact`'s compact_boundary record.
+pub const COMPACTION_COMPACT_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// The turn the daily compaction asks for before `/compact` (ADR-025): two
+/// labeled sections. SUMMARY goes to the diary; DURABLE is the memory flush —
+/// observations worth keeping that never made it into the diary. Split by
+/// [`split_rotation_reply`]; a reply that ignores the format becomes a
+/// summary only. Mirror of the WhatsApp bot's `SUMMARY_PROMPT`.
 const SUMMARY_PROMPT: &str =
-    "This session rotates now. Reply with exactly two sections and no other text:\n\
+    "This session is compacted now. Reply with exactly two sections and no other text:\n\
      SUMMARY:\n\
-     5-10 bullets for tomorrow's session — ongoing tasks, decisions made, \
-     key facts about the user, anything a fresh assistant would need to know.\n\
+     5-10 bullets for the diary — ongoing tasks, decisions made, \
+     key facts about the user, open threads.\n\
      DURABLE:\n\
-     Bullets for observations worth keeping beyond tomorrow that are NOT yet \
+     Bullets for observations worth keeping beyond today that are NOT yet \
      recorded anywhere: decisions, corrections, recurring user preferences, \
      unresolved threads. Write none if everything durable is already recorded.";
 
-/// Split the rotation reply into (summary, durable). The DURABLE header is
+/// Poll `path` from byte `from` until a `compact_boundary` record appears
+/// (true) or `timeout` passes (false).
+async fn wait_for_compaction(path: &Path, from: u64, timeout: Duration) -> bool {
+    let start = Instant::now();
+    let mut tracker = crate::turn_tracker::TurnTracker::new();
+    let mut offset = from;
+    loop {
+        let mut buf = Vec::new();
+        if let Ok(mut f) = tokio::fs::File::open(path).await {
+            if f.seek(SeekFrom::Start(offset)).await.is_ok() {
+                let _ = f.read_to_end(&mut buf).await;
+            }
+        }
+        // Feed only complete lines; a partial last line is read again.
+        if let Some(end) = buf.iter().rposition(|b| *b == b'\n') {
+            offset += (end + 1) as u64;
+            let compacted = tracker
+                .feed(&String::from_utf8_lossy(&buf[..=end]))
+                .iter()
+                .any(|e| matches!(e, crate::turn_tracker::TrackEvent::Compacted { .. }));
+            if compacted {
+                return true;
+            }
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Split the summary reply into (summary, durable). The DURABLE header is
 /// matched line-anchored (last occurrence wins); a missing header, an empty
 /// body, or a literal "none" yields no durable section. Mirrored in
 /// messaging/whatsapp `splitRotationReply`; shared vectors in
@@ -1368,33 +1455,6 @@ pub(crate) fn split_rotation_reply(reply: &str) -> (String, Option<String>) {
     (summary, durable)
 }
 
-/// Build the first message a freshly-rotated session sees: yesterday's
-/// summary on top, then the last N turns replayed in plain "USER:"/
-/// "ASSISTANT:" form for textual continuity. Audio attachments are not
-/// included specially — they've already been transcribed by the time
-/// the turn lands in the transcript JSONL.
-fn build_priming_preamble(summary: &str, replay: &[Turn]) -> String {
-    let mut out = String::new();
-    out.push_str("[Yesterday's session summary, for context]\n");
-    out.push_str(summary.trim());
-    out.push_str("\n\n[Recent conversation, replayed for continuity]\n");
-    for turn in replay {
-        let label = match turn.role {
-            TurnRole::User => "USER",
-            TurnRole::Assistant => "ASSISTANT",
-        };
-        out.push_str(label);
-        out.push_str(": ");
-        out.push_str(turn.text.trim());
-        out.push_str("\n\n");
-    }
-    out.push_str(
-        "[End of priming. The user has not sent a new message yet — \
-         acknowledge briefly that you have the context and stand by.]",
-    );
-    out
-}
-
 /// Resolve the operator's timezone for scheduling. Reads `NUCLEUS_TZ`,
 /// then `TZ`, falling back to UTC if neither parses. In real deployments
 /// `NUCLEUS_TZ` is always set (the launchd plist + dotenv populate it),
@@ -1412,26 +1472,21 @@ pub fn nucleus_tz() -> chrono_tz::Tz {
     chrono_tz::UTC
 }
 
-/// Sleep until the next 04:00 local time in [`nucleus_tz`]. Used by each
-/// bot's main loop to gate the daily rotation tick. Returns immediately
-/// after the wakeup; callers run the rotation, then call this again to
-/// schedule the following day.
+/// How long from now until the next daily compaction: the next 04:00 in
+/// [`nucleus_tz`]. Mirror of the WhatsApp bot's `msUntilNextCompaction`.
 ///
-/// Testing override: setting `NUCLEUS_ROTATION_TEST_DELAY_SECONDS` to a
-/// positive integer short-circuits the 4am math and sleeps that many
-/// seconds instead. Lets us validate the rotation end-to-end on a live
-/// bot without waiting until 4am. Leave unset in production.
-pub async fn sleep_until_next_4am() {
-    if let Ok(s) = std::env::var("NUCLEUS_ROTATION_TEST_DELAY_SECONDS") {
+/// Testing override: `NUCLEUS_COMPACTION_TEST_DELAY_SECONDS=<n>` (a positive
+/// integer) makes it n seconds, to run the compaction end to end on a live
+/// bot without waiting for 04:00. Leave it unset in production.
+pub fn duration_until_next_compaction() -> Duration {
+    if let Ok(s) = std::env::var("NUCLEUS_COMPACTION_TEST_DELAY_SECONDS") {
         if let Ok(secs) = s.parse::<u64>() {
             if secs > 0 {
-                tokio::time::sleep(Duration::from_secs(secs)).await;
-                return;
+                return Duration::from_secs(secs);
             }
         }
     }
-    let delay = duration_until_next_4am(chrono::Utc::now(), nucleus_tz());
-    tokio::time::sleep(delay).await;
+    duration_until_next_4am(chrono::Utc::now(), nucleus_tz())
 }
 
 /// Compute how long from `now_utc` until the next 04:00 in `tz`. Pulled
@@ -3329,28 +3384,58 @@ mod tests {
         assert!(turns.is_empty());
     }
 
-    /// Priming preamble structural sanity: summary up top, alternating
-    /// USER:/ASSISTANT: lines, closing instruction at the bottom.
+    /// The compaction wait counts only a compact_boundary written after the
+    /// offset, and a record split across two writes is read whole.
+    #[tokio::test]
+    async fn wait_for_compaction_sees_only_a_boundary_after_the_offset() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.jsonl");
+        std::fs::write(&p, "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n").unwrap();
+        let from = std::fs::metadata(&p).unwrap().len();
+        assert!(!wait_for_compaction(&p, from, Duration::from_millis(600)).await);
+        let p2 = p.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p2).unwrap();
+            f.write_all(b"{\"type\":\"user\",\"message\":{\"content\":\"/compact\"}}\n{\"type\":\"system\",\"subty")
+                .unwrap();
+            f.flush().unwrap();
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            f.write_all(b"pe\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"manual\"}}\n").unwrap();
+        });
+        assert!(wait_for_compaction(&p, from, Duration::from_secs(5)).await);
+        writer.await.unwrap();
+    }
+
     #[test]
-    fn build_priming_preamble_orders_summary_then_replay() {
-        let replay = vec![
-            Turn {
-                role: TurnRole::User,
-                text: "hello".into(),
-            },
-            Turn {
-                role: TurnRole::Assistant,
-                text: "hi there".into(),
-            },
+    fn stored_session_reads_rfc3339_and_treats_anything_else_as_unknown() {
+        let s = StoredSession::new("1".into(), "s".into(), "2026-10-14T04:00:00+00:00");
+        assert_eq!(s.last_active.unwrap().to_rfc3339(), "2026-10-14T04:00:00+00:00");
+        assert!(StoredSession::new("1".into(), "s".into(), "yesterday").last_active.is_none());
+    }
+
+    /// Chats without recent activity, and sessions with too few turns since
+    /// their last compaction, are skipped without spawning anything.
+    #[tokio::test]
+    async fn daily_compact_skips_idle_chats_and_small_sessions_without_spawning() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = SessionPool::new(PoolConfig {
+            workspace_root: root.path().to_path_buf(),
+            tmux_session: "nucleus-test-compact-skip".into(),
+            ..PoolConfig::default()
+        });
+        let old = (chrono::Utc::now() - chrono::Duration::hours(30)).to_rfc3339();
+        let recent = chrono::Utc::now().to_rfc3339();
+        let stored = vec![
+            StoredSession::new("idle".into(), uuid::Uuid::new_v4().to_string(), &old),
+            StoredSession::new("unknown".into(), uuid::Uuid::new_v4().to_string(), "not a time"),
+            // Recent, but its transcript does not exist: 0 turns.
+            StoredSession::new("small".into(), uuid::Uuid::new_v4().to_string(), &recent),
         ];
-        let out = build_priming_preamble("- did X\n- decided Y", &replay);
-        let summary_idx = out.find("- did X").expect("summary present");
-        let user_idx = out.find("USER: hello").expect("user line present");
-        let asst_idx = out.find("ASSISTANT: hi there").expect("assistant line present");
-        let closing_idx = out.find("End of priming").expect("closing line present");
-        assert!(summary_idx < user_idx);
-        assert!(user_idx < asst_idx);
-        assert!(asst_idx < closing_idx);
+        let stats = pool.daily_compact("test", stored, Duration::from_secs(60)).await;
+        assert_eq!(stats, CompactionStats { considered: 3, compacted: 0, skipped: 3, failed: 0 });
+        assert!(pool.entries.read().await.is_empty(), "no slot was claimed");
     }
 
     /// Wraparound: at 03:30 local we sleep ~30 minutes; at 04:30 local we

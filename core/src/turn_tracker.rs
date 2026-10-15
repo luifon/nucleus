@@ -3,8 +3,8 @@
 //! Reads the Claude Code transcript JSONL incrementally and reports what the
 //! session is doing in terms a caller can act on: a prompt was accepted, a
 //! message typed during a running turn was absorbed, the model wrote
-//! intermediate text before a tool call, a background task started or
-//! finished, and the turn ended.
+//! intermediate text before a tool call, a background task started, finished
+//! or never started, the session was compacted, and the turn ended.
 //!
 //! Why this exists: `Session::ask` returns the first assistant text followed by
 //! a quiet transcript (or the first `end_turn`). Both are wrong for long
@@ -29,6 +29,18 @@
 //! - `{"type":"assistant","message":{"id":…,"stop_reason":…,"content":[…]}}` —
 //!   one record per content block; all records of one message share `id`.
 //! - `{"type":"system","subtype":"turn_duration"}` — the turn is over.
+//! - `{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":…}}`
+//!   followed by a `user` record with `isCompactSummary` and
+//!   `isVisibleInTranscriptOnly` — the context was compacted (`/compact` or
+//!   the automatic compaction). The summary record is not a prompt; no
+//!   `turn_duration` follows a compaction outside a turn (Claude Code 2.1.300,
+//!   verified 2026-10-15).
+//! - A slash command typed into the session is a `user` record with the
+//!   command line and no `origin`, then records starting `<command-name>` and
+//!   `<local-command-stdout>`. A local command writes no `turn_duration`, so
+//!   none of these is a prompt.
+//! - A `tool_result` with `is_error: true` for a background tool call: the
+//!   call was refused (permission classifier, operator) and never started.
 //!
 //! The TypeScript mirror is `messaging/whatsapp/src/turn_tracker.ts`; both run
 //! the shared vectors.
@@ -52,9 +64,15 @@ pub enum TrackEvent {
     /// Assistant text written before a tool call, inside a running turn.
     Progress { text: String },
     /// A tool call that runs in the background (`run_in_background: true`).
-    BgStarted { id: String },
+    /// `description` is what the call says it runs (see [`bg_description`]).
+    BgStarted { id: String, description: Option<String> },
     /// The harness reported a background task as finished.
     BgFinished { id: String },
+    /// A background tool call whose result was an error: it never started.
+    BgNeverStarted { id: String },
+    /// The session's context was compacted (`compact_boundary`). `trigger`
+    /// is `manual` for `/compact`, `auto` for the automatic compaction.
+    Compacted { trigger: String },
     /// The turn ended. `final_text` is the text of the turn's last assistant
     /// message, or `None` when that message had no text (an interrupted
     /// turn). `pending_bg` counts background tasks still running: the model
@@ -143,8 +161,18 @@ impl TurnTracker {
                 }
             }
             Some("system") => {
-                if v.get("subtype").and_then(Value::as_str) == Some("turn_duration") && self.open {
+                let subtype = v.get("subtype").and_then(Value::as_str);
+                if subtype == Some("turn_duration") && self.open {
                     self.end_turn(out);
+                } else if subtype == Some("compact_boundary") {
+                    // The session's context was replaced by a summary. An open
+                    // turn stays open and ends on its own turn_duration.
+                    let trigger = v
+                        .pointer("/compactMetadata/trigger")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    out.push(TrackEvent::Compacted { trigger });
                 }
             }
             _ => {}
@@ -152,18 +180,34 @@ impl TurnTracker {
     }
 
     fn user(&mut self, v: &Value, out: &mut Vec<TrackEvent>) {
-        if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        // The compaction summary is a user record shown only in the transcript.
+        let flag = |k: &str| v.get(k).and_then(Value::as_bool) == Some(true);
+        if flag("isMeta") || flag("isCompactSummary") || flag("isVisibleInTranscriptOnly") {
             return;
         }
         let content = v.pointer("/message/content");
         let text = match content {
             Some(Value::String(s)) => s.clone(),
             Some(Value::Array(items)) => {
-                // Tool results are part of the running turn, not prompts.
                 if items
                     .iter()
                     .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
                 {
+                    // Tool results are part of the running turn, not prompts. A
+                    // failed result of a background call means the command never
+                    // started (the permission classifier or the operator
+                    // refused it).
+                    for b in items {
+                        if b.get("type").and_then(Value::as_str) == Some("tool_result")
+                            && b.get("is_error").and_then(Value::as_bool) == Some(true)
+                        {
+                            if let Some(id) = b.get("tool_use_id").and_then(Value::as_str) {
+                                if self.pending_bg.remove(id) {
+                                    out.push(TrackEvent::BgNeverStarted { id: id.to_string() });
+                                }
+                            }
+                        }
+                    }
                     return;
                 }
                 items
@@ -176,6 +220,9 @@ impl TurnTracker {
             _ => return,
         };
         if text.trim().is_empty() || text.trim_start().starts_with("[Request interrupted") {
+            return;
+        }
+        if local_command(v, &text) {
             return;
         }
         let origin = v
@@ -230,7 +277,10 @@ impl TurnTracker {
                     if bg {
                         if let Some(tid) = b.get("id").and_then(Value::as_str) {
                             if self.pending_bg.insert(tid.to_string()) {
-                                out.push(TrackEvent::BgStarted { id: tid.to_string() });
+                                out.push(TrackEvent::BgStarted {
+                                    id: tid.to_string(),
+                                    description: bg_description(b.get("input")),
+                                });
                             }
                         }
                     }
@@ -258,6 +308,79 @@ impl TurnTracker {
         self.last_msg_text.clear();
         out.push(TrackEvent::TurnEnd { final_text, pending_bg: self.pending_bg.len() });
     }
+}
+
+/// Text of the records a slash command typed into the session leaves
+/// (`/compact`, `/model`): the command's name and arguments and a local
+/// command's output. A local command writes no turn_duration, so a turn these
+/// records opened would never end.
+const LOCAL_COMMAND_PREFIXES: &[&str] =
+    &["<command-name>", "<command-message>", "<command-args>", "<local-command-"];
+
+/// A slash command line as the harness records it: one line, no `origin`.
+fn slash_command_line(t: &str) -> bool {
+    let Some(rest) = t.strip_prefix('/') else { return false };
+    if t.contains('\n') || !rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let name_end = rest.find(' ').unwrap_or(rest.len());
+    rest[..name_end].chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '-'))
+}
+
+fn local_command(v: &Value, text: &str) -> bool {
+    let t = text.trim();
+    if LOCAL_COMMAND_PREFIXES.iter().any(|p| t.starts_with(p)) {
+        return true;
+    }
+    v.get("origin").is_none() && slash_command_line(t)
+}
+
+/// Longest description kept for a background command, in characters.
+const BG_DESCRIPTION_CHARS: usize = 120;
+
+/// What a background tool call says it runs: the first line of its
+/// `description`, else the first line of its `command`, cut to
+/// [`BG_DESCRIPTION_CHARS`] characters; `None` when it has neither.
+fn bg_description(input: Option<&Value>) -> Option<String> {
+    let first_line = |k: &str| {
+        input
+            .and_then(|i| i.get(k))
+            .and_then(Value::as_str)
+            .map(|s| s.trim().split('\n').next().unwrap_or("").trim().to_string())
+            .unwrap_or_default()
+    };
+    let mut d = first_line("description");
+    if d.is_empty() {
+        d = first_line("command");
+    }
+    if d.is_empty() {
+        return None;
+    }
+    if d.chars().count() > BG_DESCRIPTION_CHARS {
+        let cut: String = d.chars().take(BG_DESCRIPTION_CHARS).collect();
+        return Some(format!("{cut}…"));
+    }
+    Some(d)
+}
+
+/// Turns that ended after the last compaction of a whole transcript (after
+/// its start when it was never compacted). The daily compaction skips a
+/// session with fewer than its threshold. Pure.
+pub fn turns_since_compaction(transcript: &str) -> usize {
+    let mut t = TurnTracker::new();
+    let mut n = 0usize;
+    let mut events = t.feed(transcript);
+    if !transcript.ends_with('\n') {
+        events.extend(t.feed("\n"));
+    }
+    for ev in events {
+        match ev {
+            TrackEvent::Compacted { .. } => n = 0,
+            TrackEvent::TurnEnd { .. } => n += 1,
+            _ => {}
+        }
+    }
+    n
 }
 
 fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
@@ -294,6 +417,9 @@ mod tests {
             got.extend(t.feed(&jsonl[cut..]));
             let want: Vec<TrackEvent> = serde_json::from_value(case["events"].clone()).unwrap();
             assert_eq!(got, want, "case {name:?}");
+            if let Some(n) = case.get("turns_since_compaction").and_then(Value::as_u64) {
+                assert_eq!(turns_since_compaction(&jsonl), n as usize, "case {name:?}");
+            }
         }
     }
 
