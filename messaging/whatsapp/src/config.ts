@@ -330,7 +330,7 @@ export function turnsConfig(
   return {
     ackAfterMs: (pos(t.ack_after_secs) ?? 30) * 1000,
     progressIntervalMs: (pos(t.progress_interval_secs) ?? 180) * 1000,
-    progressMaxChars: pos(t.progress_max_chars) ?? 160,
+    progressMaxChars: pos(t.progress_max_chars) ?? 280,
     ceilingMs: (pos(t.turn_ceiling_hours) ?? 6) * 3_600_000,
     permissionStallMs: (pos(t.permission_stall_secs) ?? 120) * 1000,
     texts: textsFrom(texts),

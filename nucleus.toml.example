@@ -158,16 +158,17 @@ notify = true
 # ack_after_secs: an operator message without an answer this long gets one
 #   code-sent acknowledgement ([whatsapp.texts] ack).
 # progress_interval_secs: at most one progress message per turn per interval,
-#   only when the model wrote new intermediate text; cut to progress_max_chars.
-#   The outbound secret filter withholds a progress message that names a
-#   secret or an identifier.
+#   only when the model wrote new intermediate text. A progress message is
+#   sent whole or skipped: text within progress_max_chars is sent as is,
+#   longer text is skipped (never cut with an ellipsis). The outbound secret
+#   filter withholds a progress message that names a secret or an identifier.
 # turn_ceiling_hours: a turn running longer is interrupted and reported.
 # permission_stall_secs: a turn stuck on an on-screen confirmation this long
 #   is reported once.
 [whatsapp.turns]
 ack_after_secs = 30
 progress_interval_secs = 180
-progress_max_chars = 160
+progress_max_chars = 280
 turn_ceiling_hours = 6
 permission_stall_secs = 120
 

@@ -103,11 +103,13 @@ Rules the engine enforces in code:
    `ack_after_secs` (default 30), the engine sends the `ack` text once. At most
    one acknowledgement per busy period, so never more than one per turn.
 3. **Progress.** The latest intermediate text of a running turn may go out as
-   a short progress message (the `progress_prefix` text, then the text cut to
-   `progress_max_chars`, default 160), at most once per
-   `progress_interval_secs` (default 180), only when the text is new. The
-   secret filter (§8) withholds a progress message that names a secret or an
-   identifier.
+   a short progress message (the `progress_prefix` text, then the progress
+   text), at most once per `progress_interval_secs` (default 180), only when
+   the text is new. A progress message is sent whole or not at all: text
+   within `progress_max_chars` (default 280) is sent as is; longer text is
+   skipped this tick, never cut with an ellipsis (a truncated status reads as
+   cut content — operator demand 2026-10-15). The secret filter (§8) withholds
+   a progress message that names a secret or an identifier.
 4. **Delivery.** Every reply, acknowledgement, progress message and note goes
    through `outbound_queue` (retry, allowlist check, secret filter, live
    socket). A final reply quotes the first operator message of its turn: the
@@ -551,7 +553,7 @@ automatic resume.
 [whatsapp.turns]
 ack_after_secs = 30
 progress_interval_secs = 180
-progress_max_chars = 160
+progress_max_chars = 280
 turn_ceiling_hours = 6
 permission_stall_secs = 120
 

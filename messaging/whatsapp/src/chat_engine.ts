@@ -91,7 +91,9 @@ export interface TurnsConfig {
 export const DEFAULT_TURNS: TurnsConfig = {
   ackAfterMs: 30_000,
   progressIntervalMs: 180_000,
-  progressMaxChars: 160,
+  // A progress line is sent whole or skipped (never cut). Keep this generous
+  // enough that an ordinary one-sentence status fits whole.
+  progressMaxChars: 280,
   ceilingMs: 6 * 60 * 60_000,
   permissionStallMs: 120_000,
   texts: DEFAULT_TEXTS,
@@ -291,6 +293,16 @@ export function clip(text: string, max: number): string {
   const cut = Array.from(t).slice(0, max).join("");
   const sp = cut.lastIndexOf(" ");
   return (sp > max * 0.6 ? cut.slice(0, sp) : cut).trimEnd() + "…";
+}
+
+/** A progress line to send, or null to send none this tick. A progress
+ *  message is a status preview, so it is sent whole or not at all — never
+ *  cut with an ellipsis (operator demand 2026-10-15: never deliver content by
+ *  halves). Returns the text when it fits in `max`, else null. Pure. */
+export function progressLine(text: string, max: number): string | null {
+  const t = text.trim().replace(/\s+\n/g, "\n");
+  if (t.length === 0) return null;
+  return Array.from(t).length <= max ? t : null;
 }
 
 interface PendingSubmit {
@@ -953,10 +965,16 @@ class ChatActor {
         open.latestProgress !== open.sentProgress &&
         t - open.lastProgressAt >= cfg.progressIntervalMs
       ) {
-        open.sentProgress = open.latestProgress;
-        open.lastProgressAt = t;
-        this.send(`${this.texts.progressPrefix}${clip(open.latestProgress, cfg.progressMaxChars)}`, null, "chat-progress");
-        this.e.turns.bumpProgress(open.id);
+        // Send the progress line whole or skip it — a truncated-with-ellipsis
+        // status reads as cut content. A line too long to fit is not sent;
+        // the next shorter progress or the final reply carries the state.
+        const line = progressLine(open.latestProgress, cfg.progressMaxChars);
+        if (line) {
+          open.sentProgress = open.latestProgress;
+          open.lastProgressAt = t;
+          this.send(`${this.texts.progressPrefix}${line}`, null, "chat-progress");
+          this.e.turns.bumpProgress(open.id);
+        }
       }
       // Safety ceiling. A turn that owes nobody a reply (no operator message
       // and no autonomous quote: a context or foreign turn, for example one a

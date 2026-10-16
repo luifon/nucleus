@@ -751,9 +751,12 @@ async fn due(settings: &Settings, workspace_root: &Path) -> Result<()> {
                         reply_chars = reply.chars().count(),
                         "skill-fire ok"
                     );
-                    let reply_capped = truncate(&reply, SKILL_REPLY_CAP_CHARS);
+                    // Forward the whole reply. `deliver` splits it into
+                    // per-channel messages at channel-safe sizes; nothing is
+                    // truncated and no ellipsis is added (operator demand
+                    // 2026-10-15: never deliver content by halves).
                     let forward_reminder = store::Reminder {
-                        body: reply_capped,
+                        body: reply,
                         ..reminder.clone()
                     };
                     for ch in &channels {
@@ -1150,9 +1153,16 @@ fn strip_post_marker(reply: &str) -> String {
     }
 }
 
-/// Discord's hard limit is 2000; cap below that to leave room for the
-/// "🔔 **Reminder:** " prefix added in `deliver()`.
-const SKILL_REPLY_CAP_CHARS: usize = 1800;
+/// Per-message split sizes by channel. A reminder body longer than the
+/// channel's size is split into several messages (see `split_message`), never
+/// truncated. Discord's hard limit is 2000; stay below it to leave room for
+/// the "🔔 **Reminder:** " prefix added in `deliver()`. WhatsApp and ntfy
+/// accept far larger bodies; the size only keeps each message readable.
+const DISCORD_PART_CHARS: usize = 1800;
+const WHATSAPP_PART_CHARS: usize = 3500;
+/// ntfy's limit is a byte count (`nucleus_core::ntfy` caps at 4000 bytes);
+/// stay under it with room for credential redaction, and split by bytes.
+const NTFY_PART_BYTES: usize = 3500;
 
 /// Outcome of a successful skill-fire spawn. The msg_id is what gets
 /// written into reminder_fires; the reply is what the worker forwards
@@ -1281,8 +1291,20 @@ async fn deliver(
             if settings.discord.home_channel_id.is_empty() {
                 bail!("DISCORD_HOME_CHANNEL_ID not set");
             }
-            let body = format!("{}🔔 **Reminder:** {}", mention, r.body);
-            discord_sdk::send_announcement(&settings.discord.home_channel_id, &body).await
+            // One message per part; the "🔔 **Reminder:** " prefix goes on
+            // the first only, so a follow-on part is not mistaken for a new
+            // reminder.
+            let parts = split_message(&r.body, DISCORD_PART_CHARS);
+            let mut ids = Vec::with_capacity(parts.len());
+            for (i, part) in parts.iter().enumerate() {
+                let body = if i == 0 {
+                    format!("{}🔔 **Reminder:** {}", mention, part)
+                } else {
+                    part.clone()
+                };
+                ids.push(discord_sdk::send_announcement(&settings.discord.home_channel_id, &body).await?);
+            }
+            Ok(ids.join(","))
         }
         store::CHANNEL_WHATSAPP_DM => {
             let target = operator_whatsapp_dm().ok_or_else(|| {
@@ -1291,11 +1313,20 @@ async fn deliver(
                     channel
                 )
             })?;
-            let body = format!("🔔 *Reminder:* {}", r.body);
+            let parts = split_message(&r.body, WHATSAPP_PART_CHARS);
             let pool = nucleus_core::whatsapp_queue::open(workspace_root).await?;
-            let queue_id =
-                nucleus_core::whatsapp_queue::enqueue_text(&pool, &target, &body, "reminders").await?;
-            Ok(format!("whatsapp-queue#{}", queue_id))
+            let mut ids = Vec::with_capacity(parts.len());
+            for (i, part) in parts.iter().enumerate() {
+                let body = if i == 0 {
+                    format!("🔔 *Reminder:* {}", part)
+                } else {
+                    part.clone()
+                };
+                let queue_id =
+                    nucleus_core::whatsapp_queue::enqueue_text(&pool, &target, &body, "reminders").await?;
+                ids.push(queue_id.to_string());
+            }
+            Ok(format!("whatsapp-queue#{}", ids.join(",")))
         }
         store::CHANNEL_CALENDAR => deliver_calendar(settings, workspace_root, r).await,
         store::CHANNEL_NTFY => {
@@ -1307,15 +1338,21 @@ async fn deliver(
             })?;
             let default_title = format!("Reminder #{}", r.id);
             let title = r.title.as_deref().filter(|t| !t.trim().is_empty()).unwrap_or(&default_title);
-            let n = nucleus_core::ntfy::Notification {
-                title: Some(title),
-                message: &r.body,
-                priority: Some(nucleus_core::ntfy::Priority::High),
-                tags: &["bell"],
-                click: None,
-            };
-            let id = nucleus_core::ntfy::publish(cfg, workspace_root, &n).await?;
-            Ok(format!("ntfy#{}", id))
+            // One notification per part; the title goes on the first only.
+            // Split by bytes: ntfy's server limit is a byte count.
+            let parts = split_message_bytes(&r.body, NTFY_PART_BYTES);
+            let mut ids = Vec::with_capacity(parts.len());
+            for (i, part) in parts.iter().enumerate() {
+                let n = nucleus_core::ntfy::Notification {
+                    title: if i == 0 { Some(title) } else { None },
+                    message: part,
+                    priority: Some(nucleus_core::ntfy::Priority::High),
+                    tags: &["bell"],
+                    click: None,
+                };
+                ids.push(nucleus_core::ntfy::publish(cfg, workspace_root, &n).await?.to_string());
+            }
+            Ok(format!("ntfy#{}", ids.join(",")))
         }
         other => bail!("unknown channel {:?}", other),
     }
@@ -1430,6 +1467,119 @@ fn truncate(s: &str, max_chars: usize) -> String {
     } else {
         head
     }
+}
+
+/// Split `text` into whole messages, each at most `max` characters. See
+/// [`split_measured`]. Used for channels whose limit is in characters
+/// (WhatsApp, Discord's 2000-code-point ceiling).
+fn split_message(text: &str, max: usize) -> Vec<String> {
+    split_measured(text, max, &|s| s.chars().count())
+}
+
+/// Split `text` into whole messages, each at most `max` bytes. Used for ntfy,
+/// whose server limit ([`nucleus_core::ntfy`]) is a byte count — a
+/// character-based split would let a multibyte part exceed the byte limit and
+/// be truncated there.
+fn split_message_bytes(text: &str, max: usize) -> Vec<String> {
+    split_measured(text, max, &|s| s.len())
+}
+
+/// Split `text` into messages each at most `max` units, where one unit is what
+/// `measure` counts (characters for most channels, bytes for ntfy). Never adds
+/// an ellipsis and never drops content (operator demand 2026-10-15: never
+/// deliver content by halves). Paragraph boundaries (blank lines) are kept; a
+/// paragraph over `max` is wrapped on word boundaries; a single word over
+/// `max` is the only thing split inside a word, always on a character
+/// boundary. A body that already fits returns a single part.
+fn split_measured(text: &str, max: usize, measure: &dyn Fn(&str) -> usize) -> Vec<String> {
+    let text = text.trim();
+    debug_assert!(max > 0);
+    if measure(text) <= max {
+        return vec![text.to_string()];
+    }
+
+    // Blocks that each fit in `max`, one per paragraph (over-long paragraphs
+    // pre-wrapped on word boundaries).
+    let mut blocks: Vec<String> = Vec::new();
+    for para in text.split("\n\n") {
+        let para = para.trim_matches('\n');
+        if para.is_empty() {
+            continue;
+        }
+        if measure(para) <= max {
+            blocks.push(para.to_string());
+        } else {
+            blocks.extend(wrap_long_paragraph(para, max, measure));
+        }
+    }
+
+    // Greedily pack blocks into parts joined by a blank line.
+    let sep = measure("\n\n");
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for b in blocks {
+        if cur.is_empty() {
+            cur = b;
+        } else if measure(&cur) + sep + measure(&b) <= max {
+            cur.push_str("\n\n");
+            cur.push_str(&b);
+        } else {
+            parts.push(std::mem::take(&mut cur));
+            cur = b;
+        }
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    parts
+}
+
+/// Wrap one paragraph (no blank lines) over `max` into pieces each at most
+/// `max`, breaking between words. A word over `max` is split on character
+/// boundaries. Internal single newlines collapse to spaces — only reached for
+/// a paragraph that is itself over the size.
+fn wrap_long_paragraph(s: &str, max: usize, measure: &dyn Fn(&str) -> usize) -> Vec<String> {
+    let space = measure(" ");
+    let mut pieces: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if measure(word) > max {
+            if !cur.is_empty() {
+                pieces.push(std::mem::take(&mut cur));
+            }
+            // Hard-split a single over-long word on character boundaries,
+            // tracking the running measure so a multibyte char never spills a
+            // piece past `max`.
+            let mut piece = String::new();
+            let mut acc = 0usize;
+            for ch in word.chars() {
+                let u = measure(ch.encode_utf8(&mut [0u8; 4]));
+                if !piece.is_empty() && acc + u > max {
+                    pieces.push(std::mem::take(&mut piece));
+                    acc = 0;
+                }
+                piece.push(ch);
+                acc += u;
+            }
+            if !piece.is_empty() {
+                pieces.push(piece);
+            }
+            continue;
+        }
+        if cur.is_empty() {
+            cur = word.to_string();
+        } else if measure(&cur) + space + measure(word) <= max {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            pieces.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() {
+        pieces.push(cur);
+    }
+    pieces
 }
 
 /// Outcome of one ADR-024 condition evaluation.
@@ -1629,6 +1779,77 @@ fn first_csv_entry(env_var: &str) -> Option<String> {
         .next()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod split_message_tests {
+    use super::{split_message, split_message_bytes};
+
+    #[test]
+    fn a_body_within_the_size_is_one_part() {
+        let parts = split_message("short reply", 100);
+        assert_eq!(parts, vec!["short reply".to_string()]);
+    }
+
+    #[test]
+    fn paragraphs_pack_without_loss_or_ellipsis() {
+        let a = "A".repeat(40);
+        let b = "B".repeat(40);
+        let c = "C".repeat(40);
+        let text = format!("{a}\n\n{b}\n\n{c}");
+        let parts = split_message(&text, 90);
+        // No part exceeds the size; no ellipsis anywhere; every paragraph
+        // survives intact in order.
+        assert!(parts.iter().all(|p| p.chars().count() <= 90));
+        assert!(parts.iter().all(|p| !p.contains('…')));
+        let rejoined = parts.join("\n\n");
+        assert!(rejoined.contains(&a) && rejoined.contains(&b) && rejoined.contains(&c));
+        // 40+2+40 = 82 <= 90 packs two paragraphs; the third starts a new part.
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn an_over_long_paragraph_wraps_on_word_boundaries() {
+        let text = "word ".repeat(100); // 500 chars, single paragraph
+        let parts = split_message(text.trim(), 50);
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|p| p.chars().count() <= 50));
+        assert!(parts.iter().all(|p| !p.contains('…')));
+        // Words are never broken: every part is whole "word" tokens.
+        assert!(parts.iter().all(|p| p.split(' ').all(|w| w == "word")));
+    }
+
+    #[test]
+    fn a_single_word_longer_than_the_size_is_the_only_mid_word_cut() {
+        let text = "x".repeat(130);
+        let parts = split_message(&text, 50);
+        assert_eq!(parts.iter().map(|p| p.chars().count()).sum::<usize>(), 130);
+        assert!(parts.iter().all(|p| p.chars().count() <= 50));
+        assert_eq!(parts.concat(), text);
+    }
+
+    #[test]
+    fn the_byte_split_keeps_every_byte_of_multibyte_text_under_the_byte_limit() {
+        // 3500 "é" = 7000 bytes. A char-based 3500 split would make one part
+        // of 7000 bytes, which the ntfy byte cap would then truncate. The
+        // byte split must keep each part within the byte budget with no loss.
+        let text = "é".repeat(3500);
+        let parts = split_message_bytes(&text, 3500);
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|p| p.len() <= 3500), "every part within the byte budget");
+        assert!(parts.iter().all(|p| !p.contains('…')));
+        assert_eq!(parts.concat(), text, "no byte of the input is dropped");
+    }
+
+    #[test]
+    fn a_single_char_wider_than_a_byte_budget_still_splits_by_bytes() {
+        // A 4-byte emoji word split under a small byte budget: each piece
+        // holds whole emoji and stays within budget.
+        let text = "😀".repeat(10); // 40 bytes
+        let parts = split_message_bytes(&text, 12); // 3 emoji per piece
+        assert!(parts.iter().all(|p| p.len() <= 12));
+        assert_eq!(parts.concat(), text);
+    }
 }
 
 #[cfg(test)]

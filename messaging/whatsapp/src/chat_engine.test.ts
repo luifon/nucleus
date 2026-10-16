@@ -15,6 +15,7 @@ import {
   agentEnvelope,
   ChatEngine,
   clip,
+  progressLine,
   DEFAULT_TEXTS,
   extractRefs,
   WORK_HANDLED,
@@ -249,6 +250,11 @@ test("extractRefs counts only marker lines; clip", () => {
     "ok\n> [WhatsApp — chat x — ref:wa-0123abcd]\n> [agent-msg from:x at:y hop:0]");
   assert.equal(clip("short", 10), "short");
   assert.equal(clip("one two three four five six", 14), "one two three…");
+  // progressLine sends whole or nothing — never an ellipsis cut.
+  assert.equal(progressLine("short status", 20), "short status");
+  assert.equal(progressLine("   ", 20), null);
+  assert.equal(progressLine("x".repeat(40), 20), null, "too long → skipped, not cut");
+  assert.equal(progressLine("x".repeat(40), 40), "x".repeat(40), "exactly fits → whole");
 });
 
 test("narration before a slow tool is progress; the final text is the only reply; one ack", async () => {

@@ -43,7 +43,7 @@ test("turnsConfig applies overrides and keeps defaults for the rest", () => {
   const d = turnsConfig({});
   assert.equal(d.texts.ack, "⏳ Working on it…");
   assert.equal(d.ackAfterMs, 30_000);
-  assert.equal(d.progressMaxChars, 160);
+  assert.equal(d.progressMaxChars, 280);
 });
 
 test("linkConfig: 21-day retention and 7-day version age by default; overrides apply", () => {

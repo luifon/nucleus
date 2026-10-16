@@ -274,10 +274,14 @@ text above. Recording them here so the next reader has the ground truth:
    `nucleus-post` CLI, the reminders worker captures the session's
    final assistant message and posts it to the listed `--channels` via
    the existing `deliver()` path. The persona enforces a
-   ready-to-send-reply contract. Reply is capped at 1800 chars to fit
-   under Discord's 2000-char ceiling. If a future skill needs to emit
-   multiple posts or post asynchronously, a small CLI bridge would be
-   the right addition then; punted for v1.
+   ready-to-send-reply contract. The reply is never truncated: `deliver()`
+   splits a body longer than a channel's size into several whole messages
+   (`split_message`, on paragraph then word boundaries, no ellipsis) and
+   sends them in order — WhatsApp at 3500 chars per message, Discord at 1800
+   (under its 2000 ceiling), ntfy at 3500. Before 2026-10-15 the reply was
+   cut to 1800 chars with an ellipsis for every channel, which truncated
+   WhatsApp posts that the channel could have carried whole; the operator
+   asked that content never be delivered by halves.
 
 4. **Per-tick file lock.** Skill-fire sessions can run for minutes;
    the launchd plist ticks every 60s. The implementation adds a
