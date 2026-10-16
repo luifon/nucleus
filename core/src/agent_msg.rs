@@ -108,7 +108,10 @@ pub fn envelope(from: &str, at: &str, hop: u8, note: &str, body: &str) -> String
         out.push(' ');
         out.push_str(note.trim());
     }
-    for line in body.trim_end().lines() {
+    // A bare `\r` becomes a line break when typed, so it is a line break
+    // here too; otherwise it would start an unprefixed line.
+    let body = body.replace("\r\n", "\n").replace('\r', "\n");
+    for line in body.trim_end().split('\n') {
         out.push_str("\n│ ");
         out.push_str(line);
     }

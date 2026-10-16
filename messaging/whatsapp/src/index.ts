@@ -36,6 +36,16 @@ import { record as recordDiary } from "./diary.js";
 import { ConnectionSupervisor, DEFAULT_BREAKER, describeDisconnect } from "./breaker.js";
 import { installConsoleKeyFilter, makeBaileysLogger } from "./key_redaction.js";
 import { SentMessageStore } from "./sent_store.js";
+import {
+  isSelf,
+  operatorCheck,
+  replyBlock,
+  replyRef,
+  resolveReply,
+  sameAccount,
+  sameChat,
+  type Identity,
+} from "./reply_context.js";
 import { invalidateWaVersion, resolveWaVersion, waVersionCachePath } from "./wa_version.js";
 import NodeCache from "@cacheable/node-cache";
 
@@ -275,6 +285,7 @@ const DOC_TOOL_ALLOWLIST = [
 const TURNS_CAPABILITY_PROMPT = `## How this chat works (ADR-033)
 
 - Each operator message arrives as "[WhatsApp — chat <id> — ref:<ref>]" followed by the text. The ref is bookkeeping for the bot; do not mention it.
+- When the message is a WhatsApp reply, the message it quotes comes between the marker line and the text: a line that says whose message it is, then the quoted message with every line starting with "│ ". The text after that block is the new message, and it refers to the quoted one.
 - The operator can send more messages while you work. They reach you at your next step as queued input. Take them into account in the same turn.
 - The final message of your turn is sent to WhatsApp as the reply. Write it as the complete answer.
 - Text you write before a tool call can be sent to the operator as a short progress update, at most one every few minutes. Keep that text short and factual ("Reading the three reports."), or write none.
@@ -1221,6 +1232,10 @@ async function dispatchInbound(
 ): Promise<void> {
   const { config, engine, plansStore, docStore, jobStore, outbound } = bot;
 
+  // ADR-033: a reply carries the message it quotes; the session gets it
+  // typed above the new text.
+  const replyContext = await replyContextFor(msg, chatId, bot);
+
   // ADR-018: inbound media (images/documents) intercepts BEFORE the
   // braindump dispatch — media archives to the document library in every
   // role; only the DM role additionally gets the act-on-this path.
@@ -1232,7 +1247,7 @@ async function dispatchInbound(
     msg.message?.documentWithCaptionMessage?.message?.documentMessage;
   const inboundImg = msg.message?.imageMessage;
   if (inboundDoc || inboundImg) {
-    await handleInboundMedia(mediaDeps(sock, bot), msg, chatId, role);
+    await handleInboundMedia(mediaDeps(sock, bot), msg, chatId, role, replyContext);
     return;
   }
 
@@ -1292,7 +1307,7 @@ async function dispatchInbound(
   // before.
   let workBlock = "";
   if (role === "dm") {
-    const quoted = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? null;
+    const quoted = replyRef(msg.message)?.id ?? null;
     const routed = await routeOperatorDm({
       chatId,
       operator: botOperatorIds(config),
@@ -1349,8 +1364,40 @@ async function dispatchInbound(
     waMsgId: msg.key.id ?? null,
     quotedJson,
     context: workBlock,
+    replyContext,
   });
   log.info({ chatId, ref, duplicate }, "whatsapp: message handed to the turn engine");
+}
+
+/** How the live connection identifies accounts, for reply_context.ts. */
+function identity(config: Config): Identity {
+  return { pnForLid, isOperator: operatorCheck(botOperatorIds(config), pnForLid) };
+}
+
+/** ADR-033: the block naming the message `msg` replies to, or "" when it
+ *  is not a reply (reply_context.ts). */
+async function replyContextFor(msg: WAMessage, chatId: string, bot: Bot): Promise<string> {
+  const ref = replyRef(msg.message);
+  if (!ref) return "";
+  const dm = chatType(chatId) === "dm";
+  const id = identity(bot.config);
+  const sender = msg.key.participant ?? "";
+  const ctx = await resolveReply(ref, {
+    sent: (msgId) => bot.sent.lookup(msgId) ?? null,
+    inbound: (msgId) =>
+      bot.turnStore
+        .inboundByWaMsgId(msgId)
+        .map((r) => ({ chatId: r.chatId, text: r.text, inputKind: r.inputKind })),
+    sameChat: (jid) => sameChat(chatId, jid, id),
+    isBot: (jid) => isSelf(jid, selfIds()),
+    isSender: (jid) => (sender ? sameAccount(jid, sender, id) : Promise.resolve(false)),
+    dm,
+  });
+  log.info(
+    { chatId, quotedId: ref.id, source: ctx.source, author: ctx.author, chars: ctx.text.length },
+    "whatsapp: message is a reply",
+  );
+  return replyBlock(ctx);
 }
 
 /** ADR-036: `text` for a message the operator typed, `forwarded` for a

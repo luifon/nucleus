@@ -16,6 +16,7 @@ import { spawnSync } from "node:child_process";
 import { ChatEngine, DEFAULT_TEXTS, type TurnsConfig } from "./chat_engine.js";
 import { ChatSessionStore, OutboundQueueStore } from "./db.js";
 import { TurnStore } from "./turn_store.js";
+import { replyBlock } from "./reply_context.js";
 import { projectDirName } from "./claude_session.js";
 
 const ENABLED = process.env.NUCLEUS_IT === "1";
@@ -156,6 +157,39 @@ test(
           tr.some((r) => r.type === "user" && JSON.stringify(r.message).includes("BANANA")),
         "the mid-turn message reached the session",
       );
+    } finally {
+      await t.stop();
+    }
+  },
+);
+
+test(
+  "real session: a reply reaches the session with the message it quotes",
+  { skip: !ENABLED, timeout: 5 * 60_000 },
+  async () => {
+    const t = setup();
+    try {
+      const replyContext = replyBlock({
+        author: "bot",
+        text: "Reminder: parking for Friday.\nLevel 3, spot 4471.",
+        source: "sent",
+      });
+      t.engine.receive({
+        ...msg("Which spot number is in the message I am replying to? Reply with the number only.", "R1"),
+        replyContext,
+      });
+      await t.until("final reply", () => t.sent().some((m) => m.source === "chat-reply"), 180_000);
+      const reply = t.sent().find((m) => m.source === "chat-reply")!;
+      console.log("[it] reply:", reply.body);
+      assert.match(reply.body, /4471/, "the session read the quoted message");
+      const typed = t
+        .transcript()
+        .find((r) => r.type === "user" && JSON.stringify(r.message).includes("spot number is in the message"));
+      assert.ok(typed);
+      assert.equal(typed.promptSource, "typed");
+      const content = typeof typed.message.content === "string" ? typed.message.content : JSON.stringify(typed.message.content);
+      assert.match(content, /This message is a reply to a message the bot sent\./);
+      assert.match(content, /│ Level 3, spot 4471\./);
     } finally {
       await t.stop();
     }

@@ -60,13 +60,20 @@ export class SentMessageStore {
   /** The content of sent message `id`, or undefined when it is not stored
    *  (Baileys then leaves the retry unanswered). */
   get(id: string | null | undefined): proto.IMessage | undefined {
+    return this.lookup(id)?.message;
+  }
+
+  /** Sent message `id` with the chat it was sent to, or undefined when it
+   *  is not stored. Used to read the message a reply quotes
+   *  (reply_context.ts). */
+  lookup(id: string | null | undefined): { jid: string; message: proto.IMessage } | undefined {
     if (!id) return undefined;
-    const row = this.db.prepare(`SELECT proto FROM sent_messages WHERE id = ?`).get(id) as
-      | { proto: Uint8Array }
+    const row = this.db.prepare(`SELECT jid, proto FROM sent_messages WHERE id = ?`).get(id) as
+      | { jid: string; proto: Uint8Array }
       | undefined;
     if (!row) return undefined;
     try {
-      return proto.Message.decode(row.proto);
+      return { jid: row.jid, message: proto.Message.decode(row.proto) };
     } catch {
       return undefined;
     }

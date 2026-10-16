@@ -303,6 +303,10 @@ export class ChatSessionStore {
       // chunks were not echoed in time (claude_session.ts flow control).
       ["prompt_source", "prompt_source TEXT"],
       ["typing_stalls", "typing_stalls INTEGER NOT NULL DEFAULT 0"],
+      // The block naming the message a reply quotes (reply_context.ts),
+      // typed above the text; a retry types it again. Null when the
+      // message is not a reply.
+      ["reply_context", "reply_context TEXT"],
     ]);
     addColumnsIfMissing(this.db, "seen_messages", [
       // received: the bot started handling the message; handled: its
@@ -340,6 +344,8 @@ export class ChatSessionStore {
         ON session_inbox(dedup_key) WHERE dedup_key IS NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_inbound_wa_msg
         ON chat_inbound(chat_id, wa_msg_id) WHERE wa_msg_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_chat_inbound_wa_id
+        ON chat_inbound(wa_msg_id) WHERE wa_msg_id IS NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_plans_source_msg
         ON pending_plans(chat_id, source_msg_id) WHERE source_msg_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_pending_plans_resolved_by

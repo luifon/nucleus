@@ -196,14 +196,44 @@ Rules the engine enforces in code:
     will not come. The engine closes the open turn as failed, reports the
     messages still waiting with one note, and follows the file from its new
     end. The task worker fails its task the same way.
+12. **Replies carry the message they quote.** When the operator replies to
+    a message, WhatsApp sends the reply with a `contextInfo` that names the
+    quoted message (`stanzaId`), its author (`participant`) and a copy of its
+    content. Until 2026-10-16 the bot read only the new text, so the session
+    never saw what a reply referred to (33 of 45 DM messages since 2026-09-26
+    were replies). `reply_context.ts` reads the reply data of every message
+    type (text, voice memo, image, video, document, inside ephemeral or
+    view-once wrappers) and takes the quoted text from the bot's own records
+    first, because they hold the exact content: `sent_messages` for a message
+    this device sent, then `chat_inbound` for an earlier message of the chat
+    (a voice memo there is its transcription), then WhatsApp's copy. A
+    stored message counts only when it belongs to the same chat (one DM
+    under its phone JID or its LID counts as one chat), so a crafted
+    `stanzaId` cannot put another chat's message into this session. Ids are
+    compared by type: when both phone numbers are known (a LID's from the
+    connection's mapping) they decide, and a LID's digits are never compared
+    with a phone number. The
+    payload is the marker line, then a code-owned line naming the author (a
+    message the bot sent, an earlier message of the same sender, a message
+    from another participant of the group), then the quoted message with
+    every line prefixed `│ `, then the new text. Line breaks in the quote
+    and in the operator's text are normalized before any prefix is applied
+    (`\r\n` and a bare `\r` become `\n`), because typing turns a bare `\r`
+    into a line break. The quoted text is never cut; the typed-input limit
+    applies to the whole payload. The block is
+    stored in `chat_inbound.reply_context`, so a retry types it again. The
+    act prompt of an image or document (ADR-018) carries the same block, and
+    the issue-pipeline routing (ADR-036) reads the quoted message id of
+    every message type, so a voice memo reply to a pipeline message reaches
+    its item.
 
 **Markers.** Every message is found again in the transcript by a marker line
 typed with it: `[WhatsApp — chat <id> — ref:wa-xxxxxxxx]` for an operator
 message, `[ref:ctx-xxxxxxxx]` for a context message. A ref counts only when
 it is alone on its line and this actor issued it. Operator text lines that
 look like a marker or an envelope header get a `> ` prefix; agent message
-bodies have every line prefixed (§2), so neither can carry a marker line and
-turn a silent context turn into a reply.
+bodies (§2) and quoted messages (item 12) have every line prefixed, so neither
+can carry a marker line and turn a silent context turn into a reply.
 
 The daily 04:00 job and the idle reaper moved from `SessionPool` into the
 engine. Since 2026-10-15 the daily job compacts each stored chat session in

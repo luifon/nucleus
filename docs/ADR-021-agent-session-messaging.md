@@ -151,7 +151,10 @@ Message from the Nucleus agent "<sender>", not from the operator. Every line of 
 ```
 
 Every body line is prefixed, so a body cannot contain a line that looks like
-a header, a turn-engine marker or an operator message.
+a header, a turn-engine marker or an operator message. Line breaks are
+normalized first (`\r\n` and a bare `\r` become `\n`): typing turns a bare
+`\r` into a line break, so a body line split only on `\n` could start an
+unprefixed line (found in review 2026-10-16).
 
 **Sender and hop are derived.** Every Nucleus-spawned session's `claude`
 starts with `NUCLEUS_SESSION` and `NUCLEUS_AGENT=<registry agent>`, and

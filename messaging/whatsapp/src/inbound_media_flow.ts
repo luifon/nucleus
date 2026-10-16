@@ -62,7 +62,16 @@ export interface MediaDeps {
   };
 }
 
-export async function handleInboundMedia(d: MediaDeps, msg: WAMessage, chatId: string, role: MediaRole): Promise<void> {
+/** `replyContext`: the block naming the message this one replies to
+ *  (reply_context.ts), or "" when it is not a reply; the act prompt carries
+ *  it above the instruction. */
+export async function handleInboundMedia(
+  d: MediaDeps,
+  msg: WAMessage,
+  chatId: string,
+  role: MediaRole,
+  replyContext = "",
+): Promise<void> {
   const m = msg.message;
   const docMsg = m?.documentMessage ?? m?.documentWithCaptionMessage?.message?.documentMessage;
   const imgMsg = m?.imageMessage;
@@ -202,9 +211,10 @@ export async function handleInboundMedia(d: MediaDeps, msg: WAMessage, chatId: s
       return;
     }
     const docPath = d.docStore.pathFor(record);
-    const framed = `[attached ${isImage ? "image" : "document"} "${record.logicalName}" archived at ${docPath} — use the Read tool on it]
-
-${decision.instruction}`;
+    const attached = `[attached ${isImage ? "image" : "document"} "${record.logicalName}" archived at ${docPath} — use the Read tool on it]`;
+    const framed = replyContext.trim()
+      ? `${attached}\n\n${replyContext.trim()}\n\n${decision.instruction}`
+      : `${attached}\n\n${decision.instruction}`;
     await d.presence(chatId, "composing");
     const { jobId, promise } = d.startAct({
       record,

@@ -4,7 +4,8 @@
 //   `ref` is the marker typed with the message, which is how the engine finds
 //   the message again in the session transcript. `text` is the complete
 //   message (a retry replays it); `text_preview` is a short form for the
-//   dashboard. (chat_id, wa_msg_id) is unique: a WhatsApp message delivered
+//   dashboard. `reply_context` is the block naming the message a reply
+//   quotes (reply_context.ts), typed above the text and again on a retry. (chat_id, wa_msg_id) is unique: a WhatsApp message delivered
 //   twice is one row.
 //     received → typed → consumed (a turn read it) → answered
 //     … → failed | interrupted
@@ -64,6 +65,9 @@ export interface InboundRow {
   promptSource: string | null;
   /** Typed chunks whose echo did not appear in time. */
   typingStalls: number;
+  /** The block naming the message this reply quotes; null when the
+   *  message is not a reply. */
+  replyContext: string | null;
 }
 
 export interface InboxRow {
@@ -144,6 +148,7 @@ function toInbound(r: any): InboundRow {
     retried: r.retried,
     promptSource: r.prompt_source ?? null,
     typingStalls: r.typing_stalls ?? 0,
+    replyContext: r.reply_context ?? null,
   };
 }
 
@@ -244,13 +249,14 @@ export class TurnStore {
     quotedJson: string | null;
     inputKind: string;
     text: string;
+    replyContext?: string | null;
   }): { ref: string; duplicate: boolean } {
     const res = this.db
       .prepare(
         `INSERT OR IGNORE INTO chat_inbound
            (ref, chat_id, pool, wa_msg_id, quoted_json, input_kind, text, text_preview,
-            received_at, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'received')`,
+            reply_context, received_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received')`,
       )
       .run(
         i.ref,
@@ -261,6 +267,7 @@ export class TurnStore {
         i.inputKind,
         i.text,
         Array.from(i.text).slice(0, PREVIEW_CHARS).join(""),
+        i.replyContext ?? null,
         now(),
       );
     if (Number(res.changes) === 1) return { ref: i.ref, duplicate: false };
@@ -274,6 +281,15 @@ export class TurnStore {
   getInbound(ref: string): InboundRow | null {
     const r = this.db.prepare(`SELECT * FROM chat_inbound WHERE ref = ?`).get(ref);
     return r ? toInbound(r) : null;
+  }
+
+  /** Stored messages with WhatsApp id `waMsgId`, in any chat (the id is
+   *  unique per chat); the caller checks the chat. */
+  inboundByWaMsgId(waMsgId: string): InboundRow[] {
+    return this.db
+      .prepare(`SELECT * FROM chat_inbound WHERE wa_msg_id = ? ORDER BY received_at`)
+      .all(waMsgId)
+      .map(toInbound);
   }
 
   /** The message was typed and submitted. `submit` is what the submit
