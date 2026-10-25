@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Plus, Send, MessageSquare, RefreshCw, ChevronLeft } from "lucide-react";
 import {
   listChats,
@@ -7,27 +7,66 @@ import {
   deleteChat,
   sendMessage,
   getChatInfo,
-  type Chat,
-  type ChatMessage,
+  ApiError,
+  type ChatDetail,
 } from "@/lib/api";
-import { useFetch } from "@/lib/hooks";
+import { useFetch, usePollWhile } from "@/lib/hooks";
 import { answeredIds } from "@/lib/canvas";
+import { chatBusy, PENDING_ID, shownMessages } from "@/lib/chat";
 import ChatListItem from "@/components/chat/ChatListItem";
 import MessageBubble from "@/components/chat/MessageBubble";
 
-const OPTIMISTIC_ID = -1;
+/** How often the page reads the chat while the server works on it. */
+const POLL_MS = 1500;
 
 export default function ChatPage() {
   const chats = useFetch(listChats);
   const info = useFetch(getChatInfo);
   const personaName = info.data?.persona_name ?? "assistant";
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [detail, setDetail] = useState<{ chat: Chat; messages: ChatMessage[] } | null>(null);
+  const [detail, setDetail] = useState<ChatDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [draft, setDraft] = useState("");
-  const [sending, setSending] = useState(false);
+  // The POST that starts a turn is in flight (it returns at once).
+  const [posting, setPosting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
+  // `<chat>:<ts>` of failed turns whose message was put back in the draft.
+  const restoredRef = useRef(new Set<string>());
+  // Every chat read takes the next number. A send moves the fence to the
+  // last number taken, so a read that started before the send's answer
+  // (and may predate its turn) is dropped instead of erasing it.
+  const readSeqRef = useRef(0);
+  const fenceRef = useRef(0);
+  // The page lost track of the server's state (a send failed: the turn may
+  // have started anyway); it polls until a read succeeds.
+  const [resync, setResync] = useState(false);
+  // Chats deleted while the list on screen still shows them; never reopened.
+  const goneRef = useRef(new Set<string>());
+
+  // The server runs each turn and each title in a task of its own, so the
+  // reply never depends on one long request: the page reads the chat until
+  // the turn is stored. A reload or a dropped connection loses nothing.
+  const turn = detail?.turn ?? null;
+  const running = turn?.status === "running";
+  const sending = posting || running;
+  const serverBusy = chatBusy(detail);
+
+  // A stored turn or a new title changes the chat list's order and labels.
+  const refetchChats = chats.refetch;
+
+  // The open chat no longer exists (deleted here or in another tab).
+  const closeGone = useCallback((id: string) => {
+    goneRef.current.add(id);
+    if (activeIdRef.current === id) {
+      setActiveId(null);
+      setDetail(null);
+      setResync(false);
+    }
+    refetchChats();
+  }, [refetchChats]);
 
   useEffect(() => {
     // Auto-open the first chat only on desktop (the side-by-side split). On
@@ -35,8 +74,9 @@ export default function ChatPage() {
     // control can return to it — otherwise this effect would immediately
     // re-select the first chat and the list would be unreachable.
     const isDesktop = window.matchMedia("(min-width: 768px)").matches;
-    if (isDesktop && !activeId && chats.data && chats.data.length > 0) {
-      setActiveId(chats.data[0].id);
+    const first = chats.data?.find((c) => !goneRef.current.has(c.id));
+    if (isDesktop && !activeId && first) {
+      setActiveId(first.id);
     }
   }, [chats.data, activeId]);
 
@@ -48,16 +88,69 @@ export default function ChatPage() {
     let cancelled = false;
     setLoadingDetail(true);
     setError(null);
-    getChat(activeId)
-      .then((d) => { if (!cancelled) setDetail(d); })
-      .catch((e) => { if (!cancelled) setError(String(e)); })
+    const seq = ++readSeqRef.current;
+    const id = activeId;
+    getChat(id)
+      .then((d) => { if (!cancelled && seq > fenceRef.current) setDetail(d); })
+      .catch((e) => {
+        if (cancelled) return;
+        if (e instanceof ApiError && e.status === 404) closeGone(id);
+        else setError(String(e));
+      })
       .finally(() => { if (!cancelled) setLoadingDetail(false); });
     return () => { cancelled = true; };
-  }, [activeId]);
+  }, [activeId, closeGone]);
+
+  // Results for a chat that is no longer open, or older than the last
+  // send, are dropped.
+  const refreshDetail = useCallback(() => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    const seq = ++readSeqRef.current;
+    getChat(id)
+      .then((d) => {
+        if (activeIdRef.current !== id || seq <= fenceRef.current) return;
+        setDetail(d);
+        setResync(false);
+      })
+      .catch((e) => {
+        if (activeIdRef.current !== id) return;
+        // Deleted elsewhere: nothing left to poll. Anything else: the next
+        // poll retries.
+        if (e instanceof ApiError && e.status === 404) closeGone(id);
+      });
+  }, [closeGone]);
+
+  usePollWhile(refreshDetail, !!activeId && (serverBusy || resync), POLL_MS);
+
+  // A tab hidden on mobile stops its timers; read the chat once it is back.
+  useEffect(() => {
+    if (!serverBusy) return;
+    const onVisible = () => { if (document.visibilityState === "visible") refreshDetail(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [serverBusy, refreshDetail]);
+
+  useEffect(() => {
+    if (detail) refetchChats();
+  }, [detail?.chat.title, detail?.chat.last_active, refetchChats]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A failed turn stored nothing: put its message back in the box once,
+  // when the box is empty, so the operator can edit and resend it.
+  const draftEmpty = !draft.trim();
+  useEffect(() => {
+    if (turn?.status !== "failed" || !detail || !draftEmpty) return;
+    const key = `${detail.chat.id}:${turn.ts}`;
+    if (restoredRef.current.has(key)) return;
+    restoredRef.current.add(key);
+    setDraft(turn.message);
+  }, [turn, detail, draftEmpty]);
+
+  const shown = useMemo(() => shownMessages(detail), [detail]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [detail?.messages.length, sending]);
+  }, [shown.length, sending]);
 
   const onCreate = async () => {
     try {
@@ -72,8 +165,7 @@ export default function ChatPage() {
   const onDelete = async (id: string) => {
     try {
       await deleteChat(id);
-      if (activeId === id) setActiveId(null);
-      await chats.refetch();
+      closeGone(id);
     } catch (e) {
       setError(String(e));
     }
@@ -82,46 +174,30 @@ export default function ChatPage() {
   // Shared send path: typed drafts and canvas submissions both go through
   // here — a canvas response IS a normal user message (ADR-012).
   const sendText = async (message: string) => {
-    if (!activeId || !message.trim() || sending) return;
-    setSending(true);
+    const id = activeId;
+    if (!id || !message.trim() || sending) return;
+    setPosting(true);
     setError(null);
-
-    // ask() can take many seconds; render the user message immediately
-    // so the operator doesn't watch a blank box waiting for it to land.
-    const optimisticTs = new Date().toISOString();
-    setDetail((d) => d && {
-      ...d,
-      messages: [
-        ...d.messages,
-        { id: OPTIMISTIC_ID, chat_id: activeId, role: "user", content: message, ts: optimisticTs },
-      ],
-    });
-
     try {
-      const resp = await sendMessage(activeId, message);
-      setDetail((d) => d && {
-        chat: {
-          ...d.chat,
-          title: resp.chat_title ?? d.chat.title,
-          claude_session_id: resp.session_id,
-          last_active: resp.assistant_message.ts,
-        },
-        messages: [
-          ...d.messages.filter((m) => m.id !== OPTIMISTIC_ID),
-          resp.user_message,
-          resp.assistant_message,
-        ],
-      });
-      await chats.refetch();
+      const started = await sendMessage(id, message);
+      fenceRef.current = readSeqRef.current;
+      // The running turn renders the message and starts the polling; the
+      // read confirms it (and loads the chat if it was still loading).
+      setDetail((d) => (d && d.chat.id === id ? { ...d, turn: started } : d));
+      refreshDetail();
     } catch (e) {
+      fenceRef.current = readSeqRef.current;
       setError(String(e));
       // Restore the draft so the operator can edit and retry. (For a
       // canvas submission this puts the raw response text in the box —
       // visible, editable, and re-sendable, which beats losing it.)
-      setDetail((d) => d && { ...d, messages: d.messages.filter((m) => m.id !== OPTIMISTIC_ID) });
       setDraft(message);
+      // The server may have started the turn anyway (the response was
+      // lost, or another tab's turn runs): poll until its state is known.
+      setResync(true);
+      refreshDetail();
     } finally {
-      setSending(false);
+      setPosting(false);
     }
   };
 
@@ -146,10 +222,8 @@ export default function ChatPage() {
 
   // Canvas blocks already answered in this chat — derived from the message
   // list alone, so history re-render and live render agree (ADR-012).
-  const answered = useMemo(
-    () => answeredIds(detail?.messages ?? []),
-    [detail?.messages],
-  );
+  const answered = useMemo(() => answeredIds(shown), [shown]);
+  const shownError = error ?? (turn?.status === "failed" ? `not sent: ${turn.error}` : null);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -238,14 +312,14 @@ export default function ChatPage() {
             <div className="flex-1 overflow-y-auto p-5">
               {loadingDetail ? (
                 <div className="text-xs text-[var(--color-nucleus-faint)]">loading messages…</div>
-              ) : detail?.messages.length === 0 ? (
+              ) : detail && shown.length === 0 ? (
                 <div className="text-xs text-[var(--color-nucleus-faint)]">
                   no messages yet. ask anything about your vault.
                 </div>
               ) : (
                 <ul className="space-y-3">
-                  {detail?.messages.map((m, i) => (
-                    <li key={m.id === OPTIMISTIC_ID ? `opt-${i}` : m.id}>
+                  {shown.map((m) => (
+                    <li key={m.id === PENDING_ID ? `pending-${m.ts}` : m.id}>
                       <MessageBubble
                         message={m}
                         personaName={personaName}
@@ -255,7 +329,7 @@ export default function ChatPage() {
                       />
                     </li>
                   ))}
-                  {sending && (
+                  {running && (
                     <li>
                       <div className="flex justify-start">
                         <div className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)] px-3 py-2 text-xs text-[var(--color-nucleus-faint)]">
@@ -270,9 +344,9 @@ export default function ChatPage() {
               <div ref={messagesEndRef} />
             </div>
 
-            {error && (
+            {shownError && (
               <div className="border-t border-[var(--color-status-down)] bg-[color-mix(in_srgb,var(--color-status-down)_15%,var(--color-nucleus-surface))] px-5 py-2 text-xs text-[var(--color-status-down)]">
-                {error}
+                {shownError}
               </div>
             )}
 

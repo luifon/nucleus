@@ -289,6 +289,46 @@ Single origin (`$NUCLEUS_PUBLIC_URL`), path-scoped:
 The `news/api` public contract is preserved bit-for-bit so external
 subscribers don't break.
 
+### Chat turns
+
+`POST /chat/api/chats/{id}/messages` records the turn and returns 202 at
+once. The turn (the pool `ask`, then one transaction that stores the user
+message and the reply) runs in a `tokio::spawn` task, and the chat title
+runs in a second task with its own one-shot session. A page reload or a
+dropped connection therefore cannot cancel either one. Before this, the
+request returned only after the reply and the title: the operator waited for
+both, and a reload dropped the handler, which stored the reply but never
+showed it and left the title's tmux window open.
+
+`GET /chat/api/chats/{id}` reports the work with the messages:
+
+- `turn` — the chat's last turn that is not stored as messages:
+  `running` (with its message and timestamp) or `failed` (with the error;
+  nothing was stored). A failed turn stays until the next message replaces
+  it or the chat is deleted.
+- `titling` — a title is being generated.
+
+The page polls the chat while `turn` is running or `titling` is true, so a
+reloaded page shows the running turn and then its reply. A chat runs one
+turn at a time; a second message gets 409. The state is in memory only; a
+dashboard restart also ends the tasks.
+
+Ordering: a turn commits its messages, starts the title and removes its
+running state while it holds a lock for writing (`commit_gate`), and `GET`
+reads the state and the rows while it holds the same lock for reading. A
+read therefore sees the chat either before the commit (running, no reply) or
+after it (the reply, with `titling` set when a title starts); it never sees
+the reply with nothing left to poll for while the title is still to come. A
+task that ends without setting a final state (a panic) marks its turn
+failed, so the page never polls a task that no longer runs.
+
+The page drops chat reads that started before the answer to its last send,
+so an older read cannot erase the running turn the send started. The stored
+user row keeps the turn's timestamp, and the page shows a running turn whose
+row is already stored only once. After a failed send it polls until a read
+succeeds, because the turn may have started anyway. A 404 while polling
+(the chat was deleted elsewhere) closes the chat.
+
 ### Frontend shell
 
 `App.tsx` renders a left sidebar with the route inventory, a content

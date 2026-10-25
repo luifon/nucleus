@@ -3,7 +3,7 @@
 import { jsonGet, jsonPost } from "./client";
 import type { MessageRow } from "./generated/MessageRow";
 import type { ChatDetail as ChatDetailWire } from "./generated/ChatDetail";
-import type { SendResp as SendRespWire } from "./generated/SendResp";
+import type { PendingTurn } from "./generated/PendingTurn";
 import type { ChatRow as Chat } from "./generated/ChatRow";
 import type { CreatedChat } from "./generated/CreatedChat";
 import type { ChatInfo } from "./generated/ChatInfo";
@@ -11,6 +11,7 @@ import type { ChatInfo } from "./generated/ChatInfo";
 export type { ChatRow as Chat } from "./generated/ChatRow";
 export type { CreatedChat } from "./generated/CreatedChat";
 export type { ChatInfo } from "./generated/ChatInfo";
+export type { PendingTurn } from "./generated/PendingTurn";
 
 /** UI-layer refinement: the wire shape (generated MessageRow) carries
  *  `role: string`; only these two values are ever written by the
@@ -27,12 +28,6 @@ export type ChatDetail = Omit<ChatDetailWire, "messages"> & {
   messages: ChatMessage[];
 };
 
-/** Wire shape is generated; message fields carry the UI-narrowed ChatMessage. */
-export type SendResp = Omit<SendRespWire, "user_message" | "assistant_message"> & {
-  user_message: ChatMessage;
-  assistant_message: ChatMessage;
-};
-
 export const getChatInfo = () => jsonGet<ChatInfo>("/chat/api/info");
 export const listChats = () => jsonGet<Chat[]>("/chat/api/chats");
 export const createChat = () =>
@@ -43,8 +38,10 @@ export const deleteChat = (id: string) =>
     if (!r.ok) throw new Error(`delete chat → ${r.status}`);
     return r.json() as Promise<{ ok: boolean; deleted: string }>;
   });
+/** Starts a turn and returns at once (202); the reply arrives through
+ *  `getChat`, whose `turn` stays "running" until it is stored. */
 export const sendMessage = (id: string, message: string) =>
-  jsonPost<SendResp, { message: string }>(
+  jsonPost<PendingTurn, { message: string }>(
     `/chat/api/chats/${encodeURIComponent(id)}/messages`,
     { message },
   );

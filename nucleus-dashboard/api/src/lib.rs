@@ -405,6 +405,8 @@ async fn init_chat(
         sessions,
         ask_options,
         claude: settings.claude.clone(),
+        background: Default::default(),
+        commit_gate: Default::default(),
     })
 }
 
