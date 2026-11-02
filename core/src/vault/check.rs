@@ -153,6 +153,8 @@ pub struct CheckOptions {
     pub source_vocabulary: Vec<String>,
     pub orphan_exempt: GlobSet,
     pub frontmatter_exempt: GlobSet,
+    /// Duplicate findings whose every member matches are intentional repeats.
+    pub duplicate_exempt: GlobSet,
     /// "Today" for age calculations (local date).
     pub today: chrono::NaiveDate,
     /// Where the fix puts moved files (`<workspace>/`[`QUARANTINE_DIR`]
@@ -172,6 +174,8 @@ impl CheckOptions {
             orphan_exempt: GlobSet::new(&cfg.orphan_exempt).context("[vault_check] orphan_exempt")?,
             frontmatter_exempt: GlobSet::new(&cfg.frontmatter_exempt)
                 .context("[vault_check] frontmatter_exempt")?,
+            duplicate_exempt: GlobSet::new(&cfg.duplicate_exempt)
+                .context("[vault_check] duplicate_exempt")?,
             today: chrono::Local::now().date_naive(),
             quarantine_dir: None,
         })
@@ -516,8 +520,13 @@ pub fn analyze(vault: &Path, ex: &Exclusions, opts: &CheckOptions) -> Result<Ana
         }
     }
 
-    // Duplicates.
+    // Duplicates. A group whose every member is covered by the
+    // `duplicate_exempt` globs is an intentional repeat (per-project template
+    // notes, a dated check-in series) — suppress it.
     for g in duplicate_groups(&notes) {
+        if duplicate_group_exempt(&g.related, &opts.duplicate_exempt) {
+            continue;
+        }
         counts.duplicates += 1;
         findings.push(g);
     }
@@ -996,6 +1005,13 @@ const DATED_SERIES_MIN: usize = 3;
 const CONTENT_MIN_WORDS: usize = 60;
 const CONTENT_JACCARD: f64 = 0.6;
 const MINHASH_K: usize = 64;
+
+/// A duplicate/similar/series finding is an intentional repeat when it has
+/// members and every member path is matched by the `duplicate_exempt` globs.
+/// An empty group is never exempt (there is nothing to vouch for).
+fn duplicate_group_exempt(related: &[String], exempt: &GlobSet) -> bool {
+    !related.is_empty() && related.iter().all(|p| exempt.matches(p))
+}
 
 fn duplicate_groups(notes: &[Note]) -> Vec<Finding> {
     let mut out = Vec::new();
@@ -1575,6 +1591,37 @@ mod tests {
         let p = root.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, text).unwrap();
+    }
+
+    #[test]
+    fn duplicate_group_exempt_needs_every_member_matched() {
+        let exempt = GlobSet::new(&[
+            "contract.md".to_string(),
+            "4-Areas/Wellbeing/check-ins/**".to_string(),
+        ])
+        .unwrap();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // Component glob on the basename: every `*/contract.md` is covered.
+        assert!(duplicate_group_exempt(
+            &s(&["3-Projects/A/contract.md", "3-Projects/B/contract.md"]),
+            &exempt
+        ));
+        // Path glob: every check-in under the folder is covered.
+        assert!(duplicate_group_exempt(
+            &s(&[
+                "4-Areas/Wellbeing/check-ins/2026-05-31.md",
+                "4-Areas/Wellbeing/check-ins/2026-06-03.md",
+            ]),
+            &exempt
+        ));
+        // One member outside the exempt set: the finding stands.
+        assert!(!duplicate_group_exempt(
+            &s(&["3-Projects/A/contract.md", "3-Projects/B/stack.md"]),
+            &exempt
+        ));
+        // An empty group vouches for nothing.
+        assert!(!duplicate_group_exempt(&[], &exempt));
     }
 
     fn fm(created: &str, source: &str) -> String {

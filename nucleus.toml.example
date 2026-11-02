@@ -146,6 +146,12 @@ source_vocabulary = [
 orphan_exempt = ["README.md", "index.md", "Home.md", "_*", "0-Inbox/**", "1-Main-Notes/**", "2-Daily-Notes/**", "7-Archives/**"]
 # Never reported for frontmatter or source.
 frontmatter_exempt = ["README.md", "Home.md"]
+# Intentional repeats: a duplicate_name / dated_series / similar_title /
+# duplicate_content finding is suppressed when EVERY member note matches.
+# Same matcher as orphan_exempt (no `/` = any path component; with `/` = whole
+# path). Empty by default. Example: template notes that repeat per project, and
+# a dated check-in series.
+# duplicate_exempt = ["contract.md", "stack.md", "4-Areas/Wellbeing/check-ins/**"]
 # Scheduled runs: apply the safe fix (move empty `Untitled*` files that
 # nothing links to into memory/vault-quarantine/). The check never rewrites
 # a note; a missing `created` is only reported.

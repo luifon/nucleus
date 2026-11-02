@@ -206,6 +206,17 @@ Findings:
 | `empty_file` | A 0-byte file, a note with no text after its frontmatter, or a canvas with no nodes. |
 | `oversized` | A note larger than 2 MiB; it is not read or checked. |
 
+A `duplicate_name`, `dated_series`, `similar_title` or `duplicate_content`
+finding is suppressed when every member note matches `duplicate_exempt`
+(empty by default). The globs use the orphan-exempt matcher: a pattern
+without `/` matches any path component (so `contract.md` covers every
+`*/contract.md`), one with `/` matches the whole path. This keeps the
+operator's intentional repeats out of the report without a rename or a
+merge — per-engagement template notes (`contract`, `stack`, `lessons`), a
+dated check-in series, or the same work filed under two mediums. A group is
+never suppressed by a partial match: one member outside the set and the
+finding stands.
+
 One safe fix, only with `--apply` (or `scheduled_apply = true`), recorded on
 its finding (`not applied: <reason>` when a check below fails): move an
 empty file whose name starts with `Untitled` (Obsidian's default name) and

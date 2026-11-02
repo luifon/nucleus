@@ -471,6 +471,14 @@ pub struct VaultCheckConfig {
     /// Notes never reported for missing frontmatter or unknown source.
     #[serde(default = "default_frontmatter_exempt")]
     pub frontmatter_exempt: Vec<String>,
+    /// Duplicate-name / similar-title / duplicate-content / dated-series
+    /// findings whose every member note is matched here are intentional
+    /// repeats (per-project template notes, a dated check-in series) and are
+    /// suppressed. Globs use the same matcher as `orphan_exempt`: a pattern
+    /// without `/` matches any path component (so `contract.md` matches every
+    /// `*/contract.md`); a pattern with `/` matches the whole path.
+    #[serde(default = "default_duplicate_exempt")]
+    pub duplicate_exempt: Vec<String>,
     /// Apply the safe fix on scheduled runs. Manual runs use `--apply`.
     #[serde(default)]
     pub scheduled_apply: bool,
@@ -488,6 +496,7 @@ impl Default for VaultCheckConfig {
             source_vocabulary: default_source_vocabulary(),
             orphan_exempt: default_orphan_exempt(),
             frontmatter_exempt: default_frontmatter_exempt(),
+            duplicate_exempt: default_duplicate_exempt(),
             scheduled_apply: false,
             notify: true,
         }
@@ -545,6 +554,11 @@ fn default_orphan_exempt() -> Vec<String> {
 }
 fn default_frontmatter_exempt() -> Vec<String> {
     ["README.md", "Home.md"].iter().map(|s| s.to_string()).collect()
+}
+/// Empty by default: duplicate findings are intentional-repeat decisions the
+/// operator makes per vault, configured in `nucleus.toml`, not shipped here.
+fn default_duplicate_exempt() -> Vec<String> {
+    Vec::new()
 }
 
 /// Background task workers (ADR-033). Internal safety limits only — the
