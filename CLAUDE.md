@@ -255,7 +255,7 @@ to check the deploy", "tomorrow 9am about Q3 sync") — use `--at`:
 ./target/release/nucleus reminders add \
   --at "2026-05-14T16:45:00<offset>" \
   --body "dentist appointment at 17h" \
-  --channels discord-home
+  --channels whatsapp-dm
 ```
 
 **Recurring** ("every weekday at 18:30 send an end-of-day reminder", "every
@@ -267,7 +267,7 @@ evaluated in `NUCLEUS_TZ`:
 ./target/release/nucleus reminders add \
   --cron "30 18 * * 1-5" \
   --body "⏰ End of day — wrap up." \
-  --channels discord-home
+  --channels whatsapp-dm
 ```
 
 `--at` and `--cron` are mutually exclusive. `--at` accepts RFC3339 with
@@ -280,10 +280,12 @@ unset) to resolve the offset, and resolve relative phrases ("tomorrow",
 "in N hours") against *now*, not session start.
 
 `--channels` is plural, comma-separated, and validates against the
-known set. Default is `discord-home`. Examples:
+known set. The CLI's default is `discord-home`; sessions pass
+`--channels whatsapp-dm` unless the operator names another channel (see
+below). Examples:
 
-- `--channels discord-home`
 - `--channels whatsapp-dm`
+- `--channels discord-home`
 - `--channels discord-home,whatsapp-dm` (delivers to both, per-channel retry)
 
 **Condition watchers (ADR-024).** `--condition "<shell cmd>"` gates the
@@ -346,14 +348,13 @@ Supported `--channels` values:
   `NUCLEUS_NTFY_TOKEN`. Arrives as a phone notification with high
   priority, not a chat message. Unavailable unless all three are set.
 
-Pick the channels based on where the user asked. "Remind me on
-WhatsApp" → `whatsapp-dm`. "Push it to my phone" / "notify me on
-ntfy" → `ntfy`. No default to WhatsApp — Discord is the
-safe default for
-unattended delivery, since the WhatsApp app is on the user's phone and
-could be muted/inactive. "Schedule X" / "put X on my calendar" /
-"invite me to X" → `calendar` (typically combined with `discord-home`
-for a same-day heads-up: `--channels calendar,discord-home`).
+Pick the channels based on where the user asked. When he names no
+channel, use `whatsapp-dm`, and always pass `--channels` explicitly: the
+CLI's own default for `--body` is `discord-home`. "Remind me on
+Discord" → `discord-home`. "Push it to my phone" / "notify me on
+ntfy" → `ntfy`. "Schedule X" / "put X on my calendar" /
+"invite me to X" → `calendar` (typically combined with `whatsapp-dm`
+for a same-day heads-up: `--channels calendar,whatsapp-dm`).
 Multi-channel ("remind me on Discord AND WhatsApp") works: pass a
 comma list. Each channel retries independently up to 3 attempts before
 giving up for that fire; the others aren't redelivered while a laggard
@@ -373,8 +374,8 @@ just post a static body, use `--system-prompt` instead of `--body`:
 ```bash
 ./target/release/nucleus reminders add \
   --cron "20 8 * * 1-5" \
-  --system-prompt "Run pre-meeting-prep skill, post results to discord-home." \
-  --channels discord-home
+  --system-prompt "Run pre-meeting-prep skill, post the result." \
+  --channels whatsapp-dm
 ```
 
 At fire time the worker spawns a one-shot interactive Claude session
