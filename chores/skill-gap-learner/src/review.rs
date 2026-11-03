@@ -261,6 +261,8 @@ Do NOT suggest (these harden into self-imposed constraints):
   • Negative claims about tools ("browser tools don't work", "Y is broken").
   • Transient errors that resolved in the session (capture the retry pattern, not the failure).
   • One-off task narratives, and anything already covered by a pending suggestion (add evidence instead).
+  • A rule a program can check on its own: forbidden values or file paths in commits, a required format, a check that must run before a command. That belongs in a hook, a test or a lint rule, not in a skill a session may or may not follow.
+  • An interruption or a stop by the operator that carries no stated correction, preference or rule. Stopping a step is not by itself a lesson.
   • Anything a rejected suggestion already proposed, unless this session gives a reason the rejection did not consider; then set overrides_rejected to its id and say what is new in why_new."#;
 
 const ANSWER_FORMAT: &str = r#"Answer with ONE JSON object and nothing else:
