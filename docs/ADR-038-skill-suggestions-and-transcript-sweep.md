@@ -77,6 +77,10 @@ label, short quotes), a status (`pending`, `accepted`, `rejected`,
 - A revision replaces a pending suggestion with a new one that carries its
   evidence; the old one becomes `superseded`. A suggestion the operator
   edited is never revised by the model; new sessions only add evidence.
+- An edit whose draft has a different `name:` renames a create suggestion.
+  The new name is checked like a new suggestion's name (kebab-case, no skill
+  and no other pending suggestion with that name). A patch suggestion keeps
+  the name of the skill it changes; an edit that renames it is refused.
 
 The DTOs derive `ts_rs::TS` (Rule 12) so the dashboard can show and decide
 suggestions through the same functions.

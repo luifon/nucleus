@@ -610,14 +610,15 @@ mod suggestion_routes {
         assert_eq!(review["suggestion"]["evidence"][0]["quotes"][0], "USER: build before you push");
         assert_eq!(review["accept_blockers"], serde_json::json!([]));
         assert!(review["live"].is_null());
+        let stored_a = review["suggestion"]["draft"].as_str().unwrap().to_string();
 
         // An invalid edit is refused with every problem listed; the draft stays.
         let (code, err) = call(&app, "POST", "/suggestions/edit", Some(serde_json::json!({"id": a, "draft": "---\nname: x\n---\nbody\n"}))).await;
         assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(err["issues"].as_array().unwrap().len() > 1, "{err}");
         assert!(err["error"].as_str().unwrap().starts_with("the draft is not valid"));
-        // A valid edit replaces it.
-        let edited = DRAFT.replace("1. Build.", "1. Build and test.");
+        // A valid edit of the shown draft replaces it.
+        let edited = stored_a.replace("1. Build.", "1. Build and test.");
         let (code, review) = call(&app, "POST", "/suggestions/edit", Some(serde_json::json!({"id": a, "draft": edited}))).await;
         assert_eq!(code, StatusCode::OK, "{review}");
         assert_eq!(review["suggestion"]["edited"], true);

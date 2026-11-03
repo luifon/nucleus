@@ -868,6 +868,8 @@ pub async fn reject(pool: &SqlitePool, id: i64, reason: Option<&str>) -> Result<
 /// Replace the draft of a pending suggestion with the operator's text. The
 /// text is checked like any draft; a patch keeps the base hash it was
 /// filed against, so accept still refuses it if the live skill changed.
+/// A different `name:` in a create suggestion's draft renames it, checked
+/// like a new name; a patch keeps the name of the skill it changes.
 pub async fn edit(
     pool: &SqlitePool,
     workspace_root: &Path,
@@ -887,19 +889,38 @@ pub async fn edit(
         bail!("suggestion #{id} is {status}, not pending");
     }
     let kind = SuggestionKind::parse(&kind).ok_or_else(|| anyhow!("unknown kind {kind}"))?;
+    let drafted = skills::parse_frontmatter(draft, Path::new(skills::SKILL_FILE))
+        .and_then(|fm| fm.name)
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty() && *n != name);
+    let name = match (drafted, kind) {
+        (None, _) => name,
+        (Some(_), SuggestionKind::Patch) => {
+            return Err(InvalidDraft {
+                context: "the draft is not valid".into(),
+                issues: vec![format!("a patch suggestion keeps the name of the skill it changes (`{name}`)")],
+            }
+            .into());
+        }
+        (Some(new_name), SuggestionKind::Create) => new_name,
+    };
     // The ownership fields come from the live skill; the base hash is the
     // one the suggestion was filed against, checked again at accept.
     let prepared = prepare_draft(workspace_root, roots, kind, &name, draft, None)
         .map_err(|issues| InvalidDraft { context: "the draft is not valid".into(), issues })?;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    if let Some(other) = pending_for(&mut tx, &name).await?.filter(|other| *other != id) {
+        bail!("suggestion #{other} for `{name}` is already pending; choose another name");
+    }
     let done = sqlx::query(
-        "UPDATE suggestions SET draft = ?2, edited = 1, updated_at = ?3
+        "UPDATE suggestions SET draft = ?2, name = ?5, edited = 1, updated_at = ?3
           WHERE id = ?1 AND status = 'pending' AND base_hash IS ?4",
     )
     .bind(id)
     .bind(&prepared.text)
     .bind(crate::timestamp::now())
     .bind(base_hash.as_deref())
+    .bind(&name)
     .execute(&mut *tx)
     .await?;
     if done.rows_affected() == 0 {
@@ -1108,6 +1129,11 @@ mod tests {
         }
     }
 
+    /// `DRAFT` with `name` in its frontmatter, as the stored draft carries it.
+    fn named(name: &str) -> String {
+        DRAFT.replace("name: ignored", &format!("name: {name}"))
+    }
+
     fn put_skill(root: &Path, name: &str, body: &str) {
         std::fs::create_dir_all(root.join(name)).unwrap();
         std::fs::write(root.join(name).join("SKILL.md"), body).unwrap();
@@ -1264,13 +1290,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_renames_a_create_suggestion_and_keeps_a_patch_name() {
+        let w = ws().await;
+        let id = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "service-deploy", DRAFT)).await.unwrap();
+        // The stored draft carries the stored name, so saving it unchanged
+        // does not rename.
+        let stored = get(&w.pool, id).await.unwrap().unwrap().draft;
+        edit(&w.pool, &w.ws, &w.roots, id, &stored).await.unwrap();
+        assert_eq!(get(&w.pool, id).await.unwrap().unwrap().name, "service-deploy");
+
+        // A new name in the draft renames the suggestion and its draft.
+        edit(&w.pool, &w.ws, &w.roots, id, &named("deploy-a-service")).await.unwrap();
+        let s = get(&w.pool, id).await.unwrap().unwrap();
+        assert_eq!(s.name, "deploy-a-service");
+        assert!(s.draft.contains("name: deploy-a-service"), "{}", s.draft);
+        accept(&w.pool, &w.ws, &w.roots, id, &shown(&w.pool, id).await).await.unwrap();
+        assert!(w.roots.personal.join("deploy-a-service").join(skills::SKILL_FILE).exists());
+        assert!(!w.roots.personal.join("service-deploy").exists());
+
+        // A new name is checked like any name: not kebab-case, taken by a
+        // skill, or taken by another pending suggestion.
+        let a = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "first-skill", DRAFT)).await.unwrap();
+        create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "second-skill", DRAFT)).await.unwrap();
+        let err = edit(&w.pool, &w.ws, &w.roots, a, &named("Not_Kebab")).await.unwrap_err();
+        assert!(err.downcast_ref::<InvalidDraft>().is_some(), "{err:#}");
+        let err = edit(&w.pool, &w.ws, &w.roots, a, &named("deploy-a-service")).await.unwrap_err();
+        assert!(format!("{err:#}").contains("already exists"), "{err:#}");
+        let err = edit(&w.pool, &w.ws, &w.roots, a, &named("second-skill")).await.unwrap_err();
+        assert!(format!("{err:#}").contains("already pending"), "{err:#}");
+        assert_eq!(get(&w.pool, a).await.unwrap().unwrap().name, "first-skill");
+
+        // A patch keeps the name of the skill it changes.
+        put_skill(&w.roots.personal, "hand", &named("hand"));
+        let p = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Patch, "hand", DRAFT)).await.unwrap();
+        let err = edit(&w.pool, &w.ws, &w.roots, p, &named("hand-renamed")).await.unwrap_err();
+        assert!(format!("{err:#}").contains("keeps the name"), "{err:#}");
+        assert_eq!(get(&w.pool, p).await.unwrap().unwrap().name, "hand");
+    }
+
+    #[tokio::test]
     async fn accept_writes_only_the_draft_the_operator_reviewed() {
         let w = ws().await;
         let id = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "service-deploy", DRAFT)).await.unwrap();
         let seen = review(&w.pool, &w.ws, &w.roots, id).await.unwrap().unwrap().draft_hash;
         assert_eq!(seen, shown(&w.pool, id).await);
         // The draft changes after the operator read it.
-        edit(&w.pool, &w.ws, &w.roots, id, &DRAFT.replace("Build.", "Build by hand.")).await.unwrap();
+        edit(&w.pool, &w.ws, &w.roots, id, &named("service-deploy").replace("Build.", "Build by hand.")).await.unwrap();
         let err = accept(&w.pool, &w.ws, &w.roots, id, &seen).await.unwrap_err();
         assert!(format!("{err:#}").contains("changed after you reviewed it"), "{err:#}");
         assert!(err.downcast_ref::<InvalidDraft>().is_none(), "a stale view is a conflict, not a draft problem");
@@ -1341,7 +1406,7 @@ mod tests {
         // Edit: the operator's draft is checked, and a model revision no
         // longer replaces it.
         assert!(edit(&w.pool, &w.ws, &w.roots, b, "not a skill").await.is_err());
-        edit(&w.pool, &w.ws, &w.roots, b, &DRAFT.replace("Build.", "Build by hand.")).await.unwrap();
+        edit(&w.pool, &w.ws, &w.roots, b, &named("service-deploy").replace("Build.", "Build by hand.")).await.unwrap();
         let edited = get(&w.pool, b).await.unwrap().unwrap();
         assert!(edited.edited && edited.draft.contains("Build by hand."));
         assert!(revise(&w.pool, &w.ws, &w.roots, b, &new(SuggestionKind::Create, "service-deploy", DRAFT)).await.is_err());
