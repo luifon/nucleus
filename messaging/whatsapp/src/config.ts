@@ -203,8 +203,6 @@ export interface Config {
   vaultPath: string;
   diaryRoot: string;
   dbPath: string;
-  /** ADR-017: on-the-fly skill-review nudge interval (asks per chat). 0 = off. */
-  skillNudgeInterval: number;
   /** ADR-018: outbound media size cap (bytes). WHATSAPP_MEDIA_MAX_BYTES. */
   mediaMaxBytes: number;
   /** ADR-018: document-library binaries dir. WHATSAPP_DOCUMENTS_DIR override
@@ -243,7 +241,6 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
   const claude = parsed.claude ?? {};
   const diary = parsed.diary ?? { root: "memory/diaries" };
   const obsidian = parsed.obsidian ?? {};
-  const skillLearner = parsed.skill_learner ?? {};
 
   const userName = envRequired("NUCLEUS_USER_NAME");
   const personaDefault = resolvePersona(workspaceRoot, userName, "whatsapp");
@@ -290,9 +287,6 @@ export function loadConfig(workspaceRoot: string, discover: boolean): Config {
     vaultPath,
     diaryRoot: path.resolve(workspaceRoot, diary.root ?? "memory/diaries"),
     dbPath: path.join(workspaceRoot, "memory/whatsapp.db"),
-    // ADR-017 on-the-fly skill review: 0 disables (enabled=false in toml).
-    skillNudgeInterval:
-      skillLearner.enabled === false ? 0 : Number(skillLearner.nudge_interval ?? 12),
     // ADR-018 document library + outbound media.
     mediaMaxBytes: Number(process.env.WHATSAPP_MEDIA_MAX_BYTES ?? 64 * 1024 * 1024),
     documentsDir: process.env.WHATSAPP_DOCUMENTS_DIR

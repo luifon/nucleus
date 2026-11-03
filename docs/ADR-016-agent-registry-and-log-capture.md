@@ -65,7 +65,7 @@ One **uniform `Agent` record** with descriptive attributes (required:
 | `log_path` | launchd stdout/err file |
 | `diary_key` | `memory/diaries/<diary_key>/` |
 | `persona_venue` | conversational agents — `resolve_persona()` → display_name (ADR-009) |
-| `capabilities` | in-agent behaviors — `rotates` now, `skill_review` future |
+| `capabilities` | in-agent behaviors — `rotates` (the `skill_review` capability existed from ADR-017 until ADR-038 removed it) |
 | `enabled` | future-reserved agents ship `false` |
 
 The registry is the source of truth for `/agents` and any future surface.

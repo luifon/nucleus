@@ -315,7 +315,6 @@ pub fn interactive_pool(
     ctx: &ProfileContext,
     persona: String,
     idle_timeout: Duration,
-    review_nudge_interval: u32,
 ) -> (PoolConfig, AskOptions) {
     (
         PoolConfig {
@@ -328,7 +327,6 @@ pub fn interactive_pool(
             tmux_session: ctx.tmux_session.to_string(),
             idle_timeout,
             agent_label: Some(ctx.agent_label.to_string()),
-            review_nudge_interval,
         },
         AskOptions {
             max_wait: Duration::from_secs(180),
@@ -443,7 +441,7 @@ mod tests {
             tmux_session: "nucleus-test",
             agent_label: "test",
         };
-        let (cfg, ask) = interactive_pool(&ctx, "persona".into(), Duration::from_secs(60), 0);
+        let (cfg, ask) = interactive_pool(&ctx, "persona".into(), Duration::from_secs(60));
         assert!(!ask.await_turn_complete);
         assert_eq!(cfg.disallowed_tools, vec!["Bash(rm *)".to_string()]);
     }

@@ -386,11 +386,6 @@ async fn init_chat(
         },
         persona_body,
         std::time::Duration::from_secs(60 * 60 * 2),
-        if settings.skill_learner.enabled {
-            settings.skill_learner.nudge_interval
-        } else {
-            0
-        },
     );
     // Vault answering needs --add-dir; pool fields are public for exactly
     // this kind of per-venue extension.

@@ -1,8 +1,9 @@
 //! Shared skill-library access (ADR-008 / ADR-017).
 //!
 //! Discovery, SKILL.md frontmatter parsing, and the format validator — used
-//! by the dashboard `/skills` handler (read) and the skill-gap learner
-//! (read + write + validate) so both judge skills identically. Mirrors the
+//! by the dashboard `/skills` handler (read), the skill-gap learner
+//! (read + write + validate) and the suggestion store's accept path
+//! (`skill_learner`, ADR-038) so all of them judge skills identically. Mirrors the
 //! lib+bin sharing the reminders crate does.
 //!
 //! Two storage trees under the workspace root:
@@ -623,44 +624,6 @@ pub fn validate(content: &str) -> Vec<String> {
         }
     }
     issues
-}
-
-/// Fire a detached on-the-fly skill review (ADR-017) for a conversation that
-/// just crossed the nudge interval. Best-effort and fully decoupled: it spawns
-/// `nucleus skill-gap-learner review` and returns immediately, so it never
-/// blocks the caller's reply or fails it. A no-op if the binary isn't built
-/// yet. The conversational agents call this when `AskResult.review_due`.
-///
-/// Deliberately a subprocess rather than a library call even though both halves
-/// now live in one binary (ADR-030): the review must outlive the reply it was
-/// triggered by, and it must not be able to fail the conversation turn.
-pub fn fire_skill_review(workspace_root: &Path, venue: &str, chat_key: &str, transcript_path: &str) {
-    use std::process::{Command, Stdio};
-    let release = workspace_root.join("target/release/nucleus");
-    let bin = if release.exists() {
-        release
-    } else {
-        workspace_root.join("target/debug/nucleus")
-    };
-    if !bin.exists() {
-        return;
-    }
-    let _ = Command::new(bin)
-        .current_dir(workspace_root)
-        .args([
-            "skill-gap-learner",
-            "review",
-            "--transcript",
-            transcript_path,
-            "--venue",
-            venue,
-            "--chat-key",
-            chat_key,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
 }
 
 #[cfg(test)]

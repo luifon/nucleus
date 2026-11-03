@@ -58,13 +58,36 @@ cron = "0 4 * * *"
 # model = "claude-sonnet-4-6"   # optional override (reserved; unused today)
 
 [skill_learner]
-# ADR-017: the skill-gap learner. On-the-fly arm reviews a conversation after
-# this many turns per chat; periodic arm proposes missing skills + curates.
-nudge_interval = 12
-cron = "30 4 * * *"          # periodic `learn` (informational; truth in the plist)
+# ADR-017 / ADR-038: the skill-gap learner. The nightly `learn` run sweeps this
+# workspace's session transcripts for skill suggestions (new sessions, then a
+# limited backfill batch of old ones), then proposes missing skills from the
+# diaries and curates the library.
+cron = "30 4 * * *"          # nightly `learn` (informational; truth in the plist)
 stale_after_days = 30        # agent-created skills idle this long → stale
 archive_after_days = 90      # …this long → auto-archived (never deleted)
-enabled = true
+enabled = true               # transcript sweep + backfill on/off
+# "suggest": reviewed sessions become suggestions for the operator
+# (`nucleus skills suggestions`). "write": the live sweep writes skills
+# directly (validation gate applies). The backfill always suggests.
+live_mode = "suggest"
+quiet_minutes = 30           # transcripts modified more recently are still in use
+# Automated sessions never reviewed (agent label prefixes).
+skip_agents = ["reminders-fire", "calendar-fire", "news-fetcher", "skill-gap-learner", "distiller", "gmail-metabolism", "intake-interpreter", "work-interpreter", "jobs", "chat-title"]
+# Pre-filter (code, no model). A part of a session is reviewed when it has at
+# least min_user_turns operator turns and one of: min_corrections correcting
+# turns, a loaded skill followed by a correction, min_error_recoveries failed
+# tool calls retried successfully, min_tool_calls tool calls. Sessions read from
+# the session index (transcript deleted) have no tool calls: corrections or
+# index_min_user_turns operator turns.
+min_user_turns = 2
+min_tool_calls = 40
+min_corrections = 1
+min_error_recoveries = 3
+index_min_user_turns = 8
+review_window_bytes = 24576  # rendered conversation per review (max 24576); longer parts are split
+live_max_reviews = 20        # review sessions per live sweep
+backfill_per_night = 10      # review sessions per night for old sessions
+backfill_max_new_per_night = 5  # stop the backfill for the night above this many new suggestions
 
 [gmail]
 # Daily inbox metabolism (ADR-007). 5am local; cron evaluated in NUCLEUS_TZ.

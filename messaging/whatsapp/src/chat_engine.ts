@@ -126,8 +126,6 @@ export interface PoolSpec {
   addDirs?: string[];
   agentLabel?: string;
   idleTimeoutMs: number;
-  /** ADR-017 skill-review nudge after this many operator turns. 0 = off. */
-  reviewNudgeInterval?: number;
   /** ADR-033: sessions of this pool get a task scope (NUCLEUS_TASK_SCOPE)
    *  bound to their chat. Only the DM pool. */
   taskScope?: boolean;
@@ -170,8 +168,6 @@ export interface ReplyInfo {
   replyChars: number;
   elapsedMs: number;
   sessionId: string;
-  transcriptPath: string;
-  reviewDue: boolean;
   inputKind: string;
   inputChars: number;
 }
@@ -367,7 +363,6 @@ class ChatActor {
   private issued = new Map<string, "operator" | "context">();
   private pendingQuoteRef: string | null = null;
   private lastPresence = 0;
-  private operatorTurns = 0;
   private lastAliveCheck = 0;
   private lastPaneCheck = 0;
 
@@ -855,9 +850,6 @@ class ChatActor {
       "chat: reply queued",
     );
     if (open.kind === "operator") {
-      this.operatorTurns++;
-      const n = this.pool.reviewNudgeInterval ?? 0;
-      const reviewDue = n > 0 && this.operatorTurns % n === 0;
       const first = open.refs.length ? this.e.turns.getInbound(open.refs[0]) : null;
       this.e.onOperatorReply?.({
         chatId: this.chatId,
@@ -866,8 +858,6 @@ class ChatActor {
         replyChars: finalText.length,
         elapsedMs: this.now() - open.startedAt,
         sessionId: s.sessionId,
-        transcriptPath: s.transcriptPath,
-        reviewDue,
         inputKind: first?.inputKind ?? "text",
         inputChars: first?.text.length ?? 0,
       });

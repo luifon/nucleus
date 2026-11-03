@@ -89,10 +89,8 @@ export interface AskResult {
   sessionId: string;
   elapsedMs: number;
   wasColdSpawn: boolean;
-  /** Absolute path to the session transcript (ADR-016/017). */
+  /** Absolute path to the session transcript (ADR-016). */
   transcriptPath: string;
-  /** True when this ask crossed reviewNudgeInterval for the chat (ADR-017). */
-  reviewDue: boolean;
 }
 
 const DEFAULT_ASK: Required<AskOptions> = {

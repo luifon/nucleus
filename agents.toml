@@ -17,7 +17,7 @@
 #   schedule is informational — the real schedule is in the plist.
 #   tmux_session present  => drives Claude => raw output via runs.jsonl index.
 #   log_path present      => launchd stdout/err file.
-#   capabilities          => rotates | skill_review  (Layer-A, in-agent).
+#   capabilities          => rotates  (Layer-A, in-agent).
 
 # ── conversational (fixed daemons hosting operator-facing Claude pools) ──
 
@@ -31,7 +31,7 @@ tmux_session  = "nucleus-discord"
 log_path      = "memory/discord.log"
 diary_key     = "discord"
 persona_venue = "discord"
-capabilities  = ["rotates", "skill_review"]
+capabilities  = ["rotates"]
 
 [[agent]]
 name          = "whatsapp"
@@ -45,7 +45,7 @@ tmux_session  = "nucleus-whatsapp"
 log_path      = "memory/whatsapp.log"
 diary_key     = "whatsapp"
 persona_venue = "whatsapp"
-capabilities  = ["rotates", "skill_review"]
+capabilities  = ["rotates"]
 
 [[agent]]
 name          = "chat"
@@ -56,7 +56,7 @@ runtime       = "rust"
 tmux_session  = "nucleus-chat"
 diary_key     = "chat"
 persona_venue = "chat"
-capabilities  = ["rotates", "skill_review"]
+capabilities  = ["rotates"]
 
 # ── scheduled (launchd-cron domain jobs that drive Claude) ──
 
@@ -109,11 +109,12 @@ launch        = "launchd-cron"
 runtime       = "rust"
 launchd_label = "dev.nucleus.skill-gap-learner"
 tmux_session  = "nucleus-skill-gap-learner"
-# ADR-017: all-facets successor to the sunset preference-learner. The periodic
-# `learn` pass (this entry) proposes missing skills across diaries + curates
-# the library; the on-the-fly arm is the `skill_review` capability on the
-# conversational agents below. Writes to .nucleus/.claude/skills under the
-# workspace root (operator-personal, gitignored).
+# ADR-017 / ADR-038: the nightly `learn` run first sweeps this workspace's
+# session transcripts (new sessions, then a limited backfill batch of old
+# ones) and files skill suggestions for the operator to accept or reject
+# (`nucleus skills suggestions`), then proposes missing skills across diaries
+# and curates the library. Skills are written only to .nucleus/.claude/skills
+# under the workspace root (operator-personal, gitignored).
 schedule      = "30 4 * * *"
 log_path      = "memory/skill-gap-learner.log"
 diary_key     = "skill-gap-learner"

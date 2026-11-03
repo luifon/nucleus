@@ -1,17 +1,25 @@
 //! Session search (ADR-023): FTS5 retrieval over session transcripts —
 //! the missing layer between T1 (raw transcripts) and T2 (promoted facts).
 //!
-//! Core owns `memory/session_index.db` (ADR-020 DB-ownership). The index
-//! is DERIVED data: corruption or loss is repaired by a full rescan, never
-//! backed up. Three operations:
+//! Core owns `memory/session_index.db` (ADR-020 DB-ownership). The index is
+//! derived from the transcripts while they exist, but it is NOT rebuildable:
+//! Claude Code deletes transcripts after its cleanup period, and the index
+//! keeps the turns of every eligible session whose transcript is gone. Those
+//! rows are the only copy of that text (the skill-gap learner's backfill
+//! reads them, ADR-038). So no code path removes the turns of a session
+//! because its transcript file is missing, and the index is never rebuilt
+//! from scratch: a full rescan would drop them. Back it up like source data.
+//! Three operations:
 //!
 //! - [`update_index`] — incremental: (re)index transcripts whose
-//!   mtime/size changed. Cheap enough to run before every query.
+//!   mtime/size changed. Cheap enough to run before every query. It only
+//!   visits files that exist; a row whose file is gone is left as it is.
 //! - [`search`] — FTS5 match over turn text, newest-session-first bias
 //!   via rank, optional agent + age filters.
 //! - [`prune_junk`] — delete transcripts that never became eligible
 //!   (no substantive exchange) once they are old enough. Dry-run by
-//!   default; the `[session_search] prune_apply` toml flag arms it.
+//!   default; the `[session_search] prune_apply` toml flag arms it. It
+//!   never touches an eligible session, whether or not its file exists.
 //!
 //! Eligibility (the junk gate): a transcript enters the index only with
 //! ≥1 real user turn AND ≥1 assistant text turn after the standard
@@ -19,7 +27,7 @@
 //! same `last_n_turns` filter the priming machinery uses), and only when
 //! its agent label isn't a known synthetic (chat-title spawns etc.).
 
-use crate::claude_session::{Turn, TurnRole, last_n_turns};
+use crate::claude_session::{TranscriptEventKind, Turn, TurnRole, transcript_events};
 use anyhow::{Context, Result};
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
@@ -30,7 +38,12 @@ pub const DB_PATH: &str = "memory/session_index.db";
 /// Agent labels whose sessions are synthetic by construction — never
 /// indexed, pruned when old. Matched as prefixes against the runs.jsonl
 /// `agent` field (e.g. "chat-title", "healthcheck-probe").
-const SYNTHETIC_AGENT_PREFIXES: &[&str] = &["chat-title", "healthcheck", "sstest", "test-skill"];
+pub const SYNTHETIC_AGENT_PREFIXES: &[&str] = &["chat-title", "healthcheck", "sstest", "test-skill"];
+
+/// True when `agent` is one of the [`SYNTHETIC_AGENT_PREFIXES`].
+pub fn is_synthetic_agent(agent: &str) -> bool {
+    SYNTHETIC_AGENT_PREFIXES.iter().any(|p| agent.starts_with(p))
+}
 
 const MIGRATIONS: &[crate::migrate::Migration] = &[crate::migrate::Migration {
     version: 1,
@@ -62,6 +75,78 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(DB_PATH)).await?;
     crate::migrate::migrate(&pool, MIGRATIONS).await?;
     Ok(pool)
+}
+
+/// The index opened read-only, for readers that must not create or change
+/// it (the skill-gap learner). `None` when there is no index yet.
+pub async fn open_read_only(workspace_root: &Path) -> Result<Option<SqlitePool>> {
+    let path = workspace_root.join(DB_PATH);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(crate::db::open_read_only(&path).await?))
+}
+
+/// An eligible session of the index.
+#[derive(Debug, Clone)]
+pub struct IndexedSession {
+    pub session_id: String,
+    /// The transcript path recorded when the session was indexed. The file
+    /// may no longer exist.
+    pub path: String,
+    pub agent: Option<String>,
+    /// Transcript mtime (unix seconds) when it was last indexed.
+    pub mtime: i64,
+    pub turn_count: i64,
+}
+
+/// Every eligible session in the index, oldest first.
+pub async fn eligible_sessions(pool: &SqlitePool) -> Result<Vec<IndexedSession>> {
+    let rows: Vec<(String, String, Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT session_id, path, agent, mtime, turn_count FROM indexed_sessions
+          WHERE eligible = 1 ORDER BY mtime, session_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(session_id, path, agent, mtime, turn_count)| IndexedSession {
+            session_id,
+            path,
+            agent: agent.filter(|a| !a.is_empty()),
+            mtime,
+            turn_count,
+        })
+        .collect())
+}
+
+/// One indexed turn: its position in the session (`seq`, from 0) and text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexedTurn {
+    pub seq: i64,
+    pub role: TurnRole,
+    pub text: String,
+}
+
+/// The indexed turns of `session_id` with `seq >= from_seq`, in order.
+pub async fn session_turns(pool: &SqlitePool, session_id: &str, from_seq: i64) -> Result<Vec<IndexedTurn>> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT text, role, CAST(seq AS INTEGER) FROM turns_fts
+          WHERE session_id = ?1 AND CAST(seq AS INTEGER) >= ?2
+          ORDER BY CAST(seq AS INTEGER)",
+    )
+    .bind(session_id)
+    .bind(from_seq)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(text, role, seq)| IndexedTurn {
+            seq,
+            role: if role == "assistant" { TurnRole::Assistant } else { TurnRole::User },
+            text,
+        })
+        .collect())
 }
 
 /// The Claude Code transcript dir for this workspace
@@ -103,10 +188,8 @@ pub fn load_agent_map(workspace_root: &Path) -> HashMap<String, String> {
 /// The ADR-023 junk gate. Emptiness is a CONTENT property — even a no-op
 /// spawn writes ~20 KB of boilerplate, so file size proves nothing.
 pub fn is_substantive(turns: &[Turn], agent: Option<&str>) -> bool {
-    if let Some(a) = agent {
-        if SYNTHETIC_AGENT_PREFIXES.iter().any(|p| a.starts_with(p)) {
-            return false;
-        }
+    if agent.is_some_and(is_synthetic_agent) {
+        return false;
     }
     let users = turns.iter().filter(|t| t.role == TurnRole::User).count();
     let assistants = turns.iter().filter(|t| t.role == TurnRole::Assistant).count();
@@ -162,7 +245,23 @@ pub async fn update_index(pool: &SqlitePool, workspace_root: &Path) -> Result<Up
             continue;
         }
 
-        let turns = last_n_turns(&path, usize::MAX);
+        // A transcript that cannot be read now (deleted after the directory
+        // listing, unreadable) keeps its indexed turns: they may be the
+        // only copy left.
+        let turns: Vec<Turn> = match transcript_events(&path, 0) {
+            Ok(read) => read
+                .events
+                .into_iter()
+                .filter_map(|e| match e.kind {
+                    TranscriptEventKind::Text { role, text, .. } => Some(Turn { role, text }),
+                    _ => None,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(session = %session_id, "session index: cannot read the transcript, keeping its rows: {e}");
+                continue;
+            }
+        };
         let agent = agent_map.get(&session_id).cloned();
         let eligible = is_substantive(&turns, agent.as_deref());
         let session_ts = chrono::DateTime::from_timestamp(mtime, 0)
@@ -411,5 +510,24 @@ mod tests {
         assert_eq!((real.candidates, real.deleted), (1, 1));
         assert!(!dir.join("bbbb-junk.jsonl").exists());
         assert!(dir.join("aaaa-real.jsonl").exists());
+
+        // Claude Code's cleanup deletes the eligible transcript: its turns
+        // stay in the index through update_index and prune_junk, even when
+        // the row is old enough to be a prune candidate by age.
+        std::fs::remove_file(dir.join("aaaa-real.jsonl")).unwrap();
+        sqlx::query("UPDATE indexed_sessions SET mtime = 0").execute(&pool).await.unwrap();
+        let after = update_index(&pool, &workspace).await.unwrap();
+        assert_eq!(after.scanned, 0);
+        let pruned = prune_junk(&pool, &workspace, true, 14).await.unwrap();
+        assert_eq!((pruned.candidates, pruned.deleted), (0, 0));
+        let kept = eligible_sessions(&pool).await.unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].session_id, "aaaa-real");
+        let turns = session_turns(&pool, "aaaa-real", 0).await.unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!((turns[0].seq, turns[0].role), (0, TurnRole::User));
+        assert!(turns[1].text.contains("10%"));
+        assert_eq!(session_turns(&pool, "aaaa-real", 1).await.unwrap().len(), 1);
+        assert!(!search(&pool, "orçamento", None, None, 10).await.unwrap().is_empty());
     }
 }

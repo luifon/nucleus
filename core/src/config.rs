@@ -130,13 +130,10 @@ fn default_distiller_cron() -> String {
     "0 4 * * *".to_string()
 }
 
-/// Skill-gap learner settings (ADR-017). All defaulted so an operator's
-/// nucleus.toml without a `[skill_learner]` table still loads.
+/// Skill-gap learner settings (ADR-017, ADR-038). All defaulted so an
+/// operator's nucleus.toml without a `[skill_learner]` table still loads.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillLearnerConfig {
-    /// On-the-fly: review a conversation after this many turns per chat.
-    #[serde(default = "default_nudge_interval")]
-    pub nudge_interval: u32,
     /// Periodic `learn` schedule (informational; real schedule in the plist).
     #[serde(default = "default_skill_learner_cron")]
     pub cron: String,
@@ -146,27 +143,97 @@ pub struct SkillLearnerConfig {
     /// Agent-created skills idle this long are auto-archived (never deleted).
     #[serde(default = "default_archive_days")]
     pub archive_after_days: u32,
-    /// Master switch for the on-the-fly arm (the periodic arm is gated by
-    /// whether the launchd job is installed).
+    /// Master switch for the transcript sweep and the backfill (ADR-038).
+    /// The diary gap pass and the curator are gated by whether the launchd
+    /// job is installed.
     #[serde(default = "default_true_bool")]
     pub enabled: bool,
+    /// What the live sweep does with a reviewed session: file suggestions
+    /// for the operator (`suggest`), or write skills directly through the
+    /// ADR-017 write path and validation gate (`write`). The backfill always
+    /// suggests.
+    #[serde(default)]
+    pub live_mode: LiveMode,
+    /// A transcript modified less than this many minutes ago is still in
+    /// use; the sweep leaves it for a later run.
+    #[serde(default = "default_quiet_minutes")]
+    pub quiet_minutes: u32,
+    /// Agent labels whose sessions are automated and never reviewed,
+    /// matched as prefixes (ADR-023's synthetic labels are always skipped
+    /// as well). Bot chats and unlabelled terminal sessions are reviewed.
+    #[serde(default = "default_skip_agents")]
+    pub skip_agents: Vec<String>,
+    /// Pre-filter: a part of a session needs at least this many operator
+    /// turns to be reviewed at all.
+    #[serde(default = "default_min_user_turns")]
+    pub min_user_turns: u32,
+    /// Pre-filter: tool calls in the part that make it worth a review on
+    /// their own.
+    #[serde(default = "default_min_tool_calls")]
+    pub min_tool_calls: u32,
+    /// Pre-filter: operator turns that read as a correction or frustration.
+    #[serde(default = "default_min_corrections")]
+    pub min_corrections: u32,
+    /// Pre-filter: failed tool calls followed later by a successful call of
+    /// the same tool.
+    #[serde(default = "default_min_error_recoveries")]
+    pub min_error_recoveries: u32,
+    /// Pre-filter for sessions read from the session index (no tool calls
+    /// there): operator turns that make the part worth a review without a
+    /// correction.
+    #[serde(default = "default_index_min_user_turns")]
+    pub index_min_user_turns: u32,
+    /// Largest rendered conversation one review sees, in bytes. A longer
+    /// new part is split into consecutive parts of at most this size, each
+    /// reviewed on its own. At most 24 KiB, so the whole review prompt stays
+    /// under the typed-prompt limit.
+    #[serde(default = "default_review_window_bytes")]
+    pub review_window_bytes: usize,
+    /// Most review sessions the live sweep runs in one run; the rest wait
+    /// for the next run.
+    #[serde(default = "default_live_max_reviews")]
+    pub live_max_reviews: u32,
+    /// Most review sessions the backfill runs per night.
+    #[serde(default = "default_backfill_per_night")]
+    pub backfill_per_night: u32,
+    /// The backfill stops for the night once it has created more than this
+    /// many suggestions that day.
+    #[serde(default = "default_backfill_max_new_per_night")]
+    pub backfill_max_new_per_night: u32,
+}
+
+/// See [`SkillLearnerConfig::live_mode`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveMode {
+    #[default]
+    Suggest,
+    Write,
 }
 
 impl Default for SkillLearnerConfig {
     fn default() -> Self {
         Self {
-            nudge_interval: default_nudge_interval(),
             cron: default_skill_learner_cron(),
             stale_after_days: default_stale_days(),
             archive_after_days: default_archive_days(),
             enabled: true,
+            live_mode: LiveMode::default(),
+            quiet_minutes: default_quiet_minutes(),
+            skip_agents: default_skip_agents(),
+            min_user_turns: default_min_user_turns(),
+            min_tool_calls: default_min_tool_calls(),
+            min_corrections: default_min_corrections(),
+            min_error_recoveries: default_min_error_recoveries(),
+            index_min_user_turns: default_index_min_user_turns(),
+            review_window_bytes: default_review_window_bytes(),
+            live_max_reviews: default_live_max_reviews(),
+            backfill_per_night: default_backfill_per_night(),
+            backfill_max_new_per_night: default_backfill_max_new_per_night(),
         }
     }
 }
 
-fn default_nudge_interval() -> u32 {
-    12
-}
 fn default_skill_learner_cron() -> String {
     "30 4 * * *".to_string()
 }
@@ -175,6 +242,53 @@ fn default_stale_days() -> u32 {
 }
 fn default_archive_days() -> u32 {
     90
+}
+fn default_quiet_minutes() -> u32 {
+    30
+}
+fn default_skip_agents() -> Vec<String> {
+    [
+        "reminders-fire",
+        "calendar-fire",
+        "news-fetcher",
+        "skill-gap-learner",
+        "distiller",
+        "gmail-metabolism",
+        "intake-interpreter",
+        "work-interpreter",
+        "jobs",
+        "chat-title",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+fn default_min_user_turns() -> u32 {
+    2
+}
+fn default_min_tool_calls() -> u32 {
+    40
+}
+fn default_min_corrections() -> u32 {
+    1
+}
+fn default_min_error_recoveries() -> u32 {
+    3
+}
+fn default_index_min_user_turns() -> u32 {
+    8
+}
+fn default_review_window_bytes() -> usize {
+    24 * 1024
+}
+fn default_live_max_reviews() -> u32 {
+    20
+}
+fn default_backfill_per_night() -> u32 {
+    10
+}
+fn default_backfill_max_new_per_night() -> u32 {
+    5
 }
 fn default_true_bool() -> bool {
     true

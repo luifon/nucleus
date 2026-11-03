@@ -1,6 +1,9 @@
 # ADR-017 — Skill-gap learner
 
-**Status:** Accepted (2026-05-24) — Implemented (2026-05-24)
+**Status:** Accepted (2026-05-24) — Implemented (2026-05-24). Arm 1 (the
+on-the-fly review) superseded by [[ADR-038]] (2026-11-03): a nightly
+transcript sweep files skill suggestions for the operator instead. Arm 2
+(gap detection + curator) is unchanged.
 
 **Builds on:**
 - [[ADR-008]] — skills are procedural memory in SKILL.md; this adds an agent
@@ -30,7 +33,7 @@ an in-process fork. Hermes' two prompts (`SKILL_REVIEW_PROMPT`,
 
 A `chores/skill-gap-learner` crate with two arms sharing one review engine.
 
-### Arm 1 — on-the-fly (the runtime behavior)
+### Arm 1 — on-the-fly (the runtime behavior) — superseded by ADR-038
 
 A capability (`skill_review`) on the conversational agents (discord, whatsapp,
 chat). `SessionPool` counts asks per `chat_key`; crossing
@@ -71,9 +74,9 @@ just by prompt.
 ### Shared infrastructure
 
 - `nucleus_core::skills` — discovery, strict→lenient frontmatter parse,
-  `validate()`, and `fire_skill_review()`. Shared with the dashboard `/skills`
+  `validate()`, and `fire_skill_review()` (removed by ADR-038). Shared with the dashboard `/skills`
   handler so both read skills identically.
-- `[skill_learner]` config: `nudge_interval` (12), `cron`, `stale_after_days`
+- `[skill_learner]` config: `nudge_interval` (12, removed by ADR-038), `cron`, `stale_after_days`
   (30), `archive_after_days` (90), `enabled` — all serde-defaulted.
 - Frontmatter-based staleness (`created_by`, `pinned`, `last_used`),
   markdown-canonical — no `.usage.json` sidecar (ADR-004 footgun).
@@ -90,8 +93,9 @@ just by prompt.
 
 - Persona auto-evolution (ADR-004's "SOUL slot") as reviewable suggestions —
   the learner is the right home; not built yet.
-- Tool-iteration-aware nudging (count tool_use events in the transcript span,
-  closer to Hermes) instead of a flat turn counter.
+- Tool-iteration-aware nudging — done differently by ADR-038: the pre-filter
+  counts tool calls, failed calls retried successfully and corrections in
+  each transcript part.
 - Usage counters / pinning surfaced + editable from `/agents` or `/skills`.
 
 ## Out of scope

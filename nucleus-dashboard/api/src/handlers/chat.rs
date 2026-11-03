@@ -374,16 +374,6 @@ async fn run_turn(s: Arc<ChatState>, chat: ChatRow, message: String, mut guard: 
         }
     };
 
-    // On-the-fly skill review (ADR-017) — detached, fire-and-forget.
-    if ask_result.review_due {
-        nucleus_core::skills::fire_skill_review(
-            &s.workspace_root,
-            "chat",
-            &id,
-            &ask_result.transcript_path,
-        );
-    }
-
     if let Some(titling) = titling {
         spawn_title(s.clone(), titling, message.clone(), ask_result.reply.clone());
     }

@@ -5,7 +5,7 @@
 //!
 //! - `daily_sessions` — one claude session per local day per key. A
 //!   high-frequency or multi-pass job (the */30 heartbeat, the distiller's
-//!   metabolism + contemplation, the skill-gap-learner's review + learn arms)
+//!   metabolism + contemplation, the skill-gap-learner's writing passes)
 //!   resumes the day's session instead of spawning a fresh transcript every
 //!   time. Wired through [`crate::session_profile::SessionProfile::daily_session`].
 //! - `watermarks` — the last point a job processed, so a run that failed

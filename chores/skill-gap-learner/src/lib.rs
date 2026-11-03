@@ -1,38 +1,57 @@
-//! skill-gap-learner — the all-facets successor to preference-learner (ADR-017).
+//! skill-gap-learner — the all-facets successor to preference-learner
+//! (ADR-017, ADR-038).
 //!
-//! Two arms, one review engine, ported from Hermes' skill-review + curator:
-//!   review  — on-the-fly: read ONE conversation transcript, autonomously
-//!             create/patch skills it warrants. Fired detached by the
-//!             conversational agents every N turns.
-//!   learn   — periodic (launchd-cron): propose skills for recurring patterns
-//!             across all diaries, then curate (stale/archive + consolidate).
-//!             The diary window stretches back over missed runs (ADR-029
-//!             watermark).
+//! One nightly run (`learn`, launchd-cron) with these steps, in order:
+//!   1. live sweep — review the parts of this workspace's session
+//!      transcripts written since the last run (ADR-038). Files skill
+//!      suggestions for the operator, or writes skills directly when
+//!      `[skill_learner] live_mode = "write"`.
+//!   2. backfill — the same review over old transcripts and over sessions
+//!      whose transcript only survives in the session index, a limited
+//!      batch per night. Always files suggestions.
+//!   3. auto-transitions, gap detection over the agent diaries, and the
+//!      curator (ADR-017's periodic arm). The diary window stretches back
+//!      over missed runs (ADR-029 watermark).
 //!
-//! All arms run in one claude session per local day (ADR-029 daily session,
-//! key `skill-gap-learner`).
+//! `sweep` and `backfill` run steps 1 and 2 alone, with `--limit` and
+//! `--dry-run` for a manual check.
 //!
-//! Autonomous writes go to `<workspace>/.nucleus/.claude/skills/` only
+//! Skills are written only to `<workspace>/.nucleus/.claude/skills/`
 //! (`skills::personal_skills_root` — operator-personal, gitignored, Rule 1);
-//! never to the repo's committed `.claude/skills/`. Every touched SKILL.md is
-//! run through `nucleus_core::skills::validate`; a malformed write is
-//! quarantined to `.rejected/` (inside the personal root) instead of polluting
-//! the live library.
+//! never to the repo's committed `.claude/skills/`. Every SKILL.md a session
+//! touched is run through `nucleus_core::skills::validate`; a malformed write
+//! is quarantined to `.rejected/` (inside the personal root) instead of
+//! polluting the live library. Suggestions are checked by the same
+//! validator before they are stored and again when the operator accepts one
+//! (`nucleus skills suggestions`).
 
-use anyhow::{Context, Result};
+mod parts;
+mod prefilter;
+mod review;
+mod source;
+mod sweep;
+
+use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use nucleus_core::{
     chore_state,
-    claude_session::{last_n_turns, TurnRole},
-    config::Settings,
-    diary, skills,
+    claude_session::{AskOptions, Session},
+    config::{LiveMode, Settings},
+    diary, skill_learner,
     session_profile::{ProfileContext, SessionProfile},
+    skills,
 };
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 const AGENT_NAME: &str = "skill-gap-learner";
 const TMUX_SESSION: &str = "nucleus-skill-gap-learner";
+/// Held for the whole run, so two runs never review the same session or
+/// kill each other's tmux session.
+const LOCK_PATH: &str = "memory/skill-gap-learner.lock";
+/// Ceiling for one review answer: a review drafts whole SKILL.md files.
+const REVIEW_MAX_WAIT: Duration = Duration::from_secs(300);
 
 /// Watermark key for the periodic arm: the local date of the last `learn`
 /// that completed (ADR-029). The gap pass reads at least
@@ -42,7 +61,7 @@ const LEARN_WATERMARK_KEY: &str = "skill-gap-learner.learn";
 const GAP_WINDOW_DAYS: i64 = 7;
 
 #[derive(Parser)]
-#[command(name = "skill-gap-learner", about = "Nucleus skill-gap learner (ADR-017)")]
+#[command(name = "skill-gap-learner", about = "Nucleus skill-gap learner (ADR-017, ADR-038)")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -50,20 +69,52 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// On-the-fly: review one conversation transcript and update skills.
-    Review {
-        /// Path to the Claude transcript JSONL to review.
-        #[arg(long)]
-        transcript: PathBuf,
-        /// Conversational venue the transcript came from (discord|chat|whatsapp).
-        #[arg(long)]
-        venue: String,
-        /// Chat key (for the diary context line). Optional.
-        #[arg(long)]
-        chat_key: Option<String>,
-    },
-    /// Periodic: propose missing skills across diaries, then curate. (default)
+    /// The nightly run: live sweep, backfill batch, then gap detection and
+    /// curation. (default)
     Learn,
+    /// Review the session parts written since the last sweep.
+    Sweep {
+        /// Most review sessions (default: `[skill_learner] live_max_reviews`).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Show which parts would be reviewed; review and record nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Review one batch of old sessions (always files suggestions).
+    Backfill {
+        /// Most review sessions (default: `[skill_learner] backfill_per_night`).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Show which parts would be reviewed; review and record nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// The run lock (`flock` on [`LOCK_PATH`], released when the process ends).
+struct RunLock {
+    _file: std::fs::File,
+}
+
+fn take_lock(workspace_root: &Path) -> Result<RunLock> {
+    let path = workspace_root.join(LOCK_PATH);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(RunLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!("another skill-gap-learner run holds {}", path.display())
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(e).with_context(|| format!("locking {}", path.display())),
+    }
 }
 
 /// Entry point for this subcommand of the `nucleus` binary. `args` is the
@@ -74,66 +125,187 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     let settings = Settings::load().context("loading settings")?;
     let workspace_root = settings.workspace_root()?;
     let cli = Cli::parse_from(args);
+    let command = cli.command.unwrap_or(Cmd::Learn);
+    let dry_run = matches!(command, Cmd::Sweep { dry_run: true, .. } | Cmd::Backfill { dry_run: true, .. });
 
-    // A stale tmux session left from a prior crash blocks `new-window`.
-    let _ = tokio::process::Command::new("tmux")
-        .args(["kill-session", "-t", TMUX_SESSION])
-        .output()
-        .await;
+    let _lock = if dry_run { None } else { Some(take_lock(&workspace_root)?) };
+    if !dry_run {
+        // A stale tmux session left from a prior crash blocks `new-window`.
+        let _ = tokio::process::Command::new("tmux")
+            .args(["kill-session", "-t", TMUX_SESSION])
+            .output()
+            .await;
+    }
 
-    match cli.command.unwrap_or(Cmd::Learn) {
-        Cmd::Review { transcript, venue, chat_key } => {
-            review(&workspace_root, &settings, &transcript, &venue, chat_key.as_deref()).await
-        }
+    match command {
         Cmd::Learn => learn(&workspace_root, &settings).await,
+        Cmd::Sweep { limit, dry_run } => {
+            let cfg = &settings.skill_learner;
+            let opts = sweep::PassOptions {
+                limit: limit.unwrap_or(cfg.live_max_reviews),
+                dry_run,
+                write_mode: cfg.live_mode == LiveMode::Write,
+            };
+            let report = run_one_pass(&workspace_root, &settings, sweep::Pass::Live, opts).await?;
+            print_report(&report);
+            report_result(&report)
+        }
+        Cmd::Backfill { limit, dry_run } => {
+            let cfg = &settings.skill_learner;
+            let opts = sweep::PassOptions {
+                limit: limit.unwrap_or(cfg.backfill_per_night),
+                dry_run,
+                write_mode: false,
+            };
+            let report = run_one_pass(&workspace_root, &settings, sweep::Pass::Backfill, opts).await?;
+            print_report(&report);
+            report_result(&report)
+        }
     }
 }
 
-/// On-the-fly review of a single conversation (the Hermes skill-review arm).
-async fn review(
+fn print_report(r: &sweep::PassReport) {
+    for l in &r.lines {
+        println!("{l}");
+    }
+    println!("{}", r.summary());
+}
+
+fn report_result(r: &sweep::PassReport) -> Result<()> {
+    match &r.error {
+        Some(e) => bail!("{} pass stopped: {e}", r.pass),
+        None => Ok(()),
+    }
+}
+
+/// The production [`review::Backend`]: Claude sessions in the learner's
+/// tmux session.
+struct ClaudeBackend<'a> {
+    workspace_root: &'a Path,
+    settings: &'a Settings,
+}
+
+struct ClaudeReview {
+    session: Option<Session>,
+    ask: AskOptions,
+}
+
+#[async_trait]
+impl review::ReviewSession for ClaudeReview {
+    async fn ask(&mut self, prompt: &str) -> Result<String> {
+        let session = self.session.as_mut().context("the review session is closed")?;
+        session.ask(prompt, self.ask.clone()).await
+    }
+
+    fn session_id(&self) -> Option<String> {
+        self.session.as_ref().map(|s| s.session_id().to_string())
+    }
+
+    async fn close(mut self: Box<Self>) {
+        if let Some(s) = self.session.take() {
+            let _ = s.close().await;
+        }
+    }
+}
+
+#[async_trait]
+impl review::Backend for ClaudeBackend<'_> {
+    /// A fresh no-tools session per review, not the day's session (ADR-029):
+    /// each review prompt is self-contained and up to ~60 KB, so resuming
+    /// one session would carry every earlier review into the next and end
+    /// in auto-compaction. Each review session is labelled with this agent
+    /// and recorded in the ledger as the learner's own, so no sweep reviews
+    /// it.
+    async fn open(&self, window: &str) -> Result<Box<dyn review::ReviewSession>> {
+        let (session, ask) = SessionProfile::one_shot_no_tools(&ProfileContext {
+            workspace_root: self.workspace_root,
+            claude: &self.settings.claude,
+            tmux_session: TMUX_SESSION,
+            agent_label: AGENT_NAME,
+        })
+        .window_name(window)
+        .max_wait(REVIEW_MAX_WAIT)
+        .spawn()
+        .await?;
+        Ok(Box::new(ClaudeReview { session: Some(session), ask }))
+    }
+
+    async fn write_review(&self, window: &str, prompt: &str) -> Result<String> {
+        let (reply, gate) = run_skill_session(self.workspace_root, self.settings, window, prompt).await?;
+        Ok(if gate.is_empty() {
+            truncate(&reply, 240)
+        } else {
+            format!("{} (gate: {})", truncate(&reply, 240), gate.names().join(", "))
+        })
+    }
+}
+
+/// Run one pass with the production backend.
+async fn run_one_pass(
     workspace_root: &Path,
     settings: &Settings,
-    transcript: &Path,
-    venue: &str,
-    chat_key: Option<&str>,
-) -> Result<()> {
+    pass: sweep::Pass,
+    opts: sweep::PassOptions,
+) -> Result<sweep::PassReport> {
+    let pool = skill_learner::open(workspace_root).await?;
+    let index = nucleus_core::session_index::open_read_only(workspace_root).await?;
+    let roots = skills::LibraryRoots::for_workspace(workspace_root);
     let operator_root = skills::personal_skills_root(workspace_root);
     let repo_root = skills::repo_skills_root(workspace_root);
+    let summary = move || library_summary(&operator_root, &repo_root, skills::global_skills_root().as_deref());
+    let env = sweep::Env {
+        ws: workspace_root,
+        cfg: &settings.skill_learner,
+        roots: &roots,
+        pool: &pool,
+        index: index.as_ref(),
+        transcripts_dir: nucleus_core::session_index::transcripts_dir(workspace_root),
+        library_summary: &summary,
+        now: chrono::Utc::now().timestamp(),
+    };
+    let backend = ClaudeBackend { workspace_root, settings };
+    sweep::run_pass(&env, pass, opts, &backend).await
+}
 
-    // Extract the recent conversation (clean user/assistant text — corrections,
-    // frustration, techniques described). Bail cheaply if there's nothing to
-    // review (a single-turn exchange rarely warrants a skill).
-    let turns = last_n_turns(transcript, 50);
-    if turns.len() < 3 {
-        tracing::info!("review[{venue}]: transcript too short ({} turns) — skipping", turns.len());
-        return Ok(());
+/// Steps 1 and 2 of the nightly run. Each pass's summary goes to the diary;
+/// an error is returned after both had their chance.
+async fn nightly_sweep(workspace_root: &Path, settings: &Settings) -> (Vec<String>, Option<String>) {
+    let cfg = &settings.skill_learner;
+    if !cfg.enabled {
+        return (vec!["sweep disabled ([skill_learner] enabled = false)".into()], None);
     }
-    let conversation = render_conversation(&turns);
-
-    // Library summary so the reviewer can decide patch-vs-create.
-    let library = library_summary(&operator_root, &repo_root, skills::global_skills_root().as_deref());
-
-    let prompt = build_review_prompt(&operator_root, &library, venue, &conversation);
-    let (reply, quarantined) =
-        run_skill_session(workspace_root, settings, &format!("review-{venue}"), &prompt).await?;
-
-    let summary = if quarantined.is_empty() {
-        format!("reviewed {venue} ({} turns): {}", turns.len(), truncate(&reply, 240))
-    } else {
-        format!(
-            "reviewed {venue}: gate quarantined [{}] flagged [{}] committed-tree writes [{}]",
-            quarantined.quarantined.join(", "),
-            quarantined.flagged.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "),
-            quarantined.repo_writes.join(", ")
-        )
-    };
-    let ctx = match chat_key {
-        Some(k) => format!("review:{venue}:{k}"),
-        None => format!("review:{venue}"),
-    };
-    let _ = diary::record_observation(workspace_root, AGENT_NAME, &ctx, &summary, diary::Tag::Observation);
-    tracing::info!("review[{venue}]: {summary}");
-    Ok(())
+    let mut lines = Vec::new();
+    let mut error = None;
+    let passes = [
+        (
+            sweep::Pass::Live,
+            sweep::PassOptions { limit: cfg.live_max_reviews, dry_run: false, write_mode: cfg.live_mode == LiveMode::Write },
+        ),
+        (sweep::Pass::Backfill, sweep::PassOptions { limit: cfg.backfill_per_night, dry_run: false, write_mode: false }),
+    ];
+    for (pass, opts) in passes {
+        match run_one_pass(workspace_root, settings, pass, opts).await {
+            Ok(r) => {
+                tracing::info!("learn: {}", r.summary());
+                if r.error.is_some() && error.is_none() {
+                    error = r.error.clone();
+                }
+                lines.push(r.summary());
+                if r.error.is_some() {
+                    // The reviewer is unreachable (usage limit, spawn
+                    // failure): the next pass would fail the same way.
+                    break;
+                }
+            }
+            Err(e) => {
+                let msg = format!("{} pass failed: {e:#}", pass.as_str());
+                tracing::warn!("learn: {msg}");
+                lines.push(msg.clone());
+                error.get_or_insert(msg);
+            }
+        }
+    }
+    (lines, error)
 }
 
 #[derive(Default)]
@@ -360,21 +532,6 @@ async fn alert_gate(outcome: &GateOutcome) {
     }
 }
 
-fn render_conversation(turns: &[nucleus_core::claude_session::Turn]) -> String {
-    let mut out = String::new();
-    for t in turns {
-        let label = match t.role {
-            TurnRole::User => "USER",
-            TurnRole::Assistant => "ASSISTANT",
-        };
-        out.push_str(label);
-        out.push_str(": ");
-        out.push_str(t.text.trim());
-        out.push_str("\n\n");
-    }
-    out
-}
-
 fn render_library(lib: &[skills::Skill]) -> String {
     if lib.is_empty() {
         return "(the skill library is currently empty)".into();
@@ -418,72 +575,9 @@ fn truncate(s: &str, max: usize) -> String {
     t
 }
 
-/// The ported Hermes SKILL_REVIEW_PROMPT, adapted for Nucleus: writes go to
-/// the operator-personal tree via the session's own file tools; the SKILL.md
-/// contract (frontmatter + the required `# Failure modes` section, Rule 11)
-/// is spelled out so direct writes match what skill-creator would scaffold.
-fn build_review_prompt(operator_root: &Path, library: &str, venue: &str, conversation: &str) -> String {
-    let dir = operator_root.display();
-    format!(
-        r#"You are Nucleus' background skill reviewer. Review the {venue} conversation below and update the skill library. Be ACTIVE — most sessions that contain a correction or a non-trivial technique should produce at least one skill update. A pass that does nothing when a signal fired is a missed learning opportunity. But "Nothing to save." is a real and correct answer for a smooth, unremarkable exchange — say it and stop.
-
-Target shape: CLASS-LEVEL skills, each a rich SKILL.md, not a flat list of one-session-one-skill entries.
-
-Signals to look for (any one warrants action):
-  • The user corrected your style, tone, format, verbosity, or legibility — "stop doing X", "too verbose", "just give me the answer", "you always do Y and I hate it", or an explicit "remember this". Embed the preference in the relevant skill so the next session starts knowing it.
-  • The user corrected your workflow, approach, or sequence of steps. Encode it as a pitfall or explicit step.
-  • A non-trivial technique, fix, workaround, debugging path, or tool-usage pattern emerged that a future session would benefit from.
-  • A skill that was loaded/consulted this session turned out wrong, missing a step, or outdated. Patch it NOW.
-
-Preference order — pick the earliest that fits when a signal fired:
-  1. PATCH a skill that was loaded/consulted this session (the one in play).
-  2. PATCH an existing class-level skill that covers the territory (add a subsection, pitfall, or broaden a trigger).
-  3. ADD a support file under an existing skill: references/<topic>.md (session detail, quirks), templates/<name>.<ext> (copy-and-modify starters), or scripts/<name>.<ext> (re-runnable actions). Add a one-line pointer in the SKILL.md.
-  4. CREATE a new class-level skill ONLY when no existing skill covers the class. The name MUST be class-level — never a PR number, error string, codename, or "fix-X-today" artifact.
-
-Do NOT capture (these harden into self-imposed constraints that bite later):
-  • Environment-dependent failures (missing binary, "command not found", unconfigured credential, post-migration path). The operator fixes these — capture the FIX under a setup skill if anything, never "X doesn't work".
-  • Negative claims about tools ("browser tools don't work", "Y is broken"). They become refusals the bot cites for months.
-  • Transient errors that resolved before the conversation ended (capture the retry pattern, not the original failure).
-  • One-off task narratives.
-
-HOW TO WRITE (this is Nucleus, not Hermes — there is no skill_manage tool):
-  • Write skills with your own Read/Write/Edit file tools, under {dir}/<skill-name>/SKILL.md (the gitignored operator-personal tree ONLY — never the repo's committed .claude/skills at the workspace root).
-  • Every CREATED skill's SKILL.md MUST have this exact shape or it will be rejected by the validator:
-      ---
-      name: <kebab-case-class-level-name>
-      description: <one line — what class of task + when>
-      flavor: learned
-      created_by: agent
-      last_used: {today}
-      ---
-
-      # When to invoke
-      <natural-language triggers>
-
-      # Steps
-      <ordered procedure>
-
-      # Failure modes
-      <what goes wrong + how to recover — REQUIRED, never empty>
-  • When you PATCH an existing skill, bump its `last_used: {today}` and keep the required sections intact.
-  • Never write a secret, token, phone number, email, or personal identifier into a skill body.
-
-Current skill library:
-{library}
-
-Conversation to review ({venue}):
----
-{conversation}
----
-
-Do the work now, then reply with a ONE-LINE summary of what you changed (e.g. "patched git-rebase-recovery: added the detached-HEAD pitfall") or exactly "Nothing to save."."#,
-        today = chrono::Local::now().format("%Y-%m-%d"),
-    )
-}
-
 /// Spawn a one-shot skill-writing session, run the prompt, then run the
-/// validation gate over anything it touched. Shared by review / gap / curate.
+/// validation gate over anything it touched. Shared by the write-mode
+/// review, the gap pass and the curator.
 /// Returns (reply, quarantined skill names).
 ///
 /// ADR-020: goes through `SessionProfile::one_shot_agentic`, which fixes two
@@ -503,9 +597,12 @@ async fn run_skill_session(
     // `--add-dir` (which is what makes the written skills load).
     std::fs::create_dir_all(operator_root)
         .with_context(|| format!("creating {}", operator_root.display()))?;
+    // ADR-038: no suggestion accept writes the library while this session
+    // may (an accept holds the lock for milliseconds; wait it out).
+    let _library = skill_learner::library_lock(workspace_root, Duration::from_secs(120)).await?;
     let started = SystemTime::now();
-    // ADR-029: every arm — each on-the-fly review, the gap pass, the
-    // curator — resumes one session per local day.
+    // ADR-029: every writing pass — each write-mode review, the gap pass,
+    // the curator — resumes one session per local day.
     let outcome = SessionProfile::one_shot_agentic(&ProfileContext {
         workspace_root,
         claude: &settings.claude,
@@ -527,15 +624,27 @@ async fn run_skill_session(
     Ok((outcome.reply, gate))
 }
 
-// ── periodic arm: gap detection + curator ──────────────────────────────────
+// ── nightly run: sweep, backfill, gap detection, curator ───────────────────
 
-/// The periodic pass (launchd-cron). Pure auto-archive of stale agent-created
-/// skills, then an LLM gap-detection pass over recent diaries, then an LLM
-/// curator/consolidation pass. Mirrors the distiller's two-phase shape.
+/// The nightly run (launchd-cron). The live sweep and a backfill batch
+/// (ADR-038), then the ADR-017 periodic arm: pure auto-archive of stale
+/// agent-created skills, an LLM gap-detection pass over recent diaries, and
+/// an LLM curator/consolidation pass. A sweep that fails does not stop the
+/// periodic arm; the run reports the failure at the end.
 async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
     let operator_root = skills::personal_skills_root(workspace_root);
     let repo_root = skills::repo_skills_root(workspace_root);
     let cfg = &settings.skill_learner;
+
+    // 0. Transcript sweep + backfill (ADR-038).
+    let (sweep_lines, sweep_error) = nightly_sweep(workspace_root, settings).await;
+    let _ = diary::record_observation(
+        workspace_root,
+        AGENT_NAME,
+        "sweep",
+        &sweep_lines.join("\n"),
+        diary::Tag::Observation,
+    );
 
     // 1. Pure auto-transitions (no LLM): archive agent-created, unpinned skills
     // idle past archive_after_days; count the merely-stale for the log.
@@ -603,7 +712,10 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
     if let Some(yesterday) = today.pred_opt() {
         chore_state::set_watermark(workspace_root, LEARN_WATERMARK_KEY, &yesterday.to_string()).await?;
     }
-    Ok(())
+    match sweep_error {
+        Some(e) => bail!("transcript sweep: {e}"),
+        None => Ok(()),
+    }
 }
 
 /// Archive agent-created, unpinned skills whose last activity is older than
@@ -749,9 +861,35 @@ Create the missing skills now, then reply with ONE line per skill created, or ex
 /// agent-created skills; consolidation happens via file tools; archive =
 /// move the dir into `.archive/` (never delete); pinned + hand-written
 /// (created_by != agent) skills are off-limits.
+fn build_curate_prompt(operator_root: &Path, library: &str) -> String {
+    let dir = operator_root.display();
+    format!(
+        r#"You are Nucleus' background skill CURATOR. This is an UMBRELLA-BUILDING consolidation pass, not a passive audit and not a duplicate-finder. The goal is a LIBRARY OF CLASS-LEVEL skills — one broad umbrella with labeled subsections beats five narrow siblings for discoverability (an agent matches skills on description, not exact name).
+
+Hard rules — do not violate:
+  1. Only work inside {dir} (the gitignored operator-personal tree). NEVER write to or move anything in the repo's committed .claude/skills at the workspace root.
+  2. Only touch skills with `created_by: agent` in their frontmatter. NEVER touch hand-written skills (no created_by, or created_by != agent) or anything marked `pinned: true`.
+  3. NEVER delete a skill. The maximum action is ARCHIVING — move its directory into {dir}/.archive/ (recoverable). Use your terminal/file tools: `mv {dir}/<name> {dir}/.archive/<name>`.
+  4. Do not use age/recency as a reason to skip consolidation — judge overlap on CONTENT.
+  5. "Each has a distinct trigger" is NOT a reason to keep them separate. The bar is: would a maintainer write these as N skills, or one skill with N labeled subsections? If the latter, merge.
+
+How to work:
+  1. Identify clusters of agent-created skills sharing a domain/first word.
+  2. For each cluster of 2+: pick or create the umbrella (a class-level SKILL.md), patch it to add a labeled subsection (or a references/<topic>.md support file) for each sibling's unique content, then ARCHIVE the absorbed siblings.
+  3. Keep the SKILL.md contract intact on anything you write (frontmatter incl. flavor: learned + created_by: agent + the # When to invoke / # Steps / # Failure modes sections). Bump last_used: {today} on skills you patch.
+
+Current skill library (only act on created_by: agent entries):
+{library}
+
+Do the consolidation now via your file tools, then reply with a short summary: which umbrellas you built and which siblings you archived into them. If nothing needs consolidating, reply exactly "Library is already well-shaped."."#,
+        today = chrono::Local::now().format("%Y-%m-%d"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn write_skill(root: &Path, name: &str, frontmatter: &str, backdate: bool) {
         let dir = root.join(name);
@@ -900,8 +1038,19 @@ mod tests {
         let root = skills::personal_skills_root(Path::new("/ws"));
         let dir = root.display().to_string();
         assert_eq!(dir, "/ws/.nucleus/.claude/skills");
+        let part = parts::Part { from: 0, to: 1, text_turns: 1, text: "USER: conv".into(), signals: prefilter::Signals::default() };
+        let subject = review::Subject {
+            session_id: "s",
+            source: nucleus_core::skill_learner::ledger::Source::Transcript,
+            agent: None,
+            part: &part,
+            part_number: 1,
+            part_count: 1,
+            opening: None,
+            reason: "test",
+        };
         let prompts = [
-            build_review_prompt(&root, "lib", "discord", "conv"),
+            review::build_write_prompt(&root, "lib", &subject),
             build_gap_prompt(&root, "lib", "diaries"),
             build_curate_prompt(&root, "lib"),
         ];
@@ -912,29 +1061,4 @@ mod tests {
         }
         assert!(prompts[2].contains(&format!("{dir}/.archive/")), "curator archives inside the personal root");
     }
-}
-
-fn build_curate_prompt(operator_root: &Path, library: &str) -> String {
-    let dir = operator_root.display();
-    format!(
-        r#"You are Nucleus' background skill CURATOR. This is an UMBRELLA-BUILDING consolidation pass, not a passive audit and not a duplicate-finder. The goal is a LIBRARY OF CLASS-LEVEL skills — one broad umbrella with labeled subsections beats five narrow siblings for discoverability (an agent matches skills on description, not exact name).
-
-Hard rules — do not violate:
-  1. Only work inside {dir} (the gitignored operator-personal tree). NEVER write to or move anything in the repo's committed .claude/skills at the workspace root.
-  2. Only touch skills with `created_by: agent` in their frontmatter. NEVER touch hand-written skills (no created_by, or created_by != agent) or anything marked `pinned: true`.
-  3. NEVER delete a skill. The maximum action is ARCHIVING — move its directory into {dir}/.archive/ (recoverable). Use your terminal/file tools: `mv {dir}/<name> {dir}/.archive/<name>`.
-  4. Do not use age/recency as a reason to skip consolidation — judge overlap on CONTENT.
-  5. "Each has a distinct trigger" is NOT a reason to keep them separate. The bar is: would a maintainer write these as N skills, or one skill with N labeled subsections? If the latter, merge.
-
-How to work:
-  1. Identify clusters of agent-created skills sharing a domain/first word.
-  2. For each cluster of 2+: pick or create the umbrella (a class-level SKILL.md), patch it to add a labeled subsection (or a references/<topic>.md support file) for each sibling's unique content, then ARCHIVE the absorbed siblings.
-  3. Keep the SKILL.md contract intact on anything you write (frontmatter incl. flavor: learned + created_by: agent + the # When to invoke / # Steps / # Failure modes sections). Bump last_used: {today} on skills you patch.
-
-Current skill library (only act on created_by: agent entries):
-{library}
-
-Do the consolidation now via your file tools, then reply with a short summary: which umbrellas you built and which siblings you archived into them. If nothing needs consolidating, reply exactly "Library is already well-shaped."."#,
-        today = chrono::Local::now().format("%Y-%m-%d"),
-    )
 }

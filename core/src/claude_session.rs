@@ -886,10 +886,6 @@ pub struct PoolConfig {
     /// Registry agent name for the run-log (ADR-016); threaded into every
     /// session this pool spawns. `None` = no run-log.
     pub agent_label: Option<String>,
-    /// On-the-fly skill review (ADR-017): after this many `ask`s on a given
-    /// chat_key, the next `AskResult.review_due` is true. 0 = disabled (the
-    /// default; only the conversational pools enable it).
-    pub review_nudge_interval: u32,
 }
 
 impl Default for PoolConfig {
@@ -904,7 +900,6 @@ impl Default for PoolConfig {
             tmux_session: "nucleus".into(),
             idle_timeout: Duration::from_secs(60 * 60 * 4), // 4h
             agent_label: None,
-            review_nudge_interval: 0,
         }
     }
 }
@@ -932,8 +927,6 @@ struct Slot {
     /// flight, failed, or the window died and a respawn-in-place is pending.
     session: Option<Session>,
     last_active: Instant,
-    /// Asks on this chat_key since the last on-the-fly review (ADR-017).
-    turns_since_review: u32,
 }
 
 /// Result of a `SessionPool::ask` call.
@@ -943,12 +936,6 @@ pub struct AskResult {
     pub elapsed: Duration,
     /// True if a fresh session was spawned for this call.
     pub was_cold_spawn: bool,
-    /// Absolute path to this session's transcript JSONL (ADR-016/017) — the
-    /// on-the-fly skill reviewer reads it.
-    pub transcript_path: String,
-    /// True when this ask crossed `review_nudge_interval` for the chat_key:
-    /// the caller should fire a detached `skill-gap-learner review` (ADR-017).
-    pub review_due: bool,
 }
 
 impl SessionPool {
@@ -974,7 +961,6 @@ impl SessionPool {
                         Arc::new(Mutex::new(Slot {
                             session: None,
                             last_active: Instant::now(),
-                            turns_since_review: 0,
                         }))
                     })
                     .clone()
@@ -1073,27 +1059,13 @@ impl SessionPool {
         let session = guard.session.as_mut().expect("session ensured above");
         let reply = session.ask(message, ask_opts).await?;
         let session_id = session.session_id().to_string();
-        let transcript_path = session.transcript_path().to_string_lossy().into_owned();
         guard.last_active = Instant::now();
-
-        // On-the-fly skill-review nudge (ADR-017): count asks per chat_key; when
-        // we cross the interval, flag the caller to fire a detached reviewer.
-        let mut review_due = false;
-        if self.config.review_nudge_interval > 0 {
-            guard.turns_since_review += 1;
-            if guard.turns_since_review >= self.config.review_nudge_interval {
-                review_due = true;
-                guard.turns_since_review = 0;
-            }
-        }
 
         Ok(AskResult {
             reply,
             session_id,
             elapsed: t0.elapsed(),
             was_cold_spawn: was_cold,
-            transcript_path,
-            review_due,
         })
     }
 
@@ -2827,63 +2799,161 @@ pub struct Turn {
 /// Returns turns in chronological order — oldest first, newest last.
 /// Returns an empty Vec if the transcript file is missing or unreadable;
 /// callers should treat that as "nothing to replay" rather than an error.
+///
+/// The text turns of [`transcript_events`]: one parser for both.
 pub fn last_n_turns(transcript_path: &Path, n: usize) -> Vec<Turn> {
-    use std::io::BufRead;
-    let file = match std::fs::File::open(transcript_path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
+    let Ok(read) = transcript_events(transcript_path, 0) else {
+        return Vec::new();
     };
-    let reader = std::io::BufReader::new(file);
-    let mut turns: Vec<Turn> = Vec::new();
-    for line in reader.lines().map_while(|r| r.ok()) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let kind = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
-        let role = match kind {
-            "user" => TurnRole::User,
-            "assistant" => TurnRole::Assistant,
-            _ => continue,
-        };
-        let Some(content) = v.get("message").and_then(|m| m.get("content")) else {
-            continue;
-        };
-        let mut text_parts: Vec<&str> = Vec::new();
-        if let Some(s) = content.as_str() {
-            text_parts.push(s);
-        } else if let Some(arr) = content.as_array() {
-            for item in arr {
-                if item.get("type").and_then(|s| s.as_str()) != Some("text") {
-                    continue;
-                }
-                if let Some(t) = item.get("text").and_then(|s| s.as_str()) {
-                    text_parts.push(t);
-                }
-            }
-        }
-        if text_parts.is_empty() {
-            continue;
-        }
-        let mut text = text_parts.join("\n");
-        if matches!(role, TurnRole::User) && is_system_injected_user_turn(&text) {
-            continue;
-        }
-        text = strip_date_preamble(&text).trim().to_string();
-        if text.is_empty() {
-            continue;
-        }
-        turns.push(Turn { role, text });
-    }
+    let mut turns: Vec<Turn> = read
+        .events
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            TranscriptEventKind::Text { role, text, .. } => Some(Turn { role, text }),
+            _ => None,
+        })
+        .collect();
     if turns.len() > n {
         let drop = turns.len() - n;
         turns.drain(..drop);
     }
     turns
+}
+
+/// One conversational event of a transcript, with the 0-based line it came
+/// from. See [`transcript_events`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptEvent {
+    pub line: usize,
+    pub kind: TranscriptEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranscriptEventKind {
+    /// The text blocks of one user or assistant message, joined with `\n`,
+    /// date preamble stripped and trimmed. System-injected user turns
+    /// (`<system-reminder>` and the like) are left out. `meta` is true for a
+    /// user message Claude Code wrote itself rather than the operator: a
+    /// loaded skill's body (`isMeta`) or a compaction summary
+    /// (`isCompactSummary`).
+    Text { role: TurnRole, text: String, meta: bool },
+    /// An assistant `tool_use` block.
+    ToolUse { id: String, name: String, input: serde_json::Value },
+    /// A user `tool_result` block. `text` is the result's text content.
+    ToolResult { tool_use_id: String, is_error: bool, text: String },
+}
+
+/// What [`transcript_events`] read.
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptRead {
+    pub events: Vec<TranscriptEvent>,
+    /// Number of complete lines in the file: newline-terminated lines, plus
+    /// a final unterminated line that is a whole JSON record. A partial last
+    /// line, still being written, is not counted and not parsed; the next
+    /// read from this position picks it up once it is complete.
+    pub complete_lines: usize,
+}
+
+/// Every conversational event of a transcript JSONL from line `from_line`
+/// (0-based) on: user and assistant text, tool calls and tool results.
+/// Lines that are not JSON, not a user/assistant record, or carry nothing
+/// conversational are skipped. Errors only when the file cannot be opened
+/// or read.
+pub fn transcript_events(transcript_path: &Path, from_line: usize) -> std::io::Result<TranscriptRead> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(transcript_path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut out = TranscriptRead::default();
+    let mut buf = String::new();
+    let mut line_no = 0usize;
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if !buf.ends_with('\n') && serde_json::from_str::<serde_json::Value>(buf.trim()).is_err() {
+            break; // a record still being written
+        }
+        let this = line_no;
+        line_no += 1;
+        if this < from_line {
+            continue;
+        }
+        parse_transcript_line(buf.trim(), this, &mut out.events);
+    }
+    out.complete_lines = line_no;
+    Ok(out)
+}
+
+fn parse_transcript_line(line: &str, line_no: usize, out: &mut Vec<TranscriptEvent>) {
+    if line.is_empty() {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    let role = match v.get("type").and_then(|s| s.as_str()).unwrap_or("") {
+        "user" => TurnRole::User,
+        "assistant" => TurnRole::Assistant,
+        _ => return,
+    };
+    let Some(content) = v.get("message").and_then(|m| m.get("content")) else {
+        return;
+    };
+    let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+    let meta = role == TurnRole::User && (flag("isMeta") || flag("isCompactSummary"));
+    let mut text_parts: Vec<&str> = Vec::new();
+    let mut tools: Vec<TranscriptEventKind> = Vec::new();
+    if let Some(s) = content.as_str() {
+        text_parts.push(s);
+    } else if let Some(arr) = content.as_array() {
+        for item in arr {
+            match item.get("type").and_then(|s| s.as_str()) {
+                Some("text") => {
+                    if let Some(t) = item.get("text").and_then(|s| s.as_str()) {
+                        text_parts.push(t);
+                    }
+                }
+                Some("tool_use") if role == TurnRole::Assistant => tools.push(TranscriptEventKind::ToolUse {
+                    id: item.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                    name: item.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                    input: item.get("input").cloned().unwrap_or(serde_json::Value::Null),
+                }),
+                Some("tool_result") if role == TurnRole::User => tools.push(TranscriptEventKind::ToolResult {
+                    tool_use_id: item.get("tool_use_id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                    is_error: item.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false),
+                    text: tool_result_text(item.get("content")),
+                }),
+                _ => {}
+            }
+        }
+    }
+    if !text_parts.is_empty() {
+        let text = text_parts.join("\n");
+        if !(role == TurnRole::User && is_system_injected_user_turn(&text)) {
+            let text = strip_date_preamble(&text).trim().to_string();
+            if !text.is_empty() {
+                out.push(TranscriptEvent { line: line_no, kind: TranscriptEventKind::Text { role, text, meta } });
+            }
+        }
+    }
+    out.extend(tools.into_iter().map(|kind| TranscriptEvent { line: line_no, kind }));
+}
+
+/// The text of a `tool_result` block's content: a string, or the text items
+/// of an array (images and other blocks are left out).
+fn tool_result_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 /// Claude Code injects synthetic `<…>`-wrapped user turns (IDE state,
@@ -3382,6 +3452,46 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let turns = last_n_turns(&tmp, 10);
         assert!(turns.is_empty());
+    }
+
+    /// transcript_events keeps tool calls and results, flags Claude Code's
+    /// own user texts, numbers lines from 0, and does not count a record
+    /// that is still being written.
+    #[test]
+    fn transcript_events_reads_tools_meta_and_positions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"[context: today is x]\n\nfix the build"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"On it."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"make"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":[{"type":"text","text":"boom"}]}]}}"#,
+            r#"{"type":"user","isMeta":true,"message":{"content":[{"type":"text","text":"Base directory for this skill: /x/y"}]}}"#,
+            r#"{"type":"user","message":{"content":"<system-reminder>ignore</system-reminder>"}}"#,
+            r#"{"type":"file-history-snapshot"}"#,
+        ];
+        std::fs::write(&path, format!("{}\n{{\"type\":\"user\",\"mess", lines.join("\n"))).unwrap();
+        let read = transcript_events(&path, 0).unwrap();
+        assert_eq!(read.complete_lines, 6, "the partial last record is not counted");
+        let kinds: Vec<(usize, &TranscriptEventKind)> = read.events.iter().map(|e| (e.line, &e.kind)).collect();
+        assert_eq!(kinds.len(), 5, "{kinds:?}");
+        assert_eq!(kinds[0], (0, &TranscriptEventKind::Text { role: TurnRole::User, text: "fix the build".into(), meta: false }));
+        assert!(matches!(kinds[1], (1, TranscriptEventKind::Text { role: TurnRole::Assistant, .. })));
+        assert!(matches!(kinds[2], (1, TranscriptEventKind::ToolUse { name, .. }) if name == "Bash"));
+        assert_eq!(
+            kinds[3],
+            (2, &TranscriptEventKind::ToolResult { tool_use_id: "t1".into(), is_error: true, text: "boom".into() })
+        );
+        assert!(matches!(kinds[4], (3, TranscriptEventKind::Text { meta: true, .. })));
+        let later = transcript_events(&path, 2).unwrap();
+        assert_eq!(later.events.first().map(|e| e.line), Some(2));
+        assert_eq!(later.complete_lines, 6);
+        // last_n_turns is the text part of the same reader.
+        let turns = last_n_turns(&path, 10);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].text, "fix the build");
+        // A final record without a newline counts once it is whole JSON.
+        std::fs::write(&path, lines[0]).unwrap();
+        assert_eq!(transcript_events(&path, 0).unwrap().complete_lines, 1);
     }
 
     /// The compaction wait counts only a compact_boundary written after the

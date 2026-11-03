@@ -43,7 +43,7 @@ brain is your existing Claude subscription — no separate API billing.
               │  │ reminders-tick (60s)     │
    discord    │  └──────────────────────────┘
               │   (all agents declared in agents.toml — ADR-016;
-              │    skill-gap-learner also reviews on-the-fly — ADR-017)
+              │    skill-gap-learner sweeps transcripts — ADR-038)
    (Rust,     │
    serenity)  │  ┌──────────────────────────────────────────────┐
               │  │  nucleus-core (Rust lib)                     │
@@ -342,8 +342,9 @@ widget_feed_dir = "~/Library/Application Support/NotchWidget"
 cron = "0 4 * * *"          # one consolidated daily pass (ADR-016)
 
 [skill_learner]
-# ADR-017: on-the-fly review after N turns/chat + a periodic learn/curate pass.
-nudge_interval = 12
+# ADR-017/038: nightly transcript sweep (skill suggestions) + backfill batch +
+# learn/curate. Pre-filter thresholds and limits: see nucleus.toml.example.
+live_mode = "suggest"        # "write": the live sweep writes skills directly
 stale_after_days = 30
 archive_after_days = 90
 enabled = true
@@ -419,6 +420,13 @@ go free-form (`"Read today's diary, post a one-line blockers summary."`).
 
 ### Authoring
 
+The skill-gap learner reviews this workspace's sessions every night and files
+**skill suggestions** (a new skill or a full replacement of a personal one)
+instead of writing skills (ADR-038). Review them with
+`nucleus skills suggestions list|show <id>`, then `accept <id>`,
+`reject <id> --reason …` or `edit <id> --file <path>`. A session that finds a
+loaded skill wrong files a patch suggestion with `nucleus skills suggest`.
+
 The bot **should not author a skill in one shot.** The recommended flow
 (per ADR-008):
 
@@ -473,7 +481,7 @@ nucleus/
 ├── chores/
 │   ├── distiller/          one daily distillation pass (ADR-016; was hourly+weekly)
 │   ├── reminders/          ad-hoc reminders CLI + once-per-minute polling tick
-│   └── skill-gap-learner/  autonomous skill learner — on-the-fly + periodic (ADR-017)
+│   └── skill-gap-learner/  skill learner — transcript sweep, suggestions, curator (ADR-017/038)
 ├── tools/
 │   ├── launchd/            plist templates + install.sh
 │   └── cloudflared/        tunnel config templates
@@ -501,7 +509,7 @@ nucleus/
 - `docs/ADR-014-obsidian-vault-customization.md` — vault appearance/config for read-mostly operator use
 - `docs/ADR-015-nucleus-dashboard-unified-operator-app.md` — the single operator app + aesthetic guardrails
 - `docs/ADR-016-agent-registry-and-log-capture.md` — `agents.toml` registry, run-log capture, `/agents` front door, distiller consolidation
-- `docs/ADR-017-skill-gap-learner.md` — autonomous skill learner (on-the-fly review + periodic gap-detection/curator), the validation gate
+- `docs/ADR-017-skill-gap-learner.md` — autonomous skill learner (periodic gap-detection/curator), the validation gate
 - `docs/ADR-018-whatsapp-media.md` — WhatsApp media + personal document library, encrypted Drive (proposed)
 - `docs/ADR-019-image-generation-surface.md` — local Bonsai image gen + dashboard gallery (withdrawn 2026-09-26)
 - `docs/ADR-020-architecture-hardening.md` — hardening pass: session profiles, migrations, DB ownership rule, ops pruning/rotation, typegen — and the rejected alternatives
@@ -517,6 +525,7 @@ nucleus/
 - `docs/ADR-034-usage-accounting.md` — token and estimated-cost accounting for every Claude Code and Codex session: parsing and dedupe rules, cost-state reconciliation, price table, project and Nucleus attribution, `/usage` surface
 - `docs/ADR-033-turn-engine-and-task-ledger.md` — WhatsApp turn engine (real end of turn, mid-turn messages, ack/progress, quoted replies via the queue, typed input everywhere, outbound idempotency and secret filter) + the background task ledger (`nucleus tasks`, per-chat scopes)
 - `docs/ADR-036-work-items-and-issue-pipeline.md` — work items: source-agnostic events (`nucleus events`, GitHub adapter polled with `gh`) and the issue pipeline: label gate, collaborator-only comments, eval → refinement → implementation → draft PR, short WhatsApp notices with a dashboard link (no per-item groups), the dashboard Work page
+- `docs/ADR-038-skill-suggestions-and-transcript-sweep.md` — the nightly transcript sweep and backfill, skill suggestions the operator accepts or rejects (`nucleus skills suggestions`)
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
@@ -540,7 +549,7 @@ tmux attach -t nucleus-chat               # Obsidian chat service
 # One-shot scheduled jobs only have a tmux session while they're running:
 tmux attach -t nucleus-news-fetcher       # if a run is in flight
 tmux attach -t nucleus-distiller          # daily distillation pass
-tmux attach -t nucleus-skill-gap-learner  # skill review (on-the-fly) + daily learn/curate (ADR-017)
+tmux attach -t nucleus-skill-gap-learner  # nightly transcript sweep + learn/curate (ADR-017/038)
 tmux attach -t nucleus-gmail              # gmail metabolism + calendar fires (was nucleus-jarvis)
 
 # Reload a specific service after a code change

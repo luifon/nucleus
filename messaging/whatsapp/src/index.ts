@@ -518,7 +518,6 @@ async function main() {
           `replied to ${r.inputKind} in ${(r.elapsedMs / 1000).toFixed(1)}s (${r.inputChars}c in → ${r.replyChars}c out, session ${r.sessionId.slice(0, 8)})`,
           "OBSERVATION",
         );
-        if (r.reviewDue) fireSkillReview(config, "whatsapp", r.chatId, r.transcriptPath);
       },
     },
     {
@@ -531,7 +530,6 @@ async function main() {
         disallowedTools: config.disallowedTools,
         agentLabel: "whatsapp",
         idleTimeoutMs: 4 * 60 * 60 * 1000,
-        reviewNudgeInterval: config.skillNudgeInterval,
       },
       // ADR-018: the DM pool also gets the document library; ADR-033: and
       // background tasks, scoped to the chat by a per-session token. Both
@@ -547,7 +545,6 @@ async function main() {
         allowedTools: [...DOC_TOOL_ALLOWLIST, ...TASKS_TOOL_ALLOWLIST, ...WORK_TOOL_ALLOWLIST],
         agentLabel: "whatsapp",
         idleTimeoutMs: 4 * 60 * 60 * 1000,
-        reviewNudgeInterval: config.skillNudgeInterval,
       },
     },
   );
@@ -1468,21 +1465,6 @@ function mediaDeps(sock: WASocket, bot: Bot): MediaDeps {
     quickWindow: (p) => withQuickWindow(p, ACT_QUICK_WINDOW_MS),
     log,
   };
-}
-
-/** Fire a detached on-the-fly skill review (ADR-017). Best-effort and fully
- *  decoupled — shells out to the built skill-gap-learner binary and returns
- *  immediately so it never blocks the reply. No-op if the binary isn't built. */
-function fireSkillReview(
-  config: Config,
-  venue: string,
-  chatKey: string,
-  transcriptPath: string,
-): void {
-  // ADR-030: one signed binary, subcommand dispatch.
-  runNucleus(config, [
-    "skill-gap-learner", "review", "--transcript", transcriptPath, "--venue", venue, "--chat-key", chatKey,
-  ]);
 }
 
 /** Brain-dump pipeline entry (ADR-005a review-before-apply).

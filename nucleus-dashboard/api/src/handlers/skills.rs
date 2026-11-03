@@ -72,6 +72,15 @@ impl SkillsState {
     pub fn with_roots(roots: LibraryRoots, private_repo: PathBuf, reminders: Option<SqlitePool>) -> Self {
         Self { roots, private_repo, reminders, write_lock: tokio::sync::Mutex::new(()) }
     }
+
+    /// The cross-program library write lock (ADR-038), so a move or archive
+    /// never interleaves with a suggestion accept or a learner writing pass.
+    async fn library_guard(&self) -> Result<nucleus_core::skill_learner::LibraryLock, SkillsError> {
+        let ws = self.private_repo.parent().unwrap_or(&self.private_repo);
+        nucleus_core::skill_learner::library_lock(ws, std::time::Duration::from_secs(10))
+            .await
+            .map_err(|e| SkillsError::Conflict(format!("{e:#}")))
+    }
 }
 
 pub fn router(state: Arc<SkillsState>) -> Router {
@@ -336,6 +345,7 @@ async fn do_move(s: &SkillsState, req: MoveSkillReq) -> Result<SkillActionResp, 
     let src_root = require_root(&s.roots, from)?;
     let dst_root = require_root(&s.roots, to)?;
     let _guard = s.write_lock.lock().await;
+    let _library = s.library_guard().await?;
 
     let lib = load_library(s).await?;
     let skill = find_skill(&lib, from, &req.dir_name, &src_root)?;
@@ -388,6 +398,7 @@ async fn do_archive(s: &SkillsState, req: ArchiveSkillReq) -> Result<SkillAction
     let src_root = require_root(&s.roots, from)?;
     let dst_root = require_root(&s.roots, to)?;
     let _guard = s.write_lock.lock().await;
+    let _library = s.library_guard().await?;
 
     let lib = load_library(s).await?;
     let skill = find_skill(&lib, from, &req.dir_name, &src_root)?;
@@ -445,6 +456,7 @@ async fn do_restore(s: &SkillsState, req: ArchivedSkillReq) -> Result<SkillActio
     let src_root = require_root(&s.roots, from)?;
     let dst_root = require_root(&s.roots, to)?;
     let _guard = s.write_lock.lock().await;
+    let _library = s.library_guard().await?;
 
     let lib = load_library(s).await?;
     let skill = find_skill(&lib, from, &req.dir_name, &src_root)?;
@@ -508,6 +520,7 @@ async fn do_delete(s: &SkillsState, req: ArchivedSkillReq) -> Result<SkillAction
     let from = SkillTier::from(req.tier);
     let root = require_root(&s.roots, from)?;
     let _guard = s.write_lock.lock().await;
+    let _library = s.library_guard().await?;
 
     let dir = req.dir_name.clone();
     let removed_link = blocking(move || {

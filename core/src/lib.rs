@@ -39,6 +39,7 @@ pub mod runlog;
 pub mod secret_filter;
 pub mod session_index;
 pub mod session_profile;
+pub mod skill_learner;
 pub mod skills;
 pub mod tasks;
 pub mod timestamp;

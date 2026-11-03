@@ -2638,12 +2638,15 @@ name = "skill-gap-learner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "nucleus-core",
+ "regex",
  "reminders",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
  "tracing",

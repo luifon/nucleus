@@ -22,7 +22,7 @@ Usage: nucleus <command> [args...]
 Services (run by launchd):
   distiller             daily diary distillation pass
   reminders <sub>       time-triggered notifications (due|add|list|show|…)
-  skill-gap-learner     skill review + curator (learn|review)
+  skill-gap-learner     transcript sweep + curator (learn|sweep|backfill)
   discord               Discord bot daemon
   gmail-metabolism      daily inbox sweep
   vault-check           weekly structural check of the Obsidian vault
@@ -33,6 +33,7 @@ Operator tools:
   session-search        FTS5 search over session transcripts
   vault-search          FTS5 search over the Obsidian vault
   session-send          send a message into another agent session
+  skills <sub>          skill suggestions (suggestions list|show|accept|…, suggest)
   usage <sub>           token and cost accounting (refresh|report)
   tasks <sub>           background tasks (start|list|status|output|cancel|sweep)
   work <sub>          issue pipeline (tick|list|show|reply|approve-plan|…)
@@ -71,7 +72,7 @@ async fn main() -> Result<()> {
     sub.extend(argv.into_iter().skip(1));
 
     // Operator tools print their result on stdout; their logs go to stderr.
-    if matches!(name.as_str(), "tasks" | "session-send" | "session-search" | "work" | "events") {
+    if matches!(name.as_str(), "tasks" | "session-send" | "session-search" | "work" | "events" | "skills") {
         nucleus_core::init_tracing_stderr();
     } else {
         nucleus_core::init_tracing();
@@ -101,6 +102,7 @@ async fn main() -> Result<()> {
         "vault-search" => nucleus_core::cmd::vault_search::run(sub).await,
         "vault-check" => vault_check::run(sub).await,
         "session-send" => nucleus_core::cmd::session_send::run(sub).await,
+        "skills" => nucleus_core::cmd::skills::run(sub).await,
         "usage" => nucleus_core::cmd::usage::run(sub).await,
         "tasks" => nucleus_core::cmd::tasks::run(sub).await,
         "work" => nucleus_core::cmd::work::run(sub).await,

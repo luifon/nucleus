@@ -446,15 +446,27 @@ skill name in two trees — the `~/.claude/skills/` or committed copy wins
 without a warning. Skill bodies refer to their own files through
 `${CLAUDE_SKILL_DIR}`. Do not create `.nucleus/CLAUDE.md`.
 
-**Skills are now also written autonomously** by the `skill-gap-learner`
-(ADR-017): an on-the-fly reviewer after conversations + a daily curator.
-Its skills land in `.nucleus/.claude/skills/` with `flavor: learned` +
-`created_by: agent`, validated against the SKILL.md contract (the
-`# Failure modes` requirement below is enforced mechanically — malformed
-writes are quarantined to `.rejected/`). So expect agent-authored skills
-to appear there; the curator archives stale ones to `.archive/` (never
-deletes; skips `pinned: true`). `/skill-creator` remains the operator's
-*manual* path. The authoring discipline below governs both.
+**The `skill-gap-learner` learns skills from sessions** (ADR-017, ADR-038).
+Every night it sweeps this workspace's session transcripts (terminal, bot
+and dashboard chats; automated sessions are skipped), plus a limited
+backfill batch of old sessions, and files **skill suggestions**: a new skill
+or a full replacement of a personal one. The operator decides them with
+`nucleus skills suggestions list|show|accept|reject|edit` or on the
+dashboard; accept writes into `.nucleus/.claude/skills/` with
+`flavor: learned` + `created_by: agent`, after the SKILL.md contract check
+(the `# Failure modes` requirement below is enforced mechanically). The
+same nightly run's diary gap pass and curator still write and archive
+agent-created skills directly (malformed writes are quarantined to
+`.rejected/`; the curator archives stale ones to `.archive/`, never deletes,
+skips `pinned: true`). `/skill-creator` remains the operator's *manual*
+path. The authoring discipline below governs all of them.
+
+**When a skill you loaded turns out wrong or incomplete**, file a patch
+suggestion before the session ends: take `shasum -a 256` of its SKILL.md
+before you write the draft, then `nucleus skills suggest --kind patch
+--name <skill> --base <that hash> --rationale "<what was wrong>" --file -
+<<'EOF'` followed by the complete corrected SKILL.md (`--kind create`
+without `--base` for a missing skill). The operator accepts or rejects it.
 
 When invoking `/skill-creator create`, **name the destination path in
 the prompt** rather than letting the model infer it. Example:

@@ -64,8 +64,6 @@ pub enum Launch {
 pub enum Capability {
     /// Daily 04:00 session rotation (summarize → diary → respawn).
     Rotates,
-    /// On-the-fly post-session skill review (skill-gap learner arm).
-    SkillReview,
 }
 
 /// One agent. A uniform record — optional fields are present or absent per

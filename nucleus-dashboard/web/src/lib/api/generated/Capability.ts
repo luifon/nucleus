@@ -5,4 +5,4 @@
  * ADR-016 — capabilities live inside agents; maintenance *agents* are
  * separate registry entries).
  */
-export type Capability = "rotates" | "skill_review";
+export type Capability = "rotates";
