@@ -9,6 +9,7 @@ members = [
     "chores/reminders",
     "chores/skill-gap-learner",
     "chores/vault-check",
+    "chores/backup",
     "nucleus-dashboard/api",
     "nucleus",
 ]

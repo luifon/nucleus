@@ -42,6 +42,7 @@ NUCLEUS_LAUNCHD_PREFIX=tech.mycompany ./tools/launchd/install.sh
 | `preference-learner.plist.example` | Weekly news preference learning | StartCalendarInterval |
 | `reminders-tick.plist.example` | Reminders polling worker | StartInterval 60 |
 | `vault-check.plist.example` | Weekly vault check (ADR-035); runs when `[vault_check] cron` is due | StartInterval 3600 |
+| `backup.plist.example` | Daily encrypted backup to the homelab HDD (ADR-039); runs when `[backup] cron` is due | StartCalendarInterval :00/:15/:30/:45 |
 
 ## Checking the jobs: `check.sh`
 

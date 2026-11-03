@@ -527,6 +527,7 @@ nucleus/
 - `docs/ADR-033-turn-engine-and-task-ledger.md` — WhatsApp turn engine (real end of turn, mid-turn messages, ack/progress, quoted replies via the queue, typed input everywhere, outbound idempotency and secret filter) + the background task ledger (`nucleus tasks`, per-chat scopes)
 - `docs/ADR-036-work-items-and-issue-pipeline.md` — work items: source-agnostic events (`nucleus events`, GitHub adapter polled with `gh`) and the issue pipeline: label gate, collaborator-only comments, eval → refinement → implementation → draft PR, short WhatsApp notices with a dashboard link (no per-item groups), the dashboard Work page
 - `docs/ADR-038-skill-suggestions-and-transcript-sweep.md` — the nightly transcript sweep and backfill, skill suggestions the operator accepts or rejects (`nucleus skills suggestions`)
+- `docs/ADR-039-backup-to-homelab.md` — daily encrypted restic backup of Nucleus's state to the homelab HDD: what is backed up, SQLite copies with the backup API, the HDD guard, Keychain password, retention, alerts, restore (`nucleus backup`)
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
@@ -627,6 +628,17 @@ tail -f memory/work.log
 ./target/release/nucleus vault-search "weekly review" --bucket 3-Projects
 # Structural vault report; --apply also moves empty Untitled files into the quarantine
 ./target/release/nucleus vault-check
+
+# Daily encrypted backup to the homelab HDD (ADR-039). launchd runs
+# `backup run --scheduled` every 15 min; it runs at 05:30 (or the next wake),
+# alerts on WhatsApp on failure, and checks the repository on Sundays.
+./target/release/nucleus backup status                  # last success, last run, last check
+./target/release/nucleus backup plan                    # paths and SQLite databases a run reads
+./target/release/nucleus backup run                     # back up now (--check also verifies)
+./target/release/nucleus backup guard                   # is the repository on the HDD? (exit 1 = no)
+./target/release/nucleus backup snapshots
+./target/release/nucleus backup restore --to /tmp/nucleus-restore --path memory/session_index.db --path .nucleus
+tail -f memory/backup.log
 
 # One-shot WhatsApp send (uses the paired session)
 cd messaging/whatsapp && npm run send -- <phone-or-jid> "<message>"

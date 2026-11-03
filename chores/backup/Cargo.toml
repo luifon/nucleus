@@ -1,0 +1,29 @@
+[package]
+name = "backup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "backup"
+path = "src/lib.rs"
+
+[dependencies]
+nucleus-core = { workspace = true }
+reminders = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# SQLite's online backup API. 0.32 links the same libsqlite3-sys (0.30) as
+# sqlx, so the workspace keeps one SQLite library.
+rusqlite = { version = "0.32", features = ["backup"] }
+
+[dev-dependencies]
+tempfile = "3"
+sqlx = { workspace = true }

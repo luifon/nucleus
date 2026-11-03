@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LAUNCHD_PREFIX__.backup</string>
+    <!-- ADR-039: the daily encrypted backup to the homelab HDD. launchd
+         wakes it every 15 minutes (at :00, :15, :30, :45); the command
+         itself decides whether the [backup] cron in nucleus.toml (default
+         05:30) is due, so a missed slot runs at the next wake. restic comes
+         from Homebrew (PATH); ssh reads ~/.ssh/config; the repository
+         password comes from the login Keychain. No claude session. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__USER_HOME__/Development/nucleus/target/release/nucleus</string>
+        <string>backup</string>
+        <string>run</string>
+        <string>--scheduled</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__USER_HOME__/Development/nucleus</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TZ</key>
+        <string>__TZ__</string>
+        <key>NUCLEUS_LOG</key>
+        <string>info</string>
+        <key>PATH</key>
+        <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Minute</key><integer>45</integer></dict>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>__USER_HOME__/Development/nucleus/memory/backup.log</string>
+</dict>
+</plist>

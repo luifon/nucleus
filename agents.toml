@@ -132,6 +132,20 @@ schedule      = "0 20 * * 0"
 log_path      = "memory/vault-check.log"
 diary_key     = "vault-check"
 
+[[agent]]
+name          = "backup"
+class         = "maintenance"
+launch        = "launchd-cron"
+runtime       = "rust"
+launchd_label = "dev.nucleus.backup"
+# ADR-039: daily encrypted restic backup of Nucleus's state to the homelab
+# HDD (no claude session). launchd wakes it every 15 minutes; `[backup] cron`
+# in nucleus.toml decides when it runs. A failure enqueues one WhatsApp alert;
+# the last success is the `backup.last_success` chore-state watermark.
+schedule      = "30 5 * * *"
+log_path      = "memory/backup.log"
+diary_key     = "backup"
+
 # ── infra (host process / scheduler; no operator persona) ──
 
 [[agent]]

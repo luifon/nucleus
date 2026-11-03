@@ -27,6 +27,7 @@ pub struct Settings {
     pub usage: UsageConfig,
     pub vault_search: VaultSearchConfig,
     pub vault_check: VaultCheckConfig,
+    pub backup: BackupConfig,
     pub tasks: TasksConfig,
     pub work: WorkConfig,
     pub ports: PortsConfig,
@@ -707,6 +708,178 @@ fn default_duplicate_exempt() -> Vec<String> {
     Vec::new()
 }
 
+/// The daily backup to the homelab (ADR-039). Everything here is the same
+/// for every operator; the repository and the HDD's filesystem UUID identify
+/// one operator's setup and come from `.env` (`NUCLEUS_BACKUP_REPOSITORY`,
+/// `NUCLEUS_BACKUP_HDD_UUID`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BackupConfig {
+    /// When `nucleus backup run --scheduled` is due (5-field cron in
+    /// `NUCLEUS_TZ`). launchd wakes the job every 15 minutes; this decides
+    /// whether a wake runs the backup. Default: daily 05:30.
+    #[serde(default = "default_backup_cron")]
+    pub cron: String,
+    /// When a scheduled run also runs `restic check` after the backup.
+    /// Default: Sunday 05:30.
+    #[serde(default = "default_backup_check_cron")]
+    pub check_cron: String,
+    /// `restic check --read-data-subset` value for the weekly check.
+    #[serde(default = "default_backup_check_subset")]
+    pub check_read_data_subset: String,
+    /// What is backed up. `~/x` is under `$HOME`; a relative path is under
+    /// the workspace root; `{claude_project}` is this workspace's Claude Code
+    /// project directory, `{vault}` is `[obsidian] vault_path` and
+    /// `{launchd_prefix}` is `NUCLEUS_LAUNCHD_PREFIX` (default `dev.nucleus`). `*` and
+    /// `?` are allowed in the last path component. A missing path is skipped
+    /// and logged.
+    #[serde(default = "default_backup_paths")]
+    pub paths: Vec<String>,
+    /// File and directory names never backed up, at any depth (`*` and `?`
+    /// allowed, no `/`).
+    #[serde(default = "default_backup_exclude")]
+    pub exclude: Vec<String>,
+    #[serde(default = "default_keep_daily")]
+    pub keep_daily: u32,
+    #[serde(default = "default_keep_weekly")]
+    pub keep_weekly: u32,
+    #[serde(default = "default_keep_monthly")]
+    pub keep_monthly: u32,
+    /// The login-Keychain generic password that holds the repository
+    /// password (service and account names).
+    #[serde(default = "default_backup_keychain_service")]
+    pub keychain_service: String,
+    #[serde(default = "default_backup_keychain_account")]
+    pub keychain_account: String,
+    /// Parent of the job-owned `work/` directory where SQLite snapshots are
+    /// written before restic reads them. Only `work/` (marked with a marker
+    /// file) is created and removed. Must not be `/`, `$HOME` or one of its
+    /// parents, and must not contain or lie inside a backed-up path.
+    #[serde(default = "default_backup_staging_dir")]
+    pub staging_dir: String,
+    /// The host name recorded in every snapshot, so snapshots group the
+    /// same way whatever the Mac's host name is at the time.
+    #[serde(default = "default_backup_snapshot_host")]
+    pub snapshot_host: String,
+    /// After a failed scheduled run, the next attempt waits this long.
+    #[serde(default = "default_backup_retry_minutes")]
+    pub retry_minutes: i64,
+    /// SSH connect timeout for the guard and for restic's SFTP connection.
+    #[serde(default = "default_backup_ssh_timeout")]
+    pub ssh_connect_timeout_secs: u32,
+    /// The restic executable (looked up in `PATH` when not absolute).
+    #[serde(default = "default_backup_restic_bin")]
+    pub restic_bin: String,
+    /// Enqueue a WhatsApp alert to the operator's DM when a scheduled run
+    /// fails.
+    #[serde(default = "default_true_bool")]
+    pub notify: bool,
+    /// `NUCLEUS_BACKUP_REPOSITORY`: an `sftp:[user@]host:/absolute/path`
+    /// restic repository.
+    #[serde(skip)]
+    pub repository: Option<String>,
+    /// `NUCLEUS_BACKUP_HDD_UUID`: the UUID of the filesystem the repository
+    /// must be on.
+    #[serde(skip)]
+    pub hdd_uuid: Option<String>,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            cron: default_backup_cron(),
+            check_cron: default_backup_check_cron(),
+            check_read_data_subset: default_backup_check_subset(),
+            paths: default_backup_paths(),
+            exclude: default_backup_exclude(),
+            keep_daily: default_keep_daily(),
+            keep_weekly: default_keep_weekly(),
+            keep_monthly: default_keep_monthly(),
+            keychain_service: default_backup_keychain_service(),
+            keychain_account: default_backup_keychain_account(),
+            staging_dir: default_backup_staging_dir(),
+            snapshot_host: default_backup_snapshot_host(),
+            retry_minutes: default_backup_retry_minutes(),
+            ssh_connect_timeout_secs: default_backup_ssh_timeout(),
+            restic_bin: default_backup_restic_bin(),
+            notify: true,
+            repository: None,
+            hdd_uuid: None,
+        }
+    }
+}
+
+fn default_backup_cron() -> String {
+    "30 5 * * *".to_string()
+}
+fn default_backup_check_cron() -> String {
+    "30 5 * * 0".to_string()
+}
+fn default_backup_check_subset() -> String {
+    "10%".to_string()
+}
+fn default_backup_paths() -> Vec<String> {
+    [
+        "memory",
+        ".nucleus",
+        ".env",
+        "nucleus.toml",
+        ".claude/secret-strings",
+        ".claude/settings.local.json",
+        "messaging/whatsapp/auth",
+        "docs/ROADMAP.md",
+        "docs/TODO.md",
+        "docs/PRIVATE.md",
+        "tools/cloudflared/*.yaml",
+        "{claude_project}",
+        "{vault}",
+        "~/.claude/settings.json",
+        "~/.claude/CLAUDE.md",
+        "~/.claude/skills",
+        "~/.claude/output-styles",
+        "~/.claude/hooks",
+        "~/.claude/statusline-command.sh",
+        "~/.nucleus/playwright-storage.json",
+        "~/.cloudflared",
+        "~/Library/LaunchAgents/{launchd_prefix}.*.plist",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+fn default_backup_exclude() -> Vec<String> {
+    [".DS_Store", "node_modules", "target", "__pycache__"].iter().map(|s| s.to_string()).collect()
+}
+fn default_keep_daily() -> u32 {
+    7
+}
+fn default_keep_weekly() -> u32 {
+    4
+}
+fn default_keep_monthly() -> u32 {
+    12
+}
+fn default_backup_keychain_service() -> String {
+    "nucleus-backup".to_string()
+}
+fn default_backup_keychain_account() -> String {
+    "restic".to_string()
+}
+fn default_backup_staging_dir() -> String {
+    "~/Library/Caches/nucleus-backup".to_string()
+}
+fn default_backup_snapshot_host() -> String {
+    "nucleus".to_string()
+}
+fn default_backup_retry_minutes() -> i64 {
+    60
+}
+fn default_backup_ssh_timeout() -> u32 {
+    20
+}
+fn default_backup_restic_bin() -> String {
+    "restic".to_string()
+}
+
 /// Background task workers (ADR-033). Internal safety limits only — the
 /// operator never sees them unless one is hit, and every hit is logged as a
 /// task event.
@@ -1326,6 +1499,8 @@ struct TomlConfig {
     #[serde(default)]
     vault_check: VaultCheckConfig,
     #[serde(default)]
+    backup: BackupConfig,
+    #[serde(default)]
     tasks: TasksConfig,
     #[serde(default)]
     work: WorkConfig,
@@ -1418,6 +1593,10 @@ impl Settings {
         gmail.account = std::env::var("NUCLEUS_GMAIL_ACCOUNT").unwrap_or_default();
         gmail.personal_email = std::env::var("NUCLEUS_PERSONAL_EMAIL").unwrap_or_default();
 
+        let mut backup = toml.backup;
+        backup.repository = env_optional("NUCLEUS_BACKUP_REPOSITORY");
+        backup.hdd_uuid = env_optional("NUCLEUS_BACKUP_HDD_UUID");
+
         Ok(Settings {
             identity,
             public_urls,
@@ -1436,6 +1615,7 @@ impl Settings {
             usage: toml.usage,
             vault_search: toml.vault_search,
             vault_check: toml.vault_check,
+            backup,
             tasks: toml.tasks,
             work: toml.work,
             ports: toml.ports,

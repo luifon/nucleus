@@ -194,6 +194,48 @@ scheduled_apply = false
 # Scheduled runs: enqueue the one-line summary to the operator's WhatsApp DM.
 notify = true
 
+# ADR-039 daily encrypted backup to the homelab HDD (`nucleus backup`).
+# The repository (NUCLEUS_BACKUP_REPOSITORY) and the HDD's filesystem UUID
+# (NUCLEUS_BACKUP_HDD_UUID) are in .env; the password is in the login
+# Keychain under keychain_service / keychain_account. Every key is optional;
+# the values below are the defaults.
+[backup]
+cron = "30 5 * * *"                  # daily 05:30, NUCLEUS_TZ
+check_cron = "30 5 * * 0"            # Sunday: also `restic check`
+check_read_data_subset = "10%"
+keep_daily = 7
+keep_weekly = 4
+keep_monthly = 12
+# `~/x` = under $HOME; relative = under the workspace root;
+# {claude_project} = this workspace's Claude Code project dir (transcripts +
+# Tier-2 memory); {vault} = [obsidian] vault_path; {launchd_prefix} =
+# NUCLEUS_LAUNCHD_PREFIX. `*`/`?` only in the last component. Missing paths
+# are skipped and logged. Every SQLite database found under these paths is
+# copied with SQLite's backup API; the live file is not read by restic.
+paths = [
+  "memory", ".nucleus", ".env", "nucleus.toml",
+  ".claude/secret-strings", ".claude/settings.local.json",
+  "messaging/whatsapp/auth",
+  "docs/ROADMAP.md", "docs/TODO.md", "docs/PRIVATE.md",
+  "tools/cloudflared/*.yaml",
+  "{claude_project}", "{vault}",
+  "~/.claude/settings.json", "~/.claude/CLAUDE.md", "~/.claude/skills",
+  "~/.claude/output-styles", "~/.claude/hooks", "~/.claude/statusline-command.sh",
+  "~/.nucleus/playwright-storage.json",
+  "~/.cloudflared",
+  "~/Library/LaunchAgents/{launchd_prefix}.*.plist",
+]
+# Names never backed up, at any depth (no `/`).
+exclude = [".DS_Store", "node_modules", "target", "__pycache__"]
+keychain_service = "nucleus-backup"
+keychain_account = "restic"
+staging_dir = "~/Library/Caches/nucleus-backup"  # the run uses only its work/ subdirectory
+snapshot_host = "nucleus"
+retry_minutes = 60                   # after a failed scheduled run
+ssh_connect_timeout_secs = 20
+restic_bin = "restic"
+notify = true                        # WhatsApp DM alert on a scheduled failure
+
 # ADR-033 WhatsApp turn engine. Every value is optional.
 # ack_after_secs: an operator message without an answer this long gets one
 #   code-sent acknowledgement ([whatsapp.texts] ack).

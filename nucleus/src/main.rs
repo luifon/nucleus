@@ -26,6 +26,7 @@ Services (run by launchd):
   discord               Discord bot daemon
   gmail-metabolism      daily inbox sweep
   vault-check           weekly structural check of the Obsidian vault
+  backup <sub>          encrypted daily backup to the homelab (run|status|plan|guard|snapshots|check|restore)
   news-fetcher          feed pull + profile ranking → widget feed
   dashboard             web dashboard + API
 
@@ -101,6 +102,7 @@ async fn main() -> Result<()> {
         "session-search" => nucleus_core::cmd::session_search::run(sub).await,
         "vault-search" => nucleus_core::cmd::vault_search::run(sub).await,
         "vault-check" => vault_check::run(sub).await,
+        "backup" => backup::run(sub).await,
         "session-send" => nucleus_core::cmd::session_send::run(sub).await,
         "skills" => nucleus_core::cmd::skills::run(sub).await,
         "usage" => nucleus_core::cmd::usage::run(sub).await,
