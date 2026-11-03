@@ -804,8 +804,8 @@ Before the push, the PR title, the body, the commit's author line and
 message, and every line the commit adds relative to its base (with every
 file name it touches, and symlink targets) go through the secret guard; the comment goes through it
 before it is posted. The guard is `tools/check-secrets.sh` run from the
-Nucleus workspace root (`.env` values, the `.claude/secret-strings`
-denylist, personal-information patterns, home paths, private skill names)
+Nucleus workspace root (`.env` values, the
+`~/.config/commit-guard/denylist` denylist, personal-information patterns, home paths, private skill names)
 plus the credential shapes of `secret_filter::CredentialRules`. A finding,
 or a guard that cannot run, moves the item to `blocked` with the finding
 categories (for example `pii-email`, `env-value`, `credential-…`,

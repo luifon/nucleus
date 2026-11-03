@@ -37,14 +37,16 @@ one of the placeholders `{claude_project}` (this workspace's directory under
 default list:
 
 - workspace: `memory/`, `.nucleus/`, `.env`, `nucleus.toml`,
-  `.claude/secret-strings`, `.claude/settings.local.json`,
+  `.claude/settings.local.json`,
   `messaging/whatsapp/auth/`, the gitignored planning docs, the rendered
   cloudflared yaml;
 - Claude Code: the project directory (transcripts and Tier-2 memory),
   `settings.json`, `CLAUDE.md`, `skills/`, `output-styles/`, `hooks/` and the
   status line script that `settings.json` refers to;
 - the Playwright storage-state snapshot (ADR-022), the cloudflared directory,
-  the installed Nucleus launchd plists;
+  the commit-guard directory (`~/.config/commit-guard/`: denylist, scanner,
+  hook dispatcher) and the global git hooks (`~/.config/git/hooks/`), the
+  installed Nucleus launchd plists;
 - the Obsidian vault.
 
 Not backed up: tracked source (it is in git), `target/`, `node_modules/`,

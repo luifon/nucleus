@@ -10,9 +10,13 @@
 #
 # Layers:
 #   A. Live `.env` VALUES (tokens/IDs/allowlisted names >=6 chars) — substring.
-#   B. Curated denylist `.claude/secret-strings` (gitignored) — the sensitive
-#      literals the `.env`-value layer can't see (third-party names, etc.).
-#      Whole-word, case-insensitive, any length.
+#   B. The machine-wide commit-guard denylist (~/.config/commit-guard/denylist,
+#      outside every repo) — the sensitive literals the `.env`-value layer
+#      can't see (third-party names, etc.). Matched by its own scanner
+#      (~/.config/commit-guard/scan): whole word, case- and accent-insensitive,
+#      any length. The global git hooks run the same scanner on every commit
+#      on the machine; this layer adds the Write/Edit hook (before content
+#      reaches disk) and the work pipeline's publish scan.
 #   C. Generic PII heuristics — personal emails, phone/E.164, chat JIDs +
 #      snowflake IDs, and the operator's home path. Catches personal data
 #      even when it isn't registered anywhere.
@@ -23,15 +27,19 @@
 #   E. Structural (staged diffs only) — any staged path under .nucleus/.
 #      That tree is gitignored; a staged path there means it was force-added.
 #
+# For a diff, the scanned text is the added lines plus the new path of every
+# file in the diff, so A–D also catch an identifier that appears only in a
+# file or directory name.
+#
 # Nothing sensitive is hardcoded in this file — every literal is derived at
-# runtime from .env / the gitignored denylist / the private skill trees, so
+# runtime from .env / the commit-guard denylist / the private skill trees, so
 # the guard itself is safe to commit. Bypass intentionally: git commit --no-verify.
 
 set -euo pipefail
 
 WORKSPACE_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 ENV_FILE="$WORKSPACE_ROOT/.env"
-DENYLIST="$WORKSPACE_ROOT/.claude/secret-strings"
+GUARD_SCAN="$HOME/.config/commit-guard/scan"
 
 # ── build the exact-literal blocklists ──────────────────────────────────────
 # SUBSTR: matched as substrings (grep -F). WORD: matched whole-word (grep -iwF).
@@ -64,16 +72,6 @@ if [ -f "$ENV_FILE" ]; then
   done < "$ENV_FILE"
   # operator home dir (leaks the local username via absolute paths)
   [ -n "${HOME:-}" ] && [ ${#HOME} -ge 6 ] && SUBSTR+=("$HOME")
-fi
-
-# B. curated denylist (gitignored) — whole-word so distinctive names can be
-# listed without false-positiving as substrings.
-if [ -f "$DENYLIST" ]; then
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ''|'#'*) continue ;; esac
-    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
-    [ -n "$line" ] && WORD+=("$line")
-  done < "$DENYLIST"
 fi
 
 # D. operator-personal-skill names = the skill dirs in ~/.claude/skills and
@@ -150,8 +148,12 @@ case "$HAY" in
       } >&2
       exit 2
     fi
+    # New paths of the files in the diff (`+++ b/<path>`, `rename to`,
+    # `copy to`), with git's C-style quoting undone so non-ASCII names match.
+    diff_paths="$(printf '%s\n' "$HAY" | perl -ne 'if (/^\+\+\+ "?b\/(.*?)"?$/ || /^(?:rename|copy) to "?(.*?)"?$/) { my $p = $1; $p =~ s/\\([0-7]{3})/chr(oct($1))/ge; print "$p\n" }' || true)"
     HAY="$(printf '%s' "$HAY" | grep '^+' | grep -v '^+++' || true)"
-    [ -z "$HAY" ] && exit 0
+    [ -n "$diff_paths" ] && HAY="$HAY"$'\n'"$diff_paths"
+    [ -z "${HAY//$'\n'/}" ] && exit 0
     ;;
 esac
 
@@ -164,6 +166,22 @@ done
 for pat in ${WORD[@]+"${WORD[@]}"}; do
   printf '%s' "$HAY" | grep -iwF -- "$pat" >/dev/null 2>&1 && FOUND+=("denylist/skill:$pat")
 done
+
+# B. commit-guard denylist, through its scanner. Exit 1 = match; any other
+# non-zero exit is a scanner failure and blocks too (fail closed). The
+# scanner names the denylist line, never the term, because its stderr is
+# captured here. A clone on a machine without commit-guard skips the layer.
+if [ -x "$GUARD_SCAN" ]; then
+  guard_rc=0
+  guard_out="$(printf '%s\n' "$HAY" | COMMIT_GUARD_SHOW_TERMS=0 "$GUARD_SCAN" text 2>&1 >/dev/null)" || guard_rc=$?
+  if [ "$guard_rc" -eq 1 ]; then
+    while IFS= read -r l; do
+      case "$l" in "    - "*) FOUND+=("denylist/skill:${l##*: }") ;; esac
+    done <<< "$guard_out"
+  elif [ "$guard_rc" -ne 0 ]; then
+    FOUND+=("denylist/skill:commit-guard scanner failed (exit $guard_rc)")
+  fi
+fi
 
 # C. PII heuristics (regex). Skip obvious placeholders.
 pii() {
@@ -186,7 +204,7 @@ if [ ${#FOUND[@]} -gt 0 ]; then
     echo ""
     echo "  Personal info, third-party identifiers, and operator-personal-skill"
     echo "  content do not belong in this public repo. See .claude/rules/secrets.md."
-    echo "  Route real values through .env / .claude/secret-strings / .nucleus/.claude/skills."
+    echo "  Route real values through .env / ~/.config/commit-guard/denylist / .nucleus/.claude/skills."
     echo "  Bypass intentionally: git commit --no-verify"
   } >&2
   exit 2

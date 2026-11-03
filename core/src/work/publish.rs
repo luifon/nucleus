@@ -12,7 +12,7 @@
 //! body go through [`SecretGuard`]; before the comment is posted, the
 //! comment does. The production guard runs the repository's own
 //! `tools/check-secrets.sh` from the Nucleus workspace root (`.env` values,
-//! the `.claude/secret-strings` denylist, personal-information patterns,
+//! the `~/.config/commit-guard/denylist` denylist, personal-information patterns,
 //! home paths, private skill names) and the credential shapes of
 //! `secret_filter`. A hit, or a guard that cannot run, blocks the step:
 //! the item moves to `blocked` with the finding categories, never the

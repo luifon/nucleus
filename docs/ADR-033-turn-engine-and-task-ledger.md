@@ -644,8 +644,8 @@ returns the row to `pending` with the same id without using an attempt
 Every outbound text — replies, progress, acknowledgements, notes, task
 results, reminders, job replies, media captions — passes through a runtime
 secret filter (`secret_filter.ts`) built from the same sources as
-`tools/check-secrets.sh`: `.env` values, the gitignored
-`.claude/secret-strings` denylist, PII patterns (emails, JIDs, E.164 phones,
+`tools/check-secrets.sh`: `.env` values, the machine-wide
+`~/.config/commit-guard/denylist`, PII patterns (emails, JIDs, E.164 phones,
 home paths), plus credential-shaped tokens: PEM private keys (also without
 their end line), JWTs, Anthropic/OpenAI, Stripe (`sk_`/`rk_` live and test),
 Google (`AIza…`), GitLab (`glpat-`), GitHub, Slack (`xox?-`), AWS access key

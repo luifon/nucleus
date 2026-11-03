@@ -823,7 +823,6 @@ fn default_backup_paths() -> Vec<String> {
         ".nucleus",
         ".env",
         "nucleus.toml",
-        ".claude/secret-strings",
         ".claude/settings.local.json",
         "messaging/whatsapp/auth",
         "docs/ROADMAP.md",
@@ -840,6 +839,8 @@ fn default_backup_paths() -> Vec<String> {
         "~/.claude/statusline-command.sh",
         "~/.nucleus/playwright-storage.json",
         "~/.cloudflared",
+        "~/.config/commit-guard",
+        "~/.config/git/hooks",
         "~/Library/LaunchAgents/{launchd_prefix}.*.plist",
     ]
     .iter()

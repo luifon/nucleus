@@ -26,9 +26,11 @@ into committed files — is the reason this rule has teeth, not just text.
   public)
 
 The specific real literals that aren't `.env` values (so the value-scan
-can't infer them) go in the gitignored `.claude/secret-strings` denylist —
-one per line, whole-word matched. Never put a real value in the committed
-`.claude/secret-strings.example`.
+can't infer them) go in the machine-wide commit-guard denylist
+`~/.config/commit-guard/denylist` (outside every repo, mode 600) — one per
+line, matched whole-word, case- and accent-insensitively. Never put a real
+value in the committed `.claude/secret-strings.example`, which only shows
+the format.
 
 ## How to route it
 
@@ -40,24 +42,36 @@ one per line, whole-word matched. Never put a real value in the committed
 | ADR / docs | Refer by role ("the trash account", `$NUCLEUS_PERSONAL_EMAIL`), never the literal — including any external party (name them by role, not literally) |
 | Test data | Synthetic values, not redacted real values |
 | A tool/skill that integrates a specific external product | It's operator-personal → `.nucleus/.claude/skills/` + `.env`, never committed under `tools/`/`core/`/`chores/` |
-| A sensitive literal that isn't an `.env` value | Add it to the gitignored `.claude/secret-strings` denylist so the guard catches it |
+| A sensitive literal that isn't an `.env` value | Add it to `~/.config/commit-guard/denylist` so both guards catch it, in every repo on the machine |
 
 ## Enforcement layers
 
-All three call `tools/check-secrets.sh`, which scans for **four** things:
-`.env` values (substring), the gitignored `.claude/secret-strings` denylist
-(whole-word), generic PII heuristics (emails / JIDs / phones / home paths),
-and operator-personal-skill names (`.nucleus/.claude/skills/` plus
-`~/.claude/skills/`, minus the repo-wired `.claude/skills/`). It also rejects
-any staged path under `.nucleus/`; a pre-push hook repeats that path check.
-Add an env var or a denylist line → all three call sites cover it without
-code changes.
+**Machine-wide commit guard.** `git config --global core.hooksPath` points
+at `~/.config/git/hooks/`; every hook there is a symlink to
+`~/.config/commit-guard/hook`. Its `pre-commit` runs
+`~/.config/commit-guard/scan staged` (every added line and the path of every
+added, copied or renamed file) and its `commit-msg` runs `scan message` (the
+commit message), both against the denylist. Then it runs the repository's
+own hook of the same name from `.git/hooks/`, so Nucleus's `pre-commit` and
+`pre-push` still run after it. A term that belongs in one repository is
+exempted there with `git config --local --add commit-guard.allow '<term>'`.
+
+**Nucleus layers.** The three call sites below run `tools/check-secrets.sh`,
+which scans for **four** things: `.env` values (substring), the commit-guard
+denylist (through the same scanner), generic PII heuristics (emails / JIDs /
+phones / home paths), and operator-personal-skill names
+(`.nucleus/.claude/skills/` plus `~/.claude/skills/`, minus the repo-wired
+`.claude/skills/`). For a diff it scans the added lines and the new path of
+every file. It also rejects any staged path under `.nucleus/`; a pre-push
+hook repeats that path check. Add an env var or a denylist line → all call
+sites cover it without code changes.
 
 | Layer | Where | Fires on |
 |---|---|---|
 | Claude `PreToolUse` on `Write` / `Edit` | `.claude/settings.local.json` (gitignored) | The earliest point — before a leaked value even hits disk |
 | Claude `PreToolUse` on `Bash` (matching `git commit`) | same | Before I invoke `git commit` |
-| Git `pre-commit` hook | `.git/hooks/pre-commit` (not tracked by git ever) | Universal backstop — any `git commit` from any source |
+| Global git `pre-commit` / `commit-msg` | `~/.config/git/hooks/` → `~/.config/commit-guard/` | Every commit in every repo on the machine (denylist only) |
+| Git `pre-commit` hook | `.git/hooks/pre-commit` (not tracked by git ever), run by the global hook | Any `git commit` in this repo, from any source |
 
 Bypass when intentional (e.g., committing a fixture with an env-shaped
 value that genuinely belongs in the test): `git commit --no-verify` for

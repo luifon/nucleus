@@ -26,18 +26,24 @@ comments, or test fixtures. If the value should be identical for everyone
 who clones the repo (cron schedules, ports, denylists, behavior toggles), it
 goes in `nucleus.toml`. If it identifies a specific operator's setup, it goes
 in `.env`. The specific real literals a value-scan can't infer (names that
-aren't env values) go in the gitignored `.claude/secret-strings` denylist.
+aren't env values) go in the machine-wide commit-guard denylist
+`~/.config/commit-guard/denylist` (outside every repo, one term per line).
 
 **Placement rule:** anything that integrates or names a specific external
 product/service is operator-personal → `.nucleus/.claude/skills/` + `.env`, never
 under `tools/`, `core/`, `chores/`, or `docs/` (those are venue/
 infrastructure code that refers to any external party by role, not name).
 
-`tools/check-secrets.sh` (wired into Write/Edit, `git commit`, and the git
-pre-commit hook) enforces this: it scans for `.env` values, the
-`.claude/secret-strings` denylist, generic PII (emails/JIDs/phones/home
-paths), and operator-personal-skill names. Bypass intentionally only with
-`git commit --no-verify`. Full policy in `docs/SECRETS.md`.
+Two guards enforce this. The global git hooks (`core.hooksPath =
+~/.config/git/hooks`) run `~/.config/commit-guard/scan` on every commit on
+the machine: added lines, new file paths and the commit message against the
+denylist (whole word, case- and accent-insensitive). `tools/check-secrets.sh`
+(wired into Write/Edit, `git commit`, and the repo pre-commit hook) adds the
+Nucleus layers: `.env` values, the same denylist through that scanner,
+generic PII (emails/JIDs/phones/home paths), operator-personal-skill names
+(in content and in file paths), and staged `.nucleus/` paths. Bypass
+intentionally only with `git commit --no-verify`. Full policy in
+`docs/SECRETS.md`.
 
 ## Rule 2 — Personal project state stays gitignored
 

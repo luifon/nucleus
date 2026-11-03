@@ -2,7 +2,7 @@
 # PreToolUse guard for Write/Edit. Reads the full tool-call JSON on stdin.
 #
 # Skips the secret scan when the target file is GITIGNORED: gitignored files
-# (.env, .claude/secret-strings, .claude/settings.local.json, …) never get
+# (.env, .claude/settings.local.json, …) never get
 # committed, and the secret-holding ones must legitimately contain real
 # values — scanning them here would block editing the very files that feed
 # the guard. The commit-time layers (git-commit PreToolUse + git pre-commit)

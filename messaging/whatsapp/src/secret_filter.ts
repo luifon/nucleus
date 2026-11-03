@@ -8,8 +8,9 @@
 //
 //   A. `.env` values (>= 6 characters, minus benign values), plus the
 //      operator's home directory;
-//   B. the gitignored `.claude/secret-strings` denylist (whole word,
-//      case-insensitive);
+//   B. the machine-wide commit-guard denylist
+//      (`$COMMIT_GUARD_DENYLIST`, else `~/.config/commit-guard/denylist`;
+//      whole word, case-insensitive);
 //   C. PII patterns: email addresses, WhatsApp JIDs, E.164 phone numbers,
 //      home-directory paths.
 //
@@ -232,7 +233,8 @@ export class SecretRuleSource {
   ) {}
 
   private files(): string[] {
-    return [path.join(this.workspaceRoot, ".env"), path.join(this.workspaceRoot, ".claude/secret-strings")];
+    const denylist = process.env.COMMIT_GUARD_DENYLIST || path.join(this.home, ".config/commit-guard/denylist");
+    return [path.join(this.workspaceRoot, ".env"), denylist];
   }
 
   current(): SecretRules {

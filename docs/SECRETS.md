@@ -6,9 +6,11 @@ account, channel, path, or external party lives in `.env` (gitignored) — and
 belonging to an operator-personal skill (the gitignored
 `.nucleus/.claude/skills/`, as opposed to the repo-wired `.claude/skills/`;
 see ADR-032), must never appear in a tracked file.
-Sensitive literals that aren't `.env` values go in the gitignored
-`.claude/secret-strings` denylist. `tools/check-secrets.sh` enforces all of
-this (see `.claude/rules/secrets.md`). Nothing committed to the repo should
+Sensitive literals that aren't `.env` values go in the machine-wide
+commit-guard denylist `~/.config/commit-guard/denylist`, outside every repo.
+The global git hooks (`~/.config/git/hooks/`) scan every commit on the
+machine against it, and `tools/check-secrets.sh` enforces the rest (see
+`.claude/rules/secrets.md`). Nothing committed to the repo should
 let a reader figure out who runs Nucleus, where, or for whom.
 
 **Second hard rule:** personal project state (roadmaps, todo lists, sprint
@@ -61,6 +63,30 @@ Substitution happens at install/load time:
   `nucleus_core::config`) or `envRequired("VAR_NAME")` (TS).
 - Generic prompts must use the templated user name from settings, not a
   hardcoded literal.
+
+## Commit guard (machine-wide)
+
+- `~/.config/commit-guard/denylist` — one term per line, `#` comments. Mode
+  600, directory 700. Matched as whole words, case-insensitive and
+  accent-insensitive (`Joao` matches `João`), with no minimum length. The
+  words of a multi-word term match across any run of spaces, `_`, `-` or `.`.
+- `~/.config/commit-guard/scan` — the scanner (Python 3). Modes: `staged`
+  (added lines and new paths of the staged changes), `message <file>`,
+  `text` (stdin), `files` (every tracked file of the current repo), `count`.
+  `COMMIT_GUARD_DENYLIST` overrides the denylist path (tests use it). A hit
+  names the location and the denylist line number; the term itself is
+  printed only when stderr is a terminal.
+- `~/.config/commit-guard/hook` — the dispatcher. Every file in
+  `~/.config/git/hooks/` (`git config --global core.hooksPath`) is a symlink
+  to it. `pre-commit` and `commit-msg` scan; every hook name then runs the
+  repository's own hook from `<git common dir>/hooks/` with the same
+  arguments and stdin.
+- A repository with its own `core.hooksPath` (husky, a tracked `.githooks/`)
+  does not run the global hooks; its tracked `pre-commit` and `commit-msg`
+  call the scanner directly and skip it with a warning when it is missing.
+- A term that legitimately belongs in one repository:
+  `git config --local --add commit-guard.allow '<term>'` (untracked
+  `.git/config`).
 
 ## Checking before a commit
 
