@@ -83,7 +83,8 @@ pub struct PassReport {
     pub reviewed: usize,
     pub failed: usize,
     pub created: Vec<(i64, String)>,
-    pub revised: usize,
+    /// The new suggestion of each revision.
+    pub revised: Vec<i64>,
     pub evidence: usize,
     /// Sessions not reached because the pass stopped.
     pub remaining: usize,
@@ -113,7 +114,7 @@ impl PassReport {
                     self.created.iter().map(|(id, n)| format!("#{id} {n}")).collect::<Vec<_>>().join(", ")
                 )
             },
-            self.revised,
+            self.revised.len(),
             self.evidence,
             self.busy,
             self.skipped_agent,
@@ -196,8 +197,45 @@ async fn load(env: &Env<'_>, c: &Candidate, window: usize) -> Result<(Vec<Part>,
 
 /// Run one pass. Returns its report; a review that could not reach its
 /// reviewer is reported in `error`, not as `Err`.
-pub async fn run_pass(env: &Env<'_>, pass: Pass, opts: PassOptions, backend: &dyn Backend) -> Result<PassReport> {
+/// A pass that stopped on an error, with what it did until then: the
+/// suggestions it filed before the error are stored and still need their
+/// notice.
+#[derive(Debug)]
+pub struct PassFailed {
+    pub report: Box<PassReport>,
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for PassFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for PassFailed {}
+
+pub async fn run_pass(
+    env: &Env<'_>,
+    pass: Pass,
+    opts: PassOptions,
+    backend: &dyn Backend,
+) -> std::result::Result<PassReport, PassFailed> {
     let mut report = PassReport { pass: pass.as_str(), ..PassReport::default() };
+    match run_pass_into(env, pass, opts, backend, &mut report).await {
+        Ok(()) => Ok(report),
+        Err(error) => Err(PassFailed { report: Box::new(report), error }),
+    }
+}
+
+/// The pass, recording into `report` as it goes, so a `?` part-way keeps
+/// what was filed before it.
+async fn run_pass_into(
+    env: &Env<'_>,
+    pass: Pass,
+    opts: PassOptions,
+    backend: &dyn Backend,
+    report: &mut PassReport,
+) -> Result<()> {
     let ledger_rows = ledger::all(env.pool).await?;
     let labels = source::labels(env.ws).await;
     let index_sessions = match env.index {
@@ -306,6 +344,10 @@ pub async fn run_pass(env: &Env<'_>, pass: Pass, opts: PassOptions, backend: &dy
             };
             match result {
                 Ok(o) => {
+                    // Recorded first: the suggestions are stored, whatever
+                    // the ledger writes below do.
+                    report.created.extend(o.created.iter().map(|(id, _, n)| (*id, n.clone())));
+                    report.revised.extend(o.revised.iter().map(|(_, new_id)| *new_id));
                     let detail = review::describe(&o);
                     ledger::finish_run(
                         env.pool,
@@ -320,8 +362,6 @@ pub async fn run_pass(env: &Env<'_>, pass: Pass, opts: PassOptions, backend: &dy
                     ledger::advance(env.pool, &c.session_id, c.source, c.agent.as_deref(), &mark, Outcome::Reviewed, signals.as_deref())
                         .await?;
                     report.reviewed += 1;
-                    report.created.extend(o.created.iter().map(|(id, _, n)| (*id, n.clone())));
-                    report.revised += o.revised.len();
                     report.evidence += o.evidence_for.len();
                     report.lines.push(format!("{} [{}..{}): {detail}", c.session_id, part.from, part.to));
                     tracing::info!(session = %c.session_id, from = part.from, to = part.to, "skill review: {detail}");
@@ -350,7 +390,7 @@ pub async fn run_pass(env: &Env<'_>, pass: Pass, opts: PassOptions, backend: &dy
             }
         }
     }
-    Ok(report)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -370,6 +410,9 @@ mod tests {
         prompts: Arc<Mutex<Vec<String>>>,
         opened: Arc<Mutex<usize>>,
         fail_open: bool,
+        /// SQL run when a review session closes (before its items are
+        /// filed), to make a later step of the pass fail.
+        on_close: Option<(SqlitePool, &'static str)>,
     }
 
     impl Fake {
@@ -397,7 +440,11 @@ mod tests {
         fn session_id(&self) -> Option<String> {
             Some(self.id.clone())
         }
-        async fn close(self: Box<Self>) {}
+        async fn close(self: Box<Self>) {
+            if let Some((pool, sql)) = &self.fake.on_close {
+                sqlx::query(sql).execute(pool).await.unwrap();
+            }
+        }
     }
 
     #[async_trait]
@@ -487,6 +534,36 @@ mod tests {
 
     fn reply(items: Vec<serde_json::Value>) -> String {
         format!("```json\n{}\n```", json!({"items": items}))
+    }
+
+    #[tokio::test]
+    async fn a_pass_that_fails_after_filing_keeps_the_filed_ids() {
+        let w = world().await;
+        transcript(
+            &w,
+            "s-old",
+            &[user("release the build"), asst("Pushed it."), user("no, you forgot to run the tests first"), asst("Running them now.")],
+            10 * 86_400,
+        );
+        let mut fake = Fake::with(&[&reply(vec![create_item("release-build", DRAFT, "you forgot to run the tests first")])]);
+        // The run's ledger row cannot be finished: the pass errors after
+        // the review filed its suggestion.
+        fake.on_close = Some((w.pool.clone(), "DROP TABLE review_runs"));
+        let s = summary;
+        let env = Env {
+            ws: &w.ws,
+            cfg: &w.cfg,
+            roots: &w.roots,
+            pool: &w.pool,
+            index: None,
+            transcripts_dir: w.dir.clone(),
+            library_summary: &s,
+            now: w.now,
+        };
+        let failed = run_pass(&env, Pass::Backfill, opts(5), &fake).await.unwrap_err();
+        assert_eq!(failed.report.created.len(), 1, "{}", failed.error);
+        let id = failed.report.created[0].0;
+        assert_eq!(suggestions::get(&w.pool, id).await.unwrap().unwrap().status, SuggestionStatus::Pending);
     }
 
     #[tokio::test]

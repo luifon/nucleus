@@ -200,6 +200,36 @@ pub struct SkillLearnerConfig {
     /// many suggestions that day.
     #[serde(default = "default_backfill_max_new_per_night")]
     pub backfill_max_new_per_night: u32,
+    /// After a nightly run that filed or revised suggestions still pending
+    /// at its end, queue one WhatsApp notice to the operator's DM (ADR-038).
+    #[serde(default = "default_true_bool")]
+    pub notify: bool,
+    /// The notice texts (`[skill_learner.texts]`).
+    #[serde(default)]
+    pub texts: SkillLearnerTexts,
+}
+
+/// The WhatsApp notice after a nightly skill-gap-learner run (ADR-038).
+/// `{count}` is the number of new pending suggestions, `{link}` the
+/// dashboard's Skills page (or the one suggestion's page), empty when
+/// `NUCLEUS_PUBLIC_URL` is unset. Code fills only these two values; no
+/// suggestion text goes into the notice.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SkillLearnerTexts {
+    /// One new pending suggestion.
+    pub notice_one: String,
+    /// More than one.
+    pub notice_many: String,
+}
+
+impl Default for SkillLearnerTexts {
+    fn default() -> Self {
+        Self {
+            notice_one: "🧩 1 new skill suggestion to review on the dashboard. {link}".into(),
+            notice_many: "🧩 {count} new skill suggestions to review on the dashboard. {link}".into(),
+        }
+    }
 }
 
 /// See [`SkillLearnerConfig::live_mode`].
@@ -230,6 +260,8 @@ impl Default for SkillLearnerConfig {
             live_max_reviews: default_live_max_reviews(),
             backfill_per_night: default_backfill_per_night(),
             backfill_max_new_per_night: default_backfill_max_new_per_night(),
+            notify: true,
+            texts: SkillLearnerTexts::default(),
         }
     }
 }
@@ -1752,6 +1784,23 @@ mod vault_config_tests {
         assert!(search.credential_content_regex.is_empty());
         assert_eq!(check.cron, "0 20 * * 0");
         assert!(!check.scheduled_apply);
+    }
+}
+
+#[cfg(test)]
+mod skill_learner_config_tests {
+    use super::*;
+
+    /// The documented example and the code defaults must not drift.
+    #[test]
+    fn example_skill_learner_table_matches_defaults() {
+        let example: toml::Value = toml::from_str(include_str!("../../nucleus.toml.example")).unwrap();
+        let cfg: SkillLearnerConfig = example["skill_learner"].clone().try_into().unwrap();
+        let d = SkillLearnerConfig::default();
+        assert_eq!((cfg.notify, &cfg.texts), (d.notify, &d.texts));
+        assert_eq!(cfg.backfill_max_new_per_night, d.backfill_max_new_per_night);
+        let empty: SkillLearnerConfig = toml::from_str("").unwrap();
+        assert!(empty.notify && empty.texts == d.texts);
     }
 }
 

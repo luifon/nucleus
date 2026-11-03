@@ -15,6 +15,10 @@
 //!   - `POST /skills/api/restore { dir_name, tier: "personal-archive" | "global-archive" }`
 //!   - `POST /skills/api/delete  { dir_name, tier: "personal-archive" | "global-archive" }`
 //!
+//! Suggestions (ADR-038; `skills/suggestions.rs`):
+//!   - `GET  /skills/api/suggestions`, `GET /skills/api/suggestions/detail?id=`
+//!   - `POST /skills/api/suggestions/{accept,reject,edit}`
+//!
 //! The repo tier is read-only here: changing it is a git change to the
 //! public repository, not a dashboard action.
 //!
@@ -73,11 +77,15 @@ impl SkillsState {
         Self { roots, private_repo, reminders, write_lock: tokio::sync::Mutex::new(()) }
     }
 
+    /// The workspace root (the parent of `.nucleus`).
+    fn workspace_root(&self) -> &Path {
+        self.private_repo.parent().unwrap_or(&self.private_repo)
+    }
+
     /// The cross-program library write lock (ADR-038), so a move or archive
     /// never interleaves with a suggestion accept or a learner writing pass.
     async fn library_guard(&self) -> Result<nucleus_core::skill_learner::LibraryLock, SkillsError> {
-        let ws = self.private_repo.parent().unwrap_or(&self.private_repo);
-        nucleus_core::skill_learner::library_lock(ws, std::time::Duration::from_secs(10))
+        nucleus_core::skill_learner::library_lock(self.workspace_root(), std::time::Duration::from_secs(10))
             .await
             .map_err(|e| SkillsError::Conflict(format!("{e:#}")))
     }
@@ -91,6 +99,11 @@ pub fn router(state: Arc<SkillsState>) -> Router {
         .route("/archive", post(archive_skill))
         .route("/restore", post(restore_skill))
         .route("/delete", post(delete_skill))
+        .route("/suggestions", get(suggestions::list))
+        .route("/suggestions/detail", get(suggestions::detail))
+        .route("/suggestions/accept", post(suggestions::accept))
+        .route("/suggestions/reject", post(suggestions::reject))
+        .route("/suggestions/edit", post(suggestions::edit))
         .with_state(state)
 }
 
@@ -244,6 +257,9 @@ pub struct SkillsErrorBody {
     /// Reminders that block the action (409 on move/archive); empty
     /// otherwise.
     pub reminders: Vec<ReminderRef>,
+    /// Each problem of a refused suggestion draft (422 on a suggestion
+    /// edit or accept); empty otherwise.
+    pub issues: Vec<String>,
 }
 
 // ─── read ──────────────────────────────────────────────────────────────────
@@ -935,6 +951,10 @@ pub enum SkillsError {
     Unprocessable(String),
     /// 503 — a dependency (HOME, reminders.db) is missing.
     Unavailable(String),
+    /// 403 — a browser marked the write as cross-site.
+    Forbidden(String),
+    /// 422 — a suggestion draft failed core's checks; `issues` lists them.
+    Invalid { message: String, issues: Vec<String> },
 }
 
 impl From<JsonRejection> for SkillsError {
@@ -946,6 +966,7 @@ impl From<JsonRejection> for SkillsError {
 impl IntoResponse for SkillsError {
     fn into_response(self) -> axum::response::Response {
         let mut reminders = Vec::new();
+        let mut issues = Vec::new();
         let (code, error) = match self {
             Self::Io(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             Self::OutsideRoots => (
@@ -962,10 +983,17 @@ impl IntoResponse for SkillsError {
             }
             Self::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
             Self::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
+            Self::Forbidden(m) => (StatusCode::FORBIDDEN, m),
+            Self::Invalid { message, issues: list } => {
+                issues = list;
+                (StatusCode::UNPROCESSABLE_ENTITY, message)
+            }
         };
-        (code, Json(SkillsErrorBody { error, reminders })).into_response()
+        (code, Json(SkillsErrorBody { error, reminders, issues })).into_response()
     }
 }
+
+mod suggestions;
 
 #[cfg(test)]
 mod tests;

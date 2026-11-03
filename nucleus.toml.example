@@ -88,6 +88,17 @@ review_window_bytes = 24576  # rendered conversation per review (max 24576); lon
 live_max_reviews = 20        # review sessions per live sweep
 backfill_per_night = 10      # review sessions per night for old sessions
 backfill_max_new_per_night = 5  # stop the backfill for the night above this many new suggestions
+# After a nightly run that filed or revised suggestions, one WhatsApp message to
+# the operator's DM with the count and the dashboard link (NUCLEUS_PUBLIC_URL +
+# /skills; no link when unset). Never carries suggestion text.
+notify = true
+
+# {count} = new pending suggestions, {link} = the dashboard page (empty when
+# NUCLEUS_PUBLIC_URL is unset). Keep {link} bare: WhatsApp breaks a URL inside
+# `*` bold markers.
+[skill_learner.texts]
+notice_one = "🧩 1 new skill suggestion to review on the dashboard. {link}"
+notice_many = "🧩 {count} new skill suggestions to review on the dashboard. {link}"
 
 [gmail]
 # Daily inbox metabolism (ADR-007). 5am local; cron evaluated in NUCLEUS_TZ.

@@ -5,7 +5,9 @@ import Markdown from "@/components/Markdown";
 import Select from "@/components/Select";
 import { approvePlan, type WorkItem, type WorkPlanVersion } from "@/lib/api";
 import { canApproveShown, planStatus } from "@/lib/work";
-import { collapseUnchanged, diffStats, lineDiff, type DiffRow } from "@/lib/linediff";
+import DiffView, { DiffCount } from "@/components/DiffView";
+import ViewTab from "@/components/ViewTab";
+import { lineDiff } from "@/lib/linediff";
 import { shortTime } from "@/lib/tasks";
 import { ActionButton } from "./parts";
 
@@ -146,82 +148,4 @@ function PlanStatus({ status, item }: { status: ReturnType<typeof planStatus>; i
     return <span className="text-xs text-[var(--color-nucleus-accent)]">proposed, not approved</span>;
   }
   return <span className="text-xs text-[var(--color-nucleus-faint)]">replaced by a later version</span>;
-}
-
-function ViewTab({
-  active,
-  disabled,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  disabled?: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      role="tab"
-      aria-selected={active}
-      disabled={disabled}
-      onClick={onClick}
-      className={[
-        "rounded px-2 py-0.5 transition-colors disabled:opacity-40",
-        active
-          ? "bg-[color-mix(in_srgb,var(--color-nucleus-accent)_12%,transparent)] text-[var(--color-nucleus-accent)]"
-          : "text-[var(--color-nucleus-faint)] hover:text-[var(--color-nucleus-text)]",
-      ].join(" ")}
-    >
-      {children}
-    </button>
-  );
-}
-
-function DiffCount({ rows }: { rows: ReturnType<typeof lineDiff> }) {
-  const { added, removed } = diffStats(rows);
-  return (
-    <span className="ml-auto text-[11px]">
-      <span className="text-[var(--color-status-ok)]">+{added}</span> <span className="text-[var(--color-status-down)]">−{removed}</span>
-    </span>
-  );
-}
-
-/** The line changes, with unchanged runs collapsed to three lines of
- *  context; a collapsed run expands when clicked. */
-export function DiffView({ ops }: { ops: ReturnType<typeof lineDiff> }) {
-  const [expanded, setExpanded] = useState(false);
-  const rows: DiffRow[] = expanded ? ops : collapseUnchanged(ops, 3);
-  if (ops.every((o) => o.kind === "same")) {
-    return <div className="text-xs text-[var(--color-nucleus-faint)]">no line changed</div>;
-  }
-  return (
-    <pre className="overflow-x-auto rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-bg)] py-1 text-xs leading-relaxed">
-      {rows.map((r, k) => {
-        if (r.kind === "skip") {
-          return (
-            <button
-              key={k}
-              onClick={() => setExpanded(true)}
-              className="block w-full px-3 py-0.5 text-left text-[var(--color-nucleus-faint)] hover:text-[var(--color-nucleus-accent)]"
-            >
-              ⋯ {r.count} unchanged {r.count === 1 ? "line" : "lines"}
-            </button>
-          );
-        }
-        const cls =
-          r.kind === "add"
-            ? "bg-[color-mix(in_srgb,var(--color-status-ok)_18%,transparent)] text-[var(--color-nucleus-text)]"
-            : r.kind === "del"
-              ? "bg-[color-mix(in_srgb,var(--color-status-down)_18%,transparent)] text-[var(--color-nucleus-faint)]"
-              : "text-[var(--color-nucleus-faint)]";
-        const sign = r.kind === "add" ? "+" : r.kind === "del" ? "−" : " ";
-        return (
-          <div key={k} data-diff={r.kind} className={`whitespace-pre-wrap break-words px-3 ${cls}`}>
-            <span className="mr-2 select-none opacity-70">{sign}</span>
-            {r.text || " "}
-          </div>
-        );
-      })}
-    </pre>
-  );
 }

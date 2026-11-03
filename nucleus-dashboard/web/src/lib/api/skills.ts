@@ -18,6 +18,21 @@ import type { SkillActionResp } from "./generated/SkillActionResp";
 import type { SkillLibrary } from "./generated/SkillLibrary";
 import type { SkillsErrorBody } from "./generated/SkillsErrorBody";
 import type { SkillTier } from "./generated/SkillTier";
+import type { AcceptOutcome } from "./generated/AcceptOutcome";
+import type { AcceptSuggestionReq } from "./generated/AcceptSuggestionReq";
+import type { EditSuggestionReq } from "./generated/EditSuggestionReq";
+import type { RejectSuggestionReq } from "./generated/RejectSuggestionReq";
+import type { BaseState } from "./generated/BaseState";
+import type { Evidence } from "./generated/Evidence";
+import type { EvidenceSource } from "./generated/EvidenceSource";
+import type { LiveSkill } from "./generated/LiveSkill";
+import type { Suggestion } from "./generated/Suggestion";
+import type { SuggestionAcceptResp } from "./generated/SuggestionAcceptResp";
+import type { SuggestionKind } from "./generated/SuggestionKind";
+import type { SuggestionOrigin } from "./generated/SuggestionOrigin";
+import type { SuggestionReview } from "./generated/SuggestionReview";
+import type { SuggestionStatus } from "./generated/SuggestionStatus";
+import type { SuggestionSummary } from "./generated/SuggestionSummary";
 
 export type {
   ArchiveTier,
@@ -30,6 +45,18 @@ export type {
   SkillLibrary,
   SkillsErrorBody,
   SkillTier,
+  AcceptOutcome,
+  BaseState,
+  Evidence,
+  EvidenceSource,
+  LiveSkill,
+  Suggestion,
+  SuggestionAcceptResp,
+  SuggestionKind,
+  SuggestionOrigin,
+  SuggestionReview,
+  SuggestionStatus,
+  SuggestionSummary,
 };
 
 /** The whole library, grouped by tier (personal, repo, global, archived). */
@@ -47,26 +74,28 @@ export const getSkillBody = (path: string) =>
 
 /** Thrown by the write endpoints on a non-2xx response. `message` is the
  *  server's `error`; `reminders` lists the live reminders that block a
- *  move or archive (409), empty otherwise. */
+ *  move or archive (409), empty otherwise; `issues` lists each problem of a
+ *  refused suggestion draft (422), empty otherwise. */
 export class SkillActionError extends ApiError {
   constructor(
     path: string,
     status: number,
     message: string,
     public readonly reminders: ReminderRef[],
+    public readonly issues: string[] = [],
   ) {
     super(path, status, message);
     this.name = "SkillActionError";
   }
 }
 
-async function postSkillAction<B>(path: string, body: B): Promise<SkillActionResp> {
+async function postSkillAction<B, R = SkillActionResp>(path: string, body: B): Promise<R> {
   const res = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (res.ok) return res.json() as Promise<SkillActionResp>;
+  if (res.ok) return res.json() as Promise<R>;
   let parsed: Partial<SkillsErrorBody> | null = null;
   try {
     parsed = (await res.json()) as Partial<SkillsErrorBody>;
@@ -78,7 +107,8 @@ async function postSkillAction<B>(path: string, body: B): Promise<SkillActionRes
       ? parsed.error
       : `${path} → ${res.status} ${res.statusText}`;
   const reminders = Array.isArray(parsed?.reminders) ? parsed.reminders : [];
-  throw new SkillActionError(path, res.status, message, reminders);
+  const issues = Array.isArray(parsed?.issues) ? parsed.issues.filter((i) => typeof i === "string") : [];
+  throw new SkillActionError(path, res.status, message, reminders, issues);
 }
 
 /** Move an active skill between `personal` and `global` (the other one). */
@@ -92,3 +122,34 @@ export const restoreSkill = (req: ArchivedSkillReq) => postSkillAction("/skills/
 
 /** Remove an archived skill. */
 export const deleteSkill = (req: ArchivedSkillReq) => postSkillAction("/skills/api/delete", req);
+
+// ─── suggestions (ADR-038) ─────────────────────────────────────────────────
+// Every decision is made by `nucleus_core::skill_learner` on the server: the
+// draft checks, the patch base-hash binding, the library lock. A refusal
+// arrives as `SkillActionError` with core's text (and `issues` for a draft).
+
+/** Every suggestion, newest first, every status. */
+export const getSuggestions = (signal?: AbortSignal) =>
+  jsonGet<SuggestionSummary[]>("/skills/api/suggestions", signal);
+
+/** One suggestion with its draft, evidence, the live skill a patch
+ *  replaces, and why accept would be refused now. */
+export const getSuggestion = (id: number, signal?: AbortSignal) =>
+  jsonGet<SuggestionReview>(`/skills/api/suggestions/detail${qs({ id })}`, signal);
+
+/** Write the draft into the personal tree and mark it accepted.
+ *  `draft_hash` is `SuggestionReview.draft_hash` of the draft on screen;
+ *  the server refuses (409) when the stored draft changed since. */
+export const acceptSuggestion = (id: number, draft_hash: string) =>
+  postSkillAction<AcceptSuggestionReq, SuggestionAcceptResp>("/skills/api/suggestions/accept", { id, draft_hash });
+
+/** Reject a pending suggestion; later reviews see the reason. */
+export const rejectSuggestion = (id: number, reason: string | null) =>
+  postSkillAction<RejectSuggestionReq, SuggestionReview>("/skills/api/suggestions/reject", {
+    id,
+    reason,
+  });
+
+/** Replace the draft of a pending suggestion (checked again by core). */
+export const editSuggestion = (id: number, draft: string) =>
+  postSkillAction<EditSuggestionReq, SuggestionReview>("/skills/api/suggestions/edit", { id, draft });

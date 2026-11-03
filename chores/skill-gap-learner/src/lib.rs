@@ -13,6 +13,10 @@
 //!      curator (ADR-017's periodic arm). The diary window stretches back
 //!      over missed runs (ADR-029 watermark).
 //!
+//! Between steps 2 and 3, when the passes filed or revised suggestions that
+//! are still pending, one WhatsApp notice goes to the operator's DM with
+//! their count and the dashboard link ([`notice`]).
+//!
 //! `sweep` and `backfill` run steps 1 and 2 alone, with `--limit` and
 //! `--dry-run` for a manual check.
 //!
@@ -25,6 +29,7 @@
 //! validator before they are stored and again when the operator accepts one
 //! (`nucleus skills suggestions`).
 
+mod notice;
 mod parts;
 mod prefilter;
 mod review;
@@ -264,18 +269,31 @@ async fn run_one_pass(
         now: chrono::Utc::now().timestamp(),
     };
     let backend = ClaudeBackend { workspace_root, settings };
-    sweep::run_pass(&env, pass, opts, &backend).await
+    // A `PassFailed` keeps the report of what the pass did before its error.
+    sweep::run_pass(&env, pass, opts, &backend).await.map_err(anyhow::Error::new)
 }
 
-/// Steps 1 and 2 of the nightly run. Each pass's summary goes to the diary;
-/// an error is returned after both had their chance.
-async fn nightly_sweep(workspace_root: &Path, settings: &Settings) -> (Vec<String>, Option<String>) {
+/// What steps 1 and 2 of the nightly run did.
+#[derive(Default)]
+struct NightlySweep {
+    /// Each pass's summary (for the diary).
+    lines: Vec<String>,
+    /// The first error; returned after both passes had their chance.
+    error: Option<String>,
+    /// Suggestions the passes filed, and the new suggestion of each
+    /// revision.
+    filed: Vec<i64>,
+}
+
+/// Steps 1 and 2 of the nightly run.
+async fn nightly_sweep(workspace_root: &Path, settings: &Settings) -> NightlySweep {
     let cfg = &settings.skill_learner;
     if !cfg.enabled {
-        return (vec!["sweep disabled ([skill_learner] enabled = false)".into()], None);
+        return NightlySweep { lines: vec!["sweep disabled ([skill_learner] enabled = false)".into()], ..Default::default() };
     }
     let mut lines = Vec::new();
     let mut error = None;
+    let mut filed = Vec::new();
     let passes = [
         (
             sweep::Pass::Live,
@@ -287,6 +305,8 @@ async fn nightly_sweep(workspace_root: &Path, settings: &Settings) -> (Vec<Strin
         match run_one_pass(workspace_root, settings, pass, opts).await {
             Ok(r) => {
                 tracing::info!("learn: {}", r.summary());
+                filed.extend(r.created.iter().map(|(id, _)| *id));
+                filed.extend(&r.revised);
                 if r.error.is_some() && error.is_none() {
                     error = r.error.clone();
                 }
@@ -298,6 +318,12 @@ async fn nightly_sweep(workspace_root: &Path, settings: &Settings) -> (Vec<Strin
                 }
             }
             Err(e) => {
+                // The suggestions filed before the error are stored: they
+                // still get their notice.
+                if let Some(failed) = e.downcast_ref::<sweep::PassFailed>() {
+                    filed.extend(failed.report.created.iter().map(|(id, _)| *id));
+                    filed.extend(&failed.report.revised);
+                }
                 let msg = format!("{} pass failed: {e:#}", pass.as_str());
                 tracing::warn!("learn: {msg}");
                 lines.push(msg.clone());
@@ -305,7 +331,35 @@ async fn nightly_sweep(workspace_root: &Path, settings: &Settings) -> (Vec<Strin
             }
         }
     }
-    (lines, error)
+    NightlySweep { lines, error, filed }
+}
+
+/// Queue the WhatsApp notice for the suggestions the sweep filed that are
+/// still pending (none when there are none). A failure is logged; it does
+/// not stop the run.
+async fn notify_suggestions(workspace_root: &Path, settings: &Settings, filed: &[i64]) {
+    let cfg = &settings.skill_learner;
+    if !cfg.notify || filed.is_empty() {
+        return;
+    }
+    let result = async {
+        let pool = skill_learner::open(workspace_root).await?;
+        let pending = notice::new_pending(&pool, filed).await?;
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let store = skill_learner::store_id(&pool).await?;
+        let wa = nucleus_core::whatsapp_queue::open(workspace_root).await?;
+        notice::queue(&wa, &store, &cfg.texts, settings.public_urls.nucleus.as_deref(), &pending)
+            .await
+            .map(|row| row.map(|r| (r, pending.len())))
+    }
+    .await;
+    match result {
+        Ok(Some((row, n))) => tracing::info!("learn: queued the WhatsApp notice for {n} new suggestion(s) (outbound #{row})"),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("learn: the WhatsApp notice for new suggestions was not queued: {e:#}"),
+    }
 }
 
 #[derive(Default)]
@@ -636,15 +690,17 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
     let repo_root = skills::repo_skills_root(workspace_root);
     let cfg = &settings.skill_learner;
 
-    // 0. Transcript sweep + backfill (ADR-038).
-    let (sweep_lines, sweep_error) = nightly_sweep(workspace_root, settings).await;
+    // 0. Transcript sweep + backfill (ADR-038), and the WhatsApp notice for
+    // what they filed.
+    let sweep = nightly_sweep(workspace_root, settings).await;
     let _ = diary::record_observation(
         workspace_root,
         AGENT_NAME,
         "sweep",
-        &sweep_lines.join("\n"),
+        &sweep.lines.join("\n"),
         diary::Tag::Observation,
     );
+    notify_suggestions(workspace_root, settings, &sweep.filed).await;
 
     // 1. Pure auto-transitions (no LLM): archive agent-created, unpinned skills
     // idle past archive_after_days; count the merely-stale for the log.
@@ -712,7 +768,7 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
     if let Some(yesterday) = today.pred_opt() {
         chore_state::set_watermark(workspace_root, LEARN_WATERMARK_KEY, &yesterday.to_string()).await?;
     }
-    match sweep_error {
+    match sweep.error {
         Some(e) => bail!("transcript sweep: {e}"),
         None => Ok(()),
     }

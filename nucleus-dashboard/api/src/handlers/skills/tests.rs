@@ -528,3 +528,204 @@ fn copy_tree_recreates_symlinks() {
     assert_eq!(std::fs::read_to_string(dst.join("sub/f.txt")).unwrap(), "x");
     assert_eq!(std::fs::read_link(dst.join("link")).unwrap(), PathBuf::from("../elsewhere"));
 }
+
+// ─── suggestions (ADR-038) ─────────────────────────────────────────────────
+
+mod suggestion_routes {
+    use super::*;
+    use nucleus_core::skill_learner::{
+        self,
+        suggestions::{self as core_suggestions, EvidenceSource, NewEvidence, NewSuggestion, SuggestionKind, SuggestionOrigin},
+    };
+
+    const DRAFT: &str = "---\nname: x\ndescription: \"Deploy a service\"\n---\n\n# When to invoke\nWhen deploying.\n\n# Steps\n1. Build.\n\n# Failure modes\n- The push fails: retry once.\n";
+
+    fn suggestion(kind: SuggestionKind, name: &str) -> NewSuggestion {
+        NewSuggestion {
+            kind,
+            name: name.into(),
+            draft: DRAFT.into(),
+            rationale: "the operator corrected the deploy order twice".into(),
+            origin: SuggestionOrigin::Backfill,
+            expected_base: None,
+            overrides_rejected: None,
+            why_new: None,
+            evidence: NewEvidence {
+                session_id: Some("sess-1".into()),
+                source: EvidenceSource::Index,
+                agent: None,
+                note: String::new(),
+                quotes: vec!["USER: build before you push".into()],
+            },
+        }
+    }
+
+    async fn file(f: &Fixture, kind: SuggestionKind, name: &str) -> i64 {
+        let pool = skill_learner::open(&f.ws).await.unwrap();
+        core_suggestions::create(&pool, &f.ws, &f.roots, &suggestion(kind, name)).await.unwrap()
+    }
+
+    async fn call(app: &Router, method: &str, path: &str, body: Option<serde_json::Value>) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder().method(method).uri(path).header("sec-fetch-site", "same-origin");
+        if body.is_some() {
+            req = req.header("content-type", "application/json");
+        }
+        let req = req.body(body.map(|b| Body::from(b.to_string())).unwrap_or_else(Body::empty)).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn without_a_store_the_list_is_empty_and_nothing_is_found() {
+        let f = Fixture::new().await;
+        let app = router(f.state());
+        let (code, json) = call(&app, "GET", "/suggestions", None).await;
+        assert_eq!((code, json), (StatusCode::OK, serde_json::json!([])));
+        assert_eq!(call(&app, "GET", "/suggestions/detail?id=1", None).await.0, StatusCode::NOT_FOUND);
+        let (code, _) = call(&app, "POST", "/suggestions/reject", Some(serde_json::json!({"id": 1, "reason": null}))).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert!(!f.ws.join(skill_learner::DB_PATH).exists(), "a read or a refused write never creates the store");
+    }
+
+    #[tokio::test]
+    async fn list_detail_edit_reject_and_accept_go_through_core() {
+        let f = Fixture::new().await;
+        f.init_private_repo();
+        let app = router(f.state());
+        let a = file(&f, SuggestionKind::Create, "service-deploy").await;
+        let b = file(&f, SuggestionKind::Create, "other-routine").await;
+
+        let (code, list) = call(&app, "GET", "/suggestions", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        assert_eq!(list[0]["id"], b, "newest first");
+        assert_eq!((list[1]["status"].as_str(), list[1]["origin"].as_str()), (Some("pending"), Some("backfill")));
+        assert_eq!(list[1]["evidence_count"], 1);
+
+        let (code, review) = call(&app, "GET", &format!("/suggestions/detail?id={a}"), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(review["suggestion"]["draft"].as_str().unwrap().contains("created_by: agent"));
+        assert_eq!(review["suggestion"]["evidence"][0]["quotes"][0], "USER: build before you push");
+        assert_eq!(review["accept_blockers"], serde_json::json!([]));
+        assert!(review["live"].is_null());
+
+        // An invalid edit is refused with every problem listed; the draft stays.
+        let (code, err) = call(&app, "POST", "/suggestions/edit", Some(serde_json::json!({"id": a, "draft": "---\nname: x\n---\nbody\n"}))).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err["issues"].as_array().unwrap().len() > 1, "{err}");
+        assert!(err["error"].as_str().unwrap().starts_with("the draft is not valid"));
+        // A valid edit replaces it.
+        let edited = DRAFT.replace("1. Build.", "1. Build and test.");
+        let (code, review) = call(&app, "POST", "/suggestions/edit", Some(serde_json::json!({"id": a, "draft": edited}))).await;
+        assert_eq!(code, StatusCode::OK, "{review}");
+        assert_eq!(review["suggestion"]["edited"], true);
+        assert!(review["suggestion"]["draft"].as_str().unwrap().contains("Build and test."));
+
+        // Reject with a reason; a second decision is a conflict.
+        let (code, review) = call(&app, "POST", "/suggestions/reject", Some(serde_json::json!({"id": b, "reason": "  too narrow  "}))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!((review["suggestion"]["status"].as_str(), review["suggestion"]["reject_reason"].as_str()), (Some("rejected"), Some("too narrow")));
+        let shown_b = review["draft_hash"].clone();
+        let (code, err) = call(&app, "POST", "/suggestions/accept", Some(serde_json::json!({"id": b, "draft_hash": shown_b}))).await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(err["error"].as_str().unwrap().contains("not pending"), "{err}");
+
+        // Accept writes the personal tree and commits it in `.nucleus`.
+        let (_, review) = call(&app, "GET", &format!("/suggestions/detail?id={a}"), None).await;
+        let shown_a = review["draft_hash"].clone();
+        let (code, resp) = call(&app, "POST", "/suggestions/accept", Some(serde_json::json!({"id": a, "draft_hash": shown_a}))).await;
+        assert_eq!(code, StatusCode::OK, "{resp}");
+        let written = std::fs::read_to_string(f.roots.personal.join("service-deploy").join(SKILL_FILE)).unwrap();
+        assert!(written.contains("Build and test."));
+        assert_eq!(resp["git"]["status"], "committed", "{resp}");
+        assert!(git_log(&private_dir(&f.ws)).contains("dashboard: accept skill suggestion"));
+        assert!(!f.roots.repo.exists(), "the committed tree is never written");
+        let (_, review) = call(&app, "GET", &format!("/suggestions/detail?id={a}"), None).await;
+        assert_eq!(review["suggestion"]["status"], "accepted");
+    }
+
+    #[tokio::test]
+    async fn a_patch_whose_live_skill_changed_shows_and_returns_core_refusal() {
+        let f = Fixture::new().await;
+        write_skill(&f.roots.personal, "hand", "");
+        std::fs::write(
+            f.roots.personal.join("hand").join(SKILL_FILE),
+            "---\nname: hand\ndescription: d\nflavor: recipe\n---\n\n# When to invoke\nx\n# Steps\n1\n# Failure modes\n- z\n",
+        )
+        .unwrap();
+        let p = file(&f, SuggestionKind::Patch, "hand").await;
+        let app = router(f.state());
+        let (_, review) = call(&app, "GET", &format!("/suggestions/detail?id={p}"), None).await;
+        assert_eq!(review["live"]["state"], "unchanged");
+        assert!(review["live"]["text"].as_str().unwrap().contains("name: hand"));
+
+        std::fs::write(f.roots.personal.join("hand").join(SKILL_FILE), "changed by hand\n").unwrap();
+        let (_, review) = call(&app, "GET", &format!("/suggestions/detail?id={p}"), None).await;
+        assert_eq!(review["live"]["state"], "changed");
+        let blockers = review["accept_blockers"].clone();
+        assert!(blockers[0].as_str().unwrap().contains("changed after the draft was written"), "{blockers}");
+
+        let shown = review["draft_hash"].clone();
+        let (code, err) = call(&app, "POST", "/suggestions/accept", Some(serde_json::json!({"id": p, "draft_hash": shown}))).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err["issues"], blockers, "the page shows core's refusal");
+        assert_eq!(std::fs::read_to_string(f.roots.personal.join("hand").join(SKILL_FILE)).unwrap(), "changed by hand\n");
+    }
+
+    #[tokio::test]
+    async fn cross_site_writes_are_refused() {
+        let f = Fixture::new().await;
+        let a = file(&f, SuggestionKind::Create, "service-deploy").await;
+        let app = router(f.state());
+        let req = Request::post("/suggestions/reject")
+            .header("content-type", "application/json")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::from(serde_json::json!({"id": a, "reason": null}).to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let (_, review) = call(&app, "GET", &format!("/suggestions/detail?id={a}"), None).await;
+        assert_eq!(review["suggestion"]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn accept_is_bound_to_the_draft_on_screen() {
+        let f = Fixture::new().await;
+        let a = file(&f, SuggestionKind::Create, "service-deploy").await;
+        let app = router(f.state());
+        let (_, review) = call(&app, "GET", &format!("/suggestions/detail?id={a}"), None).await;
+        let shown = review["draft_hash"].as_str().unwrap().to_string();
+        assert_eq!(shown.len(), 64);
+        // Another tab edits the draft after this page showed it.
+        let edited = DRAFT.replace("1. Build.", "1. Build and push without tests.");
+        let (code, _) = call(&app, "POST", "/suggestions/edit", Some(serde_json::json!({"id": a, "draft": edited}))).await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, err) = call(&app, "POST", "/suggestions/accept", Some(serde_json::json!({"id": a, "draft_hash": shown}))).await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(err["error"].as_str().unwrap().contains("reload it"), "{err}");
+        assert!(!f.roots.personal.join("service-deploy").exists());
+        // Without the hash the request is malformed.
+        let (code, _) = call(&app, "POST", "/suggestions/accept", Some(serde_json::json!({"id": a}))).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn the_detail_never_shows_a_file_behind_a_symlinked_skill_md() {
+        let f = Fixture::new().await;
+        write_skill(&f.roots.personal, "hand", "flavor: recipe\n");
+        let md = f.roots.personal.join("hand").join(SKILL_FILE);
+        std::fs::write(&md, "---\nname: hand\ndescription: d\nflavor: recipe\n---\n\n# When to invoke\nx\n# Steps\n1\n# Failure modes\n- z\n").unwrap();
+        let p = file(&f, SuggestionKind::Patch, "hand").await;
+        let secret = f.ws.join("outside.env");
+        std::fs::write(&secret, "OUTSIDE_VALUE=do-not-show\n").unwrap();
+        std::fs::remove_file(&md).unwrap();
+        std::os::unix::fs::symlink(&secret, &md).unwrap();
+        let app = router(f.state());
+        let (code, review) = call(&app, "GET", &format!("/suggestions/detail?id={p}"), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(!review.to_string().contains("do-not-show"), "{review}");
+        assert_eq!(review["live"]["state"], "missing");
+        assert!(review["live"]["text"].is_null());
+    }
+}

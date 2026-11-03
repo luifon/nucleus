@@ -1,8 +1,11 @@
 import { useState, type ReactNode } from "react";
-import { RefreshCw, User, GitBranch, Globe, Archive, Sparkles, X } from "lucide-react";
+import { RefreshCw, User, GitBranch, Globe, Archive, Sparkles } from "lucide-react";
 import PageShell from "@/components/PageShell";
 import Tabs from "@/components/Tabs";
 import SkillRow from "@/components/skills/SkillRow";
+import OutcomePanel, { type Outcome } from "@/components/skills/OutcomePanel";
+import SuggestionsSection from "@/components/skills/SuggestionsSection";
+import SectionHeader from "@/components/SectionHeader";
 import { useFetch } from "@/lib/hooks";
 import {
   archiveSkill,
@@ -11,7 +14,6 @@ import {
   moveSkill,
   restoreSkill,
   SkillActionError,
-  type ReminderRef,
   type Skill,
   type SkillActionResp,
   type SkillLibrary,
@@ -21,17 +23,10 @@ import {
   describeResult,
   isArchiveTier,
   isMutableTier,
-  reminderLine,
   tierLabel,
 } from "@/lib/skills";
 
 type TabValue = keyof SkillLibrary;
-
-/** Outcome of the last write, shown above the list until dismissed or
- *  replaced by the next write. */
-type Outcome =
-  | { kind: "ok" | "warn"; lines: string[] }
-  | { kind: "error"; lines: string[]; reminders: ReminderRef[] };
 
 export default function SkillsPage() {
   const skills = useFetch(getSkillLibrary);
@@ -85,6 +80,9 @@ export default function SkillsPage() {
         </button>
       }
     >
+      <SuggestionsSection onLibraryChanged={skills.refetch} />
+
+      <SectionHeader label="library" />
       <Tabs
         tabs={[
           { value: "personal" as TabValue, label: tabIcon(User, "private"), count: skills.data?.personal.length ?? null },
@@ -138,52 +136,6 @@ function send(kind: ActionKind, skill: Skill): Promise<SkillActionResp> {
       : deleteSkill({ dir_name, tier: skill.tier });
   }
   return Promise.reject(new Error(`${kind} is not available for ${tierLabel(skill.tier)} skills`));
-}
-
-const OUTCOME_TONE: Record<Outcome["kind"], { border: string; text: string }> = {
-  ok: { border: "border-[var(--color-status-ok)]", text: "text-[var(--color-status-ok)]" },
-  warn: { border: "border-[var(--color-status-warn)]", text: "text-[var(--color-status-warn)]" },
-  error: { border: "border-[var(--color-status-down)]", text: "text-[var(--color-status-down)]" },
-};
-
-function OutcomePanel({ outcome, onDismiss }: { outcome: Outcome; onDismiss: () => void }) {
-  const tone = OUTCOME_TONE[outcome.kind];
-  const [head, ...rest] = outcome.lines;
-  return (
-    <div
-      className={`mb-4 flex items-start gap-3 rounded border bg-[var(--color-nucleus-surface)] px-3 py-2 text-xs ${tone.border}`}
-    >
-      <div className="min-w-0 flex-1 space-y-1">
-        <div className={tone.text}>{head}</div>
-        {rest.map((l, i) => (
-          <div key={i} className="text-[var(--color-nucleus-faint)]">
-            {l}
-          </div>
-        ))}
-        {outcome.kind === "error" && outcome.reminders.length > 0 && (
-          <div className="pt-1">
-            <div className="text-[var(--color-nucleus-faint)]">
-              These reminders refer to the skill. Change or cancel them first:
-            </div>
-            <ul className="mt-1 space-y-0.5 text-[var(--color-nucleus-text)]">
-              {outcome.reminders.map((r) => (
-                <li key={`${r.id}-${r.field}`}>
-                  <code>{reminderLine(r)}</code>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </div>
-      <button
-        onClick={onDismiss}
-        title="dismiss"
-        className="shrink-0 text-[var(--color-nucleus-faint)] hover:text-[var(--color-nucleus-accent)]"
-      >
-        <X size={12} strokeWidth={2} />
-      </button>
-    </div>
-  );
 }
 
 const PRECEDENCE =

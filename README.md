@@ -423,7 +423,8 @@ go free-form (`"Read today's diary, post a one-line blockers summary."`).
 The skill-gap learner reviews this workspace's sessions every night and files
 **skill suggestions** (a new skill or a full replacement of a personal one)
 instead of writing skills (ADR-038). Review them with
-`nucleus skills suggestions list|show <id>`, then `accept <id>`,
+`nucleus skills suggestions list|show <id>`, then `accept <id> --draft
+<hash printed by show>`,
 `reject <id> --reason …` or `edit <id> --file <path>`. A session that finds a
 loaded skill wrong files a patch suggestion with `nucleus skills suggest`.
 

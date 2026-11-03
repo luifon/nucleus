@@ -19,6 +19,7 @@
 //!   a session that continued later is reviewed only for its new part
 //!   ([`ledger`]).
 //! - `review_runs` — one row per review session the learner ran.
+//! - `store_meta` — the store's random id ([`store_id`]).
 //!
 //! Losing this file loses the pending suggestions and makes the next sweep
 //! review every session again. It is not rebuilt from anything.
@@ -106,12 +107,29 @@ crate::migrate::Migration {
         "ALTER TABLE reviewed_sessions ADD COLUMN head_hash TEXT;
         ALTER TABLE reviewed_sessions ADD COLUMN text_turns INTEGER",
     ),
+},
+// A random id of this store, made once when the database is created (or
+// migrated). Suggestion ids restart in a new store; the WhatsApp notice's
+// dedup key carries this id so a new store's notices are not taken for an
+// old store's.
+crate::migrate::Migration {
+    version: 3,
+    name: "adr038-store-id",
+    step: crate::migrate::Step::Sql(
+        "CREATE TABLE IF NOT EXISTS store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT OR IGNORE INTO store_meta (key, value) VALUES ('store_id', lower(hex(randomblob(16))))",
+    ),
 }];
 
 pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
     let pool = crate::db::open(&workspace_root.join(DB_PATH)).await?;
     crate::migrate::migrate(&pool, MIGRATIONS).await?;
     Ok(pool)
+}
+
+/// The random id of this store (see migration 3).
+pub async fn store_id(pool: &SqlitePool) -> Result<String> {
+    Ok(sqlx::query_scalar("SELECT value FROM store_meta WHERE key = 'store_id'").fetch_one(pool).await?)
 }
 
 /// The store opened read-only, for read paths that must not create it

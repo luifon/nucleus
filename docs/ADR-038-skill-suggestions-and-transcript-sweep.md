@@ -56,6 +56,10 @@ label, short quotes), a status (`pending`, `accepted`, `rejected`,
 - One pending suggestion per skill name. A suggestion for a name that was
   rejected before is refused unless it names the rejected suggestion
   (`overrides_rejected`) and says what is new (`why_new`).
+- A live SKILL.md is read without following a symlink (`O_NOFOLLOW`):
+  a symlinked SKILL.md is refused when a patch is filed, shown or
+  accepted, so a link cannot make Nucleus show, hash or overwrite another
+  file.
 - Accept writes `<workspace>/.nucleus/.claude/skills/<name>/SKILL.md`
   (through an exclusively created temporary file and a rename; refused when
   the personal tree, its `.nucleus` parents or the skill directory is a
@@ -195,11 +199,15 @@ keeps two runs from reviewing the same session.
 
 ### Terminal surface
 
-`nucleus skills suggestions list|show <id>|accept <id>|reject <id>
-[--reason]|edit <id> --file <path>` and `nucleus skills suggest --kind
+`nucleus skills suggestions list|show <id>|accept <id> --draft
+<sha256>|reject <id> [--reason]|edit <id> --file <path>` and `nucleus skills suggest --kind
 create|patch --name … --rationale … --file …`. Accept, reject and edit are
 the operator's only (the ADR-033 caller check: a terminal or an operator
-session, not a turn reacting to an agent message). Any session may file a
+session, not a turn reacting to an agent message). Accept takes the
+SHA-256 of the draft the operator read (`show` prints it; the dashboard
+sends the hash of the draft on screen) and compares it with the stored
+draft inside its transaction, so an edit or a revision made after the
+operator read the draft is never accepted unseen. Any session may file a
 suggestion; its session id and agent come from its process tree. A manual
 patch requires `--base <sha256>` of the SKILL.md its author read before
 drafting, so it cannot replace a version the author did not see. The
@@ -208,6 +216,63 @@ transcript under the configured workspace, and another spelling of the
 path would make it look in the wrong directory. CLAUDE.md
 Rule 11 tells every session to file a patch suggestion when a loaded skill
 turns out wrong.
+
+### Dashboard review
+
+The Skills page (`/skills`) has a Suggestions section above the library
+tabs. Its routes (`/skills/api/suggestions`, `…/detail`, `…/accept`,
+`…/reject`, `…/edit`) call the same `skill_learner::suggestions`
+functions as the terminal commands; the handler only maps their results
+and refusals to HTTP. A refusal because of the draft is 422 with each
+problem listed (`InvalidDraft`); any other refusal (not pending, the
+library lock is held, a symlink) is 409 with core's text. The writes
+accept a JSON body only and refuse a request a browser marks as
+cross-site, as on the Work and Tasks pages; the dashboard is the
+operator's own surface on the tailnet.
+
+- The list shows pending suggestions first (kind, name, origin, evidence
+  count, date, the rationale on one line) and the accepted, rejected and
+  superseded ones in a collapsed history.
+- An open suggestion shows the draft rendered as Markdown (its frontmatter
+  as a block above it) or raw, and the evidence: each session with its
+  source, date and quoted turns. For a patch it shows the line changes
+  from the live SKILL.md and says when the live file changed after the
+  suggestion was written.
+- `suggestions::review` returns, while a suggestion is pending, the reasons
+  accept would be refused now. Review and accept call one function for
+  these checks (`plan_accept`: name, real directories, an earlier completed
+  write, the base hash, `prepare_draft`), so the page shows accept's
+  refusal before the operator tries. The review also carries the draft's
+  hash, which the page sends with accept; a draft changed since the page
+  showed it is refused with 409 and the operator reloads.
+- Accept and reject each take a second inline step (reject with an
+  optional reason there); edit replaces the draft in a text area and the
+  save is checked like any draft. An accept is committed in the `.nucleus`
+  repository like the page's other changes to the private tier; the
+  handler holds the library write lock from the accept through that
+  commit, so the commit holds no other writer's change.
+- `/skills?suggestion=<id>` opens that suggestion.
+
+### WhatsApp notice
+
+After the nightly `learn` run's sweep and backfill, when they filed or
+revised suggestions that are still pending, one message is queued to the
+operator's DM: `[skill_learner.texts] notice_one` or `notice_many`, with
+`{count}` and `{link}` filled by code. The link is
+`NUCLEUS_PUBLIC_URL/skills`, or `/skills?suggestion=<id>` when there is
+one suggestion; without `NUCLEUS_PUBLIC_URL` there is no link. The URL
+stays bare (WhatsApp breaks a link inside `*` markers). Names, rationales,
+drafts and quotes are model output and session text and never go into the
+message. The row goes through `outbound_queue` with the target `dm`, so
+the bot's target policy sends it only to the operator and its secret
+filter reads it. The dedup key is the store's random id (`store_meta`,
+created with the database by migration 3) and the set of suggestion ids,
+so a run repeated with nothing new queues nothing, and a recreated
+`memory/skill_learner.db`, whose ids restart, still gets its notices. A
+pass that stops on an error keeps the ids it filed before the error, and
+they get the notice too. Nothing new pending: no
+message. `[skill_learner] notify = false` turns it off. A failure to
+queue is logged and does not stop the run.
 
 ### Removed
 
@@ -223,6 +288,8 @@ The on-the-fly trigger, with no replacement in the bots:
 - Terminal sessions, bot chats and dashboard chats are reviewed every
   night, and the text of deleted transcripts is reviewed once by the
   backfill.
+- The operator reviews suggestions on the dashboard or in the terminal,
+  and gets one WhatsApp message on a night that produced new ones.
 - No skill enters the library from a review without the operator, except in
   write mode. The diary gap pass and the curator still write directly
   (ADR-017 arm 2).

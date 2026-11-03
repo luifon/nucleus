@@ -13,4 +13,9 @@ error: string,
  * Reminders that block the action (409 on move/archive); empty
  * otherwise.
  */
-reminders: Array<ReminderRef>, };
+reminders: Array<ReminderRef>,
+/**
+ * Each problem of a refused suggestion draft (422 on a suggestion
+ * edit or accept); empty otherwise.
+ */
+issues: Array<string>, };

@@ -14,7 +14,7 @@
 //! Examples:
 //!   nucleus skills suggestions list
 //!   nucleus skills suggestions show 12
-//!   nucleus skills suggestions accept 12
+//!   nucleus skills suggestions accept 12 --draft <sha256 printed by show>
 //!   nucleus skills suggestions reject 12 --reason "too narrow"
 //!   nucleus skills suggestions edit 12 --file draft.md
 //!   nucleus skills suggest --kind patch --name some-skill --base <sha256> \
@@ -26,7 +26,7 @@ use crate::caller::{self, Caller, Role};
 use crate::skill_learner::{
     self,
     suggestions::{
-        self, EvidenceSource, NewEvidence, NewSuggestion, SuggestionKind, SuggestionOrigin, SuggestionStatus,
+        self, BaseState, EvidenceSource, NewEvidence, NewSuggestion, SuggestionKind, SuggestionOrigin, SuggestionStatus,
     },
 };
 use crate::skills::LibraryRoots;
@@ -104,7 +104,13 @@ enum SuggestionsCmd {
         json: bool,
     },
     /// Write the draft into the personal skill tree and mark it accepted.
-    Accept { id: i64 },
+    Accept {
+        id: i64,
+        /// The draft hash `show` printed: accept writes only the draft you
+        /// read, and is refused when it was edited or revised since.
+        #[arg(long = "draft")]
+        draft_hash: String,
+    },
     /// Reject a pending suggestion. Later reviews see the reason.
     Reject {
         id: i64,
@@ -285,22 +291,25 @@ async fn suggestions_cmd(ws: &Path, roots: &LibraryRoots, cmd: SuggestionsCmd) -
                     println!("      > {}", one_line(q, 200));
                 }
             }
-            if s.kind == SuggestionKind::Patch {
-                let live = roots.personal.join(&s.name).join(crate::skills::SKILL_FILE);
-                let state = match (std::fs::read(&live), &s.base_hash) {
-                    (Ok(b), Some(h)) if skill_learner::content_hash(&b) == *h => "unchanged since the suggestion",
-                    (Ok(_), _) => "CHANGED since the suggestion; accept will refuse it",
-                    (Err(_), _) => "MISSING; accept will refuse it",
+            if let Some(live) = suggestions::live_skill(roots, &s) {
+                let state = match live.state {
+                    BaseState::Unchanged => "unchanged since the suggestion",
+                    BaseState::Changed => "CHANGED since the suggestion; accept will refuse it",
+                    BaseState::Missing => "MISSING; accept will refuse it",
                 };
-                println!("\nlive skill {}: {state}", live.display());
+                println!("\nlive skill {}: {state}", live.path);
             }
             println!("\n----- draft SKILL.md -----\n{}", s.draft);
+            println!("----- end of draft -----\ndraft hash: {}", skill_learner::content_hash(s.draft.as_bytes()));
+            if s.status == SuggestionStatus::Pending {
+                println!("accept this draft: nucleus skills suggestions accept {} --draft {}", s.id, skill_learner::content_hash(s.draft.as_bytes()));
+            }
             Ok(())
         }
-        SuggestionsCmd::Accept { id } => {
+        SuggestionsCmd::Accept { id, draft_hash } => {
             require_operator(&caller::detect(ws).await?, "accept")?;
             let pool = skill_learner::open(ws).await?;
-            let out = suggestions::accept(&pool, ws, roots, id).await?;
+            let out = suggestions::accept(&pool, ws, roots, id, &draft_hash).await?;
             println!("accepted #{id}: wrote {}", out.path);
             if !out.superseded.is_empty() {
                 let ids: Vec<String> = out.superseded.iter().map(|i| format!("#{i}")).collect();

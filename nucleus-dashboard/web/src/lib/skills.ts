@@ -6,6 +6,7 @@
 
 import type {
   ArchiveTier,
+  GitOutcome,
   MutableTier,
   ReminderRef,
   Skill,
@@ -162,26 +163,28 @@ export function describeResult(resp: SkillActionResp): ResultSummary {
       head = `deleted ${resp.dir_name} from ${from}`;
       break;
   }
-  const lines = [head];
-  let kind: ResultSummary["kind"] = "ok";
-  switch (resp.git.status) {
-    case "committed":
-      lines.push(`git: committed ${resp.git.sha.slice(0, 7)} in .nucleus`);
-      break;
-    case "skipped":
-      lines.push(`git: no commit (${resp.git.reason})`);
-      break;
-    case "failed":
-      kind = "warn";
-      lines.push(
-        `git commit failed: ${resp.git.error}. The change is on disk and uncommitted in .nucleus.`,
-      );
-      break;
-    case "not-applicable":
-      break;
-  }
+  const git = gitSummary(resp.git);
+  const lines = [head, ...git.lines];
   if (resp.note) lines.push(resp.note);
-  return { kind, lines };
+  return { kind: git.kind, lines };
+}
+
+/** What happened in the `.nucleus` repository after a write: one line (none
+ *  when not applicable). A failed commit makes the result a warning. */
+export function gitSummary(git: GitOutcome): ResultSummary {
+  switch (git.status) {
+    case "committed":
+      return { kind: "ok", lines: [`git: committed ${git.sha.slice(0, 7)} in .nucleus`] };
+    case "skipped":
+      return { kind: "ok", lines: [`git: no commit (${git.reason})`] };
+    case "failed":
+      return {
+        kind: "warn",
+        lines: [`git commit failed: ${git.error}. The change is on disk and uncommitted in .nucleus.`],
+      };
+    case "not-applicable":
+      return { kind: "ok", lines: [] };
+  }
 }
 
 /** One line per blocking reminder: `#12 daily digest (system_prompt)`. */

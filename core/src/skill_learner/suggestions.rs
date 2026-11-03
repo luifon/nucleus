@@ -207,6 +207,67 @@ pub struct AcceptOutcome {
     pub superseded: Vec<i64>,
 }
 
+/// A draft that failed [`prepare_draft`], with every problem found. The
+/// error of [`edit`] and [`accept`] when the draft is the reason, so a
+/// caller (the dashboard) can list the problems; its text is `context:
+/// issue; issue`.
+#[derive(Debug, Clone)]
+pub struct InvalidDraft {
+    pub context: String,
+    pub issues: Vec<String>,
+}
+
+impl std::fmt::Display for InvalidDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.context, self.issues.join("; "))
+    }
+}
+
+impl std::error::Error for InvalidDraft {}
+
+/// A patch suggestion's base compared with the live SKILL.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum BaseState {
+    /// The live SKILL.md still has the suggestion's base hash.
+    Unchanged,
+    /// The live SKILL.md changed after the suggestion was written.
+    Changed,
+    /// The skill cannot be read as a personal skill (missing, or its
+    /// directory is a symlink).
+    Missing,
+}
+
+/// The live skill a patch suggestion replaces.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct LiveSkill {
+    /// The SKILL.md accept would replace.
+    pub path: String,
+    /// Its text; null when it cannot be read.
+    pub text: Option<String>,
+    pub state: BaseState,
+    /// Why it cannot be read (`missing` only).
+    pub problem: Option<String>,
+}
+
+/// A suggestion with what the operator needs to decide it: the live skill a
+/// patch replaces, and, while it is pending, the reasons accept would be
+/// refused right now (the same check accept runs; empty when it would
+/// write).
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct SuggestionReview {
+    pub suggestion: Suggestion,
+    /// SHA-256 of the draft shown. Accept requires it, so it writes only
+    /// the draft the operator reviewed.
+    pub draft_hash: String,
+    /// `patch` only.
+    pub live: Option<LiveSkill>,
+    pub accept_blockers: Vec<String>,
+}
+
 /// A checked draft, ready to store or write.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedDraft {
@@ -275,7 +336,8 @@ pub fn set_frontmatter(content: &str, fields: &[(&str, Option<&str>)]) -> Result
 }
 
 /// The personal skill `name` as it is on disk: its SKILL.md path and bytes.
-/// Errors when it does not exist or its directory is a symlink.
+/// Errors when it does not exist, or its directory or its SKILL.md is a
+/// symlink (a link could make Nucleus read, show or hash another file).
 fn live_personal_skill(roots: &LibraryRoots, name: &str) -> Result<(PathBuf, Vec<u8>)> {
     let dir = roots.personal.join(name);
     let meta = std::fs::symlink_metadata(&dir)
@@ -284,8 +346,29 @@ fn live_personal_skill(roots: &LibraryRoots, name: &str) -> Result<(PathBuf, Vec
         bail!("the personal skill `{name}` is a symlink; patch its target by hand");
     }
     let path = dir.join(skills::SKILL_FILE);
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = read_no_follow(&path)?;
     Ok((path, bytes))
+}
+
+/// Read a regular file without following a symlink at its last component
+/// (`O_NOFOLLOW`): a symlinked SKILL.md is refused, never read through.
+fn read_no_follow(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => anyhow!("{} is a symlink; Nucleus reads only real SKILL.md files", path.display()),
+            _ => anyhow::Error::new(e).context(format!("reading {}", path.display())),
+        })?;
+    if !f.metadata()?.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).with_context(|| format!("reading {}", path.display()))?;
+    Ok(bytes)
 }
 
 /// Check a draft and set its ownership fields. `Err` carries every problem
@@ -665,6 +748,101 @@ pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<Suggestion>> {
     }))
 }
 
+/// The live personal skill a patch suggestion replaces, compared with the
+/// suggestion's base hash.
+pub fn live_skill(roots: &LibraryRoots, s: &Suggestion) -> Option<LiveSkill> {
+    if s.kind != SuggestionKind::Patch {
+        return None;
+    }
+    let path = roots.personal.join(&s.name).join(skills::SKILL_FILE).to_string_lossy().into_owned();
+    Some(match live_personal_skill(roots, &s.name) {
+        Ok((_, bytes)) => {
+            let state = if s.base_hash.as_deref() == Some(content_hash(&bytes).as_str()) {
+                BaseState::Unchanged
+            } else {
+                BaseState::Changed
+            };
+            LiveSkill { path, text: Some(String::from_utf8_lossy(&bytes).into_owned()), state, problem: None }
+        }
+        Err(e) => LiveSkill { path, text: None, state: BaseState::Missing, problem: Some(format!("{e:#}")) },
+    })
+}
+
+/// What accept would do with a pending suggestion's draft.
+enum AcceptPlan {
+    /// The SKILL.md already equals the draft (an accept that stopped after
+    /// its write): only the status changes.
+    Written,
+    /// Write this checked draft.
+    Write(PreparedDraft),
+}
+
+/// The checks accept runs before it writes, shared by [`accept`] and
+/// [`review`] so the page's blockers and accept's refusal cannot differ:
+/// the name, real directories, an earlier completed write, a patch's base
+/// hash, and [`prepare_draft`]. A draft problem is an [`InvalidDraft`].
+fn plan_accept(
+    workspace_root: &Path,
+    roots: &LibraryRoots,
+    id: i64,
+    kind: SuggestionKind,
+    name: &str,
+    draft: &str,
+    base_hash: Option<&str>,
+) -> Result<(PathBuf, AcceptPlan)> {
+    if !valid_name(name) {
+        bail!("suggestion #{id} has an invalid skill name {name:?}");
+    }
+    ensure_real_dirs(roots, name)?;
+    let path = roots.personal.join(name).join(skills::SKILL_FILE);
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!("{} is a symlink; accept writes only real files of the personal tree", path.display());
+    }
+    if read_no_follow(&path).is_ok_and(|b| b == draft.as_bytes()) {
+        return Ok((path, AcceptPlan::Written));
+    }
+    if kind == SuggestionKind::Patch && base_hash.is_none() {
+        bail!("suggestion #{id} is a patch without a base hash");
+    }
+    let prepared = prepare_draft(workspace_root, roots, kind, name, draft, base_hash)
+        .map_err(|issues| InvalidDraft { context: format!("suggestion #{id} cannot be accepted"), issues })?;
+    Ok((path, AcceptPlan::Write(prepared)))
+}
+
+/// One suggestion for review ([`SuggestionReview`]). The accept blockers
+/// come from the checks [`accept`] runs before it writes.
+pub async fn review(
+    pool: &SqlitePool,
+    workspace_root: &Path,
+    roots: &LibraryRoots,
+    id: i64,
+) -> Result<Option<SuggestionReview>> {
+    let Some(suggestion) = get(pool, id).await? else {
+        return Ok(None);
+    };
+    let live = live_skill(roots, &suggestion);
+    let mut accept_blockers = Vec::new();
+    if suggestion.status == SuggestionStatus::Pending {
+        let checked = plan_accept(
+            workspace_root,
+            roots,
+            id,
+            suggestion.kind,
+            &suggestion.name,
+            &suggestion.draft,
+            suggestion.base_hash.as_deref(),
+        );
+        if let Err(e) = checked {
+            accept_blockers = match e.downcast_ref::<InvalidDraft>() {
+                Some(d) => d.issues.clone(),
+                None => vec![format!("{e:#}")],
+            };
+        }
+    }
+    let draft_hash = content_hash(suggestion.draft.as_bytes());
+    Ok(Some(SuggestionReview { suggestion, draft_hash, live, accept_blockers }))
+}
+
 /// Reject a pending suggestion, with an optional reason the later reviews
 /// see.
 pub async fn reject(pool: &SqlitePool, id: i64, reason: Option<&str>) -> Result<()> {
@@ -712,7 +890,7 @@ pub async fn edit(
     // The ownership fields come from the live skill; the base hash is the
     // one the suggestion was filed against, checked again at accept.
     let prepared = prepare_draft(workspace_root, roots, kind, &name, draft, None)
-        .map_err(|issues| anyhow!("the draft is not valid: {}", issues.join("; ")))?;
+        .map_err(|issues| InvalidDraft { context: "the draft is not valid".into(), issues })?;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let done = sqlx::query(
         "UPDATE suggestions SET draft = ?2, edited = 1, updated_at = ?3
@@ -778,19 +956,35 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
 /// `<personal tree>/<name>/SKILL.md`, mark it accepted, and supersede every
 /// other pending suggestion for the same skill.
 ///
-/// A `create` is refused when a skill with that name exists in any active
-/// tier; a `patch` when the live SKILL.md no longer has the suggestion's
-/// base hash. Accepting again after a crash between the file write and the
-/// status change finds the file already equal to the draft and completes.
+/// `draft_hash` is the SHA-256 of the draft the operator reviewed
+/// ([`SuggestionReview::draft_hash`]); accept is refused when the stored
+/// draft is different (edited or revised since). A `create` is refused when
+/// a skill with that name exists in any active tier; a `patch` when the
+/// live SKILL.md no longer has the suggestion's base hash. Accepting again
+/// after a crash between the file write and the status change finds the
+/// file already equal to the draft and completes.
 pub async fn accept(
     pool: &SqlitePool,
     workspace_root: &Path,
     roots: &LibraryRoots,
     id: i64,
+    draft_hash: &str,
 ) -> Result<AcceptOutcome> {
-    // Held from the base-hash check through the rename, so no other Nucleus
-    // writer changes the skill in between.
-    let _library = super::library_lock(workspace_root, std::time::Duration::from_secs(10)).await?;
+    let library = super::library_lock(workspace_root, std::time::Duration::from_secs(10)).await?;
+    accept_locked(pool, workspace_root, roots, id, draft_hash, &library).await
+}
+
+/// [`accept`] for a caller that already holds the library write lock, to
+/// keep it past the write (the dashboard holds it through its `.nucleus`
+/// commit, so the commit holds no other writer's change).
+pub async fn accept_locked(
+    pool: &SqlitePool,
+    workspace_root: &Path,
+    roots: &LibraryRoots,
+    id: i64,
+    draft_hash: &str,
+    _library: &super::LibraryLock,
+) -> Result<AcceptOutcome> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let row: Option<(String, String, String, String, Option<String>)> =
         sqlx::query_as("SELECT kind, name, draft, status, base_hash FROM suggestions WHERE id = ?1")
@@ -803,19 +997,14 @@ pub async fn accept(
     if status != "pending" {
         bail!("suggestion #{id} is {status}, not pending");
     }
-    let kind = SuggestionKind::parse(&kind).ok_or_else(|| anyhow!("unknown kind {kind}"))?;
-    if !valid_name(&name) {
-        bail!("suggestion #{id} has an invalid skill name {name:?}");
+    if !draft_hash.trim().eq_ignore_ascii_case(&content_hash(draft.as_bytes())) {
+        bail!(
+            "the draft of suggestion #{id} changed after you reviewed it (it was edited or revised); reload it, review it again and accept the version shown"
+        );
     }
-    ensure_real_dirs(roots, &name)?;
-    let path = roots.personal.join(&name).join(skills::SKILL_FILE);
-    let already = std::fs::read(&path).ok().is_some_and(|b| b == draft.as_bytes());
-    if !already {
-        if kind == SuggestionKind::Patch && base_hash.is_none() {
-            bail!("suggestion #{id} is a patch without a base hash");
-        }
-        let prepared = prepare_draft(workspace_root, roots, kind, &name, &draft, base_hash.as_deref())
-            .map_err(|issues| anyhow!("suggestion #{id} cannot be accepted: {}", issues.join("; ")))?;
+    let kind = SuggestionKind::parse(&kind).ok_or_else(|| anyhow!("unknown kind {kind}"))?;
+    let (path, plan) = plan_accept(workspace_root, roots, id, kind, &name, &draft, base_hash.as_deref())?;
+    if let AcceptPlan::Write(prepared) = plan {
         match kind {
             SuggestionKind::Create => {
                 std::fs::create_dir_all(&roots.personal)
@@ -888,6 +1077,11 @@ mod tests {
         let roots = LibraryRoots::new(&ws, Some(&tmp.path().join("home")));
         let pool = super::super::open(&ws).await.unwrap();
         Ws { _tmp: tmp, ws, roots, pool }
+    }
+
+    /// The draft hash the operator saw (the stored draft's).
+    async fn shown(pool: &SqlitePool, id: i64) -> String {
+        content_hash(get(pool, id).await.unwrap().unwrap().draft.as_bytes())
     }
 
     fn evidence(session: &str) -> NewEvidence {
@@ -973,13 +1167,13 @@ mod tests {
     async fn accept_writes_only_the_personal_tree_and_supersedes_siblings() {
         let w = ws().await;
         let id = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "service-deploy", DRAFT)).await.unwrap();
-        let out = accept(&w.pool, &w.ws, &w.roots, id).await.unwrap();
+        let out = accept(&w.pool, &w.ws, &w.roots, id, &shown(&w.pool, id).await).await.unwrap();
         let written = std::fs::read_to_string(w.roots.personal.join("service-deploy/SKILL.md")).unwrap();
         assert_eq!(written, get(&w.pool, id).await.unwrap().unwrap().draft);
         assert!(out.path.ends_with(".nucleus/.claude/skills/service-deploy/SKILL.md"));
         assert!(!w.roots.repo.exists(), "the committed tree is never written");
         assert_eq!(get(&w.pool, id).await.unwrap().unwrap().status, SuggestionStatus::Accepted);
-        assert!(accept(&w.pool, &w.ws, &w.roots, id).await.is_err(), "not pending any more");
+        assert!(accept(&w.pool, &w.ws, &w.roots, id, &shown(&w.pool, id).await).await.is_err(), "not pending any more");
 
         // A patch of the accepted skill is bound to the file just written.
         let p = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Patch, "service-deploy", &DRAFT.replace("Build.", "Build and test.")))
@@ -988,7 +1182,7 @@ mod tests {
         let s = get(&w.pool, p).await.unwrap().unwrap();
         assert_eq!(s.base_hash.as_deref(), Some(content_hash(written.as_bytes()).as_str()));
         assert!(s.draft.contains("created_by: agent"), "the live skill's owner is kept");
-        let out = accept(&w.pool, &w.ws, &w.roots, p).await.unwrap();
+        let out = accept(&w.pool, &w.ws, &w.roots, p, &shown(&w.pool, p).await).await.unwrap();
         assert!(out.superseded.is_empty());
         assert!(std::fs::read_to_string(&out.path).unwrap().contains("Build and test."));
     }
@@ -1005,7 +1199,7 @@ mod tests {
 
         // The operator changes the skill after the suggestion was filed.
         std::fs::write(w.roots.personal.join("hand/SKILL.md"), format!("{hand}\nmore\n")).unwrap();
-        let err = accept(&w.pool, &w.ws, &w.roots, p).await.unwrap_err();
+        let err = accept(&w.pool, &w.ws, &w.roots, p, &shown(&w.pool, p).await).await.unwrap_err();
         assert!(format!("{err:#}").contains("changed after"), "{err:#}");
         assert!(std::fs::read_to_string(w.roots.personal.join("hand/SKILL.md")).unwrap().ends_with("more\n"));
         assert_eq!(get(&w.pool, p).await.unwrap().unwrap().status, SuggestionStatus::Pending);
@@ -1021,6 +1215,111 @@ mod tests {
         assert!(create(&w.pool, &w.ws, &w.roots, &stale).await.is_err());
         // Patching a skill that is not in the personal tree is refused.
         assert!(create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Patch, "missing", DRAFT)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn review_reports_the_live_skill_and_what_accept_would_refuse() {
+        let w = ws().await;
+        let hand = "---\nname: hand\ndescription: d\n---\n\n# When to invoke\nx\n# Steps\n1\n# Failure modes\n- z\n";
+        put_skill(&w.roots.personal, "hand", hand);
+        let p = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Patch, "hand", DRAFT)).await.unwrap();
+        let r = review(&w.pool, &w.ws, &w.roots, p).await.unwrap().unwrap();
+        let live = r.live.unwrap();
+        assert_eq!((live.state, live.text.as_deref()), (BaseState::Unchanged, Some(hand)));
+        assert!(r.accept_blockers.is_empty(), "{:?}", r.accept_blockers);
+
+        // The live skill changes: the review says so, with accept's reason.
+        std::fs::write(w.roots.personal.join("hand/SKILL.md"), format!("{hand}\nmore\n")).unwrap();
+        let r = review(&w.pool, &w.ws, &w.roots, p).await.unwrap().unwrap();
+        assert_eq!(r.live.unwrap().state, BaseState::Changed);
+        assert_eq!(r.accept_blockers, vec!["the skill `hand` changed after the draft was written".to_string()]);
+        let err = accept(&w.pool, &w.ws, &w.roots, p, &shown(&w.pool, p).await).await.unwrap_err();
+        let invalid = err.downcast_ref::<InvalidDraft>().expect("accept's refusal is an InvalidDraft");
+        assert_eq!(invalid.issues, r.accept_blockers);
+
+        // The skill is gone.
+        std::fs::remove_dir_all(w.roots.personal.join("hand")).unwrap();
+        let r = review(&w.pool, &w.ws, &w.roots, p).await.unwrap().unwrap();
+        let live = r.live.unwrap();
+        assert_eq!((live.state, live.text), (BaseState::Missing, None));
+        assert!(!r.accept_blockers.is_empty());
+
+        // A create has no live skill; a decided suggestion has no blockers.
+        let c = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "service-deploy", DRAFT)).await.unwrap();
+        put_skill(&w.roots.repo, "service-deploy", DRAFT);
+        let r = review(&w.pool, &w.ws, &w.roots, c).await.unwrap().unwrap();
+        assert!(r.live.is_none());
+        assert!(r.accept_blockers[0].contains("already exists"), "{:?}", r.accept_blockers);
+        reject(&w.pool, c, None).await.unwrap();
+        assert!(review(&w.pool, &w.ws, &w.roots, c).await.unwrap().unwrap().accept_blockers.is_empty());
+        assert!(review(&w.pool, &w.ws, &w.roots, 999).await.unwrap().is_none());
+
+        // An invalid edit names every problem.
+        put_skill(&w.roots.personal, "hand", hand);
+        let p2 = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "other-skill", DRAFT)).await.unwrap();
+        let err = edit(&w.pool, &w.ws, &w.roots, p2, "---\nname: x\n---\nbody\n").await.unwrap_err();
+        let invalid = err.downcast_ref::<InvalidDraft>().expect("edit's refusal is an InvalidDraft");
+        assert!(invalid.issues.len() > 1, "{:?}", invalid.issues);
+        assert!(format!("{err:#}").starts_with("the draft is not valid: "));
+    }
+
+    #[tokio::test]
+    async fn accept_writes_only_the_draft_the_operator_reviewed() {
+        let w = ws().await;
+        let id = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "service-deploy", DRAFT)).await.unwrap();
+        let seen = review(&w.pool, &w.ws, &w.roots, id).await.unwrap().unwrap().draft_hash;
+        assert_eq!(seen, shown(&w.pool, id).await);
+        // The draft changes after the operator read it.
+        edit(&w.pool, &w.ws, &w.roots, id, &DRAFT.replace("Build.", "Build by hand.")).await.unwrap();
+        let err = accept(&w.pool, &w.ws, &w.roots, id, &seen).await.unwrap_err();
+        assert!(format!("{err:#}").contains("changed after you reviewed it"), "{err:#}");
+        assert!(err.downcast_ref::<InvalidDraft>().is_none(), "a stale view is a conflict, not a draft problem");
+        assert!(!w.roots.personal.join("service-deploy").exists());
+        assert_eq!(get(&w.pool, id).await.unwrap().unwrap().status, SuggestionStatus::Pending);
+        let now = review(&w.pool, &w.ws, &w.roots, id).await.unwrap().unwrap().draft_hash;
+        accept(&w.pool, &w.ws, &w.roots, id, &now).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_skill_file_is_never_read_or_written_through() {
+        let w = ws().await;
+        let outside = w.ws.join("outside.txt");
+        std::fs::write(&outside, "OUTSIDE-SECRET=1\n").unwrap();
+        let hand = "---\nname: hand\ndescription: d\nflavor: recipe\n---\n\n# When to invoke\nx\n# Steps\n1\n# Failure modes\n- z\n";
+        put_skill(&w.roots.personal, "hand", hand);
+        let p = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Patch, "hand", DRAFT)).await.unwrap();
+        let link = w.roots.personal.join("hand").join(skills::SKILL_FILE);
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        // The review does not return the target's text.
+        let r = review(&w.pool, &w.ws, &w.roots, p).await.unwrap().unwrap();
+        let live = r.live.unwrap();
+        assert_eq!((live.state, live.text), (BaseState::Missing, None));
+        assert!(live.problem.unwrap().contains("symlink"));
+        assert!(r.accept_blockers.iter().any(|b| b.contains("symlink")), "{:?}", r.accept_blockers);
+        // Filing a patch does not hash the target.
+        let err = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Patch, "hand", DRAFT)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        // Accept refuses it and leaves the target alone.
+        let err = accept(&w.pool, &w.ws, &w.roots, p, &shown(&w.pool, p).await).await.unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "OUTSIDE-SECRET=1\n");
+    }
+
+    #[tokio::test]
+    async fn review_blockers_are_accepts_refusal() {
+        let w = ws().await;
+        let id = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "service-deploy", DRAFT)).await.unwrap();
+        // The skill directory is a symlink: accept's directory check.
+        let elsewhere = w.ws.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(&w.roots.personal).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, w.roots.personal.join("service-deploy")).unwrap();
+        let r = review(&w.pool, &w.ws, &w.roots, id).await.unwrap().unwrap();
+        let err = accept(&w.pool, &w.ws, &w.roots, id, &r.draft_hash).await.unwrap_err();
+        assert_eq!(r.accept_blockers, vec![format!("{err:#}")]);
+        assert!(r.accept_blockers[0].contains("symlink"));
     }
 
     #[tokio::test]
@@ -1072,13 +1371,13 @@ mod tests {
         let a = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "service-deploy", DRAFT)).await.unwrap();
         // A crash after the directory was made: retrying completes.
         std::fs::create_dir_all(w.roots.personal.join("service-deploy")).unwrap();
-        accept(&w.pool, &w.ws, &w.roots, a).await.unwrap();
+        accept(&w.pool, &w.ws, &w.roots, a, &shown(&w.pool, a).await).await.unwrap();
         // A skill directory that is a symlink to somewhere else is refused.
         let outside = w.ws.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         let b = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "linked", DRAFT)).await.unwrap();
         std::os::unix::fs::symlink(&outside, w.roots.personal.join("linked")).unwrap();
-        let err = accept(&w.pool, &w.ws, &w.roots, b).await.unwrap_err();
+        let err = accept(&w.pool, &w.ws, &w.roots, b, &shown(&w.pool, b).await).await.unwrap_err();
         assert!(format!("{err:#}").contains("symlink"), "{err:#}");
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "nothing written outside");
     }
@@ -1089,7 +1388,7 @@ mod tests {
         let id = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "service-deploy", DRAFT)).await.unwrap();
         let draft = get(&w.pool, id).await.unwrap().unwrap().draft;
         put_skill(&w.roots.personal, "service-deploy", &draft);
-        accept(&w.pool, &w.ws, &w.roots, id).await.unwrap();
+        accept(&w.pool, &w.ws, &w.roots, id, &shown(&w.pool, id).await).await.unwrap();
         assert_eq!(get(&w.pool, id).await.unwrap().unwrap().status, SuggestionStatus::Accepted);
     }
 }
