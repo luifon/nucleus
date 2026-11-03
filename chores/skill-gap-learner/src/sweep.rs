@@ -70,6 +70,10 @@ pub struct PassOptions {
     pub dry_run: bool,
     /// Live pass only: write skills instead of filing suggestions.
     pub write_mode: bool,
+    /// Backfill only: stop once today's backfill suggestions exceed
+    /// `backfill_max_new_per_night`. The nightly run sets it; a backfill the
+    /// operator starts from the terminal does not, since he reviews it.
+    pub daily_cap: bool,
 }
 
 /// What a pass did.
@@ -298,7 +302,7 @@ async fn run_pass_into(
                 report.remaining = candidates.len() - i;
                 break 'sessions;
             }
-            if pass == Pass::Backfill && !opts.dry_run {
+            if pass == Pass::Backfill && opts.daily_cap && !opts.dry_run {
                 let filed = suggestions::count_created_since(env.pool, SuggestionOrigin::Backfill, &midnight).await?;
                 if filed > i64::from(env.cfg.backfill_max_new_per_night) {
                     report.stopped = Some(format!(
@@ -504,7 +508,7 @@ mod tests {
     }
 
     fn opts(limit: u32) -> PassOptions {
-        PassOptions { limit, dry_run: false, write_mode: false }
+        PassOptions { limit, dry_run: false, write_mode: false, daily_cap: true }
     }
 
     fn user(t: &str) -> String {
@@ -690,6 +694,11 @@ mod tests {
         assert_eq!((r.reviewed, r.created.len()), (1, 1));
         assert!(r.stopped.as_deref().unwrap().contains("above the limit"), "{}", r.summary());
         assert_eq!(fake.prompts().len(), 1);
+        // A manual backfill is not held to the daily limit.
+        let fake = Fake::with(&[r#"{"items": []}"#]);
+        let r = pass(&w, None, Pass::Backfill, PassOptions { daily_cap: false, ..opts(5) }, &fake).await;
+        assert!(r.reviewed >= 1, "{}", r.summary());
+        assert!(!r.stopped.as_deref().unwrap_or("").contains("above the limit"), "{}", r.summary());
     }
 
     #[tokio::test]
@@ -706,7 +715,7 @@ mod tests {
         transcript(&w, "calm", &[user("what time is it"), asst("noon")], 3600);
         transcript(&w, "fix", &[user("rename it"), user("wrong file, the other one"), asst("ok")], 3600);
 
-        let dry = pass(&w, None, Pass::Live, PassOptions { limit: 5, dry_run: true, write_mode: false }, &Fake::default()).await;
+        let dry = pass(&w, None, Pass::Live, PassOptions { limit: 5, dry_run: true, write_mode: false, daily_cap: false }, &Fake::default()).await;
         assert_eq!((dry.busy, dry.skipped_agent, dry.parts_filtered, dry.reviewed), (1, 1, 1, 1), "{}", dry.summary());
         assert!(dry.lines.iter().any(|l| l.starts_with("review fix")));
         assert!(ledger::all(&w.pool).await.unwrap().is_empty(), "a dry run records nothing");
@@ -722,7 +731,7 @@ mod tests {
         // Write mode goes through the write path.
         transcript(&w, "fix", &[user("no, you forgot the header"), asst("added")], 3600);
         let fake = Fake::default();
-        let r = pass(&w, None, Pass::Live, PassOptions { limit: 5, dry_run: false, write_mode: true }, &fake).await;
+        let r = pass(&w, None, Pass::Live, PassOptions { limit: 5, dry_run: false, write_mode: true, daily_cap: false }, &fake).await;
         assert_eq!(r.reviewed, 1, "{}", r.summary());
         assert!(fake.prompts()[0].contains("Write skills with your own Read/Write/Edit file tools"));
     }

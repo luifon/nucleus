@@ -150,6 +150,7 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
                 limit: limit.unwrap_or(cfg.live_max_reviews),
                 dry_run,
                 write_mode: cfg.live_mode == LiveMode::Write,
+                daily_cap: false,
             };
             let report = run_one_pass(&workspace_root, &settings, sweep::Pass::Live, opts).await?;
             print_report(&report);
@@ -161,6 +162,7 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
                 limit: limit.unwrap_or(cfg.backfill_per_night),
                 dry_run,
                 write_mode: false,
+                daily_cap: false,
             };
             let report = run_one_pass(&workspace_root, &settings, sweep::Pass::Backfill, opts).await?;
             print_report(&report);
@@ -297,9 +299,9 @@ async fn nightly_sweep(workspace_root: &Path, settings: &Settings) -> NightlySwe
     let passes = [
         (
             sweep::Pass::Live,
-            sweep::PassOptions { limit: cfg.live_max_reviews, dry_run: false, write_mode: cfg.live_mode == LiveMode::Write },
+            sweep::PassOptions { limit: cfg.live_max_reviews, dry_run: false, write_mode: cfg.live_mode == LiveMode::Write, daily_cap: false },
         ),
-        (sweep::Pass::Backfill, sweep::PassOptions { limit: cfg.backfill_per_night, dry_run: false, write_mode: false }),
+        (sweep::Pass::Backfill, sweep::PassOptions { limit: cfg.backfill_per_night, dry_run: false, write_mode: false, daily_cap: true }),
     ];
     for (pass, opts) in passes {
         match run_one_pass(workspace_root, settings, pass, opts).await {

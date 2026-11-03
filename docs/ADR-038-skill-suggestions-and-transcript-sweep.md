@@ -187,8 +187,10 @@ after two failed reviews the part is given up.
 - **Backfill.** Older transcripts and index-only sessions, oldest first. At
   most `backfill_per_night` (10) reviews; the pass stops for the night once
   more than `backfill_max_new_per_night` (5) backfill suggestions were filed
-  since local midnight. Progress is the ledger; the backfill ends when no
-  old session has unread text.
+  since local midnight. That limit applies only to the nightly run; a
+  backfill the operator starts from the terminal (`backfill --limit N`)
+  stops only at its review limit. Progress is the ledger; the backfill ends
+  when no old session has unread text.
 
 Both run inside the existing nightly `skill-gap-learner learn` job (04:30),
 before the diary gap pass and the curator, with no new launchd job: the
