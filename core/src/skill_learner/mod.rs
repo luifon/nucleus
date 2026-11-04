@@ -10,9 +10,10 @@
 //!
 //! Tables:
 //!
-//! - `suggestions` — a proposed new skill (`create`) or a full replacement
-//!   of an existing personal skill (`patch`), waiting for the operator
-//!   ([`suggestions`]).
+//! - `suggestions` — a proposed new skill (`create`) or a change to an
+//!   existing personal skill (`patch`, stored as the full SKILL.md that
+//!   results; the reviewer writes it as edits, [`skill_text`]), waiting for
+//!   the operator ([`suggestions`]).
 //! - `suggestion_evidence` — the sessions a suggestion came from, with short
 //!   quotes.
 //! - `reviewed_sessions` — per session, how far the learner has read it, so
@@ -25,6 +26,7 @@
 //! review every session again. It is not rebuilt from anything.
 
 pub mod ledger;
+pub mod skill_text;
 pub mod suggestions;
 
 use anyhow::Result;

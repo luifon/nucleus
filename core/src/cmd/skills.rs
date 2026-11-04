@@ -1,7 +1,7 @@
 //! `nucleus skills` — skill suggestions from the terminal (ADR-038).
 //!
-//! The skill-gap learner files suggestions (a new skill, or a full
-//! replacement of a personal skill) instead of writing skills; the operator
+//! The skill-gap learner files suggestions (a new skill, or a change to a
+//! personal skill) instead of writing skills; the operator
 //! reads and decides them here or on the dashboard. A session that finds a
 //! loaded skill wrong or incomplete files a patch suggestion with
 //! `nucleus skills suggest`.
@@ -21,10 +21,16 @@
 //!     --rationale "step 3 uses the old flag" --file - <<'EOF'
 //!   …full SKILL.md…
 //!   EOF
+//!   nucleus skills suggest --kind patch --name some-skill --base <sha256> \
+//!     --rationale "step 3 uses the old flag" --edits - <<'EOF'
+//!   [{"old": "3. Run it with --old-flag.", "new": "3. Run it with --new-flag."},
+//!    {"append_to_section": "# Failure modes", "new": "- The flag is refused: check the version."}]
+//!   EOF
 
 use crate::caller::{self, Caller, Role};
 use crate::skill_learner::{
     self,
+    skill_text::SkillEdit,
     suggestions::{
         self, BaseState, EvidenceSource, NewEvidence, NewSuggestion, SuggestionKind, SuggestionOrigin, SuggestionStatus,
     },
@@ -52,8 +58,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SuggestionsCmd,
     },
-    /// File a suggestion: a new skill or a full replacement of a personal
-    /// skill. Prints its id.
+    /// File a suggestion: a new skill, or a change to a personal skill (a
+    /// full file or edits). Prints its id.
     Suggest {
         #[arg(long, value_enum)]
         kind: KindArg,
@@ -64,8 +70,15 @@ enum Cmd {
         #[arg(long)]
         rationale: String,
         /// The full proposed SKILL.md; `-` reads it from stdin.
+        #[arg(long, required_unless_present = "edits", conflicts_with = "edits")]
+        file: Option<String>,
+        /// Patch only: a JSON array of edits of the live SKILL.md instead of
+        /// a full file; `-` reads it from stdin. Each edit is
+        /// `{"old": "<text that occurs exactly once>", "new": "<replacement>"}`
+        /// or `{"append_to_section": "<heading line>", "new": "<lines>"}`;
+        /// they apply in order, and one that does not apply refuses all.
         #[arg(long)]
-        file: String,
+        edits: Option<String>,
         /// Patch only, required: the SHA-256 of the SKILL.md you read before
         /// writing the draft (`shasum -a 256 <path>`). The suggestion is
         /// refused if the skill changed since, so a draft never replaces a
@@ -167,7 +180,7 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     let roots = LibraryRoots::for_workspace(&ws);
     match cli.cmd {
         Cmd::Suggestions { cmd } => suggestions_cmd(&ws, &roots, cmd).await,
-        Cmd::Suggest { kind, name, rationale, file, base, session, quotes, overrides_rejected, why_new } => {
+        Cmd::Suggest { kind, name, rationale, file, edits, base, session, quotes, overrides_rejected, why_new } => {
             let base = match (kind, base) {
                 (KindArg::Patch, None) => {
                     bail!("a patch needs --base <sha256 of the SKILL.md you read before drafting>")
@@ -184,7 +197,23 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
                 (Some(_), _) => bail!("--session is for the operator; a session files under its own id"),
                 (None, _) => caller.session_id.clone(),
             };
-            let draft = read_text(&file)?;
+            let draft = match (file, edits) {
+                (Some(file), None) => read_text(&file)?,
+                (None, Some(edits)) => {
+                    if !matches!(kind, KindArg::Patch) {
+                        bail!("--edits is for patches; a new skill needs --file with the whole SKILL.md");
+                    }
+                    let edits: Vec<SkillEdit> = serde_json::from_str(&read_text(&edits)?)
+                        .context("--edits must be a JSON array of {\"old\", \"new\"} or {\"append_to_section\", \"new\"} objects")?;
+                    let (draft, live) = suggestions::draft_from_edits(&roots, &name, &edits)
+                        .map_err(|problems| anyhow::anyhow!("the edits do not apply: {}", problems.join("; ")))?;
+                    if base.as_deref() != Some(live.as_str()) {
+                        bail!("the skill `{name}` changed after you read it (its SHA-256 is no longer --base); read it again");
+                    }
+                    draft
+                }
+                _ => bail!("give either --file or --edits"),
+            };
             let pool = skill_learner::open(&ws).await?;
             let s = NewSuggestion {
                 kind: match kind {

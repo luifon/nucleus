@@ -1,6 +1,7 @@
 # ADR-038 — Skill suggestions and the transcript sweep
 
-**Status:** Accepted + built (2026-11-03). Supersedes arm 1 (the on-the-fly
+**Status:** Accepted + built (2026-11-03; patches as edits and section
+requests 2026-11-04). Supersedes arm 1 (the on-the-fly
 review) of ADR-017.
 
 **Builds on:**
@@ -37,8 +38,9 @@ A suggestion is a proposed change to the skill library that waits for the
 operator. `nucleus_core::skill_learner` owns `memory/skill_learner.db`
 (ADR-020: one program writes it, every state change is one `BEGIN
 IMMEDIATE` transaction that re-checks the status it changes). A suggestion
-has a kind (`create`, or `patch` = a full replacement SKILL.md of an
-existing personal skill), the skill name, the full draft, a rationale,
+has a kind (`create`, or `patch` = a change to an existing personal
+skill), the skill name, the full draft (for a patch, the full SKILL.md
+that results from its edits; see "Patches are edits"), a rationale,
 evidence rows (session id, source `transcript` / `index` / `manual`, agent
 label, short quotes), a status (`pending`, `accepted`, `rejected`,
 `superseded`), the operator's reject reason and timestamps.
@@ -47,8 +49,12 @@ label, short quotes), a status (`pending`, `accepted`, `rejected`,
   Accept refuses it when the live file has a different hash.
 - Every draft passes `skills::validate` (the ADR-017 contract with
   `# Failure modes`), a strict YAML parse of the frontmatter, a kebab-case
-  class-level name check, a credential scan (`secret_filter`) and a 24 KiB
-  limit, when it is filed and again at accept. Code sets the ownership
+  class-level name check, a credential scan (`secret_filter`) and a size
+  limit, when it is filed and again at accept. The limit is 24 KiB for a
+  `create` (`MAX_DRAFT_BYTES`: the reviewer writes a new skill whole in one
+  answer) and 64 KiB for the result of a `patch` (`MAX_PATCH_BYTES`: the
+  live file plus edits may be larger than any new skill; the ceiling keeps
+  a skill that sessions load from growing without a bound). Code sets the ownership
   fields: a created skill gets `flavor: learned` and `created_by: agent`; a
   patch keeps the `created_by`, `flavor` and `pinned` values of the skill it
   replaces, so a patch never makes a hand-written skill archivable by the
@@ -150,16 +156,81 @@ Suggest mode uses a fresh `SessionProfile::one_shot_no_tools` session per
 review (no tools, no MCP servers, no skills, `dontAsk`), 300 s ceiling. The
 prompt is ADR-017's ported review prompt, changed so the model writes no
 files and answers with one JSON object: `create`, `patch`, `add_evidence`
-or `revise` items, and an optional `need_skills` list. The prompt carries
-the library summary, the pending and rejected suggestions, the full text of
-personal skills loaded in the part, and the part itself between nonce
-markers (`work::briefs::Fence`) as data, as are the pending and rejected
-suggestions, the skill texts and the session's opening request. Code parses the answer strictly
-(unknown fields are errors), checks every item, and asks once more when
-the model needs a skill's text to patch it or an item failed a check. Items
-that still fail are dropped and recorded. Quotes are kept only when they
-appear in the part. A create or patch for a skill with a pending
-suggestion becomes evidence for that suggestion.
+or `revise` items, and an optional `need_sections` list. The prompt carries
+the library summary, the pending and rejected suggestions, the heading
+outline of every personal skill, the whole text of the small personal
+skills loaded in the part, and the part itself. Everything except the
+library summary is between nonce markers (`work::briefs::Fence`) as data.
+Code parses the answer strictly (unknown fields are errors), checks every
+item, and asks once more when the model asked for skill sections, quoted
+skill text it was not shown, or an item failed a check. Items that still
+fail are dropped and recorded (`dropped N: …` in the run's detail). Quotes
+are kept only when they appear in the part. A create or patch for a skill
+with a pending suggestion becomes evidence for that suggestion.
+
+#### Patches are edits
+
+A `create` carries the whole new SKILL.md (`draft`). A `patch`, and a
+`revise` of a pending patch, carry `edits` instead, never a whole file:
+
+```json
+{"action": "patch", "name": "<personal skill>", "rationale": "…",
+ "edits": [{"old": "<exact text of the skill>", "new": "<replacement>"},
+           {"append_to_section": "<exact heading line>", "new": "<lines>"}],
+ "quotes": ["…"]}
+```
+
+`nucleus_core::skill_learner::skill_text::apply_edits` applies the edits in
+order to the skill's current text (normalized: no byte order mark, `\n`
+line breaks, a final line break). Each `old` must occur exactly once in the
+text as it stands after the earlier edits (overlapping occurrences count);
+an empty `old`, and an edit whose `old` equals its `new`, are refused. An
+empty `new` deletes the text. `append_to_section` names one heading line
+that occurs once; `new` is added after the last non-blank line of that
+section. Any edit that does not apply refuses the whole item, with every
+problem listed. A patch has at most 40 edits.
+
+The result is the full draft. It goes through `prepare_draft` and is
+stored exactly like a whole draft, so the store, accept, the base-hash
+binding, the dashboard and its diff view do not depend on how the draft
+was written. The edits themselves are not stored.
+
+The current text of a skill is its live SKILL.md, bound to the live file's
+hash. For a skill with a pending patch suggestion it is that suggestion's
+draft, bound to the suggestion's base hash: a `revise` edits the pending
+draft, so a revision keeps the earlier change, and a new `patch` item for
+that skill only adds evidence. The outline says which text it shows.
+
+#### Section requests
+
+The first prompt shows, for each personal skill, its size and its heading
+outline: every `#`, `##` and `###` line outside the frontmatter and fenced
+code blocks, each with the size of its section, plus `(frontmatter)` for
+the text before the first heading (at most 8 KiB of outlines, those of
+the skills loaded in the part first; a skill whose outline does not fit is
+named with its size). A section
+runs from its heading line to the next heading of the same or a higher
+level. A personal skill loaded in the part is also shown whole when it is
+at most 8 KiB and fits the room the rest of the prompt leaves (at most
+12 KiB of such texts).
+
+The model may answer with `"need_sections": [{"skill": "<name>",
+"heading": "<exact heading line>"}]` (at most 12; without `heading` for a
+whole skill of at most 8 KiB). The second prompt is a separate typed
+message with its own 64 KiB limit; it includes the requested sections that
+were not shown yet, as data blocks, until the prompt would exceed the limit,
+and lists the requests left out (for length, unknown heading, a skill too
+large to show whole, not a personal skill), so the model knows what it did
+not see. A skill of about 40 KB fits in one second prompt whole by
+sections.
+
+While a second answer can still follow, every `old` and every
+`append_to_section` heading must be text the model was shown (an outline
+heading line, a section, a whole skill, or the `new` of an earlier edit of
+the same item). A quote of text that is in the skill but was not shown
+makes code show the section that contains it in the second prompt and ask
+the model to check the edit against it. In the second answer the edits only
+need to apply.
 
 Fresh sessions instead of ADR-029's daily session: each review prompt is
 self-contained and up to ~60 KB, so one resumed session would carry every
@@ -216,7 +287,10 @@ draft inside its transaction, so an edit or a revision made after the
 operator read the draft is never accepted unseen. Any session may file a
 suggestion; its session id and agent come from its process tree. A manual
 patch requires `--base <sha256>` of the SKILL.md its author read before
-drafting, so it cannot replace a version the author did not see. The
+drafting, so it cannot replace a version the author did not see. A manual
+patch is either a full file (`--file`) or a JSON array of edits in the
+format above (`--edits`); the edits are applied to the live file, which
+must still have the `--base` hash. The
 command has no `--workspace-root`: the caller check reads the caller's
 transcript under the configured workspace, and another spelling of the
 path would make it look in the wrong directory. CLAUDE.md
@@ -317,4 +391,11 @@ The on-the-fly trigger, with no replacement in the bots:
 - **One review per whole session.** Long terminal sessions reach several
   MB; parts keep each review within the prompt limit and let a continued
   session be reviewed only for its new text.
+- **A patch as a whole new SKILL.md** (the first version). The model had to
+  see the whole skill and write it back whole inside one typed prompt, so a
+  skill of about 15 KB or more could not be patched next to a 24 KiB
+  conversation part, and the model filed a new skill instead.
+- **A patch as a unified diff.** Line numbers and hunk context are easy to
+  get wrong for a model that saw only some sections; an exact quote that
+  must occur once is checked directly and fails with a clear reason.
 - **A separate schedule for the sweep.** See "Passes and schedule".

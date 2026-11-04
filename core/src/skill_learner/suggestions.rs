@@ -1,10 +1,13 @@
 //! Skill suggestions (ADR-038): what the transcript review proposes and the
 //! operator accepts or rejects.
 //!
-//! A suggestion is either `create` (a new skill) or `patch` (a full
-//! replacement SKILL.md for an existing skill of the personal tree). A patch
-//! is bound to the SHA-256 of the live SKILL.md it was written against;
-//! accept refuses it when the live file has changed since.
+//! A suggestion is either `create` (a new skill) or `patch` (a change to an
+//! existing skill of the personal tree). Both store the full SKILL.md accept
+//! would write. The reviewer writes a patch as edits to the current text
+//! ([`super::skill_text`], [`draft_from_edits`]); code applies them and
+//! stores the result. A patch is bound to the SHA-256 of the live SKILL.md
+//! it was written against; accept refuses it when the live file has changed
+//! since.
 //!
 //! Every draft is checked before it is stored and again at accept
 //! ([`prepare_draft`]): the ADR-017 contract (`skills::validate`), strict
@@ -26,8 +29,21 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
 
-/// Largest draft SKILL.md stored.
+/// Largest draft SKILL.md of a `create`. The reviewer writes a new skill
+/// whole inside one answer, so it must fit with the rest of the review.
 pub const MAX_DRAFT_BYTES: usize = 24 * 1024;
+/// Largest SKILL.md a `patch` may produce. A patch is the live file plus
+/// edits, so it may be larger than a new skill; the ceiling keeps a skill
+/// that every session may load from growing without a bound.
+pub const MAX_PATCH_BYTES: usize = 64 * 1024;
+
+/// The size ceiling of a draft of `kind`.
+pub fn max_draft_bytes(kind: SuggestionKind) -> usize {
+    match kind {
+        SuggestionKind::Create => MAX_DRAFT_BYTES,
+        SuggestionKind::Patch => MAX_PATCH_BYTES,
+    }
+}
 /// Longest skill name.
 pub const MAX_NAME_CHARS: usize = 64;
 /// Longest rationale, note, reject reason or "why new" text.
@@ -391,8 +407,9 @@ pub fn prepare_draft(
         ));
         return Err(issues);
     }
-    if draft.len() > MAX_DRAFT_BYTES {
-        issues.push(format!("the draft is {} bytes; the limit is {MAX_DRAFT_BYTES}", draft.len()));
+    let limit = max_draft_bytes(kind);
+    if draft.len() > limit {
+        issues.push(format!("the draft is {} bytes; the limit for a {} is {limit}", draft.len(), kind.as_str()));
         return Err(issues);
     }
     let (fields, base_hash): (Vec<(&str, Option<String>)>, Option<String>) = match kind {
@@ -443,8 +460,12 @@ pub fn prepare_draft(
         Err(e) => return Err(vec![format!("{e:#}")]),
     };
     let text = if text.ends_with('\n') { text } else { format!("{text}\n") };
-    if text.len() > MAX_DRAFT_BYTES {
-        issues.push(format!("the draft is {} bytes with its frontmatter set; the limit is {MAX_DRAFT_BYTES}", text.len()));
+    if text.len() > limit {
+        issues.push(format!(
+            "the draft is {} bytes with its frontmatter set; the limit for a {} is {limit}",
+            text.len(),
+            kind.as_str()
+        ));
     }
     issues.extend(skills::validate(&text));
     if let Some(yaml) = skills::split_frontmatter(&text) {
@@ -462,6 +483,24 @@ pub fn prepare_draft(
         issues.push(format!("the draft contains credential-shaped text ({})", kinds.join(", ")));
     }
     if issues.is_empty() { Ok(PreparedDraft { text, base_hash }) } else { Err(issues) }
+}
+
+/// The full draft of a patch written as edits: `edits` applied to the live
+/// SKILL.md of the personal skill `name` (read without following a
+/// symlink). Returns the draft and the hash of the live file the edits were
+/// applied to; file it with that hash as `expected_base`, so the store
+/// keeps the result bound to the version the edits were written against.
+/// `Err` carries every problem (an edit that does not apply refuses the
+/// whole patch).
+pub fn draft_from_edits(
+    roots: &LibraryRoots,
+    name: &str,
+    edits: &[super::skill_text::SkillEdit],
+) -> std::result::Result<(String, String), Vec<String>> {
+    let (_, bytes) = live_personal_skill(roots, name).map_err(|e| vec![format!("{e:#}")])?;
+    let live = std::str::from_utf8(&bytes).map_err(|_| vec![format!("the skill `{name}` is not UTF-8 text")])?;
+    let draft = super::skill_text::apply_edits(live, edits)?;
+    Ok((draft, content_hash(&bytes)))
 }
 
 fn evidence_quotes(quotes: &[String]) -> String {
@@ -1241,6 +1280,47 @@ mod tests {
         assert!(create(&w.pool, &w.ws, &w.roots, &stale).await.is_err());
         // Patching a skill that is not in the personal tree is refused.
         assert!(create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Patch, "missing", DRAFT)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_patch_from_edits_of_a_large_skill_is_filed_and_accepted() {
+        use super::super::skill_text::SkillEdit;
+        let w = ws().await;
+        // About 40 KB: over the create ceiling, under the patch ceiling.
+        let filler: String = (0..700).map(|i| format!("- Reference line {i}: a synthetic note about step order.\n")).collect();
+        let big = named("big-skill").replace("1. Build.\n", &format!("1. Build.\n\n## Reference\n{filler}"));
+        assert!(big.len() > MAX_DRAFT_BYTES && big.len() < MAX_PATCH_BYTES, "{}", big.len());
+        put_skill(&w.roots.personal, "big-skill", &big);
+        let edits = vec![
+            SkillEdit { old: Some("1. Build.\n".into()), append_to_section: None, new: "1. Build.\n2. Run the tests.\n".into() },
+            SkillEdit { old: None, append_to_section: Some("# Failure modes".into()), new: "- Tests fail: stop.".into() },
+        ];
+        let (draft, base) = draft_from_edits(&w.roots, "big-skill", &edits).unwrap();
+        assert_eq!(base, content_hash(big.as_bytes()));
+        let mut s = new(SuggestionKind::Patch, "big-skill", &draft);
+        s.expected_base = Some(base);
+        let id = create(&w.pool, &w.ws, &w.roots, &s).await.unwrap();
+        accept(&w.pool, &w.ws, &w.roots, id, &shown(&w.pool, id).await).await.unwrap();
+        let written = std::fs::read_to_string(w.roots.personal.join("big-skill/SKILL.md")).unwrap();
+        let expected = big
+            .replace("1. Build.\n", "1. Build.\n2. Run the tests.\n")
+            .replace("- The push fails: retry once.\n", "- The push fails: retry once.\n- Tests fail: stop.\n");
+        assert_eq!(written, expected);
+
+        // A whole new skill of that size is refused, and so is a patch
+        // result over the patch ceiling.
+        let err = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Create, "too-big", &big)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("limit for a create"), "{err:#}");
+        let huge = vec![SkillEdit { old: Some("1. Build.\n".into()), append_to_section: None, new: "x\n".repeat(MAX_PATCH_BYTES / 2) }];
+        let (draft, base) = draft_from_edits(&w.roots, "big-skill", &huge).unwrap();
+        let mut s = new(SuggestionKind::Patch, "big-skill", &draft);
+        s.expected_base = Some(base);
+        let err = create(&w.pool, &w.ws, &w.roots, &s).await.unwrap_err();
+        assert!(format!("{err:#}").contains("limit for a patch"), "{err:#}");
+        // Edits that do not apply, and a skill that is not personal.
+        let bad = vec![SkillEdit { old: Some("no such text".into()), append_to_section: None, new: "y".into() }];
+        assert!(draft_from_edits(&w.roots, "big-skill", &bad).unwrap_err()[0].contains("does not occur"));
+        assert!(draft_from_edits(&w.roots, "missing", &edits).is_err());
     }
 
     #[tokio::test]

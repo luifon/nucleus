@@ -614,7 +614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patches_get_the_skill_text_and_bad_drafts_one_more_chance() {
+    async fn patches_are_edits_and_unseen_quotes_and_bad_drafts_get_one_more_chance() {
         let w = world().await;
         let live_text = DRAFT.replace("name: x", "name: release-build").replace("2. Push.", "2. Push now.");
         std::fs::create_dir_all(w.roots.personal.join("release-build")).unwrap();
@@ -626,7 +626,8 @@ mod tests {
             5 * 86_400,
         );
         let broken = DRAFT.replace("# Failure modes\n- Tests fail: stop and report.\n", "");
-        let patch = json!({"action": "patch", "name": "release-build", "rationale": "order corrected", "draft": DRAFT, "quotes": []});
+        let patch = json!({"action": "patch", "name": "release-build", "rationale": "order corrected",
+            "edits": [{"old": "2. Push now.\n", "new": "2. Run the tests again.\n3. Push now.\n"}], "quotes": []});
         let fake = Fake::with(&[
             &reply(vec![patch.clone(), create_item("ship-checklist", &broken, "ship it")]),
             &reply(vec![patch, create_item("ship-checklist", DRAFT, "ship it")]),
@@ -635,13 +636,113 @@ mod tests {
         assert_eq!(r.created.len(), 2, "{}", r.summary());
         let prompts = fake.prompts();
         assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains("`release-build` —") && prompts[0].contains("# Steps ["), "the outline is shown");
         assert!(!prompts[0].contains("Push now."), "the skill was not loaded in the session");
-        assert!(prompts[1].contains("Push now.") && prompts[1].contains("failure modes"), "{}", prompts[1]);
+        assert!(
+            prompts[1].contains("section \"# Steps\"") && prompts[1].contains("2. Push now.") && prompts[1].contains("failure modes"),
+            "the section of the unseen quote is shown: {}",
+            prompts[1]
+        );
         let all = suggestions::list(&w.pool, &[SuggestionStatus::Pending]).await.unwrap();
         let p = all.iter().find(|s| s.kind == SuggestionKind::Patch).unwrap();
         let p = suggestions::get(&w.pool, p.id).await.unwrap().unwrap();
         assert_eq!(p.base_hash.as_deref(), Some(nucleus_core::skill_learner::content_hash(live_text.as_bytes()).as_str()));
+        assert_eq!(p.draft, live_text.replace("2. Push now.\n", "2. Run the tests again.\n3. Push now.\n"));
         assert_eq!(std::fs::read_to_string(w.roots.personal.join("release-build/SKILL.md")).unwrap(), live_text);
+    }
+
+    /// A synthetic skill of about 40 KB: over the create limit, so it could
+    /// not be patched as a whole draft.
+    fn large_skill() -> String {
+        let mut s = String::from(
+            "---\nname: big-ops\ndescription: \"Operate the synthetic lab: start, check, stop\"\nflavor: recipe\n---\n\n# When to invoke\nWhen the lab needs work.\n\n# Steps\n1. Start the lab.\n2. Check the lab.\n\n",
+        );
+        for k in 0..14 {
+            s.push_str(&format!("## Service {k}\n"));
+            for i in 0..50 {
+                s.push_str(&format!("- Service {k} note {i}: a synthetic reference line for sizing.\n"));
+            }
+            s.push('\n');
+        }
+        s.push_str("# Failure modes\n- The lab does not start: read its log.\n");
+        s
+    }
+
+    #[tokio::test]
+    async fn a_large_skill_is_patched_by_sections_and_edits_then_revised_and_accepted() {
+        let w = world().await;
+        let live = large_skill();
+        assert!(live.len() > 40 * 1024 && live.len() > suggestions::MAX_DRAFT_BYTES, "{}", live.len());
+        std::fs::create_dir_all(w.roots.personal.join("big-ops")).unwrap();
+        std::fs::write(w.roots.personal.join("big-ops/SKILL.md"), &live).unwrap();
+        transcript(
+            &w,
+            "s-big",
+            &[user("check service 3"), asst("Done."), user("no, you must restart service 3 before the check"), asst("Ok.")],
+            5 * 86_400,
+        );
+        let ask = json!({"items": [], "need_sections": [{"skill": "big-ops", "heading": "## Service 3"}]}).to_string();
+        let patch = json!({"items": [{"action": "patch", "name": "big-ops", "rationale": "service 3 needs a restart first",
+            "edits": [
+                {"old": "- Service 3 note 0: a synthetic reference line for sizing.\n", "new": "- Service 3: restart it before a check.\n- Service 3 note 0: a synthetic reference line for sizing.\n"},
+                {"append_to_section": "# Failure modes", "new": "- A check of service 3 fails: restart it first."}
+            ],
+            "quotes": ["you must restart service 3 before the check"]}]})
+        .to_string();
+        let fake = Fake::with(&[&ask, &patch]);
+        let r = pass(&w, None, Pass::Backfill, opts(5), &fake).await;
+        assert_eq!(r.created.len(), 1, "{} {:?}", r.summary(), r.lines);
+        let prompts = fake.prompts();
+        let limit = nucleus_core::claude_session::MAX_TYPED_PROMPT_BYTES;
+        assert!(prompts.iter().all(|p| p.len() < limit));
+        assert!(prompts[0].contains("## Service 11 [") && !prompts[0].contains("note 7:"), "outline only");
+        assert!(prompts[1].contains("section ## Service 3") && prompts[1].contains("- Service 3 note 49:"));
+        assert!(!prompts[1].contains("Service 4 note"), "only the requested section");
+        let id = r.created[0].0;
+        let expected = live
+            .replace(
+                "- Service 3 note 0:",
+                "- Service 3: restart it before a check.\n- Service 3 note 0:",
+            )
+            .replace("read its log.\n", "read its log.\n- A check of service 3 fails: restart it first.\n");
+        assert_eq!(suggestions::get(&w.pool, id).await.unwrap().unwrap().draft, expected);
+
+        // A later session revises the pending patch: its edits apply to the
+        // pending draft, which the outline and the sections now show.
+        transcript(&w, "s-big2", &[user("restart service 3"), user("no, wrong: restart it twice"), asst("Ok.")], 4 * 86_400);
+        let ask = json!({"items": [], "need_sections": [{"skill": "big-ops", "heading": "# Failure modes"}]}).to_string();
+        let revise = json!({"items": [{"action": "revise", "suggestion_id": id, "rationale": "twice",
+            "edits": [{"old": "- A check of service 3 fails: restart it first.", "new": "- A check of service 3 fails: restart it twice."}],
+            "quotes": ["restart it twice"]}]})
+        .to_string();
+        let fake = Fake::with(&[&ask, &revise]);
+        let r = pass(&w, None, Pass::Backfill, opts(5), &fake).await;
+        assert_eq!(r.revised.len(), 1, "{} {:?}", r.summary(), r.lines);
+        assert!(fake.prompts()[0].contains(&format!("the text of pending suggestion #{id}")));
+        let new_id = r.revised[0];
+        let shown = nucleus_core::skill_learner::content_hash(
+            suggestions::get(&w.pool, new_id).await.unwrap().unwrap().draft.as_bytes(),
+        );
+        suggestions::accept(&w.pool, &w.ws, &w.roots, new_id, &shown).await.unwrap();
+        let written = std::fs::read_to_string(w.roots.personal.join("big-ops/SKILL.md")).unwrap();
+        assert_eq!(written, expected.replace("restart it first.", "restart it twice."));
+        assert!(written.contains("flavor: recipe") && !written.contains("created_by"), "ownership kept");
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_does_not_apply_drops_the_whole_item_with_its_reason() {
+        let w = world().await;
+        let live_text = DRAFT.replace("name: x", "name: release-build");
+        std::fs::create_dir_all(w.roots.personal.join("release-build")).unwrap();
+        std::fs::write(w.roots.personal.join("release-build/SKILL.md"), &live_text).unwrap();
+        transcript(&w, "s1", &[user("ship it"), user("no, wrong order, test first"), asst("Ok.")], 5 * 86_400);
+        let bad = json!({"action": "patch", "name": "release-build", "rationale": "order",
+            "edits": [{"old": "1. Run the tests.\n", "new": "1. Run all tests.\n"}, {"old": "3. Tag the release.", "new": "x"}]});
+        let fake = Fake::with(&[&reply(vec![bad.clone()]), &reply(vec![bad])]);
+        let r = pass(&w, None, Pass::Backfill, opts(5), &fake).await;
+        assert_eq!((r.reviewed, r.created.len()), (1, 0), "{}", r.summary());
+        assert!(r.lines[0].contains("dropped 1:") && r.lines[0].contains("edit 2: `old` does not occur"), "{:?}", r.lines);
+        assert!(suggestions::list(&w.pool, &[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]

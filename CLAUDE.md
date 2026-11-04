@@ -457,7 +457,7 @@ without a warning. Skill bodies refer to their own files through
 Every night it sweeps this workspace's session transcripts (terminal, bot
 and dashboard chats; automated sessions are skipped), plus a limited
 backfill batch of old sessions, and files **skill suggestions**: a new skill
-or a full replacement of a personal one. The operator decides them with
+or a patch of a personal one (written as edits, stored as the full result). The operator decides them with
 `nucleus skills suggestions list|show|accept|reject|edit` or on the
 dashboard; accept writes into `.nucleus/.claude/skills/` with
 `flavor: learned` + `created_by: agent`, after the SKILL.md contract check
@@ -472,8 +472,11 @@ path. The authoring discipline below governs all of them.
 suggestion before the session ends: take `shasum -a 256` of its SKILL.md
 before you write the draft, then `nucleus skills suggest --kind patch
 --name <skill> --base <that hash> --rationale "<what was wrong>" --file -
-<<'EOF'` followed by the complete corrected SKILL.md (`--kind create`
-without `--base` for a missing skill). The operator accepts or rejects it.
+<<'EOF'` followed by the complete corrected SKILL.md, or `--edits -` followed
+by a JSON array of edits (`{"old": …, "new": …}` or
+`{"append_to_section": "<heading line>", "new": …}`; use this for a large
+skill). `--kind create` without `--base` for a missing skill. The operator
+accepts or rejects it.
 
 When invoking `/skill-creator create`, **name the destination path in
 the prompt** rather than letting the model infer it. Example:
