@@ -19,6 +19,16 @@ notify_on_failure: []
 
 # session-handoff — moving a conversation between agents
 
+# When to invoke
+
+- A conversation or context needs to move from this session into a venue
+  bot's session, even if "handoff" is not said: "continue this on WhatsApp",
+  "brief the bot about X", "tell the discord session…".
+- A bot should message the operator ("have it message me"): Procedure step 5.
+- Work should run on its own and report back: Procedure step 4.
+
+# Steps
+
 ## The primitive
 
 ```bash

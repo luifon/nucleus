@@ -13,6 +13,16 @@ notify_on_failure: []
 
 This skill is the source of truth for modifying the operator's Obsidian vault's appearance and filtering rules. Most Obsidian customization in this stack runs through three config surfaces, all under `~/Documents/Obsidian/.obsidian/`.
 
+# When to invoke
+
+- The operator asks to style, color, hide or configure something in
+  Obsidian: file-explorer folder colors and icons, graph view color groups,
+  "Excluded files" patterns, tab accents, callout or tag styling.
+- A change to plugin data or to the committed plugin set.
+- A change to the Home dashboard (`Home.md`).
+
+# Steps
+
 ## File map
 
 | Surface | File | What it controls |
@@ -197,25 +207,13 @@ cd ~/Documents/Obsidian/.obsidian/plugins/<plugin-id>/
 # experimental.
 ```
 
-The plugin ID in `manifest.json` MUST match the directory name or
-Obsidian silently refuses to load it. Then add the ID to
+Then add the ID to
 `.obsidian/community-plugins.json` (a JSON array of enabled IDs).
-
-**Obsidian must be quit** while editing `appearance.json`, `app.json`,
-`workspace.json`, `community-plugins.json`, or per-plugin `data.json`
-— Obsidian rewrites these on quit and will clobber unsaved edits.
-CSS-snippet files and vault content (`.md`, `.base`) can be edited
-hot; Obsidian re-reads them.
 
 ## Iconize folder-icon convention
 
 Iconize's `data.json` has a **two-level shape** — plugin settings nest
 under a `settings` key, folder-path → icon mappings are top-level keys.
-Putting settings at the top level (without a `settings` wrapper) makes
-the plugin's `loadIconFolderData()` throw a TypeError on first read
-(`data.settings[k]` where `data.settings` is undefined) — the plugin
-silently fails to initialize and no icons render. Verified against
-v2.14.7 bundle.
 
 Minimum working data.json:
 
@@ -297,10 +295,6 @@ source folders (`0-Inbox`, `2-Daily-Notes`, `3-Projects`, `4-Areas`);
 Home.md just reflects. When adding a new section, prefer a query
 over a static link list.
 
-If the PARA folder structure ever changes (renumber, rename, split),
-**Home.md and the .base files must be updated in lockstep** — their
-queries name folders literally.
-
 ## Reload checklist (updated)
 
 | What you changed | Obsidian must be closed? | How to reload |
@@ -313,3 +307,21 @@ queries name folders literally.
 | `community-plugins.json` (enable/disable) | Yes | Restart Obsidian |
 | `workspace.json` | Yes (rewritten constantly) | Restart Obsidian |
 | Vault content (`.md`, `.base`) | No | Obsidian re-reads on focus |
+
+# Failure modes
+
+- **Plugin install:** The plugin ID in `manifest.json` MUST match the directory name or
+  Obsidian silently refuses to load it.
+- **Config files:** **Obsidian must be quit** while editing `appearance.json`, `app.json`,
+  `workspace.json`, `community-plugins.json`, or per-plugin `data.json`
+  — Obsidian rewrites these on quit and will clobber unsaved edits.
+  CSS-snippet files and vault content (`.md`, `.base`) can be edited
+  hot; Obsidian re-reads them.
+- **Iconize `data.json`:** Putting settings at the top level (without a `settings` wrapper) makes
+  the plugin's `loadIconFolderData()` throw a TypeError on first read
+  (`data.settings[k]` where `data.settings` is undefined) — the plugin
+  silently fails to initialize and no icons render. Verified against
+  v2.14.7 bundle.
+- **Home dashboard:** If the PARA folder structure ever changes (renumber, rename, split),
+  **Home.md and the .base files must be updated in lockstep** — their
+  queries name folders literally.
