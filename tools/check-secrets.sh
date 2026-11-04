@@ -153,7 +153,9 @@ case "$HAY" in
     diff_paths="$(printf '%s\n' "$HAY" | perl -ne 'if (/^\+\+\+ "?b\/(.*?)"?$/ || /^(?:rename|copy) to "?(.*?)"?$/) { my $p = $1; $p =~ s/\\([0-7]{3})/chr(oct($1))/ge; print "$p\n" }' || true)"
     HAY="$(printf '%s' "$HAY" | grep '^+' | grep -v '^+++' || true)"
     [ -n "$diff_paths" ] && HAY="$HAY"$'\n'"$diff_paths"
-    [ -z "${HAY//$'\n'/}" ] && exit 0
+    # grep, not ${HAY//...}: bash 3.2's pattern substitution is quadratic and
+    # took minutes on a diff of a few thousand lines.
+    printf '%s' "$HAY" | grep -q '[^[:space:]]' || exit 0
     ;;
 esac
 
