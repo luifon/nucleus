@@ -32,6 +32,8 @@ notify_on_failure: []
   queued to `whatsapp-dm` do not arrive.
 - After a fix elsewhere (env change, dependency bump, plist edit), to confirm
   that the WhatsApp connection stays up.
+- Something that worked (reminder fires, a bot) started failing after a period
+  of success → layer 6.
 
 # Steps
 
@@ -189,7 +191,39 @@ failed reminder fire with a healthy connection is not this layer.
    reminder delivery is a good probe). One successful boot does not show
    stability.
 
+## 6. Something that worked stopped working (a regression)
+
+1. Find the window: the last success and the first failure in
+   `nucleus reminders history`, in local time (`NUCLEUS_TZ`). `fired_at` is
+   stored with a `+00:00` offset and SQLite `datetime('now')` has none, so
+   compare with `julianday()` on both sides, never as text.
+2. Before reading or changing Nucleus code, list what changed outside the repo
+   in that window: `claude --version` and the binary's install time (a host
+   update can turn on a feature by default; new `seenNotifications.*` keys in
+   `~/.claude.json` show which), keys in `~/.claude/settings.json`, MCP servers
+   configured as `@latest` (pin them), machine load (`uptime`, `docker ps`
+   restart counts), and `git log` in the window. Tell the operator what you
+   found, with evidence, before proposing a code change.
+3. Reproduce in a separate tmux session, never in the session a launchd job
+   uses. Confirm a submit from the transcript file, not from `capture-pane`,
+   which can show an old frame.
+4. Fix the cause from step 2 first. Keep code changes for other states
+   separate and uncommitted until they are proven.
+5. Test without messages to the operator: do not create test reminders that
+   deliver to his DM. Use a fire that is silent when healthy, or record and
+   cancel any test reminder and confirm with `reminders list`.
+6. Call it fixed only after real scheduled fires delivered on their own.
+   Report every affected automation and every lost delivery, without ranking
+   one above the others.
+
 # Failure modes
+
+- **Repeated code fixes while the cause is a host change.** Each fix is called
+  done and the failures continue. Stop, revert the unproven changes, tell the
+  operator the state, and do layer 6 step 2.
+- **Test reminders sent to the operator's DM.** They reach him as real
+  messages and can collide with the launchd tick. Cancel them, close the
+  experiment windows, and tell him which messages were tests.
 
 - **Diagnosing from the wrong layer:** "bot ignored me" has four distinct
   causes (wedged TUI, dead process, delivery failure, missing context) with
