@@ -216,6 +216,30 @@ pub async fn mark_own(pool: &SqlitePool, session_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Clear `session_id`'s ledger entry so the next pass reviews it again from
+/// its start. The operator's way to re-review a session after a change in the
+/// review (for example a part whose items were all refused). Refuses the
+/// learner's own review sessions. Returns false when the session had no entry.
+pub async fn forget(pool: &SqlitePool, session_id: &str) -> Result<bool> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let outcome: Option<String> =
+        sqlx::query_scalar("SELECT outcome FROM reviewed_sessions WHERE session_id = ?1")
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match outcome.as_deref() {
+        None => return Ok(false),
+        Some("own") => anyhow::bail!("{session_id} is one of the learner's own review sessions"),
+        Some(_) => {}
+    }
+    sqlx::query("DELETE FROM reviewed_sessions WHERE session_id = ?1")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// One review session the learner ran, as recorded in `review_runs`.
 pub struct RunStart<'a> {
     pub pass: &'a str,
@@ -305,6 +329,14 @@ mod tests {
         let s1 = &all(&pool).await.unwrap()["s1"];
         assert_eq!((s1.position, s1.reviews, s1.failures), (120, 2, 0));
         assert_eq!((s1.head_hash.as_deref(), s1.text_turns), (Some("h"), Some(60)));
+
+        // Forget: the entry goes, so the next pass starts from 0; the
+        // learner's own sessions stay; an unknown id reports false.
+        assert!(forget(&pool, "s2").await.unwrap());
+        assert!(!all(&pool).await.unwrap().contains_key("s2"));
+        assert!(!forget(&pool, "s2").await.unwrap());
+        assert!(forget(&pool, "own-1").await.is_err());
+        assert_eq!(all(&pool).await.unwrap()["own-1"].outcome, "own");
 
         let id = start_run(
             &pool,

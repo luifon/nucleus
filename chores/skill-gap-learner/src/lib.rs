@@ -95,6 +95,13 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Clear a session's review record so the next pass reviews it again
+    /// from its start.
+    Forget {
+        /// Session id (the transcript's file name without `.jsonl`).
+        #[arg(long = "session", required = true)]
+        sessions: Vec<String>,
+    },
 }
 
 /// The run lock (`flock` on [`LOCK_PATH`], released when the process ends).
@@ -131,6 +138,17 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     let workspace_root = settings.workspace_root()?;
     let cli = Cli::parse_from(args);
     let command = cli.command.unwrap_or(Cmd::Learn);
+    if let Cmd::Forget { sessions } = &command {
+        let pool = skill_learner::open(&workspace_root).await?;
+        for id in sessions {
+            if skill_learner::ledger::forget(&pool, id).await? {
+                println!("forgot {id}: the next pass reviews it from the start");
+            } else {
+                println!("{id}: no review record");
+            }
+        }
+        return Ok(());
+    }
     let dry_run = matches!(command, Cmd::Sweep { dry_run: true, .. } | Cmd::Backfill { dry_run: true, .. });
 
     let _lock = if dry_run { None } else { Some(take_lock(&workspace_root)?) };
@@ -168,6 +186,7 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             print_report(&report);
             report_result(&report)
         }
+        Cmd::Forget { .. } => unreachable!("handled before the run lock"),
     }
 }
 
