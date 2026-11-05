@@ -443,7 +443,7 @@ const SKILL_CONTRACT: &str = r#"Every new skill, and every skill as it stands af
 
       # Failure modes
       <what goes wrong + how to recover — REQUIRED, never empty>
-  Code keeps a patched skill's name and ownership fields. Never write a secret, token, phone number, email, personal name or other identifier into a skill."#;
+  Code keeps a patched skill's name and ownership fields. Never write a secret, token, phone number, email, personal name or other identifier into a skill. When a step needs a credential, name where it is stored (a vault note, an `.env` variable, a file path) and never its value, not even an example value: an item with credential-shaped text is refused whole and its lesson is lost."#;
 
 const SIGNALS: &str = r#"Signals that warrant a suggestion:
   • The operator corrected style, tone, format, verbosity or legibility ("stop doing X", "too verbose", "just give me the answer", "remember this"). Embed the preference in the relevant skill so the next session starts knowing it.
