@@ -100,7 +100,19 @@ const CREDENTIAL_SHAPES: Array<[RegExp, string, Part]> = [
 /** A labeled value counts as a secret when it has at least 8 characters,
  *  mixes at least two character classes, and has a Shannon entropy of at
  *  least 3 bits per character. Mirrors `looks_random` in Rust. */
+/** A value that names where a secret is kept rather than the secret: an
+ *  environment variable (`$NAME`, `${NAME}`), a command substitution
+ *  (`$(...`), a file path (`/...`, `~/...`, `./...`, `../...`), or one word
+ *  of letters only. Surrounding backticks and quotes are ignored. Mirrors
+ *  `is_reference` in core/src/secret_filter.rs. */
+export function isReference(raw: string): boolean {
+  const v = raw.replace(/^[`"']+|[`"']+$/g, "");
+  if (v.startsWith("$")) return /^\$(\(|\{[A-Za-z_][A-Za-z0-9_]*\}$|[A-Za-z_][A-Za-z0-9_]*$)/.test(v);
+  return ["/", "~/", "./", "../"].some((p) => v.startsWith(p)) || /^\p{L}+$/u.test(v);
+}
+
 export function looksRandom(v: string): boolean {
+  if (isReference(v)) return false;
   const chars = Array.from(v);
   if (chars.length < 8) return false;
   const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter((re) => re.test(v)).length;

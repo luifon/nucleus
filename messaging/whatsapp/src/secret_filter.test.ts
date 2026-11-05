@@ -94,4 +94,10 @@ test("credential shapes are redacted in every message, including the operator's 
   assert.ok(!r.text.includes(jwt));
   assert.equal(looksRandom("configuration"), false);
   assert.equal(looksRandom("q8Zr2Tn5Wb4Yx7Kd"), true);
+  for (const v of ["/etc/restic/nucleus.password", "`/etc/restic/nucleus.password`", "~/.config/commit-guard/denylist", "$NUCLEUS_NTFY_TOKEN", "${NUCLEUS_NTFY_TOKEN}", "$(security", "Vaultwarden"]) {
+    assert.equal(looksRandom(v), false, v);
+  }
+  for (const v of ["h7Gq2LmX9vRp", "$2b$12$abcdefghijKLMNOP", "correct-horse-battery-staple", "ghp_A1b2C3d4E5f6G7h8"]) {
+    assert.equal(looksRandom(v), true, v);
+  }
 });

@@ -68,9 +68,13 @@ fn shapes() -> &'static [Shape] {
 
 /// A labeled value counts as a secret when it is at least 8 characters,
 /// mixes at least two character classes (lowercase, uppercase, digit,
-/// other), and has a Shannon entropy of at least 3 bits per character.
+/// other), and has a Shannon entropy of at least 3 bits per character, and
+/// is not a reference to where a secret is kept (see [`is_reference`]).
 /// Mirrors `looksRandom` in secret_filter.ts.
 pub fn looks_random(v: &str) -> bool {
+    if is_reference(v) {
+        return false;
+    }
     let chars: Vec<char> = v.chars().collect();
     if chars.len() < 8 {
         return false;
@@ -85,6 +89,26 @@ pub fn looks_random(v: &str) -> bool {
     .filter(|b| **b)
     .count();
     classes >= 2 && entropy(&chars) >= 3.0
+}
+
+/// A value that names where a secret is kept rather than the secret: an
+/// environment variable (`$NAME`, `${NAME}`), a command substitution
+/// (`$(...`), a file path (`/...`, `~/...`, `./...`, `../...`), or one word
+/// of letters only (a product or note name such as a password manager's).
+/// Surrounding backticks and quotes are ignored. Mirrors `isReference` in
+/// secret_filter.ts.
+pub fn is_reference(v: &str) -> bool {
+    let v = v.trim_matches(|c| c == '`' || c == '"' || c == '\'');
+    let env_var = |s: &str| {
+        let s = s.strip_prefix('{').and_then(|s| s.strip_suffix('}')).unwrap_or(s);
+        let mut cs = s.chars();
+        matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    if let Some(rest) = v.strip_prefix('$') {
+        return rest.starts_with('(') || env_var(rest);
+    }
+    ["/", "~/", "./", "../"].iter().any(|p| v.starts_with(p)) || (!v.is_empty() && v.chars().all(|c| c.is_alphabetic()))
 }
 
 fn entropy(chars: &[char]) -> f64 {
@@ -243,5 +267,26 @@ mod tests {
         let r = rules.redact("a tok-abcdefghijklmnop b Europe/Oslo");
         assert_eq!(r.text, "a [redacted] b Europe/Oslo");
         assert_eq!(r.hits, vec!["env-credential"]);
+    }
+
+    #[test]
+    fn references_to_where_a_secret_is_kept_are_not_secrets() {
+        for v in [
+            "/etc/restic/nucleus.password",
+            "`/etc/restic/nucleus.password`",
+            "~/.config/commit-guard/denylist",
+            "$NUCLEUS_NTFY_TOKEN",
+            "${NUCLEUS_NTFY_TOKEN}",
+            "$(security",
+            "Vaultwarden",
+        ] {
+            assert!(!looks_random(v), "{v}");
+        }
+        for v in ["h7Gq2LmX9vRp", "$2b$12$abcdefghijKLMNOP", "correct-horse-battery-staple", "ghp_A1b2C3d4E5f6G7h8"] {
+            assert!(looks_random(v), "{v}");
+        }
+        let r = CredentialRules::from_env_text("").redact("password: /etc/restic/nucleus.password and token: h7Gq2LmX9vRp");
+        assert!(r.text.contains("/etc/restic/nucleus.password"), "{}", r.text);
+        assert!(!r.text.contains("h7Gq2LmX9vRp"), "{}", r.text);
     }
 }
