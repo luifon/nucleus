@@ -2,36 +2,35 @@
 //! (ADR-017, ADR-038).
 //!
 //! One nightly run (`learn`, launchd-cron) with these steps, in order:
-//!   1. live sweep — review the parts of this workspace's session
-//!      transcripts written since the last run (ADR-038). Files skill
-//!      suggestions for the operator, or writes skills directly when
-//!      `[skill_learner] live_mode = "write"`.
+//!   1. live sweep — review the completed turns of this workspace's session
+//!      transcripts written since the last run (ADR-038).
 //!   2. backfill — the same review over old transcripts and over sessions
 //!      whose transcript only survives in the session index, a limited
-//!      batch per night. Always files suggestions.
-//!   3. auto-transitions, gap detection over the agent diaries, and the
-//!      curator (ADR-017's periodic arm). The diary window stretches back
-//!      over missed runs (ADR-029 watermark).
+//!      batch per night.
+//!   3. candidate workflows — expire the stale ones and promote the ones
+//!      seen on enough different days ([`promote`]).
+//!   4. the pure, no-model archive of stale agent-created skills.
+//!   5. gap detection over the agent diaries, and the curator (ADR-017's
+//!      periodic arm). The diary window stretches back over missed runs
+//!      (ADR-029 watermark).
 //!
-//! Between steps 2 and 3, when the passes filed or revised suggestions that
-//! are still pending, one WhatsApp notice goes to the operator's DM with
-//! their count and the dashboard link ([`notice`]).
+//! Every model pass files skill suggestions for the operator; none writes a
+//! skill. The operator accepts or rejects them (`nucleus skills
+//! suggestions`, the dashboard). At the end of the run, when any pass filed
+//! or revised suggestions that are still pending, one WhatsApp notice goes
+//! to the operator's DM with their count and the dashboard link
+//! ([`notice`]).
 //!
-//! `sweep` and `backfill` run steps 1 and 2 alone, with `--limit` and
-//! `--dry-run` for a manual check.
-//!
-//! Skills are written only to `<workspace>/.nucleus/.claude/skills/`
-//! (`skills::personal_skills_root` — operator-personal, gitignored, Rule 1);
-//! never to the repo's committed `.claude/skills/`. Every SKILL.md a session
-//! touched is run through `nucleus_core::skills::validate`; a malformed write
-//! is quarantined to `.rejected/` (inside the personal root) instead of
-//! polluting the live library. Suggestions are checked by the same
-//! validator before they are stored and again when the operator accepts one
-//! (`nucleus skills suggestions`).
+//! `sweep`, `backfill` and `promote` run steps 1, 2 and 3 alone, with
+//! `--limit` and `--dry-run` for a manual check (a dry run works on a
+//! private copy of the store and writes nothing). `backlog` lists the
+//! sessions whose completed turns have waited too long for review, for the
+//! heartbeat; it writes nothing.
 
 mod notice;
 mod parts;
 mod prefilter;
+mod promote;
 mod review;
 mod source;
 mod sweep;
@@ -42,13 +41,13 @@ use clap::{Parser, Subcommand};
 use nucleus_core::{
     chore_state,
     claude_session::{AskOptions, Session},
-    config::{LiveMode, Settings},
+    config::Settings,
     diary, skill_learner,
     session_profile::{ProfileContext, SessionProfile},
     skills,
 };
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 const AGENT_NAME: &str = "skill-gap-learner";
 const TMUX_SESSION: &str = "nucleus-skill-gap-learner";
@@ -64,6 +63,8 @@ const REVIEW_MAX_WAIT: Duration = Duration::from_secs(300);
 const LEARN_WATERMARK_KEY: &str = "skill-gap-learner.learn";
 /// The minimum diary window the gap pass reasons over.
 const GAP_WINDOW_DAYS: i64 = 7;
+/// Most bytes of one agent's diary of one day in the gap prompt.
+const DIARY_ENTRY_BYTES: usize = 4 * 1024;
 
 #[derive(Parser)]
 #[command(name = "skill-gap-learner", about = "Nucleus skill-gap learner (ADR-017, ADR-038)")]
@@ -74,10 +75,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// The nightly run: live sweep, backfill batch, then gap detection and
-    /// curation. (default)
+    /// The nightly run: live sweep, backfill batch, candidate promotion,
+    /// then gap detection and curation. (default)
     Learn,
-    /// Review the session parts written since the last sweep.
+    /// Review the completed turns written since the last sweep.
     Sweep {
         /// Most review sessions (default: `[skill_learner] live_max_reviews`).
         #[arg(long)]
@@ -86,7 +87,7 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Review one batch of old sessions (always files suggestions).
+    /// Review one batch of old sessions.
     Backfill {
         /// Most review sessions (default: `[skill_learner] backfill_per_night`).
         #[arg(long)]
@@ -94,6 +95,22 @@ enum Cmd {
         /// Show which parts would be reviewed; review and record nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Expire stale candidate workflows and promote the ready ones.
+    Promote {
+        /// Most promotions (default: `[skill_learner] promotions_per_night`).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Show what would be expired and promoted; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List the sessions the sweep reviews whose completed turns have
+    /// waited longer than `--hours` for review. Prints nothing when none
+    /// do. Read-only.
+    Backlog {
+        #[arg(long, default_value_t = 48)]
+        hours: u32,
     },
     /// Clear a session's review record so the next pass reviews it again
     /// from its start.
@@ -138,18 +155,25 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
     let workspace_root = settings.workspace_root()?;
     let cli = Cli::parse_from(args);
     let command = cli.command.unwrap_or(Cmd::Learn);
-    if let Cmd::Forget { sessions } = &command {
-        let pool = skill_learner::open(&workspace_root).await?;
-        for id in sessions {
-            if skill_learner::ledger::forget(&pool, id).await? {
-                println!("forgot {id}: the next pass reviews it from the start");
-            } else {
-                println!("{id}: no review record");
+    match &command {
+        Cmd::Forget { sessions } => {
+            let pool = skill_learner::open(&workspace_root).await?;
+            for id in sessions {
+                if skill_learner::ledger::forget(&pool, id).await? {
+                    println!("forgot {id}: the next pass reviews it from the start");
+                } else {
+                    println!("{id}: no review record");
+                }
             }
+            return Ok(());
         }
-        return Ok(());
+        Cmd::Backlog { hours } => return backlog(&workspace_root, &settings, *hours).await,
+        _ => {}
     }
-    let dry_run = matches!(command, Cmd::Sweep { dry_run: true, .. } | Cmd::Backfill { dry_run: true, .. });
+    let dry_run = matches!(
+        command,
+        Cmd::Sweep { dry_run: true, .. } | Cmd::Backfill { dry_run: true, .. } | Cmd::Promote { dry_run: true, .. }
+    );
 
     let _lock = if dry_run { None } else { Some(take_lock(&workspace_root)?) };
     if !dry_run {
@@ -160,33 +184,33 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
             .await;
     }
 
+    let cfg = &settings.skill_learner;
     match command {
         Cmd::Learn => learn(&workspace_root, &settings).await,
         Cmd::Sweep { limit, dry_run } => {
-            let cfg = &settings.skill_learner;
-            let opts = sweep::PassOptions {
-                limit: limit.unwrap_or(cfg.live_max_reviews),
-                dry_run,
-                write_mode: cfg.live_mode == LiveMode::Write,
-                daily_cap: false,
-            };
+            let opts = sweep::PassOptions { limit: limit.unwrap_or(cfg.live_max_reviews), dry_run, daily_cap: false };
             let report = run_one_pass(&workspace_root, &settings, sweep::Pass::Live, opts).await?;
             print_report(&report);
             report_result(&report)
         }
         Cmd::Backfill { limit, dry_run } => {
-            let cfg = &settings.skill_learner;
-            let opts = sweep::PassOptions {
-                limit: limit.unwrap_or(cfg.backfill_per_night),
-                dry_run,
-                write_mode: false,
-                daily_cap: false,
-            };
+            let opts = sweep::PassOptions { limit: limit.unwrap_or(cfg.backfill_per_night), dry_run, daily_cap: false };
             let report = run_one_pass(&workspace_root, &settings, sweep::Pass::Backfill, opts).await?;
             print_report(&report);
             report_result(&report)
         }
-        Cmd::Forget { .. } => unreachable!("handled before the run lock"),
+        Cmd::Promote { limit, dry_run } => {
+            let report = run_promote(&workspace_root, &settings, limit.unwrap_or(cfg.promotions_per_night), dry_run).await?;
+            for l in &report.lines {
+                println!("{l}");
+            }
+            println!("{}", report.summary());
+            match &report.error {
+                Some(e) => bail!("promotion stopped: {e}"),
+                None => Ok(()),
+            }
+        }
+        Cmd::Forget { .. } | Cmd::Backlog { .. } => unreachable!("handled before the run lock"),
     }
 }
 
@@ -255,15 +279,25 @@ impl review::Backend for ClaudeBackend<'_> {
         .await?;
         Ok(Box::new(ClaudeReview { session: Some(session), ask }))
     }
+}
 
-    async fn write_review(&self, window: &str, prompt: &str) -> Result<String> {
-        let (reply, gate) = run_skill_session(self.workspace_root, self.settings, window, prompt).await?;
-        Ok(if gate.is_empty() {
-            truncate(&reply, 240)
-        } else {
-            format!("{} (gate: {})", truncate(&reply, 240), gate.names().join(", "))
-        })
+/// The store a command works on: the real one, or for a dry run a private
+/// copy (`skill_learner::open_snapshot`), so a dry run never writes or
+/// migrates the real file. The guard keeps the copy alive.
+async fn open_store(workspace_root: &Path, dry_run: bool) -> Result<(Option<tempfile::TempDir>, sqlx::SqlitePool)> {
+    if dry_run {
+        let (dir, pool) = skill_learner::open_snapshot(workspace_root).await?;
+        Ok((Some(dir), pool))
+    } else {
+        Ok((None, skill_learner::open(workspace_root).await?))
     }
+}
+
+/// The library summary closure every review prompt uses.
+fn summary_fn(workspace_root: &Path) -> impl Fn() -> String + Sync + use<> {
+    let operator_root = skills::personal_skills_root(workspace_root);
+    let repo_root = skills::repo_skills_root(workspace_root);
+    move || library_summary(&operator_root, &repo_root, skills::global_skills_root().as_deref())
 }
 
 /// Run one pass with the production backend.
@@ -273,12 +307,10 @@ async fn run_one_pass(
     pass: sweep::Pass,
     opts: sweep::PassOptions,
 ) -> Result<sweep::PassReport> {
-    let pool = skill_learner::open(workspace_root).await?;
+    let (_copy, pool) = open_store(workspace_root, opts.dry_run).await?;
     let index = nucleus_core::session_index::open_read_only(workspace_root).await?;
     let roots = skills::LibraryRoots::for_workspace(workspace_root);
-    let operator_root = skills::personal_skills_root(workspace_root);
-    let repo_root = skills::repo_skills_root(workspace_root);
-    let summary = move || library_summary(&operator_root, &repo_root, skills::global_skills_root().as_deref());
+    let summary = summary_fn(workspace_root);
     let env = sweep::Env {
         ws: workspace_root,
         cfg: &settings.skill_learner,
@@ -294,45 +326,102 @@ async fn run_one_pass(
     sweep::run_pass(&env, pass, opts, &backend).await.map_err(anyhow::Error::new)
 }
 
-/// What steps 1 and 2 of the nightly run did.
+/// Expire and promote candidate workflows with the production backend.
+async fn run_promote(workspace_root: &Path, settings: &Settings, limit: u32, dry_run: bool) -> Result<promote::PromoteReport> {
+    let (_copy, pool) = open_store(workspace_root, dry_run).await?;
+    let index = nucleus_core::session_index::open_read_only(workspace_root).await?;
+    let roots = skills::LibraryRoots::for_workspace(workspace_root);
+    let summary = summary_fn(workspace_root);
+    let env = sweep::Env {
+        ws: workspace_root,
+        cfg: &settings.skill_learner,
+        roots: &roots,
+        pool: &pool,
+        index: index.as_ref(),
+        transcripts_dir: nucleus_core::session_index::transcripts_dir(workspace_root),
+        library_summary: &summary,
+        now: chrono::Utc::now().timestamp(),
+    };
+    let backend = ClaudeBackend { workspace_root, settings };
+    promote::run(&env, limit, dry_run, &backend).await
+}
+
+/// `backlog`: the sessions whose oldest completed turn waiting for review
+/// ended more than `hours` ago, one line each. Opens every database
+/// read-only and writes nothing.
+async fn backlog(workspace_root: &Path, settings: &Settings, hours: u32) -> Result<()> {
+    let (_copy, pool) = match skill_learner::open_read_only(workspace_root).await? {
+        Some(p) => (None, p),
+        // No store yet: an empty private copy, so every turn counts.
+        None => {
+            let (dir, p) = skill_learner::open_snapshot(workspace_root).await?;
+            (Some(dir), p)
+        }
+    };
+    let roots = skills::LibraryRoots::for_workspace(workspace_root);
+    let summary = || String::new();
+    let now = chrono::Utc::now().timestamp();
+    let env = sweep::Env {
+        ws: workspace_root,
+        cfg: &settings.skill_learner,
+        roots: &roots,
+        pool: &pool,
+        index: None,
+        transcripts_dir: nucleus_core::session_index::transcripts_dir(workspace_root),
+        library_summary: &summary,
+        now,
+    };
+    let tz = nucleus_core::claude_session::nucleus_tz();
+    for w in sweep::waiting(&env).await? {
+        if now - w.oldest < i64::from(hours) * 3600 {
+            continue;
+        }
+        let at = chrono::DateTime::from_timestamp(w.oldest, 0)
+            .map(|t| t.with_timezone(&tz).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        println!(
+            "{} {} oldest waiting turn ended {at}, {} completed turn(s) waiting",
+            w.session_id.get(..8).unwrap_or(&w.session_id),
+            w.agent.as_deref().unwrap_or("terminal"),
+            w.turns
+        );
+    }
+    Ok(())
+}
+
+/// What the nightly run's passes did: their summary lines, the first error,
+/// and every suggestion they filed or revised (the notice counts them).
 #[derive(Default)]
-struct NightlySweep {
-    /// Each pass's summary (for the diary).
+struct Nightly {
     lines: Vec<String>,
-    /// The first error; returned after both passes had their chance.
     error: Option<String>,
-    /// Suggestions the passes filed, and the new suggestion of each
-    /// revision.
     filed: Vec<i64>,
 }
 
-/// Steps 1 and 2 of the nightly run.
-async fn nightly_sweep(workspace_root: &Path, settings: &Settings) -> NightlySweep {
-    let cfg = &settings.skill_learner;
-    if !cfg.enabled {
-        return NightlySweep { lines: vec!["sweep disabled ([skill_learner] enabled = false)".into()], ..Default::default() };
+impl Nightly {
+    fn fail(&mut self, msg: String) {
+        tracing::warn!("learn: {msg}");
+        self.lines.push(msg.clone());
+        self.error.get_or_insert(msg);
     }
-    let mut lines = Vec::new();
-    let mut error = None;
-    let mut filed = Vec::new();
+}
+
+/// Steps 1 and 2 of the nightly run.
+async fn nightly_sweep(workspace_root: &Path, settings: &Settings, out: &mut Nightly) {
+    let cfg = &settings.skill_learner;
     let passes = [
-        (
-            sweep::Pass::Live,
-            sweep::PassOptions { limit: cfg.live_max_reviews, dry_run: false, write_mode: cfg.live_mode == LiveMode::Write, daily_cap: false },
-        ),
-        (sweep::Pass::Backfill, sweep::PassOptions { limit: cfg.backfill_per_night, dry_run: false, write_mode: false, daily_cap: true }),
+        (sweep::Pass::Live, sweep::PassOptions { limit: cfg.live_max_reviews, dry_run: false, daily_cap: false }),
+        (sweep::Pass::Backfill, sweep::PassOptions { limit: cfg.backfill_per_night, dry_run: false, daily_cap: true }),
     ];
     for (pass, opts) in passes {
         match run_one_pass(workspace_root, settings, pass, opts).await {
             Ok(r) => {
                 tracing::info!("learn: {}", r.summary());
-                filed.extend(r.created.iter().map(|(id, _)| *id));
-                filed.extend(&r.revised);
-                if r.error.is_some() && error.is_none() {
-                    error = r.error.clone();
-                }
-                lines.push(r.summary());
-                if r.error.is_some() {
+                out.filed.extend(r.created.iter().map(|(id, _)| *id));
+                out.filed.extend(&r.revised);
+                out.lines.push(r.summary());
+                if let Some(e) = &r.error {
+                    out.error.get_or_insert_with(|| e.clone());
                     // The reviewer is unreachable (usage limit, spawn
                     // failure): the next pass would fail the same way.
                     break;
@@ -342,22 +431,18 @@ async fn nightly_sweep(workspace_root: &Path, settings: &Settings) -> NightlySwe
                 // The suggestions filed before the error are stored: they
                 // still get their notice.
                 if let Some(failed) = e.downcast_ref::<sweep::PassFailed>() {
-                    filed.extend(failed.report.created.iter().map(|(id, _)| *id));
-                    filed.extend(&failed.report.revised);
+                    out.filed.extend(failed.report.created.iter().map(|(id, _)| *id));
+                    out.filed.extend(&failed.report.revised);
                 }
-                let msg = format!("{} pass failed: {e:#}", pass.as_str());
-                tracing::warn!("learn: {msg}");
-                lines.push(msg.clone());
-                error.get_or_insert(msg);
+                out.fail(format!("{} pass failed: {e:#}", pass.as_str()));
             }
         }
     }
-    NightlySweep { lines, error, filed }
 }
 
-/// Queue the WhatsApp notice for the suggestions the sweep filed that are
-/// still pending (none when there are none). A failure is logged; it does
-/// not stop the run.
+/// Queue the WhatsApp notice for the suggestions the run filed or revised
+/// that are still pending (none when there are none). A failure is logged;
+/// it does not stop the run.
 async fn notify_suggestions(workspace_root: &Path, settings: &Settings, filed: &[i64]) {
     let cfg = &settings.skill_learner;
     if !cfg.notify || filed.is_empty() {
@@ -380,230 +465,6 @@ async fn notify_suggestions(workspace_root: &Path, settings: &Settings, filed: &
         Ok(Some((row, n))) => tracing::info!("learn: queued the WhatsApp notice for {n} new suggestion(s) (outbound #{row})"),
         Ok(None) => {}
         Err(e) => tracing::warn!("learn: the WhatsApp notice for new suggestions was not queued: {e:#}"),
-    }
-}
-
-#[derive(Default)]
-struct GateOutcome {
-    /// Agent-authored skills moved to `.rejected/`.
-    quarantined: Vec<String>,
-    /// Personal skills left in place with a problem the operator should
-    /// see: a hand-written skill that fails the contract, or a skill whose
-    /// name collides with a machine-wide or committed skill. (name, reason)
-    flagged: Vec<(String, String)>,
-    /// Files under the committed `.claude/skills/` tree modified during the
-    /// run, relative to that tree. The learner must never write there; these
-    /// are reported only — the committed tree is hand-owned, so nothing is
-    /// moved or deleted.
-    repo_writes: Vec<String>,
-}
-
-impl GateOutcome {
-    fn is_empty(&self) -> bool {
-        self.quarantined.is_empty() && self.flagged.is_empty() && self.repo_writes.is_empty()
-    }
-    fn names(&self) -> Vec<String> {
-        let mut v = self.quarantined.clone();
-        v.extend(self.flagged.iter().map(|(n, _)| n.clone()));
-        v.extend(self.repo_writes.iter().map(|p| format!(".claude/skills/{p}")));
-        v
-    }
-}
-
-/// Skill names already taken outside the personal tree, keyed to the reason
-/// a personal skill with that name is a problem. Both the directory name and
-/// the frontmatter `name` count. Machine-wide entries take precedence over
-/// repo entries because the machine-wide copy is the one that loads.
-fn reserved_skill_names(
-    repo_root: &Path,
-    machine_root: Option<&Path>,
-) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    let mut add = |root: &Path, tier: skills::SkillTier, reason: &dyn Fn(&str) -> String| {
-        for s in skills::read_skills(root, tier) {
-            let dir_name = Path::new(&s.path)
-                .parent()
-                .and_then(|d| d.file_name())
-                .and_then(|n| n.to_str())
-                .map(str::to_string);
-            for key in std::iter::once(s.name.clone()).chain(dir_name) {
-                out.entry(key).or_insert_with(|| reason(&s.name));
-            }
-        }
-    };
-    if let Some(machine) = machine_root {
-        add(machine, skills::SkillTier::Global, &|n| {
-            format!("the machine-wide skill `{n}` in ~/.claude/skills has the same name and shadows it — this copy never loads")
-        });
-    }
-    add(repo_root, skills::SkillTier::Repo, &|n| {
-        format!("duplicates the committed skill `{n}` in .claude/skills")
-    });
-    out
-}
-
-/// Every file under `repo_root` modified at or after `since`, as paths
-/// relative to `repo_root`, sorted. Missing root → empty.
-fn repo_files_modified_since(repo_root: &Path, since: SystemTime) -> Vec<String> {
-    fn walk(dir: &Path, base: &Path, since: SystemTime, out: &mut Vec<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for dirent in entries.flatten() {
-            let path = dirent.path();
-            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
-            if meta.is_dir() {
-                walk(&path, base, since, out);
-            } else if meta.modified().is_ok_and(|m| m >= since) {
-                if let Ok(rel) = path.strip_prefix(base) {
-                    out.push(rel.to_string_lossy().into_owned());
-                }
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(repo_root, repo_root, since, &mut out);
-    out.sort();
-    out
-}
-
-/// Validate every SKILL.md under `root` (the personal tree) modified since
-/// `since`; move any that fail to `<root>/.rejected/<name>-<ts>/`. Returns
-/// what the gate did.
-///
-/// Also, for the same run:
-///   - flags a touched personal skill whose directory name or frontmatter
-///     `name` matches a skill in `machine_root` (which shadows it) or in
-///     `repo_root` (a duplicate of a committed skill);
-///   - reports every file under `repo_root` modified since `since`. The
-///     session's cwd is the workspace root, so a wrong relative path lands
-///     in the committed tree. Those files are hand-owned and are only
-///     reported, never moved.
-///
-/// Only skills this agent authored (`created_by: agent`) are ever moved.
-/// A hand-written skill is reported and left alone: the format contract
-/// exists to police autonomous writes, and an operator skill never agreed
-/// to it. On 2026-08-28 the curator made a cosmetic frontmatter fix to a
-/// hand-written skill, that touch made it eligible for the gate, and a missing
-/// `# Steps` heading moved the whole directory out of the library — taking
-/// the script a reminder depended on with it.
-fn gate_touched_skills(
-    root: &Path,
-    repo_root: &Path,
-    machine_root: Option<&Path>,
-    since: SystemTime,
-) -> Result<GateOutcome> {
-    let mut outcome = GateOutcome {
-        repo_writes: repo_files_modified_since(repo_root, since),
-        ..GateOutcome::default()
-    };
-    for rel in &outcome.repo_writes {
-        tracing::warn!("review: session wrote to the committed tree: .claude/skills/{rel}");
-    }
-    let entries = match std::fs::read_dir(root) {
-        Ok(e) => e,
-        Err(_) => return Ok(outcome),
-    };
-    let reserved = reserved_skill_names(repo_root, machine_root);
-    for dirent in entries.flatten() {
-        let dir = dirent.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        if name.starts_with('.') {
-            continue; // .archive / .rejected
-        }
-        let skill_md = dir.join(skills::SKILL_FILE);
-        let Ok(meta) = std::fs::metadata(&skill_md) else { continue };
-        let Ok(modified) = meta.modified() else { continue };
-        if modified < since {
-            continue; // not touched this run
-        }
-        let content = std::fs::read_to_string(&skill_md).unwrap_or_default();
-        let fm = skills::parse_frontmatter(&content, &skill_md).unwrap_or_default();
-        let issues = skills::validate(&content);
-        if issues.is_empty() || fm.created_by.as_deref() != Some("agent") || fm.pinned {
-            // Stays in the live tree: report the problems it has there.
-            if !issues.is_empty() {
-                // Same ownership rule as apply_auto_transitions: only
-                // auto-manage what this agent wrote, and never touch a
-                // pinned skill.
-                tracing::warn!("review: `{name}` fails the contract but is hand-written — left in place ({issues:?})");
-                outcome
-                    .flagged
-                    .push((name.clone(), format!("fails the SKILL.md contract ({})", issues.join("; "))));
-            }
-            let collision = reserved
-                .get(&name)
-                .or_else(|| fm.name.as_deref().and_then(|n| reserved.get(n)));
-            if let Some(reason) = collision {
-                tracing::warn!("review: `{name}` name collision — {reason}");
-                outcome.flagged.push((name, reason.clone()));
-            }
-            continue;
-        }
-        // Quarantine.
-        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
-        let rejected = root.join(".rejected").join(format!("{name}-{ts}"));
-        if let Some(parent) = rejected.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match std::fs::rename(&dir, &rejected) {
-            Ok(_) => {
-                tracing::warn!("review: quarantined `{name}` → {} ({:?})", rejected.display(), issues);
-                outcome.quarantined.push(name);
-            }
-            Err(e) => tracing::warn!("review: failed to quarantine `{name}`: {e}"),
-        }
-    }
-    Ok(outcome)
-}
-
-/// Tell the operator that the gate touched his library.
-///
-/// A quarantine removes a skill from the live tree, and anything depending
-/// on that directory breaks with it — a reminder's condition watcher, a
-/// script another skill shells out to. Before 2026-08-28 this was recorded
-/// only in the diary and the log, so the first sign was a reminder that
-/// stopped arriving. Delivery goes through the `reminders` binary so it
-/// reuses the channel fan-out and the per-channel retry.
-async fn alert_gate(outcome: &GateOutcome) {
-    if outcome.is_empty() {
-        return;
-    }
-    let mut lines = Vec::new();
-    for name in &outcome.quarantined {
-        lines.push(format!(
-            "• `{name}` moved to .rejected/ — anything pointing at that directory is now broken"
-        ));
-    }
-    for (name, reason) in &outcome.flagged {
-        lines.push(format!("• `{name}` {reason} — left in place"));
-    }
-    for rel in &outcome.repo_writes {
-        lines.push(format!(
-            "• `.claude/skills/{rel}` was written in the committed tree — the learner writes only to the personal tree; review it with git status (left in place)"
-        ));
-    }
-    let body = format!("⚠️ skill-gap-learner touched the skill library\n\n{}", lines.join("\n"));
-
-    // Both halves live in the same binary since ADR-030, so this is a library
-    // call rather than a subprocess. It also removes the old silent failure
-    // mode: the alert used to be dropped whenever target/release/reminders
-    // happened not to exist.
-    let at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string();
-    let out = reminders::run(
-        ["nucleus reminders", "add", "--at", &at, "--title", "skill gate",
-         "--body", &body, "--channels", "discord-home,whatsapp-dm"]
-            .iter()
-            .map(std::ffi::OsString::from)
-            .collect(),
-    )
-    .await;
-    match out {
-        Ok(()) => {
-            tracing::info!("gate alert queued for {}", outcome.names().join(", "))
-        }
-        Err(e) => tracing::warn!("gate alert failed: {e:#}"),
     }
 }
 
@@ -650,132 +511,169 @@ fn truncate(s: &str, max: usize) -> String {
     t
 }
 
-/// Spawn a one-shot skill-writing session, run the prompt, then run the
-/// validation gate over anything it touched. Shared by the write-mode
-/// review, the gap pass and the curator.
-/// Returns (reply, quarantined skill names).
-///
-/// ADR-020: goes through `SessionProfile::one_shot_agentic`, which fixes two
-/// long-standing config drops by construction — this path used to run with
-/// `await_turn_complete: false` (mid-task cutoff risk while writing skill
-/// files) and without the Settings `disallowed_tools` denylist.
-async fn run_skill_session(
+// ── nightly run: sweep, backfill, candidates, gap detection, curator ───────
+
+/// One library-level review (the gap pass or the curator): a `review_runs`
+/// row, one review session, its suggestions filed. Returns the summary line
+/// and the suggestions filed or revised; a reviewer that cannot be reached
+/// is an error.
+async fn library_review(
     workspace_root: &Path,
     settings: &Settings,
-    window: &str,
-    prompt: &str,
-) -> Result<(String, GateOutcome)> {
-    let operator_root = skills::personal_skills_root(workspace_root);
-    let operator_root = operator_root.as_path();
-    // Create the personal root up front: the session writes into it, and its
-    // `.nucleus` ancestor must exist for `build_claude_args` to pass it as
-    // `--add-dir` (which is what makes the written skills load).
-    std::fs::create_dir_all(operator_root)
-        .with_context(|| format!("creating {}", operator_root.display()))?;
-    // ADR-038: no suggestion accept writes the library while this session
-    // may (an accept holds the lock for milliseconds; wait it out).
-    let _library = skill_learner::library_lock(workspace_root, Duration::from_secs(120)).await?;
-    let started = SystemTime::now();
-    // ADR-029: every writing pass — each write-mode review, the gap pass,
-    // the curator — resumes one session per local day.
-    let outcome = SessionProfile::one_shot_agentic(&ProfileContext {
-        workspace_root,
-        claude: &settings.claude,
-        tmux_session: TMUX_SESSION,
-        agent_label: AGENT_NAME,
-    })
-    .window_name(window)
-    .daily_session(AGENT_NAME)
-    .run_one_shot(prompt)
-    .await
-    .with_context(|| format!("skill session ({window})"))?;
-    let gate = gate_touched_skills(
-        operator_root,
-        &skills::repo_skills_root(workspace_root),
-        skills::global_skills_root().as_deref(),
-        started,
-    )?;
-    alert_gate(&gate).await;
-    Ok((outcome.reply, gate))
+    pass: &str,
+    task: &review::Task<'_>,
+    origin: skill_learner::suggestions::SuggestionOrigin,
+) -> Result<(String, Vec<i64>)> {
+    use skill_learner::ledger;
+    let pool = skill_learner::open(workspace_root).await?;
+    let roots = skills::LibraryRoots::for_workspace(workspace_root);
+    let backend = ClaudeBackend { workspace_root, settings };
+    let run_id = ledger::start_run(&pool, &ledger::RunStart { pass, ..ledger::RunStart::default() }).await?;
+    let lib = review::Library::load(&pool, &roots, summary_fn(workspace_root)()).await?;
+    match review::review(&backend, &pool, workspace_root, &roots, &lib, task, origin).await {
+        Ok(o) => {
+            // The suggestions are stored: they are returned (for the notice)
+            // even when the run row cannot be closed.
+            let mut filed: Vec<i64> = o.created.iter().map(|(id, _, _)| *id).collect();
+            filed.extend(o.revised.iter().map(|(_, new)| *new));
+            let detail = review::describe(&o);
+            if let Err(e) = ledger::finish_run(
+                &pool,
+                run_id,
+                "ok",
+                o.review_session_id.as_deref(),
+                o.created.len() as i64,
+                o.evidence_for.len() as i64,
+                Some(&detail),
+            )
+            .await
+            {
+                tracing::warn!("learn: {pass}: the review-run row was not closed: {e:#}");
+            }
+            Ok((format!("{pass}: {detail}"), filed))
+        }
+        Err(e) => {
+            let outcome = if matches!(e, review::ReviewError::Infra(_)) { "failed" } else { "unparsable" };
+            ledger::finish_run(&pool, run_id, outcome, None, 0, 0, Some(&e.to_string())).await?;
+            match e {
+                review::ReviewError::Infra(_) => bail!("{pass}: {e}"),
+                _ => Ok((format!("{pass}: {e}"), Vec::new())),
+            }
+        }
+    }
 }
 
-// ── nightly run: sweep, backfill, gap detection, curator ───────────────────
-
-/// The nightly run (launchd-cron). The live sweep and a backfill batch
-/// (ADR-038), then the ADR-017 periodic arm: pure auto-archive of stale
-/// agent-created skills, an LLM gap-detection pass over recent diaries, and
-/// an LLM curator/consolidation pass. A sweep that fails does not stop the
-/// periodic arm; the run reports the failure at the end.
+/// The nightly run (launchd-cron): the live sweep and a backfill batch
+/// (ADR-038), the candidate workflows, then the ADR-017 periodic arm: pure
+/// auto-archive of stale agent-created skills, the gap pass over recent
+/// diaries and the curator, both as suggestions. A step that fails does not
+/// stop the later ones; the run reports the first failure at the end, after
+/// the one WhatsApp notice for everything the run filed.
 async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
     let operator_root = skills::personal_skills_root(workspace_root);
-    let repo_root = skills::repo_skills_root(workspace_root);
     let cfg = &settings.skill_learner;
+    let mut run = Nightly::default();
 
-    // 0. Transcript sweep + backfill (ADR-038), and the WhatsApp notice for
-    // what they filed.
-    let sweep = nightly_sweep(workspace_root, settings).await;
-    let _ = diary::record_observation(
-        workspace_root,
-        AGENT_NAME,
-        "sweep",
-        &sweep.lines.join("\n"),
-        diary::Tag::Observation,
-    );
-    notify_suggestions(workspace_root, settings, &sweep.filed).await;
+    // 1–3. Transcript sweep + backfill, then the candidate workflows.
+    if cfg.enabled {
+        nightly_sweep(workspace_root, settings, &mut run).await;
+        if run.error.is_none() {
+            match run_promote(workspace_root, settings, cfg.promotions_per_night, false).await {
+                Ok(r) => {
+                    tracing::info!("learn: {}", r.summary());
+                    run.filed.extend(&r.filed);
+                    run.lines.push(r.summary());
+                    if let Some(e) = r.error {
+                        run.error.get_or_insert(e);
+                    }
+                }
+                Err(e) => run.fail(format!("candidate promotion failed: {e:#}")),
+            }
+        }
+    } else {
+        run.lines.push("sweep disabled ([skill_learner] enabled = false)".into());
+    }
+    let _ = diary::record_observation(workspace_root, AGENT_NAME, "sweep", &run.lines.join("\n"), diary::Tag::Observation);
 
-    // 1. Pure auto-transitions (no LLM): archive agent-created, unpinned skills
-    // idle past archive_after_days; count the merely-stale for the log.
-    let (stale, archived) =
-        apply_auto_transitions(&operator_root, cfg.stale_after_days, cfg.archive_after_days);
+    // 4. Pure auto-transitions (no model), under the library write lock so
+    // an accept never writes a skill this moves.
+    let (stale, archived) = match skill_learner::library_lock(workspace_root, Duration::from_secs(120)).await {
+        Ok(_library) => apply_auto_transitions(&operator_root, cfg.stale_after_days, cfg.archive_after_days),
+        Err(e) => {
+            tracing::warn!("learn: stale-skill archive skipped: {e:#}");
+            (0, Vec::new())
+        }
+    };
     if !archived.is_empty() {
         tracing::info!("learn: auto-archived {} stale skill(s): {}", archived.len(), archived.join(", "));
     }
 
-    // 2. Gap detection over recent diaries (skip our own). The window is
+    // 5a. Gap detection over recent diaries (skip our own). The window is
     // GAP_WINDOW_DAYS, stretched back to the day after the last completed
     // run when nights were missed (ADR-029 watermark).
     let today = chrono::Local::now().date_naive();
-    let from = chore_state::resume_date_after(workspace_root, LEARN_WATERMARK_KEY, GAP_WINDOW_DAYS - 1)
-        .await?
-        .min(today - chrono::Duration::days(GAP_WINDOW_DAYS - 1));
+    let floor = today - chrono::Duration::days(GAP_WINDOW_DAYS - 1);
+    // No `?` before the notice: the suggestions filed above get it whatever
+    // fails here.
+    let from = match chore_state::resume_date_after(workspace_root, LEARN_WATERMARK_KEY, GAP_WINDOW_DAYS - 1).await {
+        Ok(d) => d.min(floor),
+        Err(e) => {
+            run.fail(format!("reading the gap-pass watermark failed: {e:#}"));
+            floor
+        }
+    };
     let window_days = (today - from).num_days() + 1;
     if window_days > GAP_WINDOW_DAYS {
         tracing::info!("learn: catching up — gap window is {window_days} days (from {from})");
     }
-    let diaries = read_all_diaries(workspace_root, &settings.diary.root, window_days);
-    let library = library_summary(&operator_root, &repo_root, skills::global_skills_root().as_deref());
-
-    let mut gap_summary = "no diaries to scan".to_string();
-    if !diaries.trim().is_empty() {
-        let prompt = build_gap_prompt(&operator_root, &library, &diaries);
-        let (reply, q) =
-            run_skill_session(workspace_root, settings, "gap", &prompt).await?;
-        gap_summary = truncate(&reply, 200);
-        if !q.is_empty() {
-            gap_summary = format!("{gap_summary} (gate: {})", q.names().join(", "));
+    let diaries = read_all_diaries(workspace_root, &settings.diary.root, window_days, review::MAX_WINDOW_BYTES);
+    let gap_summary = if diaries.text.trim().is_empty() {
+        "gap: no diaries to scan".to_string()
+    } else {
+        let task = review::Task::Gap { diaries: &diaries.text, window: &diaries.window };
+        match library_review(workspace_root, settings, "gap", &task, skill_learner::suggestions::SuggestionOrigin::Gap).await {
+            Ok((line, filed)) => {
+                run.filed.extend(filed);
+                line
+            }
+            Err(e) => {
+                run.fail(format!("gap pass failed: {e:#}"));
+                "gap: failed".into()
+            }
         }
-    }
-
-    // 3. Curator consolidation over the (refreshed) agent-created library.
-    let library = library_summary(&operator_root, &repo_root, skills::global_skills_root().as_deref());
-    let curate_summary = {
-        let prompt = build_curate_prompt(&operator_root, &library);
-        let (reply, q) =
-            run_skill_session(workspace_root, settings, "curate", &prompt).await?;
-        let mut s = truncate(&reply, 200);
-        if !q.is_empty() {
-            s = format!("{s} (gate: {})", q.names().join(", "));
-        }
-        s
     };
 
-    let summary = format!(
-        "stale={stale} archived={} · gap: {gap_summary} · curate: {curate_summary}",
-        archived.len()
-    );
+    // 5b. The curator over the agent-created, unpinned skills.
+    let agent_skills: Vec<String> = skills::read_skills(&operator_root, skills::SkillTier::Personal)
+        .into_iter()
+        .filter(|s| s.created_by.as_deref() == Some("agent") && !s.pinned && s.symlink_target.is_none())
+        .map(|s| s.dir_name)
+        .collect();
+    let curate_summary = if agent_skills.len() < 2 {
+        format!("curate: {} agent-created skill(s), nothing to consolidate", agent_skills.len())
+    } else {
+        let task = review::Task::Curate { skills: &agent_skills };
+        match library_review(workspace_root, settings, "curate", &task, skill_learner::suggestions::SuggestionOrigin::Curator)
+            .await
+        {
+            Ok((line, filed)) => {
+                run.filed.extend(filed);
+                line
+            }
+            Err(e) => {
+                run.fail(format!("curator failed: {e:#}"));
+                "curate: failed".into()
+            }
+        }
+    };
+
+    // One notice for the whole run.
+    notify_suggestions(workspace_root, settings, &run.filed).await;
+
+    let summary = format!("stale={stale} archived={} · {gap_summary} · {curate_summary}", archived.len());
     let nothing_happened = archived.is_empty()
-        && gap_summary.starts_with("No gaps")
-        && curate_summary.starts_with("Library is already well-shaped");
+        && gap_summary.ends_with("nothing to suggest")
+        && (curate_summary.ends_with("nothing to suggest") || curate_summary.ends_with("nothing to consolidate"));
     let _ = diary::record_observation(
         workspace_root,
         AGENT_NAME,
@@ -789,8 +687,8 @@ async fn learn(workspace_root: &Path, settings: &Settings) -> Result<()> {
     if let Some(yesterday) = today.pred_opt() {
         chore_state::set_watermark(workspace_root, LEARN_WATERMARK_KEY, &yesterday.to_string()).await?;
     }
-    match sweep.error {
-        Some(e) => bail!("transcript sweep: {e}"),
+    match run.error {
+        Some(e) => bail!("skill-gap-learner: {e}"),
         None => Ok(()),
     }
 }
@@ -862,105 +760,60 @@ fn skill_age_days(fm: &skills::Frontmatter, skill_md: &Path, now: chrono::DateTi
     }
 }
 
-/// Concatenate the last `days` of every agent's diary (skipping our own and
-/// hidden files) so the gap pass sees what the system has been doing.
-fn read_all_diaries(workspace_root: &Path, diary_root_rel: &str, days: i64) -> String {
+
+/// The diaries the gap pass reads, and the window they cover.
+struct Diaries {
+    text: String,
+    /// `YYYY-MM-DD..YYYY-MM-DD` of the days included, with a note when the
+    /// budget left older days out.
+    window: String,
+}
+
+/// The last `days` of every agent's diary (skipping our own and hidden
+/// files, routine entries removed), newest day first across agents, each
+/// agent's day cut to [`DIARY_ENTRY_BYTES`], at most `budget` bytes: the
+/// oldest days are left out first.
+fn read_all_diaries(workspace_root: &Path, diary_root_rel: &str, days: i64, budget: usize) -> Diaries {
     let root = workspace_root.join(diary_root_rel);
     let today = chrono::Local::now().date_naive();
-    let mut out = String::new();
-    let Ok(entries) = std::fs::read_dir(&root) else { return out };
-    for dirent in entries.flatten() {
-        let dir = dirent.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let agent = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        if agent == AGENT_NAME || agent.starts_with('.') {
-            continue; // never learn from our own diary
-        }
-        let mut agent_block = String::new();
-        for back in 0..days {
-            let Some(date) = today.checked_sub_signed(chrono::Duration::days(back)) else { continue };
-            let path = dir.join(format!("{date}.md"));
-            if let Ok(c) = std::fs::read_to_string(&path) {
-                let kept = diary::without_routine(&c);
-                if !kept.trim().is_empty() {
-                    agent_block.push_str(&format!("#### {date}\n\n{kept}"));
-                }
+    let mut agents: Vec<(String, std::path::PathBuf)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for dirent in entries.flatten() {
+            let dir = dirent.path();
+            let agent = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            if !dir.is_dir() || agent == AGENT_NAME || agent.starts_with('.') {
+                continue; // never learn from our own diary
             }
-        }
-        if !agent_block.trim().is_empty() {
-            out.push_str(&format!("\n### agent: {agent}\n{agent_block}\n"));
+            agents.push((agent, dir));
         }
     }
-    out
-}
-
-fn build_gap_prompt(operator_root: &Path, library: &str, diaries: &str) -> String {
-    let dir = operator_root.display();
-    format!(
-        r#"You are Nucleus' skill-gap detector. Below are recent diary entries from every agent (what the system has actually been doing) and the current skill library. Find RECURRING tasks or workflows that lack a skill and would clearly benefit from one, and CREATE a class-level skill for each.
-
-Rules:
-  • Only create a skill for a pattern that recurs or is clearly a reusable class of work — not a one-off task someone did once.
-  • Do NOT duplicate or near-duplicate an existing library skill. If the gap is "an existing skill is thin", that's the periodic curator's job, not yours — skip it.
-  • Class-level names only (no dates, PR numbers, codenames).
-  • Write to {dir}/<skill-name>/SKILL.md (the gitignored operator-personal tree ONLY — never the repo's committed .claude/skills at the workspace root) via your file tools, with the required contract:
-      ---
-      name: <kebab-case>
-      description: <one line>
-      flavor: learned
-      created_by: agent
-      last_used: {today}
-      ---
-      # When to invoke
-      …
-      # Steps
-      …
-      # Failure modes
-      …  (REQUIRED, never empty)
-  • Never write a secret, token, email, phone, or personal identifier into a skill.
-
-Current skill library:
-{library}
-
-Recent agent diaries:
----
-{diaries}
----
-
-Create the missing skills now, then reply with ONE line per skill created, or exactly "No gaps."."#,
-        today = chrono::Local::now().format("%Y-%m-%d"),
-    )
-}
-
-/// Ported Hermes CURATOR_REVIEW_PROMPT, adapted: candidates are the
-/// agent-created skills; consolidation happens via file tools; archive =
-/// move the dir into `.archive/` (never delete); pinned + hand-written
-/// (created_by != agent) skills are off-limits.
-fn build_curate_prompt(operator_root: &Path, library: &str) -> String {
-    let dir = operator_root.display();
-    format!(
-        r#"You are Nucleus' background skill CURATOR. This is an UMBRELLA-BUILDING consolidation pass, not a passive audit and not a duplicate-finder. The goal is a LIBRARY OF CLASS-LEVEL skills — one broad umbrella with labeled subsections beats five narrow siblings for discoverability (an agent matches skills on description, not exact name).
-
-Hard rules — do not violate:
-  1. Only work inside {dir} (the gitignored operator-personal tree). NEVER write to or move anything in the repo's committed .claude/skills at the workspace root.
-  2. Only touch skills with `created_by: agent` in their frontmatter. NEVER touch hand-written skills (no created_by, or created_by != agent) or anything marked `pinned: true`.
-  3. NEVER delete a skill. The maximum action is ARCHIVING — move its directory into {dir}/.archive/ (recoverable). Use your terminal/file tools: `mv {dir}/<name> {dir}/.archive/<name>`.
-  4. Do not use age/recency as a reason to skip consolidation — judge overlap on CONTENT.
-  5. "Each has a distinct trigger" is NOT a reason to keep them separate. The bar is: would a maintainer write these as N skills, or one skill with N labeled subsections? If the latter, merge.
-
-How to work:
-  1. Identify clusters of agent-created skills sharing a domain/first word.
-  2. For each cluster of 2+: pick or create the umbrella (a class-level SKILL.md), patch it to add a labeled subsection (or a references/<topic>.md support file) for each sibling's unique content, then ARCHIVE the absorbed siblings.
-  3. Keep the SKILL.md contract intact on anything you write (frontmatter incl. flavor: learned + created_by: agent + the # When to invoke / # Steps / # Failure modes sections). Bump last_used: {today} on skills you patch.
-
-Current skill library (only act on created_by: agent entries):
-{library}
-
-Do the consolidation now via your file tools, then reply with a short summary: which umbrellas you built and which siblings you archived into them. If nothing needs consolidating, reply exactly "Library is already well-shaped."."#,
-        today = chrono::Local::now().format("%Y-%m-%d"),
-    )
+    agents.sort();
+    let mut out = String::new();
+    let mut first: Option<chrono::NaiveDate> = None;
+    let mut left_out = 0usize;
+    for back in 0..days {
+        let Some(date) = today.checked_sub_signed(chrono::Duration::days(back)) else { continue };
+        for (agent, dir) in &agents {
+            let Ok(c) = std::fs::read_to_string(dir.join(format!("{date}.md"))) else { continue };
+            let kept = diary::without_routine(&c);
+            if kept.trim().is_empty() {
+                continue;
+            }
+            let block = format!("### {date} · agent: {agent}\n{}\n", review::budgeted(kept.trim(), DIARY_ENTRY_BYTES));
+            if out.len() + block.len() > budget {
+                left_out += 1;
+                continue;
+            }
+            out.push_str(&block);
+            first = Some(date);
+        }
+    }
+    let from = first.unwrap_or(today);
+    let mut window = format!("{from}..{today}");
+    if left_out > 0 {
+        window.push_str(&format!(", {left_out} older agent-day(s) left out for length"));
+    }
+    Diaries { text: out, window }
 }
 
 #[cfg(test)]
@@ -1031,68 +884,6 @@ mod tests {
         Trees { _tmp: tmp, personal, repo, machine }
     }
 
-    /// Backdated fixtures are from 2020, so one second of slack cannot let
-    /// them count as touched, while it absorbs coarse mtime resolution.
-    fn run_start() -> SystemTime {
-        SystemTime::now() - std::time::Duration::from_secs(1)
-    }
-
-    #[test]
-    fn gate_reports_committed_tree_writes_without_touching_them() {
-        let t = trees();
-        let since = run_start();
-        write_skill(&t.repo, "stray-write", "created_by: agent", false);
-        std::fs::create_dir_all(t.repo.join("committed-one/scripts")).unwrap();
-        std::fs::write(t.repo.join("committed-one/scripts/run.sh"), "true\n").unwrap();
-
-        let out = gate_touched_skills(&t.personal, &t.repo, Some(&t.machine), since).unwrap();
-
-        assert_eq!(
-            out.repo_writes,
-            vec!["committed-one/scripts/run.sh".to_string(), "stray-write/SKILL.md".to_string()]
-        );
-        assert!(out.quarantined.is_empty() && out.flagged.is_empty());
-        assert!(!out.is_empty(), "a committed-tree write must trigger the alert");
-        assert!(t.repo.join("stray-write/SKILL.md").exists(), "repo skills are never moved");
-        assert!(t.repo.join("committed-one/SKILL.md").exists());
-    }
-
-    #[test]
-    fn gate_flags_name_collisions_with_machine_and_repo_skills() {
-        let t = trees();
-        let since = run_start();
-        // Same directory name as a machine-wide skill.
-        write_skill(&t.personal, "machine-one", "created_by: agent", false);
-        // Different directory, frontmatter `name` of a committed skill.
-        let dir = t.personal.join("renamed-dir");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("SKILL.md"),
-            "---\nname: committed-one\ndescription: d\nflavor: learned\ncreated_by: agent\n---\n\n# When to invoke\nx\n# Steps\n1\n# Failure modes\n- z\n",
-        )
-        .unwrap();
-        // Touched, unique name: no flag.
-        write_skill(&t.personal, "unique-new", "created_by: agent", false);
-        // Colliding name but not touched this run: no flag.
-        write_skill(&t.personal, "committed-one", "created_by: agent", true);
-
-        let out = gate_touched_skills(&t.personal, &t.repo, Some(&t.machine), since).unwrap();
-
-        let mut flagged = out.flagged.clone();
-        flagged.sort();
-        assert_eq!(flagged.len(), 2, "{flagged:?}");
-        assert_eq!(flagged[0].0, "machine-one");
-        assert!(flagged[0].1.contains("machine-wide") && flagged[0].1.contains("shadows"));
-        assert_eq!(flagged[1].0, "renamed-dir");
-        assert!(flagged[1].1.contains("duplicates the committed skill `committed-one`"));
-        assert!(out.quarantined.is_empty() && out.repo_writes.is_empty());
-        assert!(t.personal.join("machine-one").exists(), "a collision is only flagged");
-
-        // Without a machine-wide tree (HOME unset) only the repo collision remains.
-        let out = gate_touched_skills(&t.personal, &t.repo, None, since).unwrap();
-        assert_eq!(out.flagged.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), vec!["renamed-dir"]);
-    }
-
     #[test]
     fn library_summary_lists_machine_skills_as_a_read_only_section() {
         let t = trees();
@@ -1111,31 +902,23 @@ mod tests {
     }
 
     #[test]
-    fn prompts_target_the_personal_root_only() {
-        let root = skills::personal_skills_root(Path::new("/ws"));
-        let dir = root.display().to_string();
-        assert_eq!(dir, "/ws/.nucleus/.claude/skills");
-        let part = parts::Part { from: 0, to: 1, text_turns: 1, text: "USER: conv".into(), signals: prefilter::Signals::default() };
-        let subject = review::Subject {
-            session_id: "s",
-            source: nucleus_core::skill_learner::ledger::Source::Transcript,
-            agent: None,
-            part: &part,
-            part_number: 1,
-            part_count: 1,
-            opening: None,
-            reason: "test",
-        };
-        let prompts = [
-            review::build_write_prompt(&root, "lib", &subject),
-            build_gap_prompt(&root, "lib", "diaries"),
-            build_curate_prompt(&root, "lib"),
-        ];
-        for p in &prompts {
-            assert!(p.contains(&format!("{dir}/")), "prompt must name the personal root");
-            assert!(p.contains("never the repo's committed .claude/skills") || p.contains("NEVER write to or move anything in the repo's committed .claude/skills"));
-            assert!(!p.contains("~/.claude/skills"), "no home-tree wording left");
+    fn diaries_are_read_newest_day_first_within_the_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let today = chrono::Local::now().date_naive();
+        for (agent, back, text) in [("alpha", 0, "ALPHA-TODAY"), ("beta", 0, "BETA-TODAY"), ("alpha", 3, "ALPHA-OLD"), (AGENT_NAME, 0, "OWN-DIARY")] {
+            let dir = ws.join("diary").join(agent);
+            std::fs::create_dir_all(&dir).unwrap();
+            let date = today - chrono::Duration::days(back);
+            std::fs::write(dir.join(format!("{date}.md")), format!("## 10:00 — run\n- OBSERVATION: {text} {}\n", "x".repeat(300))).unwrap();
         }
-        assert!(prompts[2].contains(&format!("{dir}/.archive/")), "curator archives inside the personal root");
+        let all = read_all_diaries(ws, "diary", 7, 64 * 1024);
+        assert!(all.text.find("ALPHA-TODAY").unwrap() < all.text.find("ALPHA-OLD").unwrap());
+        assert!(all.text.contains("BETA-TODAY") && !all.text.contains("OWN-DIARY"));
+        assert_eq!(all.window, format!("{}..{today}", today - chrono::Duration::days(3)));
+        // A small budget keeps today and leaves the old day out.
+        let cut = read_all_diaries(ws, "diary", 7, 800);
+        assert!(cut.text.contains("ALPHA-TODAY") && !cut.text.contains("ALPHA-OLD"), "{}", cut.text);
+        assert!(cut.window.contains("left out for length"), "{}", cut.window);
     }
 }

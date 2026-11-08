@@ -55,8 +55,9 @@ overwritten when the date rolls.
 
 Keys in use: `reminder-<id>` (reminders with the `daily_session` flag, today
 the heartbeat), `distiller` (metabolism and contemplation share the day's
-session), `skill-gap-learner` (both `learn` passes and, in write mode, the
-live sweep's reviews; ADR-038's suggest-mode reviews use a fresh session each).
+session). The `skill-gap-learner` key is no longer written: since ADR-038
+(2026-11-07) every learner review, the gap pass and the curator included,
+uses a fresh no-tools session.
 
 `SessionProfile::resume()` and the reminders-local table are gone
 (reminders migration v8 drops `reminder_daily_session`). `into_parts()` is

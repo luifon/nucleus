@@ -27,6 +27,7 @@ import {
   oneLine,
   originLabel,
   refusalHead,
+  retiresNote,
   shortDate,
   skillFilePath,
   splitFrontmatter,
@@ -360,6 +361,19 @@ function Facts({ s, onOpen }: { s: Suggestion; onOpen: (id: number) => void }) {
         <Label>rationale</Label>
         <p className="whitespace-pre-wrap leading-relaxed text-[var(--color-nucleus-text)]">{s.rationale}</p>
       </section>
+      {s.retires.length > 0 && (
+        <section>
+          <Label>retires · {s.retires.length} {s.retires.length === 1 ? "skill" : "skills"}</Label>
+          <p className="leading-relaxed text-[var(--color-nucleus-text)]">{retiresNote(s.retires)}</p>
+          <ul className="mt-1 flex flex-wrap gap-x-3 text-xs">
+            {s.retires.map((r) => (
+              <li key={r}>
+                <code className="text-[var(--color-nucleus-text)]">{r}</code>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
       {s.overrides_rejected !== null && (
         <section>
           <Label>suggested again after rejection</Label>

@@ -2719,7 +2719,6 @@ dependencies = [
  "clap",
  "nucleus-core",
  "regex",
- "reminders",
  "serde",
  "serde_json",
  "sqlx",

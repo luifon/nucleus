@@ -121,6 +121,24 @@ pub async fn watermark(workspace_root: &Path, key: &str) -> Result<Option<String
     Ok(row.map(|(v,)| v))
 }
 
+/// [`watermark`] through a read-only connection, for a caller that must
+/// not write (a health check): never creates or migrates the database.
+/// `None` when the database or the key does not exist.
+pub async fn watermark_read_only(workspace_root: &Path, key: &str) -> Result<Option<String>> {
+    let path = workspace_root.join(DB_PATH);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let pool = crate::db::open_read_only(&path).await?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM watermarks WHERE key = ?1")
+        .bind(key)
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+    pool.close().await;
+    Ok(row.map(|(v,)| v))
+}
+
 pub async fn set_watermark(workspace_root: &Path, key: &str, value: &str) -> Result<()> {
     let pool = open(workspace_root).await?;
     sqlx::query(

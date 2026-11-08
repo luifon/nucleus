@@ -1,7 +1,8 @@
 //! The WhatsApp notice after a nightly run (ADR-038).
 //!
-//! When the run filed or revised suggestions that are still pending at its
-//! end, one message goes to the operator's DM: the count and a dashboard
+//! When the run's passes (sweep, backfill, candidate promotion, gap pass,
+//! curator) filed or revised suggestions that are still pending at its end,
+//! one message goes to the operator's DM: the count and a dashboard
 //! link, from the `[skill_learner.texts]` templates. Code fills `{count}`
 //! and `{link}` only. Suggestion names, rationales, drafts and quotes are
 //! model output and session text and never go into the message.
@@ -99,13 +100,14 @@ mod tests {
             expected_base: None,
             overrides_rejected: None,
             why_new: None,
-            evidence: NewEvidence {
+            evidence: vec![NewEvidence {
                 session_id: Some("sess-1".into()),
                 source: EvidenceSource::Transcript,
                 agent: None,
                 note: "MODEL-NOTE-TEXT".into(),
                 quotes: vec!["USER: QUOTED-TURN-TEXT".into()],
-            },
+            }],
+            retires: vec![],
         }
     }
 

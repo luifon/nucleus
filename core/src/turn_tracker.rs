@@ -327,7 +327,9 @@ fn slash_command_line(t: &str) -> bool {
     rest[..name_end].chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '-'))
 }
 
-fn local_command(v: &Value, text: &str) -> bool {
+/// True for a user record a slash command typed into the session leaves:
+/// the command line itself, the command's name and arguments, its output.
+pub(crate) fn local_command(v: &Value, text: &str) -> bool {
     let t = text.trim();
     if LOCAL_COMMAND_PREFIXES.iter().any(|p| t.starts_with(p)) {
         return true;

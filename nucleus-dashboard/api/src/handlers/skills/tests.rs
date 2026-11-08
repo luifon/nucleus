@@ -550,13 +550,14 @@ mod suggestion_routes {
             expected_base: None,
             overrides_rejected: None,
             why_new: None,
-            evidence: NewEvidence {
+            evidence: vec![NewEvidence {
                 session_id: Some("sess-1".into()),
                 source: EvidenceSource::Index,
                 agent: None,
                 note: String::new(),
                 quotes: vec!["USER: build before you push".into()],
-            },
+            }],
+            retires: vec![],
         }
     }
 
@@ -645,6 +646,36 @@ mod suggestion_routes {
         assert!(!f.roots.repo.exists(), "the committed tree is never written");
         let (_, review) = call(&app, "GET", &format!("/suggestions/detail?id={a}"), None).await;
         assert_eq!(review["suggestion"]["status"], "accepted");
+    }
+
+    #[tokio::test]
+    async fn a_consolidation_shows_and_archives_the_skills_it_retires() {
+        let f = Fixture::new().await;
+        f.init_private_repo();
+        let agent = |n: &str| {
+            format!("---\nname: {n}\ndescription: d\nflavor: learned\ncreated_by: agent\n---\n\n# When to invoke\nx\n# Steps\n1\n# Failure modes\n- z\n")
+        };
+        for n in ["deploy-umbrella", "deploy-web"] {
+            std::fs::create_dir_all(f.roots.personal.join(n)).unwrap();
+            std::fs::write(f.roots.personal.join(n).join(SKILL_FILE), agent(n)).unwrap();
+        }
+        let pool = skill_learner::open(&f.ws).await.unwrap();
+        let mut s = suggestion(SuggestionKind::Patch, "deploy-umbrella");
+        s.origin = SuggestionOrigin::Curator;
+        s.retires = vec!["deploy-web".into()];
+        let id = core_suggestions::create(&pool, &f.ws, &f.roots, &s).await.unwrap();
+        let app = router(f.state());
+        let (_, review) = call(&app, "GET", &format!("/suggestions/detail?id={id}"), None).await;
+        assert_eq!(review["suggestion"]["retires"], serde_json::json!(["deploy-web"]));
+        assert_eq!(review["suggestion"]["origin"], "curator");
+        let (code, resp) =
+            call(&app, "POST", "/suggestions/accept", Some(serde_json::json!({"id": id, "draft_hash": review["draft_hash"]}))).await;
+        assert_eq!(code, StatusCode::OK, "{resp}");
+        assert_eq!(resp["accepted"]["retired"][0]["name"], "deploy-web");
+        let archived = resp["accepted"]["retired"][0]["archived_as"].as_str().unwrap();
+        assert!(f.roots.personal.join(".archive").join(archived).join(SKILL_FILE).exists());
+        assert!(!f.roots.personal.join("deploy-web").exists());
+        assert_eq!(resp["git"]["status"], "committed", "{resp}");
     }
 
     #[tokio::test]

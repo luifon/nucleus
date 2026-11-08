@@ -342,9 +342,9 @@ widget_feed_dir = "~/Library/Application Support/NotchWidget"
 cron = "0 4 * * *"          # one consolidated daily pass (ADR-016)
 
 [skill_learner]
-# ADR-017/038: nightly transcript sweep (skill suggestions) + backfill batch +
-# learn/curate. Pre-filter thresholds and limits: see nucleus.toml.example.
-live_mode = "suggest"        # "write": the live sweep writes skills directly
+# ADR-017/038: nightly review of completed session turns + backfill batch +
+# candidate workflows + gap pass + curator; every pass files suggestions.
+# Pre-filter thresholds and limits: see nucleus.toml.example.
 stale_after_days = 30
 archive_after_days = 90
 enabled = true
@@ -420,9 +420,12 @@ go free-form (`"Read today's diary, post a one-line blockers summary."`).
 
 ### Authoring
 
-The skill-gap learner reviews this workspace's sessions every night and files
-**skill suggestions** (a new skill or a full replacement of a personal one)
-instead of writing skills (ADR-038). Review them with
+The skill-gap learner reviews the completed turns of this workspace's sessions
+every night and files **skill suggestions** (a new skill or a full replacement
+of a personal one) instead of writing skills (ADR-038). Its diary gap pass and
+curator file suggestions too, and work seen repeated on several days becomes
+one. `nucleus skill-gap-learner backlog` lists sessions whose turns wait too
+long for review. Review the suggestions with
 `nucleus skills suggestions list|show <id>`, then `accept <id> --draft
 <hash printed by show>`,
 `reject <id> --reason …` or `edit <id> --file <path>`. A session that finds a

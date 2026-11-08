@@ -31,6 +31,7 @@ function review(over: Partial<SuggestionReview["suggestion"]> = {}, rest: Partia
       overrides_rejected: null,
       why_new: null,
       edited: false,
+      retires: [],
       created_at: "2026-11-03T15:00:00.000Z",
       updated_at: "2026-11-03T15:00:00.000Z",
       decided_at: null,
@@ -137,6 +138,17 @@ describe("a patch suggestion", () => {
     expect(html).toContain("The live skill changed after this suggestion was written");
     expect(html).toContain("the skill `service-deploy` changed after the draft was written");
   });
+});
+
+test("a curator consolidation names the skills accept retires, in the view and the confirmation", () => {
+  const r = review({ kind: "patch", origin: "curator", retires: ["deploy-web", "deploy-api"] });
+  const html = screen(r);
+  expect(html).toContain("retires · 2 skills");
+  expect(html).toContain("<code");
+  expect(html).toContain("deploy-web");
+  expect(html).toContain("curator");
+  expect(screen(r, "accept")).toContain("Accept also moves the 2 merged skills deploy-web, deploy-api to .nucleus/.claude/skills/.archive/");
+  expect(screen(review())).not.toContain("retires ·");
 });
 
 test("a decided suggestion has no actions", () => {

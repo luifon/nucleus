@@ -83,6 +83,13 @@ pub enum SuggestionOrigin {
     Backfill,
     /// `nucleus skills suggest`, from a session or the operator.
     Manual,
+    /// A candidate workflow that code promoted after it was seen on enough
+    /// different days ([`super::candidates`]).
+    Candidate,
+    /// The nightly gap pass over the agents' diaries.
+    Gap,
+    /// The nightly curator: a consolidation of agent-created skills.
+    Curator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -95,6 +102,10 @@ pub enum EvidenceSource {
     Index,
     /// Filed by hand with `nucleus skills suggest`.
     Manual,
+    /// The agents' diaries (the gap pass).
+    Diary,
+    /// The skill library itself (the curator).
+    Library,
 }
 
 macro_rules! str_enum {
@@ -111,8 +122,24 @@ macro_rules! str_enum {
 }
 str_enum!(SuggestionKind { Create => "create", Patch => "patch" });
 str_enum!(SuggestionStatus { Pending => "pending", Accepted => "accepted", Rejected => "rejected", Superseded => "superseded" });
-str_enum!(SuggestionOrigin { Live => "live", Backfill => "backfill", Manual => "manual" });
-str_enum!(EvidenceSource { Transcript => "transcript", Index => "index", Manual => "manual" });
+str_enum!(SuggestionOrigin {
+    Live => "live",
+    Backfill => "backfill",
+    Manual => "manual",
+    Candidate => "candidate",
+    Gap => "gap",
+    Curator => "curator",
+});
+str_enum!(EvidenceSource {
+    Transcript => "transcript",
+    Index => "index",
+    Manual => "manual",
+    Diary => "diary",
+    Library => "library",
+});
+
+/// Most skills one suggestion may retire.
+pub const MAX_RETIRES: usize = 10;
 
 /// One piece of evidence: a session the suggestion came from.
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
@@ -156,6 +183,10 @@ pub struct Suggestion {
     pub why_new: Option<String>,
     /// The operator replaced the draft.
     pub edited: bool,
+    /// Personal skills (agent-created, unpinned) accept moves to
+    /// `.archive/` after it writes the draft: the skills a curator
+    /// consolidation merged into this one. Empty for most suggestions.
+    pub retires: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
     pub decided_at: Option<String>,
@@ -206,7 +237,10 @@ pub struct NewSuggestion {
     pub expected_base: Option<String>,
     pub overrides_rejected: Option<i64>,
     pub why_new: Option<String>,
-    pub evidence: NewEvidence,
+    /// One row per session (or source) the suggestion came from.
+    pub evidence: Vec<NewEvidence>,
+    /// Skills accept archives (see [`Suggestion::retires`]).
+    pub retires: Vec<String>,
 }
 
 /// What accept did.
@@ -218,9 +252,21 @@ pub struct AcceptOutcome {
     pub name: String,
     /// The SKILL.md written.
     pub path: String,
-    /// Other pending suggestions for the same skill, now superseded.
+    /// Other pending suggestions for the same skill, or for a skill it
+    /// retired, now superseded.
     #[ts(type = "number[]")]
     pub superseded: Vec<i64>,
+    /// The retired skills this accept moved to `.archive/`.
+    pub retired: Vec<RetiredSkill>,
+}
+
+/// A skill an accept moved to `.archive/`.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct RetiredSkill {
+    pub name: String,
+    /// The directory under `.archive/` it now lives in.
+    pub archived_as: String,
 }
 
 /// A draft that failed [`prepare_draft`], with every problem found. The
@@ -503,6 +549,94 @@ pub fn draft_from_edits(
     Ok((draft, content_hash(&bytes)))
 }
 
+/// When [`check_retires`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetireCheck {
+    /// Filing a suggestion: every retired skill must exist.
+    Filing,
+    /// Accepting: a retired skill that is gone (archived meanwhile, or by
+    /// an earlier accept that stopped part-way) has nothing left to move.
+    Accept,
+}
+
+/// Check the skills suggestion `name` would retire: class-level names, no
+/// duplicates, not the suggestion's own skill, at most [`MAX_RETIRES`],
+/// and each one a real personal skill directory (not a symlink) whose
+/// SKILL.md says `created_by: agent` and is not pinned. Accept moves only
+/// such skills, so a retire never takes a hand-written or pinned skill out
+/// of the library. `Err` carries every problem.
+pub fn check_retires(
+    roots: &LibraryRoots,
+    name: &str,
+    retires: &[String],
+    when: RetireCheck,
+) -> std::result::Result<(), Vec<String>> {
+    let mut issues = Vec::new();
+    if retires.len() > MAX_RETIRES {
+        issues.push(format!("a suggestion retires at most {MAX_RETIRES} skills; it names {}", retires.len()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for r in retires {
+        if !valid_name(r) {
+            issues.push(format!("retires {r:?}: not a skill name"));
+            continue;
+        }
+        if r == name {
+            issues.push(format!("retires `{r}`: the suggestion's own skill cannot be retired"));
+            continue;
+        }
+        if !seen.insert(r.as_str()) {
+            issues.push(format!("retires `{r}` twice"));
+            continue;
+        }
+        let dir = roots.personal.join(r);
+        let meta = match std::fs::symlink_metadata(&dir) {
+            Ok(m) => m,
+            Err(_) if when == RetireCheck::Accept => continue,
+            Err(_) => {
+                issues.push(format!("retires `{r}`: there is no personal skill with that name"));
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            issues.push(format!("retires `{r}`: the skill directory is not a real directory"));
+            continue;
+        }
+        let path = dir.join(skills::SKILL_FILE);
+        let bytes = match read_no_follow(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                issues.push(format!("retires `{r}`: {e:#}"));
+                continue;
+            }
+        };
+        // Strict YAML only: the lenient fallback parser could read a pin it
+        // does not understand (`pinned: true # keep`) as unpinned, and a
+        // retire must fail closed.
+        let text = String::from_utf8_lossy(&bytes);
+        let strict = skills::split_frontmatter(&text).map(serde_yaml::from_str::<skills::Frontmatter>);
+        let fm = match strict {
+            Some(Ok(fm)) => fm,
+            _ => {
+                issues.push(format!(
+                    "retires `{r}`: its frontmatter is not valid YAML, so code cannot confirm it is agent-created and unpinned"
+                ));
+                continue;
+            }
+        };
+        if fm.created_by.as_deref() != Some("agent") {
+            issues.push(format!("retires `{r}`: only agent-created skills can be retired; this one is hand-written"));
+        } else if fm.pinned {
+            issues.push(format!("retires `{r}`: the skill is pinned"));
+        }
+    }
+    if issues.is_empty() { Ok(()) } else { Err(issues) }
+}
+
+fn retires_json(retires: &[String]) -> String {
+    serde_json::to_string(retires).unwrap_or_else(|_| "[]".into())
+}
+
 fn evidence_quotes(quotes: &[String]) -> String {
     let q: Vec<String> = quotes
         .iter()
@@ -580,6 +714,8 @@ pub async fn create(
 ) -> Result<i64> {
     let prepared = prepare_draft(workspace_root, roots, s.kind, &s.name, &s.draft, s.expected_base.as_deref())
         .map_err(|issues| anyhow!("the draft for `{}` is not valid: {}", s.name, issues.join("; ")))?;
+    check_retires(roots, &s.name, &s.retires, RetireCheck::Filing)
+        .map_err(|issues| anyhow!("the suggestion for `{}` cannot retire those skills: {}", s.name, issues.join("; ")))?;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     if let Some(id) = pending_for(&mut tx, &s.name).await? {
         bail!("suggestion #{id} for `{}` is already pending; add evidence to it or revise it", s.name);
@@ -588,8 +724,8 @@ pub async fn create(
     let now = crate::timestamp::now();
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO suggestions (kind, name, draft, rationale, base_hash, origin, status,
-                                  overrides_rejected, why_new, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?9) RETURNING id",
+                                  overrides_rejected, why_new, created_at, updated_at, retires)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?9, ?10) RETURNING id",
     )
     .bind(s.kind.as_str())
     .bind(&s.name)
@@ -600,9 +736,12 @@ pub async fn create(
     .bind(s.overrides_rejected)
     .bind(s.why_new.as_deref().map(|w| clip(w, MAX_TEXT_CHARS)))
     .bind(&now)
+    .bind(retires_json(&s.retires))
     .fetch_one(&mut *tx)
     .await?;
-    insert_evidence(&mut tx, id, &s.evidence).await?;
+    for e in &s.evidence {
+        insert_evidence(&mut tx, id, e).await?;
+    }
     tx.commit().await?;
     Ok(id)
 }
@@ -625,8 +764,9 @@ pub async fn add_evidence(pool: &SqlitePool, id: i64, e: &NewEvidence) -> Result
 
 /// Replace a pending suggestion with a revised one for the same skill: the
 /// new suggestion carries the old one's evidence plus `s.evidence`, and the
-/// old one becomes `superseded`. Refused for a suggestion the operator
-/// edited (his draft is not replaced by a model's).
+/// old one becomes `superseded`. The revision retires `s.retires`, or the
+/// old suggestion's list when `s.retires` is empty. Refused for a
+/// suggestion the operator edited (his draft is not replaced by a model's).
 pub async fn revise(
     pool: &SqlitePool,
     workspace_root: &Path,
@@ -638,15 +778,19 @@ pub async fn revise(
         .map_err(|issues| anyhow!("the revised draft for `{}` is not valid: {}", s.name, issues.join("; ")))?;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     #[allow(clippy::type_complexity)]
-    let old: Option<(String, String, String, i64, Option<i64>, Option<String>)> = sqlx::query_as(
-        "SELECT kind, name, status, edited, overrides_rejected, why_new FROM suggestions WHERE id = ?1",
+    let old: Option<(String, String, String, i64, Option<i64>, Option<String>, String)> = sqlx::query_as(
+        "SELECT kind, name, status, edited, overrides_rejected, why_new, retires FROM suggestions WHERE id = ?1",
     )
     .bind(old_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((kind, name, status, edited, overrides, why_new)) = old else {
+    let Some((kind, name, status, edited, overrides, why_new, old_retires)) = old else {
         bail!("there is no suggestion #{old_id}");
     };
+    let retires: Vec<String> =
+        if s.retires.is_empty() { serde_json::from_str(&old_retires).unwrap_or_default() } else { s.retires.clone() };
+    check_retires(roots, &s.name, &retires, RetireCheck::Filing)
+        .map_err(|issues| anyhow!("the revision of #{old_id} cannot retire those skills: {}", issues.join("; ")))?;
     if status != "pending" {
         bail!("suggestion #{old_id} is {status}, not pending");
     }
@@ -659,8 +803,8 @@ pub async fn revise(
     let now = crate::timestamp::now();
     let new_id: i64 = sqlx::query_scalar(
         "INSERT INTO suggestions (kind, name, draft, rationale, base_hash, origin, status,
-                                  overrides_rejected, why_new, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?9) RETURNING id",
+                                  overrides_rejected, why_new, created_at, updated_at, retires)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?9, ?10) RETURNING id",
     )
     .bind(s.kind.as_str())
     .bind(&s.name)
@@ -671,6 +815,7 @@ pub async fn revise(
     .bind(overrides)
     .bind(why_new)
     .bind(&now)
+    .bind(retires_json(&retires))
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query(
@@ -682,7 +827,9 @@ pub async fn revise(
     .bind(new_id)
     .execute(&mut *tx)
     .await?;
-    insert_evidence(&mut tx, new_id, &s.evidence).await?;
+    for e in &s.evidence {
+        insert_evidence(&mut tx, new_id, e).await?;
+    }
     sqlx::query(
         "UPDATE suggestions SET status = 'superseded', superseded_by = ?2, updated_at = ?3, decided_at = ?3
           WHERE id = ?1 AND status = 'pending'",
@@ -780,6 +927,13 @@ pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<Suggestion>> {
         overrides_rejected: r.get("overrides_rejected"),
         why_new: r.get("why_new"),
         edited: r.get::<i64, _>("edited") != 0,
+        // A store opened read-only before migration 4 has no `retires`
+        // column (the dashboard and `show` do not migrate).
+        retires: r
+            .try_get::<String, _>("retires")
+            .ok()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default(),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
         decided_at: r.get("decided_at"),
@@ -818,8 +972,10 @@ enum AcceptPlan {
 
 /// The checks accept runs before it writes, shared by [`accept`] and
 /// [`review`] so the page's blockers and accept's refusal cannot differ:
-/// the name, real directories, an earlier completed write, a patch's base
-/// hash, and [`prepare_draft`]. A draft problem is an [`InvalidDraft`].
+/// the name, real directories, the skills it retires, an earlier completed
+/// write, a patch's base hash, and [`prepare_draft`]. A draft or retire
+/// problem is an [`InvalidDraft`].
+#[allow(clippy::too_many_arguments)]
 fn plan_accept(
     workspace_root: &Path,
     roots: &LibraryRoots,
@@ -828,11 +984,16 @@ fn plan_accept(
     name: &str,
     draft: &str,
     base_hash: Option<&str>,
+    retires: &[String],
 ) -> Result<(PathBuf, AcceptPlan)> {
     if !valid_name(name) {
         bail!("suggestion #{id} has an invalid skill name {name:?}");
     }
     ensure_real_dirs(roots, name)?;
+    check_retires(roots, name, retires, RetireCheck::Accept).map_err(|issues| InvalidDraft {
+        context: format!("suggestion #{id} cannot retire the skills it names"),
+        issues,
+    })?;
     let path = roots.personal.join(name).join(skills::SKILL_FILE);
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         bail!("{} is a symlink; accept writes only real files of the personal tree", path.display());
@@ -870,6 +1031,7 @@ pub async fn review(
             &suggestion.name,
             &suggestion.draft,
             suggestion.base_hash.as_deref(),
+            &suggestion.retires,
         );
         if let Err(e) = checked {
             accept_blockers = match e.downcast_ref::<InvalidDraft>() {
@@ -1013,8 +1175,10 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
 }
 
 /// Accept a pending suggestion: check the draft again, write it to
-/// `<personal tree>/<name>/SKILL.md`, mark it accepted, and supersede every
-/// other pending suggestion for the same skill.
+/// `<personal tree>/<name>/SKILL.md`, move the skills it retires to
+/// `.archive/` (only agent-created, unpinned ones; never deleted), mark it
+/// accepted, and supersede every other pending suggestion for the same
+/// skill or for a retired one.
 ///
 /// `draft_hash` is the SHA-256 of the draft the operator reviewed
 /// ([`SuggestionReview::draft_hash`]); accept is refused when the stored
@@ -1046,14 +1210,16 @@ pub async fn accept_locked(
     _library: &super::LibraryLock,
 ) -> Result<AcceptOutcome> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let row: Option<(String, String, String, String, Option<String>)> =
-        sqlx::query_as("SELECT kind, name, draft, status, base_hash FROM suggestions WHERE id = ?1")
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, String, String, String, Option<String>, String)> =
+        sqlx::query_as("SELECT kind, name, draft, status, base_hash, retires FROM suggestions WHERE id = ?1")
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?;
-    let Some((kind, name, draft, status, base_hash)) = row else {
+    let Some((kind, name, draft, status, base_hash, retires)) = row else {
         bail!("there is no suggestion #{id}");
     };
+    let retires: Vec<String> = serde_json::from_str(&retires).unwrap_or_default();
     if status != "pending" {
         bail!("suggestion #{id} is {status}, not pending");
     }
@@ -1063,7 +1229,7 @@ pub async fn accept_locked(
         );
     }
     let kind = SuggestionKind::parse(&kind).ok_or_else(|| anyhow!("unknown kind {kind}"))?;
-    let (path, plan) = plan_accept(workspace_root, roots, id, kind, &name, &draft, base_hash.as_deref())?;
+    let (path, plan) = plan_accept(workspace_root, roots, id, kind, &name, &draft, base_hash.as_deref(), &retires)?;
     if let AcceptPlan::Write(prepared) = plan {
         match kind {
             SuggestionKind::Create => {
@@ -1085,6 +1251,25 @@ pub async fn accept_locked(
             SuggestionKind::Patch => write_atomic(&path, &prepared.text)?,
         }
     }
+    // The skills merged into this one leave the library only once its draft
+    // is in place. A retired skill already gone was moved by an earlier
+    // accept that stopped before its status change (or archived since).
+    let mut retired = Vec::new();
+    for r in &retires {
+        let dir = roots.personal.join(r);
+        if std::fs::symlink_metadata(&dir).is_err() {
+            continue;
+        }
+        let archive = roots.personal.join(skills::ARCHIVE_DIR);
+        if std::fs::symlink_metadata(&archive).is_ok_and(|m| m.file_type().is_symlink()) {
+            bail!("{} is a symlink; a retired skill is moved only inside the personal tree", archive.display());
+        }
+        std::fs::create_dir_all(&archive).with_context(|| format!("creating {}", archive.display()))?;
+        let archived_as = format!("{r}-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"));
+        std::fs::rename(&dir, archive.join(&archived_as))
+            .with_context(|| format!("moving the retired skill `{r}` to {}", archive.display()))?;
+        retired.push(RetiredSkill { name: r.clone(), archived_as });
+    }
     let now = crate::timestamp::now();
     sqlx::query(
         "UPDATE suggestions SET status = 'accepted', updated_at = ?2, decided_at = ?2
@@ -1094,17 +1279,21 @@ pub async fn accept_locked(
     .bind(&now)
     .execute(&mut *tx)
     .await?;
-    let superseded: Vec<i64> = sqlx::query_scalar(
-        "UPDATE suggestions SET status = 'superseded', superseded_by = ?1, updated_at = ?3, decided_at = ?3
-          WHERE name = ?2 AND status = 'pending' AND id != ?1 RETURNING id",
-    )
-    .bind(id)
-    .bind(&name)
-    .bind(&now)
-    .fetch_all(&mut *tx)
-    .await?;
+    let mut superseded = Vec::new();
+    for n in std::iter::once(&name).chain(retires.iter()) {
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "UPDATE suggestions SET status = 'superseded', superseded_by = ?1, updated_at = ?3, decided_at = ?3
+              WHERE name = ?2 AND status = 'pending' AND id != ?1 RETURNING id",
+        )
+        .bind(id)
+        .bind(n)
+        .bind(&now)
+        .fetch_all(&mut *tx)
+        .await?;
+        superseded.extend(ids);
+    }
     tx.commit().await?;
-    Ok(AcceptOutcome { id, name, path: path.to_string_lossy().into_owned(), superseded })
+    Ok(AcceptOutcome { id, name, path: path.to_string_lossy().into_owned(), superseded, retired })
 }
 
 /// Number of suggestions filed by `origin` at or after `since` (a
@@ -1164,7 +1353,8 @@ mod tests {
             expected_base: None,
             overrides_rejected: None,
             why_new: None,
-            evidence: evidence("sess-1"),
+            evidence: vec![evidence("sess-1")],
+            retires: vec![],
         }
     }
 
@@ -1525,6 +1715,124 @@ mod tests {
         let err = accept(&w.pool, &w.ws, &w.roots, b, &shown(&w.pool, b).await).await.unwrap_err();
         assert!(format!("{err:#}").contains("symlink"), "{err:#}");
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "nothing written outside");
+    }
+
+    #[tokio::test]
+    async fn a_consolidation_retires_only_agent_created_unpinned_skills_on_accept() {
+        let w = ws().await;
+        let agent = |n: &str, extra: &str| {
+            format!("---\nname: {n}\ndescription: d\nflavor: learned\ncreated_by: agent\n{extra}---\n\n# When to invoke\nx\n# Steps\n1\n# Failure modes\n- z\n")
+        };
+        put_skill(&w.roots.personal, "deploy-umbrella", &agent("deploy-umbrella", ""));
+        put_skill(&w.roots.personal, "deploy-web", &agent("deploy-web", ""));
+        put_skill(&w.roots.personal, "deploy-api", &agent("deploy-api", ""));
+        put_skill(&w.roots.personal, "deploy-pinned", &agent("deploy-pinned", "pinned: true\n"));
+        put_skill(&w.roots.personal, "deploy-hand", "---\nname: deploy-hand\ndescription: d\n---\n\n# When to invoke\nx\n# Steps\n1\n# Failure modes\n- z\n");
+
+        // Filing refuses hand-written, pinned, missing and self retires.
+        let mut s = new(SuggestionKind::Patch, "deploy-umbrella", &DRAFT.replace("Build.", "Build web and api."));
+        s.origin = SuggestionOrigin::Curator;
+        // A pin the lenient parser would miss, in frontmatter that is not
+        // strict YAML: refused, not read as unpinned.
+        put_skill(
+            &w.roots.personal,
+            "deploy-odd",
+            "---\nname: deploy-odd\ndescription: Deploy: staging\ncreated_by: agent\npinned: true # keep\n---\n\n# When to invoke\nx\n# Steps\n1\n# Failure modes\n- z\n",
+        );
+        for bad in ["deploy-hand", "deploy-pinned", "no-such-skill", "deploy-umbrella", "deploy-odd"] {
+            s.retires = vec!["deploy-web".into(), bad.into()];
+            let err = create(&w.pool, &w.ws, &w.roots, &s).await.unwrap_err();
+            assert!(format!("{err:#}").contains(&format!("`{bad}`")) || format!("{err:#}").contains("own skill"), "{bad}: {err:#}");
+        }
+        s.retires = vec!["deploy-web".into(), "deploy-api".into()];
+        let id = create(&w.pool, &w.ws, &w.roots, &s).await.unwrap();
+        let stored = get(&w.pool, id).await.unwrap().unwrap();
+        assert_eq!((stored.origin, stored.retires.clone()), (SuggestionOrigin::Curator, s.retires.clone()));
+        // A pending patch of a retired skill is superseded by the accept.
+        let p = create(&w.pool, &w.ws, &w.roots, &new(SuggestionKind::Patch, "deploy-api", DRAFT)).await.unwrap();
+
+        // The operator makes `deploy-api` his own before accepting: the
+        // review names it and accept refuses, moving nothing.
+        std::fs::write(w.roots.personal.join("deploy-api/SKILL.md"), agent("deploy-api", "pinned: true\n")).unwrap();
+        let r = review(&w.pool, &w.ws, &w.roots, id).await.unwrap().unwrap();
+        assert!(r.accept_blockers.iter().any(|b| b.contains("`deploy-api`") && b.contains("pinned")), "{:?}", r.accept_blockers);
+        assert!(accept(&w.pool, &w.ws, &w.roots, id, &r.draft_hash).await.is_err());
+        assert!(w.roots.personal.join("deploy-web").exists());
+
+        // Unpinned again, and `deploy-web` already archived by hand: accept
+        // moves what is left and supersedes the retired skill's patch.
+        std::fs::write(w.roots.personal.join("deploy-api/SKILL.md"), agent("deploy-api", "")).unwrap();
+        let p_hash = content_hash(get(&w.pool, p).await.unwrap().unwrap().draft.as_bytes());
+        assert_ne!(p_hash, "", "the patch exists");
+        std::fs::create_dir_all(w.roots.personal.join(".archive")).unwrap();
+        std::fs::rename(w.roots.personal.join("deploy-web"), w.roots.personal.join(".archive/deploy-web-by-hand")).unwrap();
+        let out = accept(&w.pool, &w.ws, &w.roots, id, &shown(&w.pool, id).await).await.unwrap();
+        assert_eq!(out.retired.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["deploy-api"]);
+        assert!(w.roots.personal.join(".archive").join(&out.retired[0].archived_as).join("SKILL.md").exists());
+        assert!(!w.roots.personal.join("deploy-api").exists());
+        assert!(w.roots.personal.join("deploy-pinned").exists() && w.roots.personal.join("deploy-hand").exists());
+        assert_eq!(out.superseded, vec![p]);
+        assert_eq!(get(&w.pool, p).await.unwrap().unwrap().status, SuggestionStatus::Superseded);
+    }
+
+    #[tokio::test]
+    async fn the_v4_rebuild_keeps_rows_ids_and_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("memory/skill_learner.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A store at version 3, with rows.
+        let pool = crate::db::open(&path).await.unwrap();
+        crate::migrate::migrate(&pool, &super::super::MIGRATIONS[..3]).await.unwrap();
+        for (id, sup) in [(2, None), (1, Some(2))] {
+            sqlx::query(
+                "INSERT INTO suggestions (id, kind, name, draft, rationale, origin, status, superseded_by, created_at, updated_at)
+                 VALUES (?1, 'create', 'a-skill', 'd', 'r', 'live', ?2, ?3, 't', 't')",
+            )
+            .bind(id)
+            .bind(if sup.is_some() { "superseded" } else { "pending" })
+            .bind(sup)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO suggestion_evidence (suggestion_id, source, created_at) VALUES (2, 'transcript', 't')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO review_runs (pass, session_id, source, from_pos, to_pos, outcome, started_at) VALUES ('live', 's', 'transcript', 0, 4, 'ok', 't')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The newest suggestion id was 5 (ids are never reused).
+        sqlx::query("UPDATE sqlite_sequence SET seq = 5 WHERE name = 'suggestions'").execute(&pool).await.unwrap();
+        pool.close().await;
+        // A read-only reader (the dashboard, `show`) before the migration.
+        let ro = crate::db::open_read_only(&path).await.unwrap();
+        assert_eq!(get(&ro, 2).await.unwrap().unwrap().retires, Vec::<String>::new());
+        ro.close().await;
+
+        let pool = super::super::open(tmp.path()).await.unwrap();
+        let s = get(&pool, 1).await.unwrap().unwrap();
+        assert_eq!((s.superseded_by, s.retires.len()), (Some(2), 0));
+        assert_eq!(get(&pool, 2).await.unwrap().unwrap().evidence.len(), 1);
+        let fk: bool = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(&pool).await.unwrap();
+        assert!(fk, "foreign keys are on again");
+        let next = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO suggestions (kind, name, draft, rationale, origin, created_at, updated_at)
+             VALUES ('create', 'b-skill', 'd', 'r', 'gap', 't', 't') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(next, 6, "the AUTOINCREMENT counter survives the rebuild");
+        sqlx::query("INSERT INTO review_runs (pass, outcome, started_at) VALUES ('curate', 'ok', 't')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Opening again applies nothing.
+        pool.close().await;
+        let again = super::super::open(tmp.path()).await.unwrap();
+        assert_eq!(get(&again, 6).await.unwrap().unwrap().origin, SuggestionOrigin::Gap);
     }
 
     #[tokio::test]

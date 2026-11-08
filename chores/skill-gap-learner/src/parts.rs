@@ -208,12 +208,28 @@ impl Builder {
 }
 
 /// Split rendered groups (one per position) into parts of at most `window`
-/// bytes each. A group larger than the window is a part of its own.
-fn split(groups: Vec<(i64, Vec<Rendered>)>, from: i64, end: i64, window: usize, mut skill_seen: bool) -> Vec<Part> {
+/// bytes each. A group larger than the window is a part of its own. A part
+/// also ends at every position in `breaks` (sorted; the start of a new
+/// local day), so no part holds two days.
+fn split(
+    groups: Vec<(i64, Vec<Rendered>)>,
+    from: i64,
+    end: i64,
+    window: usize,
+    breaks: &[i64],
+    mut skill_seen: bool,
+) -> Vec<Part> {
     let mut parts = Vec::new();
     let mut cur = Builder::default();
     let mut cur_from = from;
+    let mut breaks = breaks.iter().copied().filter(|b| *b > from && *b < end).peekable();
     for (pos, mut items) in groups {
+        while let Some(b) = breaks.next_if(|b| *b <= pos) {
+            if !cur.text.is_empty() {
+                parts.push(std::mem::take(&mut cur).finish(cur_from, b));
+                cur_from = b;
+            }
+        }
         let mut size = 0usize;
         let mut left_out = 0usize;
         for r in items.iter_mut() {
@@ -246,11 +262,13 @@ fn split(groups: Vec<(i64, Vec<Rendered>)>, from: i64, end: i64, window: usize, 
     parts
 }
 
-/// The parts of a transcript from line `from` on. `events` are all of the
-/// session's events from line 0 (tool names and skill loads before `from`
-/// count); `end` is the transcript's complete line count. Returns no part
-/// when nothing new was written.
-pub fn transcript_parts(events: &[TranscriptEvent], from: i64, end: i64, window: usize) -> Vec<Part> {
+/// The parts of a transcript in lines `[from, end)`. `events` are all of
+/// the session's events from line 0 (tool names and skill loads before
+/// `from` count); `end` is where reading stops: the line after the last
+/// completed turn (see `sweep::reading_end`). Events at or after `end` wait
+/// for a later run. `breaks` are lines where a part must end (the first
+/// line of a new local day). Returns no part when nothing new was written.
+pub fn transcript_parts(events: &[TranscriptEvent], from: i64, end: i64, window: usize, breaks: &[i64]) -> Vec<Part> {
     if end <= from {
         return Vec::new();
     }
@@ -270,12 +288,15 @@ pub fn transcript_parts(events: &[TranscriptEvent], from: i64, end: i64, window:
             skill_seen |= r.skill_load.is_some();
             continue;
         }
+        if pos >= end {
+            break;
+        }
         match groups.last_mut() {
             Some((p, items)) if *p == pos => items.push(r),
             _ => groups.push((pos, vec![r])),
         }
     }
-    let mut parts = split(groups, from, end, window, skill_seen);
+    let mut parts = split(groups, from, end, window, breaks, skill_seen);
     for p in &mut parts {
         p.text_turns = events
             .iter()
@@ -303,9 +324,12 @@ pub fn index_parts(turns: &[IndexedTurn], from: i64, end: i64, window: usize) ->
             skill_seen |= r.skill_load.is_some();
             continue;
         }
+        if t.seq >= end {
+            continue;
+        }
         groups.push((t.seq, vec![r]));
     }
-    split(groups, from, end, window, skill_seen)
+    split(groups, from, end, window, &[], skill_seen)
 }
 
 /// The session's first operator request, shown with a part that does not
@@ -356,7 +380,7 @@ mod tests {
 
     #[test]
     fn signals_and_rendering_of_one_part() {
-        let parts = transcript_parts(&session(), 0, 11, 100_000);
+        let parts = transcript_parts(&session(), 0, 11, 100_000, &[]);
         assert_eq!(parts.len(), 1);
         let p = &parts[0];
         assert_eq!((p.from, p.to, p.text_turns), (0, 11, 4));
@@ -380,16 +404,25 @@ mod tests {
     fn later_parts_start_at_the_ledger_position_and_split_at_lines() {
         let events = session();
         // Only the new part: a skill loaded before `from` still counts.
-        let parts = transcript_parts(&events, 8, 11, 100_000);
+        let parts = transcript_parts(&events, 8, 11, 100_000, &[]);
         assert_eq!(parts.len(), 1);
         assert_eq!((parts[0].from, parts[0].to), (8, 11));
         assert_eq!(parts[0].signals.skill_corrections, 2);
         assert!(!parts[0].text.contains("deploy the service"));
         // Nothing new.
-        assert!(transcript_parts(&events, 11, 11, 100_000).is_empty());
+        assert!(transcript_parts(&events, 11, 11, 100_000, &[]).is_empty());
+        // A new day starts at line 8: two parts, split there.
+        let parts = transcript_parts(&events, 0, 11, 100_000, &[8]);
+        assert_eq!(parts.iter().map(|p| (p.from, p.to)).collect::<Vec<_>>(), vec![(0, 8), (8, 11)]);
+        assert!(parts[1].text.contains("forgot to run the tests") && !parts[1].text.contains("Pushed."));
+        // Events at or after the end (a turn still running) wait.
+        let parts = transcript_parts(&events, 0, 8, 100_000, &[]);
+        assert_eq!((parts.len(), parts[0].to), (1, 8));
+        assert!(parts[0].text.contains("Pushed.") && !parts[0].text.contains("forgot to run the tests"));
+        assert_eq!(parts[0].signals.corrections, 0);
         // A small window splits at line boundaries; the parts are contiguous
         // and the last one ends at the end of the file.
-        let parts = transcript_parts(&events, 0, 12, 60);
+        let parts = transcript_parts(&events, 0, 12, 60, &[]);
         assert!(parts.len() > 2, "{parts:?}");
         assert_eq!(parts[0].from, 0);
         assert_eq!(parts.last().unwrap().to, 12);
@@ -404,7 +437,7 @@ mod tests {
         for i in 0..200 {
             events.push(call(2, &format!("c{i}"), "Bash", json!({"command": format!("check {i} {}", "x".repeat(150))})));
         }
-        let parts = transcript_parts(&events, 0, 3, 100_000);
+        let parts = transcript_parts(&events, 0, 3, 100_000, &[]);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].text.len() < 2 * GROUP_MAX, "{}", parts[0].text.len());
         assert!(parts[0].text.contains("more events of this record left out"));
@@ -414,11 +447,11 @@ mod tests {
     #[test]
     fn a_tail_without_rendered_text_extends_the_last_part() {
         let events = vec![user(0, "hi"), asst(1, "hello"), result(2, "x", false, "ok")];
-        let parts = transcript_parts(&events, 0, 3, 100_000);
+        let parts = transcript_parts(&events, 0, 3, 100_000, &[]);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].to, 3);
         // Only noise after the position: one empty part that moves the ledger.
-        let parts = transcript_parts(&events, 2, 3, 100_000);
+        let parts = transcript_parts(&events, 2, 3, 100_000, &[]);
         assert_eq!(parts.len(), 1);
         assert_eq!((parts[0].from, parts[0].to, parts[0].signals.user_turns), (2, 3, 0));
     }

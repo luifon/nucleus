@@ -1,20 +1,26 @@
 //! The transcript sweep and the backfill (ADR-038).
 //!
 //! Both passes take sessions oldest first, read each from its ledger
-//! position, split what is new into parts, run the pre-filter on every part,
-//! and review the parts that pass, one review session at a time, so each
-//! review sees the suggestions the previous one filed. The ledger moves past
-//! a part once it is filtered or reviewed.
+//! position to the end of its last completed turn, split what is new into
+//! parts, run the pre-filter on every part, and review the parts that pass,
+//! one review session at a time, so each review sees the suggestions and
+//! candidate workflows the previous one filed. The ledger moves past a part
+//! once it is filtered or reviewed.
 //!
-//! - **Live**: transcripts modified since the live start, skipping those
-//!   still in use (modified in the last `quiet_minutes`). At most
-//!   `live_max_reviews` reviews per run. `live_mode` decides whether a
-//!   review files suggestions or writes skills.
+//! A session in use is read like any other: Claude Code writes a
+//! `turn_duration` record when a turn ends, and reading stops after the
+//! last one ([`reading_end`]). What follows it — a turn still running, the
+//! bots' 04:00 `/compact`, the records Claude Code writes when a session
+//! closes — stays for a later run. A session that runs for weeks gets each
+//! day's completed turns reviewed the next night.
+//!
+//! - **Live**: transcripts modified since the live start. At most
+//!   `live_max_reviews` reviews per run.
 //! - **Backfill**: older transcripts and index-only sessions. At most
 //!   `backfill_per_night` reviews per run; the pass stops for the night once
 //!   more than `backfill_max_new_per_night` suggestions were filed by the
-//!   backfill since local midnight. Always suggest mode. It ends by itself
-//!   when no old session has anything left to read.
+//!   backfill since local midnight. It ends by itself when no old session
+//!   has anything left to read.
 //!
 //! A review that cannot reach its reviewer (spawn failure, usage limit)
 //! stops the pass without moving the ledger. A reviewer that answers twice
@@ -23,13 +29,14 @@
 
 use crate::parts::{self, Part};
 use crate::prefilter;
-use crate::review::{self, Backend, Library, ReviewError, Subject};
+use crate::review::{self, Backend, Library, ReviewError, Subject, Task};
 use crate::source::{self, Candidate};
 use anyhow::Result;
 use nucleus_core::chore_state;
-use nucleus_core::claude_session::{TranscriptEventKind, TurnRole, transcript_events};
+use nucleus_core::claude_session::{TranscriptEventKind, TranscriptRead, TurnEnd, TurnRole, transcript_events};
 use nucleus_core::config::SkillLearnerConfig;
 use nucleus_core::session_index;
+use nucleus_core::skill_learner::candidates;
 use nucleus_core::skill_learner::ledger::{self, Outcome, RunStart, Source};
 use nucleus_core::skill_learner::suggestions::{self, SuggestionOrigin};
 use nucleus_core::skills::LibraryRoots;
@@ -38,6 +45,13 @@ use std::path::{Path, PathBuf};
 
 /// Consecutive unusable answers after which a part is given up.
 pub const MAX_FAILURES: i64 = 2;
+
+/// A turn whose session wrote nothing with a timestamp for this long will
+/// not complete: the session was closed or killed in the middle of it
+/// (Claude Code writes no `turn_duration` then). Its records are read like
+/// a completed turn. Far above the longest turn a bot allows (ADR-033's
+/// ceiling is hours), so a running turn is never cut.
+pub const ABANDONED_AFTER_SECS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pass {
@@ -68,8 +82,6 @@ pub struct PassOptions {
     pub limit: u32,
     /// Measure and print, but review nothing and write nothing.
     pub dry_run: bool,
-    /// Live pass only: write skills instead of filing suggestions.
-    pub write_mode: bool,
     /// Backfill only: stop once today's backfill suggestions exceed
     /// `backfill_max_new_per_night`. The nightly run sets it; a backfill the
     /// operator starts from the terminal does not, since he reviews it.
@@ -81,7 +93,6 @@ pub struct PassOptions {
 pub struct PassReport {
     pub pass: &'static str,
     pub sessions: usize,
-    pub busy: usize,
     pub skipped_agent: usize,
     pub parts_filtered: usize,
     pub reviewed: usize,
@@ -90,6 +101,10 @@ pub struct PassReport {
     /// The new suggestion of each revision.
     pub revised: Vec<i64>,
     pub evidence: usize,
+    /// Candidate workflows opened: (id, name).
+    pub candidates_opened: Vec<(i64, String)>,
+    /// Evidence added to open candidates.
+    pub candidate_evidence: usize,
     /// Sessions not reached because the pass stopped.
     pub remaining: usize,
     /// Why the pass stopped before the end of its sessions.
@@ -103,24 +118,19 @@ pub struct PassReport {
 impl PassReport {
     pub fn summary(&self) -> String {
         let mut s = format!(
-            "{}: {} session(s) with new text, {} part(s) filtered, {} reviewed, {} failed, {} suggestion(s) filed{}, {} revised, {} evidence added; {} in use, {} skipped by agent",
+            "{}: {} session(s) with new completed turns, {} part(s) filtered, {} reviewed, {} failed, {} suggestion(s) filed{}, {} revised, {} evidence added, {} candidate(s) opened{}, {} candidate evidence added; {} skipped by agent",
             self.pass,
             self.sessions,
             self.parts_filtered,
             self.reviewed,
             self.failed,
             self.created.len(),
-            if self.created.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " ({})",
-                    self.created.iter().map(|(id, n)| format!("#{id} {n}")).collect::<Vec<_>>().join(", ")
-                )
-            },
+            ids_named(&self.created),
             self.revised.len(),
             self.evidence,
-            self.busy,
+            self.candidates_opened.len(),
+            ids_named(&self.candidates_opened),
+            self.candidate_evidence,
             self.skipped_agent,
         );
         if let Some(why) = &self.stopped {
@@ -131,6 +141,14 @@ impl PassReport {
         }
         s
     }
+}
+
+/// ` (#1 a, #2 b)`, or nothing for an empty list.
+pub fn ids_named(list: &[(i64, String)]) -> String {
+    if list.is_empty() {
+        return String::new();
+    }
+    format!(" ({})", list.iter().map(|(id, n)| format!("#{id} {n}")).collect::<Vec<_>>().join(", "))
 }
 
 /// Everything a pass needs from its caller.
@@ -149,11 +167,16 @@ pub struct Env<'a> {
 }
 
 /// The live start (see `source::LIVE_START_KEY`), set on the first run.
+/// `persist = false` (a dry run, the backlog check) reads it through a
+/// read-only connection and writes nothing.
 pub async fn live_start(ws: &Path, now: i64, persist: bool) -> Result<i64> {
-    if let Some(v) = chore_state::watermark(ws, source::LIVE_START_KEY).await? {
-        if let Ok(t) = v.trim().parse::<i64>() {
-            return Ok(t);
-        }
+    let stored = if persist {
+        chore_state::watermark(ws, source::LIVE_START_KEY).await?
+    } else {
+        chore_state::watermark_read_only(ws, source::LIVE_START_KEY).await?
+    };
+    if let Some(t) = stored.and_then(|v| v.trim().parse::<i64>().ok()) {
+        return Ok(t);
     }
     let t = now - source::FIRST_LIVE_WINDOW_SECS;
     if persist {
@@ -173,34 +196,132 @@ fn local_midnight() -> String {
     nucleus_core::timestamp::to_sortable(&local.to_rfc3339())
 }
 
-/// The new parts of a candidate, the position its reading ends at, and the
-/// session's opening request.
-async fn load(env: &Env<'_>, c: &Candidate, window: usize) -> Result<(Vec<Part>, Option<String>)> {
+/// The local date (`NUCLEUS_TZ`) of unix second `t`, `YYYY-MM-DD`.
+pub fn local_date(t: i64) -> String {
+    let tz = nucleus_core::claude_session::nucleus_tz();
+    chrono::DateTime::from_timestamp(t, 0)
+        .map(|d| d.with_timezone(&tz).date_naive().to_string())
+        .unwrap_or_else(|| "1970-01-01".into())
+}
+
+/// Where reading a transcript stops: the line after its last completed
+/// turn (its last `turn_duration` record), or 0 when no turn has
+/// completed. When nothing with a timestamp was written for
+/// [`ABANDONED_AFTER_SECS`] (`mtime` stands in when no record has one),
+/// no turn can still be running and the whole file is read.
+pub fn reading_end(read: &TranscriptRead, mtime: i64, now: i64) -> i64 {
+    let last_turn = read.turn_ends.last().map(|t| t.line as i64 + 1).unwrap_or(0);
+    let activity = read.last_activity.unwrap_or(mtime);
+    if now - activity >= ABANDONED_AFTER_SECS { read.complete_lines as i64 } else { last_turn }
+}
+
+/// The completed turns that end at or after line `from`: what a run that
+/// starts there reviews.
+pub fn turns_after(turns: &[TurnEnd], from: i64) -> impl Iterator<Item = &TurnEnd> {
+    turns.iter().filter(move |t| t.line as i64 >= from)
+}
+
+/// The time a part's work happened: the end of the turn its last line
+/// belongs to (the first completed turn ending at or after it), else
+/// `fallback`.
+fn part_time(turns: &[TurnEnd], part_to: i64, fallback: i64) -> i64 {
+    turns.iter().find(|t| t.line as i64 + 1 >= part_to).and_then(|t| t.at).unwrap_or(fallback)
+}
+
+/// A session read for one pass.
+struct Loaded {
+    parts: Vec<Part>,
+    opening: Option<String>,
+    /// Transcripts: where reading starts and stops, and the file's
+    /// complete lines.
+    from: i64,
+    end: i64,
+    complete: i64,
+    /// Transcripts: the completed turns in `[from, end)`.
+    new_turns: usize,
+    /// Local date of each part.
+    dates: Vec<String>,
+    /// Transcripts: conversation after `end` (a turn still running) that a
+    /// later run must read, at the latest when the abandoned-turn rule
+    /// applies. While it exists the file's size is not recorded, so the
+    /// `unchanged` shortcut never hides it.
+    deferred: bool,
+}
+
+/// The lines where a new local date starts among the completed turns in
+/// `[from, end)`: parts are split there, so a part (and the candidate
+/// evidence a review records at it) belongs to one day.
+fn day_breaks(turns: &[TurnEnd], from: i64, end: i64) -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut prev: Option<(i64, String)> = None;
+    for t in turns_after(turns, from).filter(|t| (t.line as i64) < end) {
+        let Some(at) = t.at else { continue };
+        let day = local_date(at);
+        if let Some((line, d)) = &prev {
+            if *d != day {
+                out.push(line + 1);
+            }
+        }
+        prev = Some((t.line as i64, day));
+    }
+    out
+}
+
+/// True when the records at or after `end` hold conversation: operator or
+/// assistant text, a tool call or its result. A `/compact`, its summary and
+/// the close records are not conversation.
+fn deferred_work(read: &TranscriptRead, end: i64) -> bool {
+    read.events.iter().any(|e| {
+        (e.line as i64) >= end && !matches!(e.kind, TranscriptEventKind::Text { role: TurnRole::User, meta: true, .. })
+    })
+}
+
+/// The new parts of a candidate, from its ledger position to the end of
+/// its last completed turn, with the session's opening request.
+async fn load(env: &Env<'_>, c: &Candidate, window: usize) -> Result<Loaded> {
     match c.source {
         Source::Transcript => {
             let path = c.path.clone();
             let read = tokio::task::spawn_blocking(move || transcript_events(&path, 0)).await??;
-            let end = read.complete_lines as i64;
+            let complete = read.complete_lines as i64;
             // Fewer lines than the ledger position: the file was rewritten.
-            let from = if c.from > end { 0 } else { c.from };
+            let from = if c.from > complete { 0 } else { c.from };
+            let end = reading_end(&read, c.mtime, env.now).max(from);
             let opening = parts::opening_request(read.events.iter().filter_map(|e| match &e.kind {
                 TranscriptEventKind::Text { role: TurnRole::User, text, meta } => Some((text.as_str(), *meta)),
                 _ => None,
             }));
-            Ok((parts::transcript_parts(&read.events, from, end, window), opening))
+            let breaks = day_breaks(&read.turn_ends, from, end);
+            let parts = parts::transcript_parts(&read.events, from, end, window, &breaks);
+            let fallback = read.last_activity.unwrap_or(c.mtime);
+            let dates = parts.iter().map(|p| local_date(part_time(&read.turn_ends, p.to, fallback))).collect();
+            let new_turns = turns_after(&read.turn_ends, from).filter(|t| (t.line as i64) < end).count();
+            let deferred = deferred_work(&read, end);
+            Ok(Loaded { parts, opening, from, end, complete, new_turns, dates, deferred })
         }
         Source::Index => {
-            let Some(index) = env.index else { return Ok((Vec::new(), None)) };
+            let Some(index) = env.index else {
+                return Ok(Loaded {
+                    parts: Vec::new(),
+                    opening: None,
+                    from: c.from,
+                    end: c.from,
+                    complete: 0,
+                    new_turns: 0,
+                    dates: Vec::new(),
+                    deferred: false,
+                });
+            };
             let turns = session_index::session_turns(index, &c.session_id, 0).await?;
             let end = c.turn_count.unwrap_or(turns.len() as i64);
             let opening = parts::opening_request(turns.iter().filter(|t| t.role == TurnRole::User).map(|t| (t.text.as_str(), false)));
-            Ok((parts::index_parts(&turns, c.from, end, window), opening))
+            let parts = parts::index_parts(&turns, c.from, end, window);
+            let dates = vec![local_date(c.mtime); parts.len()];
+            Ok(Loaded { parts, opening, from: c.from, end, complete: end, new_turns: 0, dates, deferred: false })
         }
     }
 }
 
-/// Run one pass. Returns its report; a review that could not reach its
-/// reviewer is reported in `error`, not as `Err`.
 /// A pass that stopped on an error, with what it did until then: the
 /// suggestions it filed before the error are stored and still need their
 /// notice.
@@ -218,6 +339,8 @@ impl std::fmt::Display for PassFailed {
 
 impl std::error::Error for PassFailed {}
 
+/// Run one pass. Returns its report; a review that could not reach its
+/// reviewer is reported in `error`, not as `Err`.
 pub async fn run_pass(
     env: &Env<'_>,
     pass: Pass,
@@ -247,8 +370,7 @@ async fn run_pass_into(
         None => Vec::new(),
     };
     let live_start = live_start(env.ws, env.now, !opts.dry_run).await?;
-    let inv = source::inventory(&env.transcripts_dir, env.cfg, &ledger_rows, &labels, &index_sessions, live_start, env.now);
-    report.busy = inv.busy.len();
+    let inv = source::inventory(&env.transcripts_dir, env.cfg, &ledger_rows, &labels, &index_sessions, live_start);
     report.skipped_agent = inv.skipped.len();
     if !opts.dry_run {
         for c in &inv.skipped {
@@ -263,23 +385,55 @@ async fn run_pass_into(
     };
     let window = env.cfg.review_window_bytes.clamp(4 * 1024, review::MAX_WINDOW_BYTES);
     let midnight = local_midnight();
-    let write_mode = opts.write_mode && pass == Pass::Live;
 
     'sessions: for (i, c) in candidates.iter().enumerate() {
-        let (session_parts, opening) = match load(env, c, window).await {
+        let loaded = match load(env, c, window).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(session = %c.session_id, "skill sweep: cannot read the session: {e:#}");
                 continue;
             }
         };
-        if session_parts.is_empty() {
+        if loaded.parts.is_empty() {
+            // No completed turn since the position. When the file grew only
+            // by records that are not conversation (a `/compact`, close
+            // records), note its size so the next pass does not open it
+            // again until it grows. A running turn is not cached: the next
+            // pass reads it again, and reads it whole once the
+            // abandoned-turn rule applies. A rewritten file (read from 0)
+            // keeps no size: its ledger position does not belong to it.
+            if c.source == Source::Transcript && !opts.dry_run && loaded.from == c.from && !loaded.deferred {
+                if let Some(size) = c.size {
+                    ledger::record_size(env.pool, &c.session_id, c.from, size).await?;
+                }
+            }
             continue;
         }
         report.sessions += 1;
-        let count = session_parts.len();
-        for (k, part) in session_parts.iter().enumerate() {
-            let size = if k + 1 == count { c.size } else { None };
+        let agent_label = c.agent.as_deref().unwrap_or("terminal");
+        if opts.dry_run {
+            report.lines.push(match c.source {
+                Source::Transcript => format!(
+                    "session {} ({agent_label}): lines {}..{} of {}, {} completed turn(s), {} part(s)",
+                    c.session_id,
+                    loaded.from,
+                    loaded.end,
+                    loaded.complete,
+                    loaded.new_turns,
+                    loaded.parts.len()
+                ),
+                Source::Index => format!(
+                    "session {} ({agent_label}, session index): turns {}..{}, {} part(s)",
+                    c.session_id,
+                    loaded.from,
+                    loaded.end,
+                    loaded.parts.len()
+                ),
+            });
+        }
+        let count = loaded.parts.len();
+        for (k, part) in loaded.parts.iter().enumerate() {
+            let size = if k + 1 == count && !loaded.deferred { c.size } else { None };
             let signals = serde_json::to_string(&part.signals).ok();
             let mark = ledger::Mark {
                 position: part.to,
@@ -316,42 +470,48 @@ async fn run_pass_into(
             if opts.dry_run {
                 report.reviewed += 1;
                 report.lines.push(format!(
-                    "review {} [{}..{}) {} — {reason}",
-                    c.session_id,
-                    part.from,
-                    part.to,
-                    c.agent.as_deref().unwrap_or("terminal")
+                    "review {} [{}..{}) {agent_label} {} — {reason}",
+                    c.session_id, part.from, part.to, loaded.dates[k]
                 ));
                 continue;
             }
 
-            let subject = Subject {
+            let open = candidates::open(env.pool).await?;
+            let task = Task::Session(Subject {
                 session_id: &c.session_id,
                 source: c.source,
                 agent: c.agent.as_deref(),
                 part,
                 part_number: k + 1,
                 part_count: count,
-                opening: opening.as_deref().filter(|_| part.from > 0),
+                opening: loaded.opening.as_deref().filter(|_| part.from > 0),
                 reason: &reason,
-            };
+                local_date: &loaded.dates[k],
+                candidates: &open,
+                candidate_min_days: env.cfg.candidate_min_days,
+            });
             let run_id = ledger::start_run(
                 env.pool,
-                &RunStart { pass: pass.as_str(), session_id: &c.session_id, source: c.source, from_pos: part.from, to_pos: part.to },
+                &RunStart {
+                    pass: pass.as_str(),
+                    session_id: Some(&c.session_id),
+                    source: Some(c.source),
+                    from_pos: Some(part.from),
+                    to_pos: Some(part.to),
+                    candidate_id: None,
+                },
             )
             .await?;
-            let result = if write_mode {
-                review::review_write(backend, &env.roots.personal, &(env.library_summary)(), &subject).await
-            } else {
-                let lib = Library::load(env.pool, env.roots, (env.library_summary)()).await?;
-                review::review_suggest(backend, env.pool, env.ws, env.roots, &lib, &subject, pass.origin()).await
-            };
+            let lib = Library::load(env.pool, env.roots, (env.library_summary)()).await?;
+            let result = review::review(backend, env.pool, env.ws, env.roots, &lib, &task, pass.origin()).await;
             match result {
                 Ok(o) => {
                     // Recorded first: the suggestions are stored, whatever
                     // the ledger writes below do.
                     report.created.extend(o.created.iter().map(|(id, _, n)| (*id, n.clone())));
                     report.revised.extend(o.revised.iter().map(|(_, new_id)| *new_id));
+                    report.candidates_opened.extend(o.candidates_opened.iter().cloned());
+                    report.candidate_evidence += o.candidate_evidence.len();
                     let detail = review::describe(&o);
                     ledger::finish_run(
                         env.pool,
@@ -395,6 +555,60 @@ async fn run_pass_into(
         }
     }
     Ok(())
+}
+
+/// A reviewed session whose completed turns wait for review.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Waiting {
+    pub session_id: String,
+    pub agent: Option<String>,
+    /// Unix seconds: when the oldest waiting turn ended.
+    pub oldest: i64,
+    /// Completed turns after the ledger position.
+    pub turns: usize,
+}
+
+/// The live sessions the sweep reviews (not skipped for their agent, not
+/// the learner's own) with completed turns after their ledger position,
+/// read-only. A turn the abandoned-turn rule completes counts with the
+/// time of the newest record. Sessions with nothing waiting are left out.
+pub async fn waiting(env: &Env<'_>) -> Result<Vec<Waiting>> {
+    let ledger_rows = ledger::all(env.pool).await?;
+    let labels = source::labels(env.ws).await;
+    let live_start = live_start(env.ws, env.now, false).await?;
+    let inv = source::inventory(&env.transcripts_dir, env.cfg, &ledger_rows, &labels, &[], live_start);
+    let mut out = Vec::new();
+    for c in inv.live.into_iter().filter(|c| c.source == Source::Transcript) {
+        let path = c.path.clone();
+        let read = match tokio::task::spawn_blocking(move || transcript_events(&path, 0)).await? {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(session = %c.session_id, "backlog: cannot read the transcript: {e}");
+                continue;
+            }
+        };
+        let from = if c.from > read.complete_lines as i64 { 0 } else { c.from };
+        let end = reading_end(&read, c.mtime, env.now);
+        let mut times: Vec<i64> = turns_after(&read.turn_ends, from)
+            .filter(|t| (t.line as i64) < end)
+            .map(|t| t.at.unwrap_or(c.mtime))
+            .collect();
+        let tail = read.turn_ends.last().map(|t| t.line as i64 + 1).unwrap_or(0).max(from);
+        let operator_text = read.events.iter().any(|e| {
+            (e.line as i64) >= tail
+                && (e.line as i64) < end
+                && matches!(e.kind, TranscriptEventKind::Text { role: TurnRole::User, meta: false, .. })
+        });
+        if end > tail && operator_text {
+            // An abandoned turn, read whole by the next sweep.
+            times.push(read.last_activity.unwrap_or(c.mtime));
+        }
+        if let Some(oldest) = times.iter().copied().min() {
+            out.push(Waiting { session_id: c.session_id, agent: c.agent, oldest, turns: times.len() });
+        }
+    }
+    out.sort_by_key(|w| w.oldest);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -461,10 +675,6 @@ mod tests {
             *n += 1;
             Ok(Box::new(FakeSession { fake: self.clone(), id: format!("rev-{n}") }))
         }
-        async fn write_review(&self, _window: &str, prompt: &str) -> Result<String> {
-            self.prompts.lock().unwrap().push(prompt.to_string());
-            Ok("Nothing to save.".into())
-        }
     }
 
     struct World {
@@ -492,23 +702,26 @@ mod tests {
         "(the skill library is currently empty)".into()
     }
 
-    async fn pass(w: &World, index: Option<&SqlitePool>, pass: Pass, opts: PassOptions, fake: &Fake) -> PassReport {
-        let s = summary;
-        let env = Env {
+    fn env<'a>(w: &'a World, index: Option<&'a SqlitePool>, s: &'a (dyn Fn() -> String + Sync)) -> Env<'a> {
+        Env {
             ws: &w.ws,
             cfg: &w.cfg,
             roots: &w.roots,
             pool: &w.pool,
             index,
             transcripts_dir: w.dir.clone(),
-            library_summary: &s,
+            library_summary: s,
             now: w.now,
-        };
-        run_pass(&env, pass, opts, fake).await.unwrap()
+        }
+    }
+
+    async fn pass(w: &World, index: Option<&SqlitePool>, pass: Pass, opts: PassOptions, fake: &Fake) -> PassReport {
+        let s = summary;
+        run_pass(&env(w, index, &s), pass, opts, fake).await.unwrap()
     }
 
     fn opts(limit: u32) -> PassOptions {
-        PassOptions { limit, dry_run: false, write_mode: false, daily_cap: true }
+        PassOptions { limit, dry_run: false, daily_cap: true }
     }
 
     fn user(t: &str) -> String {
@@ -516,6 +729,30 @@ mod tests {
     }
     fn asst(t: &str) -> String {
         json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": t}]}}).to_string()
+    }
+    fn rfc3339(w: &World, secs_ago: i64) -> String {
+        chrono::DateTime::from_timestamp(w.now - secs_ago, 0).unwrap().to_rfc3339()
+    }
+    /// The record Claude Code writes when a turn ends, `secs_ago`.
+    fn done(w: &World, secs_ago: i64) -> String {
+        json!({"type": "system", "subtype": "turn_duration", "timestamp": rfc3339(w, secs_ago)}).to_string()
+    }
+    /// An operator prompt with a timestamp, as a live session writes it.
+    fn prompt_at(w: &World, t: &str, secs_ago: i64) -> String {
+        json!({"type": "user", "origin": {"kind": "human"}, "timestamp": rfc3339(w, secs_ago), "message": {"role": "user", "content": t}}).to_string()
+    }
+    /// The records of the bots' 04:00 `/compact` outside a turn.
+    fn compact(w: &World, secs_ago: i64) -> Vec<String> {
+        vec![
+            json!({"type": "user", "timestamp": rfc3339(w, secs_ago), "message": {"role": "user", "content": "/compact"}}).to_string(),
+            json!({"type": "system", "subtype": "compact_boundary", "timestamp": rfc3339(w, secs_ago)}).to_string(),
+            json!({"type": "user", "isCompactSummary": true, "timestamp": rfc3339(w, secs_ago), "message": {"role": "user", "content": "This session is being continued from a previous conversation that ran out of context."}}).to_string(),
+            json!({"type": "user", "timestamp": rfc3339(w, secs_ago), "message": {"role": "user", "content": "<command-name>/compact</command-name>"}}).to_string(),
+        ]
+    }
+    /// The records Claude Code writes when a session closes (no timestamp).
+    fn close_records() -> Vec<String> {
+        vec![json!({"type": "last-prompt", "lastPrompt": "x"}).to_string(), json!({"type": "cost-state", "totalCostUSD": 1.0}).to_string()]
     }
 
     /// Write (or extend) a transcript and set its mtime `secs_ago`.
@@ -554,17 +791,7 @@ mod tests {
         // the review filed its suggestion.
         fake.on_close = Some((w.pool.clone(), "DROP TABLE review_runs"));
         let s = summary;
-        let env = Env {
-            ws: &w.ws,
-            cfg: &w.cfg,
-            roots: &w.roots,
-            pool: &w.pool,
-            index: None,
-            transcripts_dir: w.dir.clone(),
-            library_summary: &s,
-            now: w.now,
-        };
-        let failed = run_pass(&env, Pass::Backfill, opts(5), &fake).await.unwrap_err();
+        let failed = run_pass(&env(&w, None, &s), Pass::Backfill, opts(5), &fake).await.unwrap_err();
         assert_eq!(failed.report.created.len(), 1, "{}", failed.error);
         let id = failed.report.created[0].0;
         assert_eq!(suggestions::get(&w.pool, id).await.unwrap().unwrap().status, SuggestionStatus::Pending);
@@ -600,7 +827,7 @@ mod tests {
         assert_eq!((again.sessions, again.reviewed), (0, 0));
 
         // The session continues today: the live sweep reads the new lines only.
-        transcript(&w, "s-old", &[user("stop pushing before the tests pass"), asst("Understood.")], 2 * 3600);
+        transcript(&w, "s-old", &[user("stop pushing before the tests pass"), asst("Understood."), done(&w, 2 * 3600)], 2 * 3600);
         let fake2 = Fake::with(&[&reply(vec![json!({"action": "add_evidence", "suggestion_id": s.id, "note": "same correction again", "quotes": ["stop pushing before the tests pass"]})])]);
         let live = pass(&w, None, Pass::Live, opts(5), &fake2).await;
         assert_eq!((live.reviewed, live.evidence), (1, 1), "{}", live.summary());
@@ -610,7 +837,7 @@ mod tests {
         assert!(p.contains("opening request of the session (data)>>>\nUSER: release the build") || p.contains("opening request of the session (data)>>>\nrelease the build"), "{p}");
         assert!(p.contains(&format!("#{} create release-build", s.id)), "pending suggestions are shown");
         assert_eq!(suggestions::get(&w.pool, s.id).await.unwrap().unwrap().evidence.len(), 2);
-        assert_eq!(ledger::all(&w.pool).await.unwrap()["s-old"].position, 6);
+        assert_eq!(ledger::all(&w.pool).await.unwrap()["s-old"].position, 7, "after the turn_duration record");
     }
 
     #[tokio::test]
@@ -803,7 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_skipped_filtered_and_dry_runs() {
+    async fn skipped_filtered_running_and_dry_runs() {
         let w = world().await;
         std::fs::create_dir_all(w.ws.join("memory/logs/reminders-fire")).unwrap();
         std::fs::write(
@@ -811,14 +1038,17 @@ mod tests {
             format!("{}\n", json!({"session_id": "fire", "agent": "reminders-fire"})),
         )
         .unwrap();
-        transcript(&w, "fire", &[user("run the report"), user("no, wrong"), asst("ok")], 3600);
-        transcript(&w, "busy", &[user("hi"), user("no, wrong"), asst("ok")], 60);
-        transcript(&w, "calm", &[user("what time is it"), asst("noon")], 3600);
-        transcript(&w, "fix", &[user("rename it"), user("wrong file, the other one"), asst("ok")], 3600);
+        transcript(&w, "fire", &[user("run the report"), user("no, wrong"), asst("ok"), done(&w, 3600)], 3600);
+        // A turn still running, written a minute ago: nothing completed yet.
+        transcript(&w, "running", &[prompt_at(&w, "hi", 60), prompt_at(&w, "no, wrong", 60)], 60);
+        transcript(&w, "calm", &[user("what time is it"), asst("noon"), done(&w, 3600)], 3600);
+        transcript(&w, "fix", &[user("rename it"), user("wrong file, the other one"), asst("ok"), done(&w, 3600)], 3600);
 
-        let dry = pass(&w, None, Pass::Live, PassOptions { limit: 5, dry_run: true, write_mode: false, daily_cap: false }, &Fake::default()).await;
-        assert_eq!((dry.busy, dry.skipped_agent, dry.parts_filtered, dry.reviewed), (1, 1, 1, 1), "{}", dry.summary());
+        let dry = pass(&w, None, Pass::Live, PassOptions { limit: 5, dry_run: true, daily_cap: false }, &Fake::default()).await;
+        assert_eq!((dry.skipped_agent, dry.parts_filtered, dry.reviewed), (1, 1, 1), "{}", dry.summary());
         assert!(dry.lines.iter().any(|l| l.starts_with("review fix")));
+        assert!(dry.lines.iter().any(|l| l.starts_with("session fix (terminal): lines 0..4 of 4, 1 completed turn(s), 1 part(s)")), "{:?}", dry.lines);
+        assert!(!dry.lines.iter().any(|l| l.contains("running")), "{:?}", dry.lines);
         assert!(ledger::all(&w.pool).await.unwrap().is_empty(), "a dry run records nothing");
 
         let fake = Fake::with(&[r#"{"items": []}"#]);
@@ -828,13 +1058,184 @@ mod tests {
         assert_eq!(rows["fire"].outcome, "skipped-agent");
         assert_eq!(rows["calm"].outcome, "filtered");
         assert_eq!(rows["fix"].outcome, "reviewed");
-        assert!(!rows.contains_key("busy"));
-        // Write mode goes through the write path.
-        transcript(&w, "fix", &[user("no, you forgot the header"), asst("added")], 3600);
-        let fake = Fake::default();
-        let r = pass(&w, None, Pass::Live, PassOptions { limit: 5, dry_run: false, write_mode: true, daily_cap: false }, &fake).await;
+        assert!(!rows.contains_key("running"), "a session without a completed turn gets no row");
+    }
+
+    #[tokio::test]
+    async fn a_session_in_use_is_reviewed_up_to_its_last_completed_turn() {
+        let w = world().await;
+        // One completed turn with a correction, then a turn still running.
+        let turn1 = [prompt_at(&w, "deploy the service", 7200), prompt_at(&w, "no, wrong host, use the staging one", 7100), asst("Deployed to staging."), done(&w, 7000)];
+        transcript(&w, "dm", &turn1, 60);
+        transcript(&w, "dm", &[prompt_at(&w, "now RUNNING-TURN-TEXT and stop doing that", 60)], 60);
+        let fake = Fake::with(&[r#"{"items": []}"#]);
+        let r = pass(&w, None, Pass::Live, opts(5), &fake).await;
+        assert_eq!((r.sessions, r.reviewed), (1, 1), "{}", r.summary());
+        assert!(!fake.prompts()[0].contains("RUNNING-TURN-TEXT"), "a running turn waits");
+        let row = ledger::all(&w.pool).await.unwrap()["dm"].clone();
+        assert_eq!((row.position, row.outcome.as_str()), (4, "reviewed"));
+
+        // The night's /compact and the close records: no completed turn,
+        // no review. The running turn is still there, so no size is noted:
+        // the file is read again next time.
+        transcript(&w, "dm", &compact(&w, 30), 30);
+        transcript(&w, "dm", &close_records(), 30);
+        let r = pass(&w, None, Pass::Live, opts(5), &Fake::default()).await;
+        assert_eq!((r.sessions, r.reviewed, r.parts_filtered), (0, 0, 0), "{}", r.summary());
+        let row = ledger::all(&w.pool).await.unwrap()["dm"].clone();
+        assert_eq!((row.position, row.file_size), (4, None));
+
+        // The running turn completes: the next pass reviews everything after
+        // the first turn; the /compact line is not an operator turn.
+        transcript(&w, "dm", &[asst("Stopped."), done(&w, 10)], 10);
+        let fake = Fake::with(&[r#"{"items": []}"#]);
+        let r = pass(&w, None, Pass::Live, opts(5), &fake).await;
         assert_eq!(r.reviewed, 1, "{}", r.summary());
-        assert!(fake.prompts()[0].contains("Write skills with your own Read/Write/Edit file tools"));
+        let p = &fake.prompts()[0];
+        assert!(p.contains("RUNNING-TURN-TEXT") && !p.contains("USER: /compact"), "{p}");
+        let total = std::fs::read_to_string(w.dir.join("dm.jsonl")).unwrap().lines().count() as i64;
+        assert_eq!(ledger::all(&w.pool).await.unwrap()["dm"].position, total);
+
+        // The next night's /compact and close records alone: the size is
+        // noted, and the pass after that does not open the file.
+        transcript(&w, "dm", &compact(&w, 5), 5);
+        transcript(&w, "dm", &close_records(), 5);
+        let r = pass(&w, None, Pass::Live, opts(5), &Fake::default()).await;
+        assert_eq!((r.sessions, r.reviewed), (0, 0), "{}", r.summary());
+        let size = std::fs::metadata(w.dir.join("dm.jsonl")).unwrap().len() as i64;
+        let row = ledger::all(&w.pool).await.unwrap()["dm"].clone();
+        assert_eq!((row.position, row.file_size), (total, Some(size)));
+        let s = summary;
+        let inv_ledger = ledger::all(&w.pool).await.unwrap();
+        let inv = source::inventory(&w.dir, &w.cfg, &inv_ledger, &Default::default(), &[], 0);
+        assert!(inv.live.iter().all(|c| c.session_id != "dm"), "unchanged: not opened");
+        assert!(waiting(&env(&w, None, &s)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_running_turn_killed_after_a_sweep_is_read_once_it_is_abandoned() {
+        let mut w = world().await;
+        let turn1 = [prompt_at(&w, "deploy the service", 7200), prompt_at(&w, "no, wrong host", 7100), asst("ok"), done(&w, 7000)];
+        transcript(&w, "killed", &turn1, 60);
+        transcript(&w, "killed", &[prompt_at(&w, "rename the files", 60), prompt_at(&w, "no, wrong folder", 60)], 60);
+        let r = pass(&w, None, Pass::Live, opts(5), &Fake::with(&[r#"{"items": []}"#])).await;
+        assert_eq!(r.reviewed, 1, "{}", r.summary());
+        assert_eq!(ledger::all(&w.pool).await.unwrap()["killed"].position, 4);
+        // The session is killed; two days later nothing was written since.
+        w.now += 2 * 86_400;
+        let s = summary;
+        assert_eq!(waiting(&env(&w, None, &s)).await.unwrap().len(), 1, "the abandoned turn waits");
+        let fake = Fake::with(&[r#"{"items": []}"#]);
+        let r = pass(&w, None, Pass::Live, opts(5), &fake).await;
+        assert_eq!(r.reviewed, 1, "{}", r.summary());
+        assert!(fake.prompts()[0].contains("wrong folder"));
+        assert_eq!(ledger::all(&w.pool).await.unwrap()["killed"].position, 6);
+    }
+
+    #[tokio::test]
+    async fn parts_end_at_a_new_local_day() {
+        let w = world().await;
+        let lines = [
+            prompt_at(&w, "export the numbers", 3 * 86_400),
+            prompt_at(&w, "no, wrong format", 3 * 86_400),
+            asst("done"),
+            done(&w, 3 * 86_400),
+            prompt_at(&w, "export them again", 86_400),
+            prompt_at(&w, "no, wrong sheet", 86_400),
+            asst("done"),
+            done(&w, 86_400),
+        ];
+        transcript(&w, "days", &lines, 3600);
+        let fake = Fake::with(&[r#"{"items": []}"#, r#"{"items": []}"#]);
+        let r = pass(&w, None, Pass::Live, opts(5), &fake).await;
+        assert_eq!(r.reviewed, 2, "{} {:?}", r.summary(), r.lines);
+        let p = fake.prompts();
+        assert!(p[0].contains("wrong format") && !p[0].contains("wrong sheet"));
+        assert!(p[0].contains(&local_date(w.now - 3 * 86_400)) && p[1].contains(&local_date(w.now - 86_400)));
+    }
+
+    #[tokio::test]
+    async fn a_compact_alone_is_never_reviewed_and_an_abandoned_turn_is_read() {
+        let w = world().await;
+        // The files were touched an hour ago (close records carry no time);
+        // the records themselves are days old.
+        transcript(&w, "bot", &[prompt_at(&w, "check the queue", 3 * 86_400), asst("Empty."), done(&w, 3 * 86_400)], 3600);
+        let r = pass(&w, None, Pass::Live, opts(5), &Fake::default()).await;
+        assert_eq!(r.parts_filtered, 1, "{}", r.summary());
+        // A compaction two days ago and nothing since: no turn can still be
+        // running, so the records are read, and they are not operator work.
+        transcript(&w, "bot", &compact(&w, 2 * 86_400), 3600);
+        let r = pass(&w, None, Pass::Live, opts(5), &Fake::default()).await;
+        assert_eq!((r.reviewed, r.parts_filtered), (0, 1), "{}", r.summary());
+        // A session killed in the middle of a turn two days ago: its turn
+        // never completes, and it is read whole.
+        transcript(&w, "killed", &[prompt_at(&w, "rename the files", 2 * 86_400), prompt_at(&w, "no, wrong folder", 2 * 86_400)], 3600);
+        let fake = Fake::with(&[r#"{"items": []}"#]);
+        let r = pass(&w, None, Pass::Live, opts(5), &fake).await;
+        assert_eq!(r.reviewed, 1, "{}", r.summary());
+        assert_eq!(ledger::all(&w.pool).await.unwrap()["killed"].position, 2);
+    }
+
+    #[tokio::test]
+    async fn backlog_lists_completed_turns_waiting_for_review() {
+        let w = world().await;
+        let s = summary;
+        transcript(&w, "waits", &[prompt_at(&w, "a", 50 * 3600), asst("b"), done(&w, 50 * 3600), prompt_at(&w, "c", 3600), asst("d"), done(&w, 3600)], 3600);
+        transcript(&w, "fresh", &[prompt_at(&w, "a", 3600), asst("b"), done(&w, 3600)], 3600);
+        transcript(&w, "running", &[prompt_at(&w, "a", 60)], 60);
+        let list = waiting(&env(&w, None, &s)).await.unwrap();
+        let ids: Vec<(&str, usize)> = list.iter().map(|x| (x.session_id.as_str(), x.turns)).collect();
+        assert_eq!(ids, vec![("waits", 2), ("fresh", 1)], "oldest first; a running turn is not waiting");
+        assert_eq!(list[0].oldest, w.now - 50 * 3600);
+        assert!(ledger::all(&w.pool).await.unwrap().is_empty(), "the check writes nothing");
+        // After the sweep (the parts are filtered) nothing waits.
+        pass(&w, None, Pass::Live, opts(5), &Fake::default()).await;
+        assert!(waiting(&env(&w, None, &s)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_work_becomes_a_candidate_and_code_promotes_it_on_the_second_day() {
+        let w = world().await;
+        let day1 = [prompt_at(&w, "export the weekly numbers to the shared sheet", 3 * 86_400), prompt_at(&w, "no, wrong format, use the csv one", 3 * 86_400), asst("Exported as csv."), done(&w, 3 * 86_400)];
+        transcript(&w, "s-day1", &day1, 3600);
+        let first = json!({"items": [], "candidates": [{"name": "weekly-export", "description": "Export the weekly numbers as csv", "note": "asked for the export"}]}).to_string();
+        let r = pass(&w, None, Pass::Live, opts(5), &Fake::with(&[&first])).await;
+        assert_eq!(r.candidates_opened.len(), 1, "{} {:?}", r.summary(), r.lines);
+        assert!(r.summary().contains("1 candidate(s) opened (#1 weekly-export)"), "{}", r.summary());
+        let s = summary;
+        let e = env(&w, None, &s);
+        // One day only: nothing to promote.
+        let p = crate::promote::run(&e, 5, false, &Fake::default()).await.unwrap();
+        assert!(p.promoted.is_empty() && p.lines.is_empty(), "{:?}", p.lines);
+
+        // Another day, another session: the review sees the open candidate
+        // and adds evidence to it.
+        let day2 = [prompt_at(&w, "do the weekly export again", 86_400), prompt_at(&w, "no, wrong sheet", 86_400), asst("Done."), done(&w, 86_400)];
+        transcript(&w, "s-day2", &day2, 3600);
+        let second = json!({"items": [], "candidates": [{"candidate_id": 1, "note": "the export again"}]}).to_string();
+        let fake = Fake::with(&[&second]);
+        let r = pass(&w, None, Pass::Live, opts(5), &fake).await;
+        assert_eq!(r.candidate_evidence, 1, "{}", r.summary());
+        assert!(fake.prompts()[0].contains("#1 weekly-export — Export the weekly numbers as csv (seen on"), "{}", fake.prompts()[0]);
+
+        // Promotion: one review with the excerpts of both days.
+        let draft = DRAFT.replace("name: x", "name: weekly-export");
+        let promote = reply(vec![create_item("weekly-export", &draft, "use the csv one")]);
+        let fake = Fake::with(&[&promote]);
+        let p = crate::promote::run(&e, 5, false, &fake).await.unwrap();
+        assert_eq!(p.promoted.len(), 1, "{:?}", p.lines);
+        let prompt = &fake.prompts()[0];
+        assert!(prompt.contains("export the weekly numbers to the shared sheet") && prompt.contains("do the weekly export again"), "{prompt}");
+        let sid = p.promoted[0].1;
+        assert_eq!(p.filed, vec![sid]);
+        let s = suggestions::get(&w.pool, sid).await.unwrap().unwrap();
+        assert_eq!(s.origin, SuggestionOrigin::Candidate);
+        let sessions: Vec<&str> = s.evidence.iter().filter_map(|e| e.session_id.as_deref()).collect();
+        assert_eq!(sessions, vec!["s-day1", "s-day2"]);
+        assert_eq!(s.evidence[0].quotes, vec!["use the csv one".to_string()]);
+        let c = candidates::get(&w.pool, 1).await.unwrap().unwrap();
+        assert_eq!((c.status.as_str(), c.suggestion_id), ("promoted", Some(sid)));
+        assert!(ledger::all(&w.pool).await.unwrap()["rev-1"].outcome == "own", "promotion sessions are the learner's own");
     }
 
     #[tokio::test]

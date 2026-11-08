@@ -58,19 +58,16 @@ cron = "0 4 * * *"
 # model = "claude-sonnet-4-6"   # optional override (reserved; unused today)
 
 [skill_learner]
-# ADR-017 / ADR-038: the skill-gap learner. The nightly `learn` run sweeps this
-# workspace's session transcripts for skill suggestions (new sessions, then a
-# limited backfill batch of old ones), then proposes missing skills from the
-# diaries and curates the library.
+# ADR-017 / ADR-038: the skill-gap learner. The nightly `learn` run reviews the
+# completed turns of this workspace's session transcripts (new turns, then a
+# limited backfill batch of old sessions), promotes candidate workflows seen on
+# several days, then reviews the diaries for missing skills and curates the
+# library. Every pass files suggestions for the operator
+# (`nucleus skills suggestions`); no pass writes a skill.
 cron = "30 4 * * *"          # nightly `learn` (informational; truth in the plist)
 stale_after_days = 30        # agent-created skills idle this long → stale
 archive_after_days = 90      # …this long → auto-archived (never deleted)
 enabled = true               # transcript sweep + backfill on/off
-# "suggest": reviewed sessions become suggestions for the operator
-# (`nucleus skills suggestions`). "write": the live sweep writes skills
-# directly (validation gate applies). The backfill always suggests.
-live_mode = "suggest"
-quiet_minutes = 30           # transcripts modified more recently are still in use
 # Automated sessions never reviewed (agent label prefixes).
 skip_agents = ["reminders-fire", "calendar-fire", "news-fetcher", "skill-gap-learner", "distiller", "gmail-metabolism", "intake-interpreter", "work-interpreter", "jobs", "chat-title"]
 # Pre-filter (code, no model). A part of a session is reviewed when it has at
@@ -88,7 +85,13 @@ review_window_bytes = 24576  # rendered conversation per review (max 24576); lon
 live_max_reviews = 20        # review sessions per live sweep
 backfill_per_night = 10      # review sessions per night for old sessions
 backfill_max_new_per_night = 5  # stop the backfill for the night above this many new suggestions
-# After a nightly run that filed or revised suggestions, one WhatsApp message to
+# Candidate workflows: work a review saw that may repeat. Code promotes one to a
+# suggestion once it was seen on candidate_min_days distinct local dates, and
+# drops it after candidate_expire_days without new evidence.
+candidate_min_days = 2
+candidate_expire_days = 14
+promotions_per_night = 5     # promotion reviews per run
+# After a nightly run that filed or revised suggestions (any pass), one WhatsApp message to
 # the operator's DM with the count and the dashboard link (NUCLEUS_PUBLIC_URL +
 # /skills; no link when unset). Never carries suggestion text.
 notify = true

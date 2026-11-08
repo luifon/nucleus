@@ -149,16 +149,6 @@ pub struct SkillLearnerConfig {
     /// job is installed.
     #[serde(default = "default_true_bool")]
     pub enabled: bool,
-    /// What the live sweep does with a reviewed session: file suggestions
-    /// for the operator (`suggest`), or write skills directly through the
-    /// ADR-017 write path and validation gate (`write`). The backfill always
-    /// suggests.
-    #[serde(default)]
-    pub live_mode: LiveMode,
-    /// A transcript modified less than this many minutes ago is still in
-    /// use; the sweep leaves it for a later run.
-    #[serde(default = "default_quiet_minutes")]
-    pub quiet_minutes: u32,
     /// Agent labels whose sessions are automated and never reviewed,
     /// matched as prefixes (ADR-023's synthetic labels are always skipped
     /// as well). Bot chats and unlabelled terminal sessions are reviewed.
@@ -201,6 +191,19 @@ pub struct SkillLearnerConfig {
     /// many suggestions that day.
     #[serde(default = "default_backfill_max_new_per_night")]
     pub backfill_max_new_per_night: u32,
+    /// A candidate workflow (work a review saw that may repeat) is promoted
+    /// to a suggestion once it has evidence on this many distinct local
+    /// dates.
+    #[serde(default = "default_candidate_min_days")]
+    pub candidate_min_days: u32,
+    /// An open candidate that got no new evidence for this many days is
+    /// dropped (its row stays, as `expired`).
+    #[serde(default = "default_candidate_expire_days")]
+    pub candidate_expire_days: u32,
+    /// Most candidate promotions (one review session each) per run; the
+    /// rest wait for the next run.
+    #[serde(default = "default_promotions_per_night")]
+    pub promotions_per_night: u32,
     /// After a nightly run that filed or revised suggestions still pending
     /// at its end, queue one WhatsApp notice to the operator's DM (ADR-038).
     #[serde(default = "default_true_bool")]
@@ -233,15 +236,6 @@ impl Default for SkillLearnerTexts {
     }
 }
 
-/// See [`SkillLearnerConfig::live_mode`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LiveMode {
-    #[default]
-    Suggest,
-    Write,
-}
-
 impl Default for SkillLearnerConfig {
     fn default() -> Self {
         Self {
@@ -249,8 +243,6 @@ impl Default for SkillLearnerConfig {
             stale_after_days: default_stale_days(),
             archive_after_days: default_archive_days(),
             enabled: true,
-            live_mode: LiveMode::default(),
-            quiet_minutes: default_quiet_minutes(),
             skip_agents: default_skip_agents(),
             min_user_turns: default_min_user_turns(),
             min_tool_calls: default_min_tool_calls(),
@@ -261,6 +253,9 @@ impl Default for SkillLearnerConfig {
             live_max_reviews: default_live_max_reviews(),
             backfill_per_night: default_backfill_per_night(),
             backfill_max_new_per_night: default_backfill_max_new_per_night(),
+            candidate_min_days: default_candidate_min_days(),
+            candidate_expire_days: default_candidate_expire_days(),
+            promotions_per_night: default_promotions_per_night(),
             notify: true,
             texts: SkillLearnerTexts::default(),
         }
@@ -276,8 +271,14 @@ fn default_stale_days() -> u32 {
 fn default_archive_days() -> u32 {
     90
 }
-fn default_quiet_minutes() -> u32 {
-    30
+fn default_candidate_min_days() -> u32 {
+    2
+}
+fn default_candidate_expire_days() -> u32 {
+    14
+}
+fn default_promotions_per_night() -> u32 {
+    5
 }
 fn default_skip_agents() -> Vec<String> {
     [
@@ -1980,6 +1981,10 @@ mod skill_learner_config_tests {
         let d = SkillLearnerConfig::default();
         assert_eq!((cfg.notify, &cfg.texts), (d.notify, &d.texts));
         assert_eq!(cfg.backfill_max_new_per_night, d.backfill_max_new_per_night);
+        assert_eq!(
+            (cfg.candidate_min_days, cfg.candidate_expire_days, cfg.promotions_per_night),
+            (d.candidate_min_days, d.candidate_expire_days, d.promotions_per_night)
+        );
         let empty: SkillLearnerConfig = toml::from_str("").unwrap();
         assert!(empty.notify && empty.texts == d.texts);
     }

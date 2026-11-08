@@ -454,19 +454,25 @@ without a warning. Skill bodies refer to their own files through
 `${CLAUDE_SKILL_DIR}`. Do not create `.nucleus/CLAUDE.md`.
 
 **The `skill-gap-learner` learns skills from sessions** (ADR-017, ADR-038).
-Every night it sweeps this workspace's session transcripts (terminal, bot
-and dashboard chats; automated sessions are skipped), plus a limited
-backfill batch of old sessions, and files **skill suggestions**: a new skill
-or a patch of a personal one (written as edits, stored as the full result). The operator decides them with
+Every night it reviews the completed turns of this workspace's session
+transcripts (terminal, bot and dashboard chats, long-lived sessions
+included; automated sessions are skipped), plus a limited backfill batch
+of old sessions, and files **skill suggestions**: a new skill or a patch
+of a personal one (written as edits, stored as the full result). Work it
+sees repeated on two or more days becomes a suggestion through a
+candidate workflow. The diary gap pass and the curator file suggestions
+too; a curator consolidation names the agent-created skills it retires.
+No pass writes a skill. The operator decides them with
 `nucleus skills suggestions list|show|accept|reject|edit` or on the
 dashboard; accept writes into `.nucleus/.claude/skills/` with
 `flavor: learned` + `created_by: agent`, after the SKILL.md contract check
-(the `# Failure modes` requirement below is enforced mechanically). The
-same nightly run's diary gap pass and curator still write and archive
-agent-created skills directly (malformed writes are quarantined to
-`.rejected/`; the curator archives stale ones to `.archive/`, never deletes,
-skips `pinned: true`). `/skill-creator` remains the operator's *manual*
-path. The authoring discipline below governs all of them.
+(the `# Failure modes` requirement below is enforced mechanically), and
+moves retired skills to `.archive/` (never deletes). The only change the
+learner makes without the operator is the archive of agent-created,
+unpinned skills idle past `archive_after_days`. `nucleus skill-gap-learner
+backlog` lists sessions whose completed turns wait too long for review.
+`/skill-creator` remains the operator's *manual* path. The authoring
+discipline below governs all of them.
 
 **When a skill you loaded turns out wrong or incomplete**, file a patch
 suggestion before the session ends: take `shasum -a 256` of its SKILL.md

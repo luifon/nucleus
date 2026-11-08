@@ -85,12 +85,18 @@ test("the live skill note names a changed or missing skill", () => {
 });
 
 test("confirmation and result texts", () => {
-  expect(acceptConfirmText({ kind: "create", name: "a-b" })).toContain(".nucleus/.claude/skills/a-b/SKILL.md");
-  expect(acceptConfirmText({ kind: "patch", name: "a-b" })).toContain("Replace the private skill a-b");
+  expect(acceptConfirmText({ kind: "create", name: "a-b", retires: [] })).toContain(".nucleus/.claude/skills/a-b/SKILL.md");
+  expect(acceptConfirmText({ kind: "patch", name: "a-b", retires: [] })).toContain("Replace the private skill a-b");
+  expect(acceptConfirmText({ kind: "patch", name: "a-b", retires: ["c-d", "e-f"] })).toContain(
+    "Accept also moves the 2 merged skills c-d, e-f to .nucleus/.claude/skills/.archive/ (nothing is deleted).",
+  );
   const resp = (git: SuggestionAcceptResp["git"], superseded: number[] = []): SuggestionAcceptResp => ({
-    accepted: { id: 7, name: "a-b", path: "/ws/.nucleus/.claude/skills/a-b/SKILL.md", superseded },
+    accepted: { id: 7, name: "a-b", path: "/ws/.nucleus/.claude/skills/a-b/SKILL.md", superseded, retired: [] },
     git,
   });
+  const retired = resp({ status: "committed", sha: "0123456789abcdef" });
+  retired.accepted.retired = [{ name: "c-d", archived_as: "c-d-20260101T000000" }];
+  expect(describeAccept(retired).lines).toContain("retired c-d: moved to .archive/c-d-20260101T000000");
   expect(describeAccept(resp({ status: "committed", sha: "0123456789abcdef" }, [9]))).toEqual({
     kind: "ok",
     lines: [

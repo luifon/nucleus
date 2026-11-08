@@ -31,4 +31,10 @@ why_new: string | null,
 /**
  * The operator replaced the draft.
  */
-edited: boolean, created_at: string, updated_at: string, decided_at: string | null, evidence: Array<Evidence>, };
+edited: boolean,
+/**
+ * Personal skills (agent-created, unpinned) accept moves to
+ * `.archive/` after it writes the draft: the skills a curator
+ * consolidation merged into this one. Empty for most suggestions.
+ */
+retires: Array<string>, created_at: string, updated_at: string, decided_at: string | null, evidence: Array<Evidence>, };

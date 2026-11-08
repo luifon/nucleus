@@ -38,6 +38,5 @@ url = "2"
 rustix = { version = "1", features = ["fs"] }
 sha2 = "0.10"
 async-trait = { workspace = true }
-
-[dev-dependencies]
+# The skill-learner store's private copy for a dry run (`open_snapshot`).
 tempfile = "3"

@@ -3,7 +3,10 @@
 **Status:** Accepted (2026-05-24) — Implemented (2026-05-24). Arm 1 (the
 on-the-fly review) superseded by [[ADR-038]] (2026-11-03): a nightly
 transcript sweep files skill suggestions for the operator instead. Arm 2
-(gap detection + curator) is unchanged.
+changed by ADR-038 (2026-11-07): the gap pass and the curator file
+suggestions too, and no pass writes skills; the "Autonomy + the validation
+gate" section below describes the removed write path. The pure stale-skill
+archive is unchanged.
 
 **Builds on:**
 - [[ADR-008]] — skills are procedural memory in SKILL.md; this adds an agent
@@ -51,11 +54,20 @@ The `skill-gap-learner` maintenance agent (launchd-cron daily). `learn` runs:
    idle past `archive_after_days` (activity = max(last_used, mtime)); count the
    merely-stale. Never touches hand-written (`created_by != agent`) or pinned.
 2. **gap detection**: read the last 7 days of every agent's diary, propose +
-   create skills for recurring patterns that lack one.
+   create skills for recurring patterns that lack one. Since 2026-11-07
+   (ADR-038) it files `create`/`patch` suggestions (origin `gap`) instead
+   of creating skills.
 3. **curate**: the ported `CURATOR_REVIEW_PROMPT` — consolidate agent-created
    skills into class-level umbrellas, **archive-never-delete** to `.archive/`.
+   Since 2026-11-07 (ADR-038) a consolidation is a patch (or create)
+   suggestion for the umbrella with an explicit `retires` list; accept
+   moves only agent-created, unpinned retired skills to `.archive/`.
 
-### Autonomy + the validation gate
+### Autonomy + the validation gate (removed 2026-11-07)
+
+Superseded by ADR-038: every pass files suggestions, the operator decides,
+and the gate below no longer exists. Kept as the record of the first
+design.
 
 Skills are written **autonomously** (Hermes-faithful) to the operator-personal
 tree only (gitignored — Rule 1; never the committed tree). Since ADR-032 that
@@ -102,5 +114,6 @@ just by prompt.
 
 - An interactive skill-authoring UI — `/skill-creator` remains the operator's
   manual path; this is the autonomous complement.
-- Touching the committed `.claude/skills/` tree — the learner writes only to
-  the operator-personal tree (`.nucleus/.claude/skills/`, ADR-032).
+- Touching the committed `.claude/skills/` tree — accepted suggestions are
+  written only to the operator-personal tree (`.nucleus/.claude/skills/`,
+  ADR-032).

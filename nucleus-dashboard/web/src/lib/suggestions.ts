@@ -63,6 +63,12 @@ export function originLabel(origin: SuggestionOrigin): string {
       return "backfill";
     case "manual":
       return "filed by a session";
+    case "candidate":
+      return "repeated work";
+    case "gap":
+      return "diary gap pass";
+    case "curator":
+      return "curator";
   }
 }
 
@@ -87,6 +93,10 @@ export function evidenceSourceLabel(source: EvidenceSource): string {
       return "session index";
     case "manual":
       return "filed by hand";
+    case "diary":
+      return "agent diaries";
+    case "library":
+      return "skill library";
   }
 }
 
@@ -138,16 +148,27 @@ export function liveSkillNote(live: LiveSkill): { kind: StatusKind; text: string
 }
 
 /** Text of the inline accept confirmation. */
-export function acceptConfirmText(s: Pick<Suggestion, "kind" | "name">): string {
-  return s.kind === "create"
-    ? `Create the private skill ${s.name} at ${skillFilePath(s.name)}? It loads in the next Nucleus session.`
-    : `Replace the private skill ${s.name} (${skillFilePath(s.name)}) with this draft? Refused if the live file changed since the suggestion.`;
+export function acceptConfirmText(s: Pick<Suggestion, "kind" | "name" | "retires">): string {
+  const base =
+    s.kind === "create"
+      ? `Create the private skill ${s.name} at ${skillFilePath(s.name)}? It loads in the next Nucleus session.`
+      : `Replace the private skill ${s.name} (${skillFilePath(s.name)}) with this draft? Refused if the live file changed since the suggestion.`;
+  return s.retires.length > 0 ? `${base} ${retiresNote(s.retires)}` : base;
+}
+
+/** The sentence about the skills an accept moves to `.archive/`. */
+export function retiresNote(retires: readonly string[]): string {
+  const n = retires.length;
+  return `Accept also moves ${n === 1 ? "the merged skill" : `the ${n} merged skills`} ${retires.join(", ")} to .nucleus/.claude/skills/.archive/ (nothing is deleted).`;
 }
 
 /** Operator-facing summary of an accept. */
 export function describeAccept(resp: SuggestionAcceptResp): ResultSummary {
   const git = gitSummary(resp.git);
   const lines = [`accepted #${resp.accepted.id}: wrote ${skillFilePath(resp.accepted.name)}`, ...git.lines];
+  for (const r of resp.accepted.retired) {
+    lines.push(`retired ${r.name}: moved to .archive/${r.archived_as}`);
+  }
   if (resp.accepted.superseded.length > 0) {
     lines.push(
       `superseded the other pending suggestions for ${resp.accepted.name}: ${resp.accepted.superseded.map((i) => `#${i}`).join(", ")}`,

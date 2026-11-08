@@ -227,13 +227,14 @@ pub async fn run(args: Vec<std::ffi::OsString>) -> Result<()> {
                 expected_base: base,
                 overrides_rejected,
                 why_new,
-                evidence: NewEvidence {
+                evidence: vec![NewEvidence {
                     session_id,
                     source: EvidenceSource::Manual,
                     agent: caller.agent.clone(),
                     note: String::new(),
                     quotes,
-                },
+                }],
+                retires: vec![],
             };
             let id = suggestions::create(&pool, &ws, &roots, &s).await?;
             println!("filed suggestion #{id} ({} {}). The operator decides it: nucleus skills suggestions show {id}", s.kind.as_str(), s.name);
@@ -306,6 +307,9 @@ async fn suggestions_cmd(ws: &Path, roots: &LibraryRoots, cmd: SuggestionsCmd) -
             if s.edited {
                 println!("draft edited by the operator");
             }
+            if !s.retires.is_empty() {
+                println!("accept also moves these merged skills to .archive/: {}", s.retires.join(", "));
+            }
             println!("\nrationale: {}\n", s.rationale);
             println!("evidence:");
             for e in &s.evidence {
@@ -340,6 +344,9 @@ async fn suggestions_cmd(ws: &Path, roots: &LibraryRoots, cmd: SuggestionsCmd) -
             let pool = skill_learner::open(ws).await?;
             let out = suggestions::accept(&pool, ws, roots, id, &draft_hash).await?;
             println!("accepted #{id}: wrote {}", out.path);
+            for r in &out.retired {
+                println!("retired {} → .archive/{}", r.name, r.archived_as);
+            }
             if !out.superseded.is_empty() {
                 let ids: Vec<String> = out.superseded.iter().map(|i| format!("#{i}")).collect();
                 println!("superseded the other pending suggestions for {}: {}", out.name, ids.join(", "));

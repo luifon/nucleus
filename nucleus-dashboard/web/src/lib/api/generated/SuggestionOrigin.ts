@@ -3,4 +3,4 @@
 /**
  * Which pass filed a suggestion.
  */
-export type SuggestionOrigin = "live" | "backfill" | "manual";
+export type SuggestionOrigin = "live" | "backfill" | "manual" | "candidate" | "gap" | "curator";

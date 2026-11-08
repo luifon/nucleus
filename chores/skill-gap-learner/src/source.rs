@@ -7,8 +7,10 @@
 //!
 //! A transcript modified at or after the live start (an ADR-029 watermark,
 //! set on the first run) belongs to the live sweep; older transcripts and
-//! every index-only session belong to the backfill. The ledger decides
-//! where reading starts, so the split never reviews a part twice.
+//! every index-only session belong to the backfill. A session in use is a
+//! candidate like any other: the sweep reads it only up to its last
+//! completed turn (`sweep::reading_end`). The ledger decides where reading
+//! starts, so the split never reviews a part twice.
 
 use nucleus_core::config::SkillLearnerConfig;
 use nucleus_core::session_index::{self, IndexedSession};
@@ -61,8 +63,6 @@ pub fn head_hash(path: &Path) -> Option<String> {
 pub struct Inventory {
     pub live: Vec<Candidate>,
     pub backfill: Vec<Candidate>,
-    /// Transcripts modified within `quiet_minutes`: left for a later run.
-    pub busy: Vec<String>,
     /// Sessions whose agent label is on the skip list and that the ledger
     /// does not record yet.
     pub skipped: Vec<Candidate>,
@@ -115,15 +115,17 @@ fn unix_mtime(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// Whether the ledger says a transcript has nothing new: the part up to the
-/// end of a file of exactly this size has been handled.
+/// Whether the ledger says a transcript has nothing new: a file of exactly
+/// this size was read up to its last completed turn and that part was
+/// handled. Records written after that turn (a turn still running, a
+/// `/compact` outside a turn, close records) are in the size, so a file
+/// that grew only by them is skipped until it grows again.
 fn unchanged(row: &LedgerRow, size: i64) -> bool {
     row.file_size == Some(size) && matches!(row.outcome.as_str(), "reviewed" | "filtered" | "gave-up")
 }
 
 /// Sort the sessions of one sweep. `index` is the session index's eligible
-/// sessions (empty when there is no index); `now` and `live_start` are unix
-/// seconds.
+/// sessions (empty when there is no index); `live_start` is unix seconds.
 pub fn inventory(
     transcripts_dir: &Path,
     cfg: &SkillLearnerConfig,
@@ -131,10 +133,8 @@ pub fn inventory(
     labels: &HashMap<String, String>,
     index: &[IndexedSession],
     live_start: i64,
-    now: i64,
 ) -> Inventory {
     let mut inv = Inventory::default();
-    let quiet_since = now - i64::from(cfg.quiet_minutes) * 60;
     let mut on_disk: HashSet<String> = HashSet::new();
 
     if let Ok(entries) = std::fs::read_dir(transcripts_dir) {
@@ -187,8 +187,6 @@ pub fn inventory(
             };
             if skip {
                 inv.skipped.push(c);
-            } else if mtime > quiet_since {
-                inv.busy.push(sid);
             } else if mtime >= live_start {
                 inv.live.push(c);
             } else {
@@ -268,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_are_sorted_into_live_backfill_busy_and_skipped() {
+    fn sessions_are_sorted_into_live_backfill_and_skipped() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let now = 2_000_000_000;
@@ -311,17 +309,16 @@ mod tests {
             idx("gone-half", 6, 80),
             idx("old", 3, 0), // still on disk: read from the transcript
         ];
-        let inv = inventory(dir, &cfg, &ledger, &labels, &index, live_start, now);
+        let inv = inventory(dir, &cfg, &ledger, &labels, &index, live_start);
 
         let ids = |v: &[Candidate]| v.iter().map(|c| c.session_id.clone()).collect::<Vec<_>>();
-        assert_eq!(ids(&inv.live), vec!["grown", "rewritten", "recent"]);
+        assert_eq!(ids(&inv.live), vec!["grown", "rewritten", "recent", "busy"], "a session in use is a candidate too");
         assert_eq!(inv.live[0].from, 1, "a grown transcript continues at the ledger position");
         assert_eq!(inv.live[1].from, 0, "a rewritten transcript is read from the start");
         assert_eq!(ids(&inv.backfill), vec!["gone-part", "gone-half", "gone", "older", "old"]);
         assert_eq!(inv.backfill[0].from, 2);
         assert_eq!((inv.backfill[1].from, inv.backfill[1].source), (4, Source::Index), "continues after the text turns read");
         assert_eq!(inv.backfill[1].source, Source::Index);
-        assert_eq!(inv.busy, vec!["busy".to_string()]);
         assert_eq!(ids(&inv.skipped), vec!["fire"]);
     }
 

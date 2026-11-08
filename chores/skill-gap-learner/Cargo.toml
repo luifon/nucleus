@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 nucleus-core = { workspace = true }
-reminders = { workspace = true }
+tempfile = "3"
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
@@ -23,5 +23,3 @@ async-trait = { workspace = true }
 regex = { workspace = true }
 sqlx = { workspace = true }
 
-[dev-dependencies]
-tempfile = "3"

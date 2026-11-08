@@ -2834,8 +2834,9 @@ pub enum TranscriptEventKind {
     /// date preamble stripped and trimmed. System-injected user turns
     /// (`<system-reminder>` and the like) are left out. `meta` is true for a
     /// user message Claude Code wrote itself rather than the operator: a
-    /// loaded skill's body (`isMeta`) or a compaction summary
-    /// (`isCompactSummary`).
+    /// loaded skill's body (`isMeta`), a compaction summary
+    /// (`isCompactSummary`), or a slash command line such as `/compact`,
+    /// which the harness runs and which starts no turn.
     Text { role: TurnRole, text: String, meta: bool },
     /// An assistant `tool_use` block.
     ToolUse { id: String, name: String, input: serde_json::Value },
@@ -2852,6 +2853,33 @@ pub struct TranscriptRead {
     /// line, still being written, is not counted and not parsed; the next
     /// read from this position picks it up once it is complete.
     pub complete_lines: usize,
+    /// The ends of completed turns from `from_line` on, in order: one entry
+    /// per `{"type":"system","subtype":"turn_duration"}` record, the record
+    /// Claude Code writes when a turn is over (see `turn_tracker`). A turn
+    /// still running, an interrupted turn before its next prompt, and a
+    /// `/compact` or other local command outside a turn have none.
+    pub turn_ends: Vec<TurnEnd>,
+    /// Unix seconds of the newest record with a `timestamp` from
+    /// `from_line` on. The records Claude Code writes when a session closes
+    /// (`last-prompt`, `cost-state`) carry none and do not count.
+    pub last_activity: Option<i64>,
+}
+
+/// The end of one completed turn: its `turn_duration` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnEnd {
+    /// 0-based line of the `turn_duration` record. The turn's records are
+    /// the lines before it, so a reader that stops after this turn stops at
+    /// `line + 1`.
+    pub line: usize,
+    /// Unix seconds of the record's `timestamp` (when the turn ended).
+    pub at: Option<i64>,
+}
+
+/// Unix seconds of a record's `timestamp` field (RFC 3339).
+fn record_time(v: &serde_json::Value) -> Option<i64> {
+    let raw = v.get("timestamp")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(raw).ok().map(|t| t.timestamp())
 }
 
 /// Every conversational event of a transcript JSONL from line `from_line`
@@ -2880,19 +2908,30 @@ pub fn transcript_events(transcript_path: &Path, from_line: usize) -> std::io::R
         if this < from_line {
             continue;
         }
-        parse_transcript_line(buf.trim(), this, &mut out.events);
+        let line = buf.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let at = record_time(&v);
+        if let Some(t) = at {
+            out.last_activity = Some(out.last_activity.map_or(t, |l| l.max(t)));
+        }
+        if v.get("type").and_then(|t| t.as_str()) == Some("system")
+            && v.get("subtype").and_then(|t| t.as_str()) == Some("turn_duration")
+        {
+            out.turn_ends.push(TurnEnd { line: this, at });
+            continue;
+        }
+        parse_transcript_record(&v, this, &mut out.events);
     }
     out.complete_lines = line_no;
     Ok(out)
 }
 
-fn parse_transcript_line(line: &str, line_no: usize, out: &mut Vec<TranscriptEvent>) {
-    if line.is_empty() {
-        return;
-    }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return;
-    };
+fn parse_transcript_record(v: &serde_json::Value, line_no: usize, out: &mut Vec<TranscriptEvent>) {
     let role = match v.get("type").and_then(|s| s.as_str()).unwrap_or("") {
         "user" => TurnRole::User,
         "assistant" => TurnRole::Assistant,
@@ -2902,7 +2941,7 @@ fn parse_transcript_line(line: &str, line_no: usize, out: &mut Vec<TranscriptEve
         return;
     };
     let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
-    let meta = role == TurnRole::User && (flag("isMeta") || flag("isCompactSummary"));
+    let mut meta = role == TurnRole::User && (flag("isMeta") || flag("isCompactSummary"));
     let mut text_parts: Vec<&str> = Vec::new();
     let mut tools: Vec<TranscriptEventKind> = Vec::new();
     if let Some(s) = content.as_str() {
@@ -2931,6 +2970,9 @@ fn parse_transcript_line(line: &str, line_no: usize, out: &mut Vec<TranscriptEve
     }
     if !text_parts.is_empty() {
         let text = text_parts.join("\n");
+        // A slash command line (`/compact`, `/model …`) runs in the harness
+        // and starts no turn; the turn tracker does not count it either.
+        meta |= role == TurnRole::User && crate::turn_tracker::local_command(v, &text);
         if !(role == TurnRole::User && is_system_injected_user_turn(&text)) {
             let text = strip_date_preamble(&text).trim().to_string();
             if !text.is_empty() {
@@ -3492,6 +3534,31 @@ mod tests {
         // A final record without a newline counts once it is whole JSON.
         std::fs::write(&path, lines[0]).unwrap();
         assert_eq!(transcript_events(&path, 0).unwrap().complete_lines, 1);
+    }
+
+    /// transcript_events reports each completed turn's `turn_duration` line
+    /// and time, and the newest timestamped record; a `/compact` line is
+    /// Claude Code's, not the operator's.
+    #[test]
+    fn transcript_events_reports_turn_ends_and_local_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        let lines = [
+            r#"{"type":"user","origin":{"kind":"human"},"timestamp":"2026-01-02T10:00:00Z","message":{"content":"deploy it"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-02T10:00:05Z","message":{"content":[{"type":"text","text":"Done."}]}}"#,
+            r#"{"type":"system","subtype":"turn_duration","timestamp":"2026-01-02T10:00:06Z"}"#,
+            r#"{"type":"user","timestamp":"2026-01-03T07:00:00Z","message":{"content":"/compact"}}"#,
+            r#"{"type":"last-prompt","lastPrompt":"deploy it"}"#,
+        ];
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let read = transcript_events(&path, 0).unwrap();
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        assert_eq!(read.turn_ends, vec![TurnEnd { line: 2, at: Some(at("2026-01-02T10:00:06Z")) }]);
+        assert_eq!(read.last_activity, Some(at("2026-01-03T07:00:00Z")), "close records carry no time");
+        let compact = read.events.iter().find(|e| e.line == 3).unwrap();
+        assert!(matches!(&compact.kind, TranscriptEventKind::Text { meta: true, text, .. } if text == "/compact"));
+        assert!(matches!(&read.events[0].kind, TranscriptEventKind::Text { meta: false, .. }));
+        assert!(transcript_events(&path, 3).unwrap().turn_ends.is_empty());
     }
 
     /// The compaction wait counts only a compact_boundary written after the

@@ -240,26 +240,54 @@ pub async fn forget(pool: &SqlitePool, session_id: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// One review session the learner ran, as recorded in `review_runs`.
+/// Record that a transcript the ledger has read up to its last completed
+/// turn now has `file_size` bytes, with no new completed turn: the records
+/// it grew by (a turn still running, a `/compact` outside a turn, the
+/// records Claude Code writes when a session closes) wait for the next
+/// completed turn. The position and outcome stay; the next pass skips the
+/// file while its size stays the same. Only a row whose part up to the
+/// position was handled (`reviewed`, `filtered`, `gave-up`) at `position`
+/// changes.
+pub async fn record_size(pool: &SqlitePool, session_id: &str, position: i64, file_size: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE reviewed_sessions SET file_size = ?3, updated_at = ?4
+          WHERE session_id = ?1 AND source = 'transcript' AND position = ?2
+            AND outcome IN ('reviewed', 'filtered', 'gave-up')",
+    )
+    .bind(session_id)
+    .bind(position)
+    .bind(file_size)
+    .bind(crate::timestamp::now())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One review session the learner ran, as recorded in `review_runs`: a
+/// part of a session (`live`, `backfill`), a candidate promotion
+/// (`promote`), the diary gap pass (`gap`) or the curator (`curate`).
+#[derive(Debug, Clone, Default)]
 pub struct RunStart<'a> {
     pub pass: &'a str,
-    pub session_id: &'a str,
-    pub source: Source,
-    pub from_pos: i64,
-    pub to_pos: i64,
+    pub session_id: Option<&'a str>,
+    pub source: Option<Source>,
+    pub from_pos: Option<i64>,
+    pub to_pos: Option<i64>,
+    pub candidate_id: Option<i64>,
 }
 
 /// Insert a `running` review-run row; returns its id.
 pub async fn start_run(pool: &SqlitePool, r: &RunStart<'_>) -> Result<i64> {
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO review_runs (pass, session_id, source, from_pos, to_pos, outcome, started_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6) RETURNING id",
+        "INSERT INTO review_runs (pass, session_id, source, from_pos, to_pos, candidate_id, outcome, started_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7) RETURNING id",
     )
     .bind(r.pass)
     .bind(r.session_id)
-    .bind(r.source.as_str())
+    .bind(r.source.map(Source::as_str))
     .bind(r.from_pos)
     .bind(r.to_pos)
+    .bind(r.candidate_id)
     .bind(crate::timestamp::now())
     .fetch_one(pool)
     .await?;
@@ -338,12 +366,29 @@ mod tests {
         assert!(forget(&pool, "own-1").await.is_err());
         assert_eq!(all(&pool).await.unwrap()["own-1"].outcome, "own");
 
+        // A transcript that grew without a completed turn keeps its
+        // position; only its size is noted.
+        record_size(&pool, "s1", 120, 26000).await.unwrap();
+        let s1 = &all(&pool).await.unwrap()["s1"];
+        assert_eq!((s1.position, s1.file_size, s1.outcome.as_str()), (120, Some(26000), "reviewed"));
+        record_size(&pool, "s1", 90, 1).await.unwrap();
+        assert_eq!(all(&pool).await.unwrap()["s1"].file_size, Some(26000), "another position is not touched");
+
         let id = start_run(
             &pool,
-            &RunStart { pass: "live", session_id: "s1", source: Source::Transcript, from_pos: 90, to_pos: 120 },
+            &RunStart {
+                pass: "live",
+                session_id: Some("s1"),
+                source: Some(Source::Transcript),
+                from_pos: Some(90),
+                to_pos: Some(120),
+                candidate_id: None,
+            },
         )
         .await
         .unwrap();
+        let gap = start_run(&pool, &RunStart { pass: "gap", ..RunStart::default() }).await.unwrap();
+        finish_run(&pool, gap, "ok", None, 0, 0, None).await.unwrap();
         finish_run(&pool, id, "ok", Some("rev-1"), 1, 0, None).await.unwrap();
         let (outcome, created): (String, i64) =
             sqlx::query_as("SELECT outcome, created FROM review_runs WHERE id = ?1")
