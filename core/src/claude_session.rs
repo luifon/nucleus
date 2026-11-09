@@ -831,13 +831,13 @@ impl Session {
     /// without the pool noticing (claude crash, manual kill, `claude update`
     /// swapping the binary, operator cleanup) — callers must check before
     /// reusing a pooled session instead of timing out against a ghost.
+    ///
+    /// The check lists every window id on the server and looks for this one.
+    /// `display-message -t <missing id>` cannot be used: tmux 3.7 exits 0 for
+    /// a window that no longer exists, so a killed window read as alive
+    /// (2026-11-07 WhatsApp DM outage).
     pub async fn is_alive(&self) -> bool {
-        Command::new("tmux")
-            .args(["display-message", "-p", "-t", &self.tmux_target, "ok"])
-            .output()
-            .await
-            .map(|out| out.status.success())
-            .unwrap_or(false)
+        window_exists(&self.tmux_target).await
     }
 
     /// Kill the tmux window (and the claude inside it).
@@ -1593,6 +1593,24 @@ pub(crate) fn transcript_path_for(workspace_root: &Path, session_id: &str) -> Pa
         .join("projects")
         .join(encoded)
         .join(format!("{}.jsonl", session_id))
+}
+
+/// True when a window with id `target` (`@N`) exists on the tmux server.
+/// False when it does not, or when no server is running.
+pub async fn window_exists(target: &str) -> bool {
+    match Command::new("tmux")
+        .args(["list-windows", "-a", "-F", "#{window_id}"])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => window_listed(&String::from_utf8_lossy(&out.stdout), target),
+        _ => false,
+    }
+}
+
+/// True when `listing` (one `#{window_id}` per line) contains `target` exactly.
+fn window_listed(listing: &str, target: &str) -> bool {
+    listing.lines().any(|line| line.trim() == target)
 }
 
 async fn ensure_tmux_session(name: &str) -> Result<()> {
@@ -3068,6 +3086,34 @@ fn with_date_preamble(message: &str) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn window_listed_matches_whole_ids_only() {
+        let listing = "@1\n@875\n@882\n";
+        assert!(window_listed(listing, "@875"));
+        assert!(!window_listed(listing, "@881"));
+        assert!(!window_listed(listing, "@87"));
+        assert!(!window_listed("", "@1"));
+    }
+
+    /// A killed window must read as dead. tmux 3.7 `display-message -t` exits
+    /// 0 for a missing window id, which is why `is_alive` lists the windows.
+    #[tokio::test]
+    async fn window_exists_is_false_after_kill() {
+        if Command::new("tmux").arg("-V").output().await.is_err() {
+            return;
+        }
+        let name = format!("nucleus-test-alive-{}", std::process::id());
+        let out = Command::new("tmux")
+            .args(["new-session", "-d", "-s", &name, "-P", "-F", "#{window_id}", "sleep 60"])
+            .output()
+            .await
+            .unwrap();
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(window_exists(&id).await);
+        Command::new("tmux").args(["kill-session", "-t", &name]).output().await.unwrap();
+        assert!(!window_exists(&id).await);
+    }
 
     #[test]
     fn project_dir_names_follow_claude_code() {

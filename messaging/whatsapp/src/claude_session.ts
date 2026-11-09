@@ -374,14 +374,14 @@ export class Session {
   /** True while the underlying tmux window still exists. A window can die
    *  without the pool noticing (claude crash, manual kill, `claude update`
    *  swapping the binary, operator cleanup) — callers must check before
-   *  reusing a pooled session instead of timing out against a ghost. */
+   *  reusing a pooled session instead of timing out against a ghost.
+   *
+   *  The check lists every window id on the server and looks for this one.
+   *  `display-message -t <missing id>` cannot be used: tmux 3.7 exits 0 for a
+   *  window that no longer exists, so a killed window read as alive and the
+   *  DM engine typed every message into it without respawning (2026-11-07). */
   async isAlive(): Promise<boolean> {
-    try {
-      await tmux(["display-message", "-p", "-t", this.tmuxTarget, "ok"]);
-      return true;
-    } catch {
-      return false;
-    }
+    return windowExists(this.tmuxTarget);
   }
 
   async close(): Promise<void> {
@@ -638,6 +638,17 @@ async function launchWindow(
     return null;
   }
   return target;
+}
+
+/** True when a window with id `target` (`@N`) exists on the tmux server.
+ *  False when it does not, or when no server is running. */
+export async function windowExists(target: string): Promise<boolean> {
+  try {
+    const { stdout } = await tmux(["list-windows", "-a", "-F", "#{window_id}"]);
+    return stdout.split("\n").some((line) => line.trim() === target);
+  } catch {
+    return false;
+  }
 }
 
 async function tmux(args: string[]): Promise<{ stdout: string; stderr: string }> {

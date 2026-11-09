@@ -8,6 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  windowExists,
   waitForTuiReady,
   msUntilNext4am,
   extractLastAssistantText,
@@ -529,4 +530,18 @@ test("transcriptAcceptance reports the promptSource of the accepted prompt", () 
   assert.deepEqual(q, { accepted: true, via: "queued", promptSource: null });
   assert.ok(!arrivedPasted(q));
   assert.equal(transcriptAcceptance(typed, "ref:wa-9").accepted, false);
+});
+
+// tmux 3.7 `display-message -t <missing id>` exits 0, so a killed window read
+// as alive and the DM engine never respawned it (2026-11-07). The liveness
+// check must report a killed window as gone.
+test("windowExists is false after the window is killed", async () => {
+  const sh = promisify(exec);
+  const name = `nucleus-test-alive-${process.pid}`;
+  const { stdout } = await sh(`tmux new-session -d -s ${name} -P -F '#{window_id}' 'sleep 60'`);
+  const id = stdout.trim();
+  assert.match(id, /^@\d+$/);
+  assert.equal(await windowExists(id), true);
+  await sh(`tmux kill-session -t ${name}`);
+  assert.equal(await windowExists(id), false);
 });
