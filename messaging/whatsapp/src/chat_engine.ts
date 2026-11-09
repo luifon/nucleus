@@ -133,6 +133,14 @@ export interface PoolSpec {
 
 export interface Outbox {
   enqueue(i: { target: string; body: string; source: string; quotedJson?: string | null }): number;
+  /** Queue under `dedupKey` unless a row has that key; `inserted` false
+   *  when the key was taken. */
+  enqueueKeyed(i: { target: string; body: string; source: string; quotedJson?: string | null; dedupKey: string }): {
+    id: number;
+    inserted: boolean;
+  };
+  /** The row queued under `dedupKey`, or null. */
+  byDedupKey(dedupKey: string): number | null;
 }
 
 export interface SessionMap {
@@ -184,6 +192,9 @@ export interface EngineDeps {
   presence?: (chatId: string, state: "composing" | "paused") => void;
   log: EngineLog;
   onOperatorReply?: (info: ReplyInfo) => void;
+  /** A reply request's answer will not come (the producer sends its own
+   *  notice; the bot runs the task sweep so it does not wait). */
+  onReplyFailed?: (inboxId: number) => void;
   spawn?: (opts: SpawnOptions) => Promise<EngineSession>;
   /** The transcript path of a stored session that is not open (default:
    *  Claude Code's path, `transcriptPathFor`). */
@@ -287,9 +298,26 @@ export function validSender(s: string): boolean {
   return /^[a-z0-9:_-]{1,64}$/.test(s);
 }
 
-/** What the receiving chat session is told about every context message. */
-const CONTEXT_NOTE =
-  "Background task results were already sent to the operator in this chat; do not repeat them. Your reply to this message is not sent anywhere; answer it with one short line.";
+/** What the receiving chat session is told about a context message whose
+ *  reply is not sent (a session-send message). */
+export const CONTEXT_NOTE = "Your reply to this message is not sent to the operator; answer it with one short line.";
+
+/** What the session is told about a task result whose digest it writes:
+ *  its reply to the message is the operator's message (ADR-033). */
+export const TASK_DIGEST_NOTE =
+  "This is the result of a background task this chat started; the operator has not seen it. " +
+  "Your reply to this message is sent to him on WhatsApp as the task's result, and he reads it on his phone. " +
+  "Write a short digest in the language of this chat: the outcome in a few lines; then only the decisions he must make, " +
+  "one line each with your recommendation; then one line saying that the full result is available on request. " +
+  "No tables, no file lists, no long quotes from the result. If the result below is cut, read the full text with the command it names first. " +
+  "Do not start or cancel tasks or send messages because of it.";
+
+/** What the session is told about a task result when the operator already
+ *  got the code-owned notice instead of a digest (the session did not take
+ *  the result in time). */
+export const TASK_NOTICED_NOTE =
+  "This is the result of a background task this chat started. The operator already got a short notice that it ended, without the result. " +
+  "Your reply to this message is not sent; answer it with one short line. When he asks about the task, answer from this result.";
 
 /** Largest agent-message body typed into a chat session (a task result,
  *  a session-send brief). Producers cap theirs (task results at 6,000,
@@ -323,6 +351,30 @@ interface PendingSubmit {
   onContextDone?: (ok: boolean, err?: string) => void;
 }
 
+/** A context message whose reply is sent: its inbox row and the outbound
+ *  dedup key the reply goes under. */
+interface ReplyRequest {
+  inboxId: number;
+  key: string;
+  sender: string;
+  /** When it was typed (released from the hold). */
+  since: number;
+  /** Its answer was queued or recorded as missing. */
+  settled: boolean;
+}
+
+/** A reply request waiting until the session is idle: it is typed only
+ *  when no turn is open and nothing else waits, so its reply is a turn of
+ *  its own, never folded into an answer to the operator. */
+interface HeldContext {
+  sender: string;
+  enqueuedAt: string;
+  body: string;
+  inboxId: number;
+  replyKey: string;
+  done: (ok: boolean, err?: string) => void;
+}
+
 interface OpenTurn {
   id: string;
   kind: TurnKind;
@@ -331,6 +383,9 @@ interface OpenTurn {
   refs: string[];
   /** For autonomous turns: the operator message the work started from. */
   quoteRef: string | null;
+  /** The reply request this turn read: its final text is sent under the
+   *  request's key. */
+  reply: ReplyRequest | null;
   latestProgress: string | null;
   sentProgress: string | null;
   lastProgressAt: number;
@@ -348,6 +403,13 @@ class ChatActor {
   private tracker = new TurnTracker();
   private decoder = new TextDecoder("utf-8");
   private queue: PendingSubmit[] = [];
+  private held: HeldContext[] = [];
+  /** The reply request typed last, until its answer is settled: no second
+   *  one is typed before then, also while the session has not yet written
+   *  the first one's prompt record (no open turn, nothing queued). */
+  private activeReply: ReplyRequest | null = null;
+  /** Context refs whose reply is sent, by ref. */
+  private replyFor = new Map<string, ReplyRequest>();
   private pumping = false;
   private following = false;
   open: OpenTurn | null = null;
@@ -386,6 +448,7 @@ class ChatActor {
     return (
       this.open !== null ||
       this.queue.length > 0 ||
+      this.held.length > 0 ||
       this.pumping ||
       this.recovering ||
       this.e.turns.unanswered(this.chatId).length > 0
@@ -439,22 +502,99 @@ class ChatActor {
     body: string,
     inboxId: number,
     done: (ok: boolean, err?: string) => void,
+    replyKey: string | null = null,
+  ): void {
+    if (replyKey) {
+      this.held.push({ sender, enqueuedAt, body, inboxId, replyKey, done });
+      this.releaseHeld();
+      return;
+    }
+    this.typeContext(sender, enqueuedAt, body, inboxId, done, CONTEXT_NOTE, null);
+  }
+
+  /** Type the first held reply request once the session is idle. When its
+   *  key is already taken (the producer sent its notice because the request
+   *  waited too long), it is typed as information only and its reply is not
+   *  sent. */
+  private releaseHeld(): void {
+    if (this.held.length === 0 || this.compacting || this.recovering || this.pumping) return;
+    if (this.open !== null || this.queue.length > 0 || this.e.turns.unanswered(this.chatId).length > 0) return;
+    const a = this.activeReply;
+    // The slot frees when the answer is settled, when the producer's notice
+    // took the key (the turn may never appear), or after the turn ceiling.
+    if (a && !a.settled && this.e.outbox.byDedupKey(a.key) === null && this.now() - a.since < this.e.cfg.ceilingMs) return;
+    this.activeReply = null;
+    const h = this.held.shift()!;
+    if (this.e.outbox.byDedupKey(h.replyKey) !== null) {
+      this.e.log.info({ chatId: this.chatId, inbox: h.inboxId }, "chat: reply request already answered by its producer — typed as information");
+      this.typeContext(h.sender, h.enqueuedAt, h.body, h.inboxId, h.done, TASK_NOTICED_NOTE, null);
+    } else {
+      const req: ReplyRequest = { inboxId: h.inboxId, key: h.replyKey, sender: h.sender, since: this.now(), settled: false };
+      this.activeReply = req;
+      this.typeContext(h.sender, h.enqueuedAt, h.body, h.inboxId, h.done, TASK_DIGEST_NOTE, req);
+    }
+  }
+
+  private typeContext(
+    sender: string,
+    enqueuedAt: string,
+    body: string,
+    inboxId: number,
+    done: (ok: boolean, err?: string) => void,
+    note: string,
+    reply: ReplyRequest | null,
   ): void {
     const ref = `ctx-${randomUUID().replace(/-/g, "").slice(0, 8)}`;
     this.issued.set(ref, "context");
+    if (reply) this.replyFor.set(ref, reply);
     // Typed like every other input (ADR-033); the envelope, not a paste
     // wrapper, tells the session that the operator did not write it.
     // Everything that reaches a chat session through the inbox is terminal
     // (hop:1): the session must not message or start work onward.
-    const envelope = agentEnvelope(sender, enqueuedAt, 1, CONTEXT_NOTE, clip(body, MAX_CONTEXT_CHARS));
+    const envelope = agentEnvelope(sender, enqueuedAt, 1, note, clip(body, MAX_CONTEXT_CHARS));
     this.queue.push({
       ref,
       payload: withDatePreamble(`${envelope}\n[ref:${ref}]`),
       kind: "context",
       inboxId,
-      onContextDone: done,
+      onContextDone: (ok, err) => {
+        // A request that was never typed has no turn; its answer will not come.
+        if (!ok && reply) this.replyFailed(reply, `could not be typed: ${err ?? "unknown error"}`);
+        done(ok, err);
+      },
     });
     void this.pump();
+  }
+
+  /** Record a reply request's answer as missing; the producer sends its
+   *  notice. */
+  private replyFailed(reply: ReplyRequest, why: string): void {
+    reply.settled = true;
+    this.replyFor.forEach((r, ref) => r === reply && this.replyFor.delete(ref));
+    this.e.turns.markInboxReply(reply.inboxId, { status: "failed", error: why });
+    this.e.log.warn({ chatId: this.chatId, inbox: reply.inboxId, why }, "chat: reply request got no answer");
+    this.e.onReplyFailed?.(reply.inboxId);
+  }
+
+  /** Queue `text` as the answer to `reply` (under its key) and record it.
+   *  When the key is taken (the producer's notice went first), the text is
+   *  queued as an ordinary message. Returns the outbound id. */
+  private sendReply(reply: ReplyRequest, text: string, quotedJson: string | null, source: string): number {
+    reply.settled = true;
+    this.replyFor.forEach((r, ref) => r === reply && this.replyFor.delete(ref));
+    const r = this.e.outbox.enqueueKeyed({
+      target: this.e.outboundTarget(this.chatId),
+      body: this.e.format(text),
+      source,
+      quotedJson,
+      dedupKey: reply.key,
+    });
+    const id = r.inserted ? r.id : this.send(text, quotedJson, source);
+    if (!r.inserted) {
+      this.e.log.warn({ chatId: this.chatId, inbox: reply.inboxId }, "chat: reply request's key already taken — reply sent on its own");
+    }
+    this.e.turns.markInboxReply(reply.inboxId, { status: "sent", outboundId: id });
+    return id;
   }
 
   /** Spawn options and the session's task scope token. The token is not
@@ -668,6 +808,7 @@ class ChatActor {
     this.e.log.warn({ chatId: this.chatId, sessionId: s.sessionId.slice(0, 8) }, "chat: transcript shrank or was replaced — resetting");
     if (this.open) {
       this.e.turns.endTurn(this.open.id, { status: "failed", error: "transcript reset" });
+      if (this.open.reply) this.replyFailed(this.open.reply, "transcript reset");
       this.open = null;
     }
     const pending = this.e.turns.unanswered(this.chatId);
@@ -763,15 +904,22 @@ class ChatActor {
       abandoned: false,
       stallSince: null,
       stallNoted: false,
+      reply: null,
     };
     this.pendingQuoteRef = null;
     this.e.turns.startTurn({ id, chatId: this.chatId, pool: this.pool.name, sessionId: s.sessionId, kind, quoteRef });
-    this.attach(opRefs);
+    this.attach(refs);
   }
 
   private attach(refs: string[]): void {
     const open = this.open;
     if (!open) return;
+    // At most one reply request is typed at a time (held until idle), so a
+    // turn reads at most one.
+    for (const r of refs) {
+      const req = this.replyFor.get(r);
+      if (req && open.reply === null) open.reply = req;
+    }
     for (const r of refs) {
       if (this.issued.get(r) !== "operator" || open.refs.includes(r)) continue;
       open.refs.push(r);
@@ -790,9 +938,18 @@ class ChatActor {
     this.open = null;
     if (!open) return;
     this.lastActive = this.now();
+    try {
+      this.finishTurn(open, finalText, pendingBg, s);
+    } finally {
+      this.releaseHeld();
+    }
+  }
+
+  private finishTurn(open: OpenTurn, finalText: string | null, pendingBg: number, s: EngineSession): void {
     if (open.abandoned) {
       // Reported and closed at the ceiling. Messages the turn read after that
       // still get its final text, so nothing typed later goes unanswered.
+      if (open.reply) this.replyFailed(open.reply, "the turn passed the safety ceiling");
       const open_ = new Set(this.e.turns.unanswered(this.chatId).map((r) => r.ref));
       const late = open.refs.filter((r) => open_.has(r));
       if (late.length > 0 && finalText !== null && classifyInfraReply(finalText) === null) {
@@ -803,14 +960,36 @@ class ChatActor {
       return;
     }
 
+    if ((open.kind === "context" || open.kind === "foreign") && open.reply) {
+      // A task result's digest: the turn's final text is the operator's
+      // message, sent under the request's key.
+      const reply = open.reply;
+      const infra = finalText === null ? null : classifyInfraReply(finalText);
+      const why = finalText === null ? "no final text" : finalText.trim() === "" ? "empty reply" : infra !== null ? `infra: ${infra}` : null;
+      if (why !== null) {
+        this.e.turns.endTurn(open.id, { status: "failed", error: why });
+        this.replyFailed(reply, why);
+        return;
+      }
+      const id = this.sendReply(reply, finalText!, null, reply.sender);
+      this.e.turns.endTurn(open.id, { status: "done", finalOutboundId: id, replyChars: finalText!.length });
+      this.e.log.info({ chatId: this.chatId, turn: open.id.slice(0, 8), inbox: reply.inboxId, replyChars: finalText!.length }, "chat: task digest queued");
+      return;
+    }
     if (open.kind === "context" || open.kind === "foreign") {
       this.e.turns.endTurn(open.id, { status: "silent", replyChars: finalText?.length ?? 0 });
       return;
     }
     const quoteRef = open.kind === "operator" ? open.refs[0] : open.quoteRef;
     const quote = quoteRef ? this.e.turns.getInbound(quoteRef) : null;
+    // An operator message that arrived during a digest turn joined it: the
+    // turn's answer covers both, and goes under the request's key. Every
+    // path below that sends no answer records the digest as missing.
+    const reply = open.reply;
+    const noDigest = (why: string) => reply && this.replyFailed(reply, why);
 
     if (finalText === null) {
+      noDigest("no final text");
       if (open.kind === "operator") {
         const id = this.send(this.texts.noFinal, quote?.quotedJson ?? null, "chat-note");
         this.e.turns.endTurn(open.id, { status: "failed", finalOutboundId: id, error: "no final text" });
@@ -823,18 +1002,24 @@ class ChatActor {
 
     const infra = classifyInfraReply(finalText);
     if (infra !== null) {
+      noDigest(`infra: ${infra}`);
       this.handleInfra(open, infra, quote);
       return;
     }
 
     // ADR-036: the issue pipeline answered this message itself.
     if (open.kind === "operator" && finalText.trim() === WORK_HANDLED) {
+      noDigest("the turn answered a pipeline decision");
       this.e.turns.endTurn(open.id, { status: "silent", replyChars: 0 });
       this.answered(open.refs);
       return;
     }
 
-    const id = this.send(finalText, quote?.quotedJson ?? null, "chat-reply");
+    // With a digest in it, the answer keeps the task-result source, so the
+    // target policy's task-result checks apply to it.
+    const id = reply
+      ? this.sendReply(reply, finalText, quote?.quotedJson ?? null, reply.sender)
+      : this.send(finalText, quote?.quotedJson ?? null, "chat-reply");
     this.e.turns.endTurn(open.id, { status: "done", finalOutboundId: id, replyChars: finalText.length });
     this.answered(open.refs);
     this.e.log.info(
@@ -937,6 +1122,7 @@ class ChatActor {
 
   async tick(): Promise<void> {
     await this.follow();
+    this.releaseHeld();
     const t = this.now();
     const cfg = this.e.cfg;
     const unanswered = this.e.turns.unanswered(this.chatId);
@@ -994,6 +1180,12 @@ class ChatActor {
       if (t - open.startedAt > cfg.ceilingMs && open.refs.length === 0 && open.quoteRef === null) {
         this.open = null;
         this.e.turns.endTurn(open.id, { status: "failed", error: "safety ceiling (owed no reply; closed silently)" });
+        // A digest turn owes the operator a message; the producer's notice
+        // replaces it.
+        if (open.reply) {
+          this.replyFailed(open.reply, "the turn passed the safety ceiling");
+          await this.session?.sendKey("Escape").catch(() => {});
+        }
         this.e.log.warn(
           { chatId: this.chatId, turn: open.id.slice(0, 8), kind: open.kind },
           "chat: turn that owes no reply passed the safety ceiling — closed without a note",
@@ -1030,6 +1222,7 @@ class ChatActor {
       if (!(await this.session.isAlive()) && !this.pumping) {
         this.e.log.warn({ chatId: this.chatId }, "chat: session window died with work outstanding");
         if (this.open) this.e.turns.endTurn(this.open.id, { status: "failed", error: "session window died" });
+        if (this.open?.reply) this.replyFailed(this.open.reply, "session window died");
         this.open = null;
         const pending = this.e.turns.unanswered(this.chatId);
         if (pending.length > 0) {
@@ -1214,11 +1407,14 @@ export class ChatEngine {
   }
 
   /** Type an agent message into a chat session as context, inside the
-   *  code-owned envelope. `sender` must be a valid agent label. */
+   *  code-owned envelope. `sender` must be a valid agent label. With a
+   *  `replyKey` (a task result, ADR-033) the message waits until the
+   *  session is idle and the session's reply to it is sent to the chat
+   *  under that outbound key, as the operator's digest. */
   injectContext(
     chatId: string,
     pool: string,
-    msg: { sender: string; enqueuedAt: string; body: string },
+    msg: { sender: string; enqueuedAt: string; body: string; replyKey?: string | null },
     inboxId: number,
     done: (ok: boolean, err?: string) => void,
   ): void {
@@ -1226,7 +1422,7 @@ export class ChatEngine {
       done(false, `invalid sender ${JSON.stringify(msg.sender)}`);
       return;
     }
-    this.actor(chatId, pool).injectContext(msg.sender, msg.enqueuedAt, msg.body, inboxId, done);
+    this.actor(chatId, pool).injectContext(msg.sender, msg.enqueuedAt, msg.body, inboxId, done, msg.replyKey ?? null);
   }
 
   async tick(): Promise<void> {

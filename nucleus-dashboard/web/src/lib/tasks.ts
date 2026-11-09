@@ -133,3 +133,16 @@ export function clockTime(iso: string): string {
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
+
+/** The task a `?task=<id>` link names (ADR-033: the WhatsApp notice links
+ *  to `/tasks?task=<full id>`): the id of the one listed task whose id
+ *  equals the value or starts with it (at least 8 characters, the short id).
+ *  Null when the value is missing, too short or matches no task or several. */
+export function linkedTaskId(value: string | null, tasks: readonly Pick<Task, "id">[]): string | null {
+  const v = value?.trim().toLowerCase() ?? "";
+  if (v.length < 8) return null;
+  const exact = tasks.find((t) => t.id === v);
+  if (exact) return exact.id;
+  const hits = tasks.filter((t) => t.id.startsWith(v));
+  return hits.length === 1 ? hits[0].id : null;
+}

@@ -76,8 +76,8 @@ notify_on_failure: []
 
 4. **Work that should run on its own** ("research X and report back"): start
    a background task with `--origin whatsapp-dm` instead of briefing the chat
-   session. The result goes to the operator's DM and into the DM session as
-   context:
+   session. The result goes to the DM session, which sends the operator a
+   short digest of it (ADR-033); the full result stays in `tasks output`:
 
    ```bash
    ./target/release/nucleus tasks start --origin whatsapp-dm --requested-by operator \

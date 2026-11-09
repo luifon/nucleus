@@ -13,6 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { ChatEngine, DEFAULT_TEXTS, type TurnsConfig } from "./chat_engine.js";
 import { ChatSessionStore, OutboundQueueStore } from "./db.js";
 import { TurnStore } from "./turn_store.js";
@@ -233,6 +234,50 @@ test(
       assert.match(content, /\[agent-msg from:task:ab12cd34 at:2026-09-24T12:00:00Z hop:1\]/);
       assert.match(content, /not from the operator/);
       assert.match(content, /│ 42 rows\./);
+    } finally {
+      await t.stop();
+    }
+  },
+);
+
+test(
+  "real session: a task result's digest request is answered with a short digest under the result key",
+  { skip: !ENABLED, timeout: 5 * 60_000 },
+  async () => {
+    const t = setup();
+    try {
+      const key = "task:ab12cd34ef:done:message";
+      const db = new DatabaseSync(path.join(t.ws, "memory/whatsapp.db"));
+      const inbox = Number(
+        db
+          .prepare(
+            `INSERT INTO session_inbox (chat, sender, payload, source, enqueued_at, status, attempts, dedup_key, reply_key)
+             VALUES (?, 'task:ab12cd34', 'x', 'task:ab12cd34', ?, 'claimed', 0, ?, ?)`,
+          )
+          .run(CHAT, new Date().toISOString(), "task:ab12cd34ef:done:context", key).lastInsertRowid,
+      );
+      const rows = Array.from({ length: 40 }, (_, i) => `| service-${i} | ok | ${100 + i} ms | no change |`).join("\n");
+      const body =
+        "Background task ab12cd34 (\"Check the 40 services\") ended with status done.\n" +
+        "Full result: ./target/release/nucleus tasks output ab12cd34\nResult:\n" +
+        "All 40 services answer. service-7 is on an old certificate that expires in 9 days.\n" +
+        "| service | state | latency | change |\n|---|---|---|---|\n" +
+        rows +
+        "\nDecision needed: renew the certificate of service-7 now or at the next maintenance window.";
+      let done: boolean | null = null;
+      t.engine.injectContext(CHAT, "dm", { sender: "task:ab12cd34", enqueuedAt: "2026-11-08T12:00:00Z", body, replyKey: key }, inbox, (ok) => (done = ok));
+      await t.until("digest queued", () => !!db.prepare(`SELECT id FROM outbound_queue WHERE dedup_key = ?`).get(key), 240_000);
+      assert.equal(done, true);
+      const row = db.prepare(`SELECT body, source FROM outbound_queue WHERE dedup_key = ?`).get(key) as { body: string; source: string };
+      const reply = db.prepare(`SELECT reply_status FROM session_inbox WHERE id = ?`).get(inbox) as { reply_status: string };
+      db.close();
+      console.log("[it] digest:", JSON.stringify(row.body));
+      assert.equal(row.source, "task:ab12cd34");
+      assert.equal(reply.reply_status, "sent");
+      assert.ok(row.body.length < 1_200, `short: ${row.body.length} chars`);
+      assert.ok(!/^\s*\|.*\|\s*$/m.test(row.body), "no table rows");
+      assert.match(row.body, /service-7/);
+      assert.equal(t.sent().length, 1, JSON.stringify(t.sent()));
     } finally {
       await t.stop();
     }

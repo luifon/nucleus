@@ -77,6 +77,9 @@ export interface InboxRow {
   payload: string;
   attempts: number;
   enqueuedAt: string;
+  /** Set when the producer wants the session's reply sent (a task result's
+   *  digest request): the outbound dedup key of that reply. */
+  replyKey: string | null;
 }
 
 /** One note the boot sweep (or a stopped session) queued. */
@@ -660,7 +663,7 @@ export class TurnStore {
     return (
       this.db
         .prepare(
-          `SELECT id, chat, sender, payload, attempts, enqueued_at FROM session_inbox
+          `SELECT id, chat, sender, payload, attempts, enqueued_at, reply_key FROM session_inbox
             WHERE status = 'pending' ORDER BY id LIMIT ?`,
         )
         .all(limit) as any[]
@@ -671,7 +674,38 @@ export class TurnStore {
       payload: r.payload,
       attempts: r.attempts,
       enqueuedAt: r.enqueued_at,
+      replyKey: r.reply_key ?? null,
     }));
+  }
+
+  /** Record what became of a reply request's answer: `sent` with the
+   *  outbound row it was queued as, or `failed` with the reason (the
+   *  producer then sends its own notice). Recorded once. */
+  markInboxReply(id: number, outcome: { status: "sent"; outboundId: number } | { status: "failed"; error: string }): void {
+    this.db
+      .prepare(
+        `UPDATE session_inbox SET reply_status = ?, reply_outbound_id = ?, reply_error = ?
+          WHERE id = ? AND reply_key IS NOT NULL AND reply_status IS NULL`,
+      )
+      .run(
+        outcome.status,
+        outcome.status === "sent" ? outcome.outboundId : null,
+        outcome.status === "failed" ? outcome.error.slice(0, 1000) : null,
+        id,
+      );
+  }
+
+  /** Boot: a reply request that was typed and has no recorded answer was
+   *  read by a turn the restart interrupted; its answer will not come.
+   *  Returns how many were marked failed. */
+  failOpenReplies(error: string): number {
+    const res = this.db
+      .prepare(
+        `UPDATE session_inbox SET reply_status = 'failed', reply_error = ?
+          WHERE reply_key IS NOT NULL AND reply_status IS NULL AND status = 'delivered'`,
+      )
+      .run(error.slice(0, 1000));
+    return Number(res.changes);
   }
 
   markInboxDelivered(id: number): void {

@@ -91,23 +91,23 @@ async fn worker_runs_a_background_command_to_completion_and_delivers() {
     assert!(result.contains("RESULT-OK") && result.contains("BG-DONE"), "result: {result}");
     assert!(result.contains(&format!("WORKER-{}", task.id)), "the worker session carries its role: {result}");
     assert!(events.iter().any(|e| e.kind == "background"), "the background command was tracked");
-    // No bot runs here: the result is queued, and delivered only once the
-    // bot marks the outbound row sent.
-    assert!(events.iter().any(|e| e.kind == "delivery_queued"), "delivery queued");
+    // No bot runs here: the result waits for the chat session's digest, and
+    // is delivered only once the bot sends it.
+    assert!(events.iter().any(|e| e.kind == "digest_requested"), "digest requested");
     assert!(task.delivered_at.is_none(), "not delivered before the bot sends it");
 
-    // Delivery rows for the bot.
+    // The digest request for the bot; no outbound row until the session
+    // answers (or the sweep sends the notice).
     let wa = nucleus_core::whatsapp_queue::open(&ws).await.unwrap();
-    let (body, target): (String, String) =
-        sqlx::query_as("SELECT body, target FROM outbound_queue").fetch_one(&wa).await.unwrap();
-    assert!(body.contains("done") && body.contains("BG-DONE"), "{body}");
-    // Started from a shell without --origin-ref: both rows go to the bot's
-    // operator-DM resolution.
-    assert_eq!(target, "dm");
-    let (payload, chat, sender): (String, String, String) =
-        sqlx::query_as("SELECT payload, chat, sender FROM session_inbox").fetch_one(&wa).await.unwrap();
+    let outbound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbound_queue").fetch_one(&wa).await.unwrap();
+    assert_eq!(outbound, 0, "the raw result never goes to WhatsApp");
+    // Started from a shell without --origin-ref: the request goes to the
+    // bot's operator-DM resolution.
+    let (payload, chat, sender, reply_key): (String, String, String, String) =
+        sqlx::query_as("SELECT payload, chat, sender, reply_key FROM session_inbox").fetch_one(&wa).await.unwrap();
     assert_eq!(chat, "dm");
     assert!(sender.starts_with("task:"), "{sender}");
+    assert_eq!(reply_key, format!("task:{}:done:message", task.id));
     assert!(payload.contains("BG-DONE") && !payload.contains("[agent-msg"), "the bot builds the envelope: {payload}");
 
     // The brief reached the model as a typed prompt, not a pasted block.

@@ -19,8 +19,9 @@
 //!
 //! `dedup_key` makes an insert idempotent: a producer that retries a delivery
 //! (the task delivery sweeper) inserts with the same key, and the second
-//! insert is ignored. Both rows of one task delivery are inserted in one
-//! transaction.
+//! insert is ignored. A `session_inbox` row with a `reply_key` asks for an
+//! answer: the bot sends the chat session's reply to it under that outbound
+//! key (a task result's digest, ADR-033).
 //!
 //! The `CREATE TABLE IF NOT EXISTS` statements and the column additions below
 //! exist only so a fresh install works before the bot has booted once, and so
@@ -100,7 +101,18 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
         ],
     )
     .await?;
-    add_columns_if_missing(&pool, "session_inbox", &[("dedup_key", "dedup_key TEXT")]).await?;
+    add_columns_if_missing(
+        &pool,
+        "session_inbox",
+        &[
+            ("dedup_key", "dedup_key TEXT"),
+            ("reply_key", "reply_key TEXT"),
+            ("reply_status", "reply_status TEXT"),
+            ("reply_outbound_id", "reply_outbound_id INTEGER"),
+            ("reply_error", "reply_error TEXT"),
+        ],
+    )
+    .await?;
     // ADR-036: LIDs the bot verified as the operator through the live LID
     // mapping, with when. The bot writes it; Rust reads it (task chats).
     // Must match messaging/whatsapp/src/work.ts.
@@ -171,7 +183,59 @@ pub async fn enqueue_inbox(
     dedup_key: Option<&str>,
 ) -> Result<i64> {
     let mut conn = pool.acquire().await?;
-    inbox_insert(&mut conn, chat, sender, body, source, dedup_key).await
+    inbox_insert(&mut conn, chat, sender, body, source, dedup_key, None).await
+}
+
+/// Queue a context message whose answer the operator gets (ADR-033, task
+/// result digests): the bot types it into the chat session of `chat`, and
+/// the session's final reply to it is queued to the same chat as an
+/// `outbound_queue` row under `reply_key`. A producer that sends a fallback
+/// message instead queues it under the same `reply_key`, so the chat gets
+/// one of the two, never both under that key. `dedup_key` makes the request
+/// itself idempotent. Returns the inbox row id.
+pub async fn enqueue_reply_request(
+    pool: &SqlitePool,
+    chat: &str,
+    sender: &str,
+    body: &str,
+    source: &str,
+    dedup_key: &str,
+    reply_key: &str,
+) -> Result<i64> {
+    let mut conn = pool.acquire().await?;
+    inbox_insert(&mut conn, chat, sender, body, source, Some(dedup_key), Some(reply_key)).await
+}
+
+/// What a producer reads of a reply request (ADR-033). The bot writes
+/// `status` (`pending`, `claimed`, `delivered` once typed, `failed` when it
+/// could not be typed) and `reply_status` (`sent` when the reply was queued
+/// as `reply_outbound_id`, `failed` with `reply_error` when the session gave
+/// no usable reply).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ReplyRequestState {
+    pub status: String,
+    pub last_error: Option<String>,
+    pub delivered_at: Option<String>,
+    pub reply_status: Option<String>,
+    pub reply_error: Option<String>,
+}
+
+/// One inbox row's reply state, or `None` when the row does not exist.
+pub async fn reply_request_state(pool: &SqlitePool, id: i64) -> Result<Option<ReplyRequestState>> {
+    Ok(sqlx::query_as(
+        "SELECT status, last_error, delivered_at, reply_status, reply_error FROM session_inbox WHERE id = ?1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// The outbound row queued under `dedup_key`, if any.
+pub async fn outbound_by_dedup(pool: &SqlitePool, dedup_key: &str) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar("SELECT id FROM outbound_queue WHERE dedup_key = ?1")
+        .bind(dedup_key)
+        .fetch_optional(pool)
+        .await?)
 }
 
 async fn inbox_insert(
@@ -181,11 +245,12 @@ async fn inbox_insert(
     body: &str,
     source: &str,
     dedup_key: Option<&str>,
+    reply_key: Option<&str>,
 ) -> Result<i64> {
     sqlx::query(
         "INSERT OR IGNORE INTO session_inbox
-           (chat, sender, payload, source, enqueued_at, status, attempts, dedup_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6)",
+           (chat, sender, payload, source, enqueued_at, status, attempts, dedup_key, reply_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7)",
     )
     .bind(chat)
     .bind(sender)
@@ -193,6 +258,7 @@ async fn inbox_insert(
     .bind(source)
     .bind(crate::timestamp::now())
     .bind(dedup_key)
+    .bind(reply_key)
     .execute(&mut *conn)
     .await
     .context("enqueue whatsapp session inbox")?;
@@ -230,43 +296,6 @@ async fn outbound_insert(
         .bind(dedup_key)
         .fetch_one(&mut *conn)
         .await?)
-}
-
-/// One delivery to a WhatsApp chat: the visible message and, optionally, the
-/// context message for the chat session. Both rows go in one transaction,
-/// keyed by `dedup_key` (`<key>:message`, `<key>:context`), so a retried
-/// delivery never duplicates either row and never leaves one without the
-/// other. `chat` is the target of both rows. `message_attempt` > 0 queues
-/// the visible message again under `<key>:message:r<n>`; the caller does
-/// this only when the earlier row failed without being transmitted
-/// ([`OutboundState::failed_untransmitted`]). The context row keeps its key
-/// and is not repeated.
-pub struct Delivery<'a> {
-    pub chat: &'a str,
-    pub message: &'a str,
-    pub context: Option<(&'a str, &'a str)>, // (sender, body)
-    pub source: &'a str,
-    pub dedup_key: &'a str,
-    pub message_attempt: u32,
-}
-
-/// Returns `(outbound id, inbox id)`.
-pub async fn enqueue_delivery(pool: &SqlitePool, d: Delivery<'_>) -> Result<(i64, Option<i64>)> {
-    let message_key = match d.message_attempt {
-        0 => format!("{}:message", d.dedup_key),
-        n => format!("{}:message:r{n}", d.dedup_key),
-    };
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let out = outbound_insert(&mut tx, d.chat, d.message, d.source, &message_key).await?;
-    let inbox = match d.context {
-        Some((sender, body)) => Some(
-            inbox_insert(&mut tx, d.chat, sender, body, d.source, Some(&format!("{}:context", d.dedup_key)))
-                .await?,
-        ),
-        None => None,
-    };
-    tx.commit().await?;
-    Ok((out, inbox))
 }
 
 /// What the tasks ledger reads of one outbound row.
@@ -686,31 +715,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_is_atomic_and_idempotent() {
+    async fn a_reply_request_is_idempotent_and_shares_its_reply_key() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
         let pool = open(dir.path()).await.unwrap();
-        let d = || Delivery {
-            chat: "dm",
-            message: "done",
-            context: Some(("task:ab12cd34", "result")),
-            source: "task:ab12cd34",
-            dedup_key: "task:ab12cd34:done",
-            message_attempt: 0,
-        };
-        let first = enqueue_delivery(&pool, d()).await.unwrap();
-        let again = enqueue_delivery(&pool, d()).await.unwrap();
-        assert_eq!(first, again, "a retried delivery returns the same rows");
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbound_queue").fetch_one(&pool).await.unwrap();
+        let req = || enqueue_reply_request(&pool, "dm", "task:ab12cd34", "result", "task:ab12cd34", "k:context", "k:message");
+        let first = req().await.unwrap();
+        assert_eq!(req().await.unwrap(), first, "a retried request returns the same row");
         let m: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_inbox").fetch_one(&pool).await.unwrap();
-        assert_eq!((n, m), (1, 1));
-        // A redrive queues the visible message again and not the context.
-        let redrive = enqueue_delivery(&pool, Delivery { message_attempt: 1, ..d() }).await.unwrap();
-        assert_ne!(redrive.0, first.0);
-        assert_eq!(redrive.1, first.1);
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbound_queue").fetch_one(&pool).await.unwrap();
-        let m: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_inbox").fetch_one(&pool).await.unwrap();
-        assert_eq!((n, m), (2, 1));
+        assert_eq!(m, 1);
+        let st = reply_request_state(&pool, first).await.unwrap().unwrap();
+        assert_eq!((st.status.as_str(), st.reply_status.as_deref()), ("pending", None));
+        // The reply and a fallback share one key: the second insert is ignored.
+        assert_eq!(outbound_by_dedup(&pool, "k:message").await.unwrap(), None);
+        let reply = enqueue_text_once(&pool, "dm", "digest", "task:ab12cd34", "k:message").await.unwrap();
+        let fallback = enqueue_text_once(&pool, "dm", "notice", "task:ab12cd34", "k:message").await.unwrap();
+        assert_eq!(reply, fallback);
+        assert_eq!(outbound_by_dedup(&pool, "k:message").await.unwrap(), Some(reply));
+        let body: String = sqlx::query_scalar("SELECT body FROM outbound_queue WHERE id = ?1")
+            .bind(reply)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(body, "digest");
     }
 
     #[tokio::test]

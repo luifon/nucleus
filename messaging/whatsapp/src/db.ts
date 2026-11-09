@@ -173,7 +173,11 @@ export class ChatSessionStore {
       -- means the operator's DM chat, otherwise it is the exact chat JID.
       -- payload is the body only: the bot builds the attribution envelope
       -- from sender when it types the message. dedup_key makes a
-      -- producer's retry idempotent.
+      -- producer's retry idempotent. reply_key (a task result's digest
+      -- request): the session's final reply to the row is queued in
+      -- outbound_queue under that dedup key; reply_status ('sent' |
+      -- 'failed'), reply_outbound_id and reply_error record the outcome for
+      -- the producer, which queues its own fallback under the same key.
       CREATE TABLE IF NOT EXISTS session_inbox (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
         chat         TEXT    NOT NULL,
@@ -293,7 +297,13 @@ export class ChatSessionStore {
       // is later.
       ["wa_ts", "wa_ts INTEGER"],
     ]);
-    addColumnsIfMissing(this.db, "session_inbox", [["dedup_key", "dedup_key TEXT"]]);
+    addColumnsIfMissing(this.db, "session_inbox", [
+      ["dedup_key", "dedup_key TEXT"],
+      ["reply_key", "reply_key TEXT"],
+      ["reply_status", "reply_status TEXT"],
+      ["reply_outbound_id", "reply_outbound_id INTEGER"],
+      ["reply_error", "reply_error TEXT"],
+    ]);
     addColumnsIfMissing(this.db, "chat_inbound", [
       // The complete message text; text_preview stays the short form the
       // dashboard shows. A retry replays `text`, never the preview.
@@ -680,6 +690,35 @@ export class OutboundQueueStore {
       return row.id;
     }
     return Number(res.lastInsertRowid);
+  }
+
+  /** Queue a text under `dedupKey` unless a row already has that key.
+   *  `inserted` is false when the key was taken (the returned id is the
+   *  other row's). */
+  enqueueKeyed(input: {
+    target: string;
+    body: string;
+    source: string;
+    quotedJson?: string | null;
+    dedupKey: string;
+  }): { id: number; inserted: boolean } {
+    const res = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO outbound_queue
+           (target, body, source, enqueued_at, status, attempts, kind, quoted_json, dedup_key)
+         VALUES (?, ?, ?, ?, 'pending', 0, 'text', ?, ?)`,
+      )
+      .run(input.target, input.body, input.source, new Date().toISOString(), input.quotedJson ?? null, input.dedupKey);
+    if (Number(res.changes) === 1) return { id: Number(res.lastInsertRowid), inserted: true };
+    return { id: this.byDedupKey(input.dedupKey) ?? 0, inserted: false };
+  }
+
+  /** The id of the row queued under `dedupKey`, or null. */
+  byDedupKey(dedupKey: string): number | null {
+    const row = this.db.prepare(`SELECT id FROM outbound_queue WHERE dedup_key = ?`).get(dedupKey) as
+      | { id: number }
+      | undefined;
+    return row?.id ?? null;
   }
 
   /** Up-to-`limit` rows to send now, oldest first: pending rows, and

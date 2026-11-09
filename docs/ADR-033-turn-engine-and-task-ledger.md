@@ -153,7 +153,9 @@ Rules the engine enforces in code:
    description at the upgrade.
 7. **Turn kinds.** `operator` (read at least one operator message; delivered),
    `autonomous` (started by the session itself; delivered), `context` (read
-   only agent messages; silent), `foreign` (no marker, for example text the
+   only agent messages; silent, except the turn that answers a task result's
+   digest request, §3 "Delivery by origin", whose final text is sent),
+   `foreign` (no marker, for example text the
    operator typed through `tmux attach`, or the resume picker's "Continue from
    where you left off."; silent).
 8. **Infrastructure banners** (model unavailable, API error, not logged in,
@@ -487,24 +489,79 @@ Only the operator's terminal or interactive session may name a sender with
 `--from`. A message body is at most 8 000 characters; the bot also cuts any
 context body over 8 000 characters before typing it.
 
-**Delivery by origin.** `whatsapp-dm`: a status line plus the result goes to
-`outbound_queue`, and the result goes to `session_inbox` for the chat session,
-both to the task's origin chat (or, for a task started from a shell, to the
-`dm` target that the bot resolves the same way for both tables). Both rows
-are inserted in one transaction with unique keys (`task:<id>:<status>:message`,
-`…:context`). The bot types the context row into the chat session inside the
-agent-message envelope (sender `task:<id>`, hop 1), with a note that the
-operator already has the result and that the reply is not sent anywhere.
-Queuing is recorded as `delivery_queued_at`; `delivered_at` is set when the
-bot has marked the outbound row `sent`.
+**Delivery by origin.** `whatsapp-dm`: the result goes to the origin chat
+session first, and the operator gets that session's reply to it — a short
+digest written for a phone — not the result itself. Until 2026-11-08 a
+status line plus the result (up to 12 000 characters) went to
+`outbound_queue` as is, and the session only got a copy marked "already
+sent, do not repeat it"; a result of about 60 lines with tables reached the
+operator's phone unchanged, and he asked that the session make every result
+easy to read, whatever its size.
+
+1. **Request.** The deliverer queues one `session_inbox` row for the task's
+   origin chat (or, for a task started from a shell, the `dm` target that
+   the bot resolves the same way for both tables), keyed
+   `task:<id>:<status>:context`, with `reply_key` = `task:<id>:<status>:message`.
+   The body holds the facts only: id, title, status, the command that prints
+   the full result (`nucleus tasks output <id>`), the task's dashboard page
+   (`NUCLEUS_PUBLIC_URL/tasks?task=<id>`, none when unset) and the result up
+   to 6 000 characters, or the error. A longer result is cut, and the body
+   says so and names the command. This is recorded as `delivery_queued_at`
+   and `delivery_inbox_ref` (`digest_requested`); no outbound row exists yet.
+2. **Digest.** The bot holds a row with a `reply_key` until the chat session
+   is idle (no open turn, nothing queued or unanswered) and the answer to the
+   request typed before it is settled (queued, recorded as missing, or
+   replaced by the notice), so each request gets a turn of its own and never
+   joins an answer to the operator or another task's digest. It types the
+   row inside the agent-message envelope (sender `task:<id>`, hop 1) with a
+   code-owned note (`TASK_DIGEST_NOTE` in `chat_engine.ts`): the operator has
+   not seen the result; the reply is sent to him on WhatsApp; write the
+   outcome in a few lines, then only the decisions he must make, one line
+   each with a recommendation, then one line saying the full result is
+   available on request; no tables, file lists or long quotes; read the full
+   text first when the body says it is cut; start, cancel or send nothing
+   because of it. The turn's final text is queued in `outbound_queue` under
+   the reply key (source `task:<id>`, so the target policy treats it as a
+   task result), and the row records `reply_status = 'sent'` with the
+   outbound id. An operator message that arrives during that turn joins it;
+   the turn's answer then quotes his message and still goes under the reply
+   key, with the source `task:<id>`. The caller checks still apply to the digest turn: it read an agent
+   message, so it may not start or cancel tasks or send anywhere else
+   (`core/src/caller.rs`, `caller_guard.ts`); its only output is the final
+   text, which goes to the origin chat.
+3. **Notice.** The digest and a code-owned notice share the reply key, and
+   both are inserted with `INSERT OR IGNORE`, so the chat gets one of the
+   two under it. The sweep (`settle_digest_requests`) queues the notice
+   (`[tasks.texts] result_notice`: the status line, "the chat could not
+   summarize the result, ask for it here or run `nucleus tasks output
+   <id>`", and the dashboard page) when no row has the key and the session
+   cannot answer: the bot could not type the request (`status = 'failed'`),
+   the turn gave no usable reply (no final text, an empty one, an
+   infrastructure banner, a transcript reset, a dead window, the safety
+   ceiling, a restart; `reply_status = 'failed'` with the reason), the
+   request is gone, or the session did not answer within `[tasks]
+   digest_timeout_mins` (default 5) of the request's arrival or, once typed,
+   of its typing. The notice never carries result text. The bot runs the
+   sweep at once when it records a failed reply, so the notice does not wait
+   for the next 5-minute sweep. When the request is released after the
+   notice took the key, the bot types it with a different note
+   (`TASK_NOTICED_NOTE`: the operator got only a notice; the reply is not
+   sent; answer from the result when he asks). A digest written after the
+   notice took the key (the session answered past the limit) is sent as an
+   ordinary message after the notice. A reply the bot recorded as queued
+   whose row is gone has an unknown outcome, and the delivery is given up as
+   below.
+4. **Confirmation.** Once a row has the key, it is recorded as
+   `delivery_ref` (`digest_queued` or `digest_missing`), and `delivered_at`
+   is set when the bot has marked that row `sent`.
 
 A new message is created only for a row that provably never left the
 machine. The drain fixes a row's WhatsApp message id (`msg_id`) immediately
 before its first send attempt, so a failed row without a `msg_id` was refused
 before any transmission (a target off the allowlist, a missing media file, a
 message the secret filter withheld). Such a failure is recorded as
-`delivery_failed`, and the message is queued again under `…:message:r<n>`;
-the context row is not repeated. A row that failed after a send attempt
+`delivery_failed`, and the notice is queued under `…:message:r<n>`; the
+session is not asked again. A row that failed after a send attempt
 (a timeout, a closed connection: the server may have accepted the message)
 or that is gone from the queue has an unknown outcome. The delivery is then
 given up: `delivery_failed_at` and `delivery_error` are set, no further
@@ -515,7 +572,11 @@ the task's origin (`[tasks.texts] delivery_failed`, keyed
 one). The same happens after 5 failures that each left nothing on the
 server. If the server acknowledges the message later, the bot marks the row
 `sent` and the sweep still sets `delivered_at`.
-`discord-home`: one message in the home channel, through a `task_outbox` row
+`discord-home`: a task can have this origin only when the operator starts it
+from a shell with `--origin discord-home`; no Discord chat session starts
+tasks or receives their results, so there is no session to write a digest.
+It keeps one message in the home channel (the status line and the result,
+cut to 1 900 characters), through a `task_outbox` row
 with a unique `task:<id>:<status>:discord` key written before the send and
 marked `sent` after it, so a retry never posts a message the outbox records
 as sent; a retry after a crash between the send and the mark uses the same
@@ -546,10 +607,11 @@ between finishing and delivering does not lose the result.
   runs `nucleus tasks sweep`. Dashboard reads use `open_read_only`.
 - **whatsapp.db** — still owned by the TypeScript bot. Rust writes only its
   queue tables, through `nucleus_core::whatsapp_queue`: `outbound_queue`
-  (reminders, task results) and `session_inbox` (task results,
-  `session-send --to whatsapp-dm`). A `session_inbox` row carries the sender
-  and the body; the bot builds the envelope. `dedup_key` makes a producer's
-  retry idempotent. Rust reads `task_scopes` and `chat_sessions` (caller
+  (reminders, task result notices) and `session_inbox` (task result digest
+  requests, `session-send --to whatsapp-dm`). A `session_inbox` row carries
+  the sender and the body; the bot builds the envelope. `dedup_key` makes a
+  producer's retry idempotent. The bot writes a row's `status` and its
+  `reply_status`, `reply_outbound_id` and `reply_error`; Rust reads them. Rust reads `task_scopes` and `chat_sessions` (caller
   detection). `chat_turns`, `chat_inbound`, `chat_background`,
   `seen_messages` and `task_scopes` are written by TypeScript only.
 
@@ -566,7 +628,11 @@ an interrupted note in the same sweep is marked lost without a second note.
 The state changes and the outbound rows are one transaction, and every note
 has a unique key, so a crash can neither lose a note nor send it twice. It
 does not resume anything. The task scope tokens are cleared (every DM session
-is respawned with a new one).
+is respawned with a new one). A task result's digest request that was typed
+and has no recorded reply is marked `reply_status = 'failed'` (the turn
+that read it was interrupted); the boot sweep then sends the operator the
+notice. A request that was held and not typed goes back to `pending` and is
+typed again.
 
 Tasks are different on purpose (operator decision): a worker is a separate
 process in its own tmux session, not part of the bot's boot wipe, so a bot
@@ -594,9 +660,11 @@ permission_stall_secs = 120
 max_concurrent = 6
 max_runtime_hours = 12
 # tmux_session = "nucleus-tasks"
+# digest_timeout_mins = 5  # per step: until the session reads the result, until it answers
 
 [tasks.texts]             # task status lines; {id} {title}
 # done = "✅ Task {id} done — {title}"
+# result_notice = "{status}\nThe chat could not summarize the result. …{link}"
 ```
 
 Every code-owned text the WhatsApp bot sends — acknowledgement, progress
@@ -613,7 +681,9 @@ the ADR-027 breaker overrides were never applied.
 
 `/tasks` has two tabs. **tasks**: status, origin, requester, duration; the
 detail shows the brief, the progress log, links and the result or error;
-cancel uses `InlineConfirm`. **turns**: the recent conversational turns with
+cancel uses `InlineConfirm`. `/tasks?task=<id>` (the link in a result
+notice and in a digest request) opens that task's row and scrolls to it.
+**turns**: the recent conversational turns with
 kind, status, acknowledgement, progress count and reply size. API:
 `/tasks/api/{list,detail,cancel,turns}`; wire types are generated (Rule 12).
 
@@ -706,8 +776,8 @@ and a redacted message says how many values were withheld.
   - `cargo test -p nucleus --test tasks_worker_it -- --ignored`: a worker ran
     a background command, recorded the interim turn end as progress, finished
     after the completion notice, ran with `NUCLEUS_TASK_WORKER`, and queued
-    the WhatsApp message and the context row (queued, not delivered: no bot
-    runs); the brief was a typed prompt.
+    the digest request with its reply key and no outbound row (not
+    delivered: no bot runs); the brief was a typed prompt.
   - `cargo test -p nucleus --test typed_input_it -- --ignored`:
     `Session::ask` and `nucleus session-send` both arrive as typed prompts;
     the agent message carries the envelope and a forged marker line in its
@@ -765,9 +835,13 @@ and a redacted message says how many values were withheld.
 - The model's intermediate text can reach the operator as progress. The
   secret filter withholds any progress text that names a secret or an
   identifier; the chat persona asks for short, factual narration.
-- A background task's result reaches the operator twice in different forms:
-  the status message from the task, and (only if the operator continues the
-  conversation) the chat session's use of the injected context.
+- A background task's result reaches the operator as the chat session's
+  digest, normally within a minute of the task's end and later when the
+  session is busy with his conversation. When the session cannot write it,
+  he gets a short notice after at most `digest_timeout_mins` per step plus
+  the sweep interval, and asks for the result in the chat. Each digest costs
+  one turn of the chat session. A digest written past the limit arrives as a
+  second message after the notice.
 - Briefs are capped at 32 000 characters.
 - Agent messages are no longer marked by Claude Code as possibly not written
   by the user; the envelope says it instead, and the CLIs refuse to start

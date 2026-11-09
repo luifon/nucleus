@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Clock, Timer, X } from "lucide-react";
 import InlineConfirm from "@/components/InlineConfirm";
 import StatusPill from "@/components/StatusPill";
@@ -15,15 +15,23 @@ export default function TaskRow({
   task,
   now,
   onChange,
+  linked = false,
 }: {
   task: Task;
+  /** The page was opened with a link to this task: start open, scrolled
+   *  into view. */
+  linked?: boolean;
   /** Epoch ms used for the runtime of tasks that are still running. */
   now: number;
   /** Called with the task returned by a successful cancel so the parent
    *  list can replace the row before its next refresh. */
   onChange: (updated: Task) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(linked);
+  const ref = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (linked) ref.current?.scrollIntoView({ block: "start" });
+  }, [linked]);
   const [confirmingCancel, setConfirmingCancel] = useState(false);
   const [pending, setPending] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -46,7 +54,7 @@ export default function TaskRow({
   };
 
   return (
-    <article className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)]">
+    <article ref={ref} className="rounded border border-[var(--color-nucleus-border)] bg-[var(--color-nucleus-surface)]">
       <div className="flex items-start gap-3 px-4 py-3">
         <button
           onClick={() => setOpen((v) => !v)}

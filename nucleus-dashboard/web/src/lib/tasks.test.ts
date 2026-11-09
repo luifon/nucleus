@@ -3,6 +3,7 @@ import {
   canCancel,
   deliveryState,
   formatDuration,
+  linkedTaskId,
   shortId,
   spanBetween,
   taskStatusKind,
@@ -105,4 +106,16 @@ describe("deliveryState", () => {
     expect(deliveryState(t({ delivery_queued_at: "x", delivery_failed_at: "y" }))).toBe("given-up"));
   test("a late confirmation wins over given up", () =>
     expect(deliveryState(t({ delivery_failed_at: "y", delivered_at: "z" }))).toBe("delivered"));
+});
+
+describe("linkedTaskId", () => {
+  const tasks = [{ id: "0123456789abcdef" }, { id: "0123456799999999" }, { id: "fedcba9876543210" }];
+  test("the full id or a unique prefix of at least 8 characters", () => {
+    expect(linkedTaskId("0123456789abcdef", tasks)).toBe("0123456789abcdef");
+    expect(linkedTaskId("FEDCBA98", tasks)).toBe("fedcba9876543210");
+    expect(linkedTaskId("01234567", tasks)).toBeNull();
+    expect(linkedTaskId("fedcba9", tasks)).toBeNull();
+    expect(linkedTaskId("ffffffffff", tasks)).toBeNull();
+    expect(linkedTaskId(null, tasks)).toBeNull();
+  });
 });
