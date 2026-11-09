@@ -156,6 +156,7 @@ function setup(script: Script, cfg: TurnsConfig = CFG, at?: { dir: string }) {
   const spawnEnv: Array<Record<string, string>> = [];
   const spawnResume: Array<string | undefined> = [];
   const flags = { failResume: false };
+  const replyFailed: number[] = [];
   const engine = new ChatEngine(
     {
       turns,
@@ -165,6 +166,7 @@ function setup(script: Script, cfg: TurnsConfig = CFG, at?: { dir: string }) {
       format: (b) => b,
       outboundTarget: (c) => c,
       log: { info() {}, warn() {}, error() {} },
+      onReplyFailed: (id) => replyFailed.push(id),
       spawn: async (opts) => {
         spawnEnv.push(opts.env ?? {});
         spawnResume.push(opts.resumeSessionId);
@@ -191,7 +193,7 @@ function setup(script: Script, cfg: TurnsConfig = CFG, at?: { dir: string }) {
       await new Promise((r) => setTimeout(r, 25));
     }
   };
-  return { engine, turns, store, sessions, sent, until, dir, dbPath, spawnEnv, spawnResume, outbound, flags };
+  return { engine, turns, store, sessions, sent, until, dir, dbPath, spawnEnv, spawnResume, outbound, flags, replyFailed };
 }
 
 const CHAT = "5511999999999@s.whatsapp.net";
@@ -375,6 +377,242 @@ test("an injected context turn is typed in the envelope and stays silent", async
   assert.match(p, /^│ result$/m);
   assert.match(p, /^\[ref:ctx-[0-9a-f]{8}\]$/m);
   assert.equal(t.sent().length, 0, JSON.stringify(t.sent()));
+});
+
+// ── task result digests (ADR-033) ──
+
+const DIGEST_KEY = "task:ab12cd34-full-id:done:message";
+
+/** A reply request as the tasks ledger queues it, already claimed by the
+ *  drain. Returns its inbox id. */
+function replyRequest(dbPath: string, key = DIGEST_KEY): number {
+  const db = new DatabaseSync(dbPath);
+  const r = db
+    .prepare(
+      `INSERT INTO session_inbox (chat, sender, payload, source, enqueued_at, status, attempts, dedup_key, reply_key)
+       VALUES (?, 'task:ab12cd34', 'result', 'task:ab12cd34', ?, 'claimed', 0, ?, ?)`,
+    )
+    .run(CHAT, new Date().toISOString(), key.replace(/:message$/, ":context"), key);
+  db.close();
+  return Number(r.lastInsertRowid);
+}
+
+function inboxReply(dbPath: string, id: number): { reply_status: string | null; reply_outbound_id: number | null; reply_error: string | null } {
+  const db = new DatabaseSync(dbPath);
+  const r = db.prepare(`SELECT reply_status, reply_outbound_id, reply_error FROM session_inbox WHERE id = ?`).get(id) as any;
+  db.close();
+  return { ...r };
+}
+
+function keyed(dbPath: string, key = DIGEST_KEY): { id: number; body: string; source: string; quoted_json: string | null } | undefined {
+  const db = new DatabaseSync(dbPath);
+  const r = db.prepare(`SELECT id, body, source, quoted_json FROM outbound_queue WHERE dedup_key = ?`).get(key) as any;
+  db.close();
+  return r;
+}
+
+const injectDigest = (t: ReturnType<typeof setup>, inbox: number, onDone: (ok: boolean) => void = () => {}) =>
+  t.engine.injectContext(
+    CHAT,
+    "dm",
+    { sender: "task:ab12cd34", enqueuedAt: "2026-11-08T12:00:00Z", body: "result", replyKey: DIGEST_KEY },
+    inbox,
+    onDone,
+  );
+
+test("a task result's digest is the session's reply, sent under the result key", async () => {
+  const t = setup(async (s, payload) => {
+    s.prompt(payload);
+    s.say("Done: 3 reports. Decide: merge — yes.", "end_turn");
+    s.end();
+  });
+  const inbox = replyRequest(t.dbPath);
+  injectDigest(t, inbox);
+  await t.until(() => keyed(t.dbPath) !== undefined);
+  const p = t.sessions[0].submitted[0].payload;
+  assert.match(p, /^\[agent-msg from:task:ab12cd34 at:2026-11-08T12:00:00Z hop:1\]$/m);
+  assert.ok(p.includes("Your reply to this message is sent to him on WhatsApp"), p);
+  assert.ok(!/do not repeat|not sent anywhere/.test(p), p);
+  const row = keyed(t.dbPath)!;
+  assert.equal(row.body, "Done: 3 reports. Decide: merge — yes.");
+  assert.equal(row.source, "task:ab12cd34", "routed as a task result");
+  assert.equal(row.quoted_json, null);
+  assert.deepEqual(inboxReply(t.dbPath, inbox), { reply_status: "sent", reply_outbound_id: row.id, reply_error: null });
+  assert.equal(t.sent().length, 1, JSON.stringify(t.sent()));
+});
+
+test("a digest request waits until the operator's turn ends, then gets a turn of its own", async () => {
+  let session: FakeSession | null = null;
+  const t = setup(async (s, payload) => {
+    session = s;
+    s.prompt(payload);
+    if (/ref:ctx-/.test(payload)) {
+      s.say("Digest.", "end_turn");
+      s.end();
+    } else {
+      s.tool("t1");
+    }
+  });
+  t.engine.receive(msg("long question", "M1"));
+  await t.until(() => session !== null && session.submitted.length === 1);
+  const inbox = replyRequest(t.dbPath);
+  injectDigest(t, inbox);
+  await sleep(100);
+  await t.engine.tick();
+  assert.equal(session!.submitted.length, 1, "not typed while the operator's turn is open");
+  session!.say("answer", "end_turn");
+  session!.end();
+  await t.until(() => keyed(t.dbPath) !== undefined);
+  assert.equal(session!.submitted.length, 2);
+  assert.equal(keyed(t.dbPath)!.body, "Digest.");
+  const replies = t.sent().filter((m) => m.source === "chat-reply");
+  assert.deepEqual(replies.map((m) => m.body), ["answer"], "the operator's answer stays separate");
+});
+
+test("a digest request whose key the notice already took is typed as information only", async () => {
+  const t = setup(async (s, payload) => {
+    s.prompt(payload);
+    s.say("Noted.", "end_turn");
+    s.end();
+  });
+  const inbox = replyRequest(t.dbPath);
+  t.outbound.enqueue({ target: CHAT, body: "notice", source: "task:ab12cd34", dedupKey: DIGEST_KEY });
+  let done = false;
+  injectDigest(t, inbox, () => (done = true));
+  await t.until(() => done);
+  await sleep(100);
+  await t.engine.tick();
+  await t.engine.tick();
+  const p = t.sessions[0].submitted[0].payload;
+  assert.ok(p.includes("already got a short notice") && p.includes("Your reply to this message is not sent"), p);
+  assert.deepEqual(t.sent().map((m) => m.body), ["notice"], "nothing besides the notice");
+  assert.equal(inboxReply(t.dbPath, inbox).reply_status, null);
+});
+
+test("a digest turn without a usable reply is recorded as failed and sends nothing", async () => {
+  for (const finalWords of ["", null]) {
+    const t = setup(async (s, payload) => {
+      s.prompt(payload);
+      if (finalWords !== null) s.say(finalWords, "end_turn");
+      s.end();
+    });
+    const inbox = replyRequest(t.dbPath);
+    injectDigest(t, inbox);
+    await t.until(() => inboxReply(t.dbPath, inbox).reply_status !== null);
+    const r = inboxReply(t.dbPath, inbox);
+    assert.equal(r.reply_status, "failed", JSON.stringify(r));
+    assert.ok(r.reply_error, JSON.stringify(r));
+    assert.deepEqual(t.replyFailed, [inbox], "the bot runs the sweep at once");
+    assert.equal(t.sent().length, 0, JSON.stringify(t.sent()));
+  }
+});
+
+test("a digest request that cannot be typed is recorded as failed", async () => {
+  const t = setup(async () => {
+    throw new Error("window gone");
+  });
+  const inbox = replyRequest(t.dbPath);
+  let ok: boolean | null = null;
+  injectDigest(t, inbox, (r) => (ok = r));
+  await t.until(() => ok !== null);
+  assert.equal(ok, false);
+  assert.equal(inboxReply(t.dbPath, inbox).reply_status, "failed");
+  assert.deepEqual(t.replyFailed, [inbox]);
+});
+
+test("a second digest request waits until the first one's answer is settled, even before its turn appears", async () => {
+  let session: FakeSession | null = null;
+  const prompts: string[] = [];
+  const t = setup(async (s, payload) => {
+    session = s;
+    // The session does not write the prompt record yet (it is still busy).
+    prompts.push(payload);
+  });
+  const k1 = "task:aaaaaaaa1:done:message";
+  const k2 = "task:bbbbbbbb2:done:message";
+  const i1 = replyRequest(t.dbPath, k1);
+  const i2 = replyRequest(t.dbPath, k2);
+  const inject = (inbox: number, key: string) =>
+    t.engine.injectContext(CHAT, "dm", { sender: "task:ab12cd34", enqueuedAt: "t", body: `result ${key}`, replyKey: key }, inbox, () => {});
+  inject(i1, k1);
+  await t.until(() => session !== null && session.submitted.length === 1);
+  inject(i2, k2);
+  for (let i = 0; i < 6; i++) {
+    await t.engine.tick();
+    await sleep(25);
+  }
+  assert.equal(session!.submitted.length, 1, "the second request is not typed before the first is answered");
+  // The first turn appears and ends.
+  session!.prompt(prompts[0]);
+  session!.say("Digest one.", "end_turn");
+  session!.end();
+  await t.until(() => session!.submitted.length === 2);
+  session!.prompt(prompts[1]);
+  session!.say("Digest two.", "end_turn");
+  session!.end();
+  await t.until(() => keyed(t.dbPath, k2) !== undefined);
+  assert.equal(keyed(t.dbPath, k1)!.body, "Digest one.");
+  assert.equal(keyed(t.dbPath, k2)!.body, "Digest two.");
+  assert.equal(inboxReply(t.dbPath, i1).reply_status, "sent");
+  assert.equal(inboxReply(t.dbPath, i2).reply_status, "sent");
+});
+
+test("a typed digest request whose turn never appears frees the slot once the notice took its key", async () => {
+  let session: FakeSession | null = null;
+  const t = setup(async (s, payload) => {
+    session = s;
+    if (/result task:bbbb/.test(payload)) {
+      s.prompt(payload);
+      s.say("Digest two.", "end_turn");
+      s.end();
+    }
+  });
+  const k1 = "task:aaaaaaaa1:done:message";
+  const k2 = "task:bbbbbbbb2:done:message";
+  const i1 = replyRequest(t.dbPath, k1);
+  const i2 = replyRequest(t.dbPath, k2);
+  const inject = (inbox: number, key: string) =>
+    t.engine.injectContext(CHAT, "dm", { sender: "task:ab12cd34", enqueuedAt: "t", body: `result ${key}`, replyKey: key }, inbox, () => {});
+  inject(i1, k1);
+  await t.until(() => session !== null && session.submitted.length === 1);
+  inject(i2, k2);
+  await t.engine.tick();
+  assert.equal(session!.submitted.length, 1);
+  // The sweep's notice takes the first key.
+  t.outbound.enqueue({ target: CHAT, body: "notice", source: "task:aaaaaaaa", dedupKey: k1 });
+  await t.until(() => keyed(t.dbPath, k2) !== undefined);
+  assert.equal(keyed(t.dbPath, k2)!.body, "Digest two.");
+  assert.equal(inboxReply(t.dbPath, i1).reply_status, null);
+});
+
+test("an operator message that joins a digest turn is answered under the result key", async () => {
+  let session: FakeSession | null = null;
+  const t = setup(async (s, payload) => {
+    session = s;
+    if (/ref:ctx-/.test(payload)) {
+      s.prompt(payload);
+      s.tool("t1");
+    } else {
+      // Busy session: the harness queues the input, then absorbs it.
+      s.append({ type: "attachment", attachment: { type: "queued_command", prompt: payload } });
+    }
+  });
+  const inbox = replyRequest(t.dbPath);
+  injectDigest(t, inbox);
+  await t.until(() => session !== null && session.submitted.length === 1);
+  t.engine.receive(msg("and the second report?", "M2"));
+  await t.until(() => session!.submitted.length === 2);
+  await sleep(50);
+  await t.engine.tick();
+  session!.say("Digest, and the second report is fine.", "end_turn");
+  session!.end();
+  await t.until(() => keyed(t.dbPath) !== undefined);
+  const row = keyed(t.dbPath)!;
+  assert.equal(row.body, "Digest, and the second report is fine.");
+  assert.ok(row.quoted_json?.includes("M2"), "quotes the operator's message");
+  assert.equal(row.source, "task:ab12cd34", "keeps the task-result source for the target policy");
+  assert.equal(inboxReply(t.dbPath, inbox).reply_status, "sent");
+  assert.equal(t.sent().length, 1, JSON.stringify(t.sent()));
 });
 
 test("an invalid inbox sender is refused before anything is typed", async () => {

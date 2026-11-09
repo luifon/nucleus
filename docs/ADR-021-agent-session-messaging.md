@@ -136,8 +136,10 @@ would interleave keystrokes and create turns the engine cannot attribute, so:
   on this route. The route checks the registry like every other route (an
   agent must own `nucleus-whatsapp-dm`), a WhatsApp chat session may not use
   it, and the send is logged in `agent_messages.db` as before.
-- Background task results reach the originating chat the same way, with the
-  sender `task:<id>`.
+- Background task results reach the originating chat session the same way,
+  with the sender `task:<id>`. A task result's row carries a `reply_key`:
+  its turn is the exception to the silent context turn, and the session's
+  reply (a short digest) is what the operator gets ([[ADR-033]] §3).
 
 **Typed, in an envelope.** Agent messages are typed like every Nucleus prompt
 (the operator decided that no prompt arrives as pasted content). The paste

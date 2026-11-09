@@ -898,6 +898,12 @@ pub struct TasksConfig {
     /// second workspace (a test run) apart from the operator's workers.
     #[serde(default = "default_tasks_tmux_session")]
     pub tmux_session: String,
+    /// How long the origin chat session gets to write a WhatsApp task
+    /// result's digest: from the result's arrival until the session reads
+    /// it, and again from then until its reply. Past either limit the
+    /// operator gets the code-owned `result_notice` instead (ADR-033).
+    #[serde(default = "default_tasks_digest_timeout_mins")]
+    pub digest_timeout_mins: u32,
     /// Operator-facing status lines for finished tasks (`[tasks.texts]`).
     #[serde(default)]
     pub texts: TaskTexts,
@@ -918,6 +924,12 @@ pub struct TaskTexts {
     /// is unknown (the send failed after the message may have left) or it
     /// failed too many times. `{reason}` is the recorded reason.
     pub delivery_failed: String,
+    /// The WhatsApp message that replaces a result's digest when the chat
+    /// session wrote none. `{status}` is the status line above, `{id}` the
+    /// short task id, `{link}` a new line with the task's dashboard page
+    /// (empty when `NUCLEUS_PUBLIC_URL` is unset). It never carries result
+    /// text.
+    pub result_notice: String,
 }
 
 impl Default for TaskTexts {
@@ -931,12 +943,19 @@ impl Default for TaskTexts {
                               ({reason}). It is not sent again, so that it cannot arrive twice. The full \
                               result is in the task ledger (dashboard, Tasks page; `nucleus tasks status {id}`)."
                 .into(),
+            result_notice: "{status}\nThe chat could not summarize the result. Ask for it here, or run \
+                            `nucleus tasks output {id}` in the terminal.{link}"
+                .into(),
         }
     }
 }
 
 fn default_tasks_tmux_session() -> String {
     crate::tasks::TASKS_TMUX_SESSION.to_string()
+}
+
+fn default_tasks_digest_timeout_mins() -> u32 {
+    5
 }
 
 fn default_tasks_max_concurrent() -> u32 {
@@ -953,6 +972,7 @@ impl Default for TasksConfig {
             max_concurrent: default_tasks_max_concurrent(),
             max_runtime_hours: default_tasks_max_runtime_hours(),
             tmux_session: default_tasks_tmux_session(),
+            digest_timeout_mins: default_tasks_digest_timeout_mins(),
             texts: TaskTexts::default(),
         }
     }

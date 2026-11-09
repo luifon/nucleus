@@ -280,9 +280,13 @@ max_concurrent = 6
 max_runtime_hours = 12
 # tmux session hosting the worker windows (change only to isolate a test run)
 # tmux_session = "nucleus-tasks"
+# A WhatsApp task's result goes to the origin chat session, and its short
+# digest is the operator's message. The session gets this many minutes to
+# read the result and again to answer; past either, result_notice is sent.
+# digest_timeout_mins = 5
 
-# Status line of a finished task's result message, per final status. Goes to
-# the task's origin (WhatsApp or Discord). {id} = short task id, {title}.
+# Status line of a finished task, per final status. Goes to the task's origin
+# (WhatsApp notice, Discord message). {id} = short task id, {title}.
 [tasks.texts]
 # done = "✅ Task {id} done — {title}"
 # failed = "⚠️ Task {id} failed — {title}"
@@ -291,6 +295,10 @@ max_runtime_hours = 12
 # Sent once when a result's delivery is given up (outcome unknown, or too many
 # failures); the result is not sent again. {reason} = the recorded reason.
 # delivery_failed = "⚠️ Task {id} — {title}: the result message was not confirmed as delivered ({reason}). …"
+# Sent instead of the digest when the chat session wrote none; never carries
+# result text. {status} = the status line, {link} = a new line with the task's
+# dashboard page (empty without NUCLEUS_PUBLIC_URL).
+# result_notice = "{status}\nThe chat could not summarize the result. Ask for it here, or run `nucleus tasks output {id}` in the terminal.{link}"
 
 # ADR-036 work items and the issue pipeline (`nucleus work`, dashboard
 # /work). Off unless enabled and at least one repo is listed. An issue enters

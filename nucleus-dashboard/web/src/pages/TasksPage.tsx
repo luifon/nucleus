@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { RefreshCw, ListChecks, MessagesSquare } from "lucide-react";
 import PageShell from "@/components/PageShell";
 import Tabs from "@/components/Tabs";
@@ -6,7 +7,7 @@ import TaskRow from "@/components/tasks/TaskRow";
 import TurnRowItem from "@/components/tasks/TurnRowItem";
 import { useFetch, usePollWhile, type FetchState } from "@/lib/hooks";
 import { listTasks, listTurns, type Task, type TurnRow } from "@/lib/api";
-import { isActiveTask } from "@/lib/tasks";
+import { isActiveTask, linkedTaskId } from "@/lib/tasks";
 
 // Background tasks (ADR-033 task ledger) and the WhatsApp turn log.
 // Both lists refresh every POLL_MS only while something in them is still
@@ -17,6 +18,7 @@ type TabValue = "tasks" | "turns";
 
 export default function TasksPage() {
   const [tab, setTab] = useState<TabValue>("tasks");
+  const [params] = useSearchParams();
 
   const tasks = useFetch((signal) => listTasks({ all: true }, signal));
   const turns = useFetch((signal) => listTurns(signal));
@@ -35,6 +37,7 @@ export default function TasksPage() {
   );
 
   const activeCount = merged.filter((t) => isActiveTask(t.status)).length;
+  const linked = linkedTaskId(params.get("task"), merged);
   const turnsRunning = (turns.data ?? []).some((t) => t.status === "running");
 
   usePollWhile(tasks.refetch, activeCount > 0, POLL_MS);
@@ -74,7 +77,7 @@ export default function TasksPage() {
       />
 
       {tab === "tasks" ? (
-        <TasksTab tasks={tasks} merged={merged} activeCount={activeCount} now={now} onChange={onChange} />
+        <TasksTab tasks={tasks} merged={merged} activeCount={activeCount} now={now} onChange={onChange} linked={linked} />
       ) : (
         <TurnsTab turns={turns} now={now} />
       )}
@@ -88,12 +91,15 @@ function TasksTab({
   activeCount,
   now,
   onChange,
+  linked,
 }: {
   tasks: FetchState<Task[]>;
   merged: Task[];
   activeCount: number;
   now: number;
   onChange: (t: Task) => void;
+  /** The task a `?task=` link names. */
+  linked: string | null;
 }) {
   if (tasks.error && !tasks.data) return <ErrorBox message={tasks.error} />;
   if (!tasks.data) return <div className="text-sm text-[var(--color-nucleus-faint)]">fetching…</div>;
@@ -117,7 +123,7 @@ function TasksTab({
       <ul className="space-y-2">
         {merged.map((t) => (
           <li key={t.id}>
-            <TaskRow task={t} now={now} onChange={onChange} />
+            <TaskRow task={t} now={now} onChange={onChange} linked={t.id === linked} />
           </li>
         ))}
       </ul>

@@ -30,13 +30,16 @@
 //! tmux session).
 //!
 //! **Delivery** is at-least-once and idempotent: a finished task is claimed
-//! for delivery, its WhatsApp rows are inserted in one transaction with
-//! unique keys, and [`sweep`] retries every finished task whose delivery did
-//! not complete. `delivered_at` is set only when the destination has the
-//! message: when the WhatsApp bot marked the queued outbound row `sent`
-//! (a row that failed for good is queued again under a new key), or when
-//! Discord returned the message, sent through the `task_outbox` row that
-//! is written before the send.
+//! for delivery, its WhatsApp row is inserted under a unique key, and
+//! [`sweep`] retries every finished task whose delivery did not complete.
+//! For a WhatsApp task the result first goes to the origin chat session,
+//! whose reply (a short digest for the operator's phone) is the message the
+//! operator gets; when the session gives no digest, a code-owned notice
+//! replaces it under the same key ([`confirm_whatsapp`]). `delivered_at` is
+//! set only when the destination has the message: when the WhatsApp bot
+//! marked the outbound row `sent` (a row that failed for good is replaced by
+//! a notice under a new key), or when Discord returned the message, sent
+//! through the `task_outbox` row that is written before the send.
 //!
 //! **Access.** [`Scope`] limits what a caller sees: the operator sees every
 //! task, a WhatsApp chat session only the tasks its chat started (see
@@ -84,8 +87,9 @@ const DELIVERY_CLAIM_TTL: Duration = Duration::from_secs(300);
 /// only for tasks that finished within [`DELIVERY_RETRY_WINDOW`].
 const DELIVERY_MAX_FAILURES: i64 = 5;
 const DELIVERY_RETRY_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
-/// Largest result text copied into a WhatsApp message and into the chat
-/// session. The ledger keeps the full text.
+/// Largest result text copied into the Discord message's source text and
+/// into the chat session's digest request. The ledger keeps the full text;
+/// the request names the command that prints it.
 const DELIVERY_MAX_CHARS: usize = 12_000;
 const INJECT_MAX_CHARS: usize = 6_000;
 const DISCORD_MAX_CHARS: usize = 1_900;
@@ -294,8 +298,8 @@ pub struct TaskEvent {
     pub at: String,
     /// created | queued_for_slot | started | progress | background |
     /// runtime_guard | done | failed | cancelled | interrupted |
-    /// delivery_queued | delivered | delivery_failed | delivery_given_up |
-    /// delivery_noted
+    /// delivery_queued | digest_requested | digest_queued | digest_missing |
+    /// delivered | delivery_failed | delivery_given_up | delivery_noted
     pub kind: String,
     pub message: String,
 }
@@ -431,6 +435,12 @@ const SCHEMA_V5: &str = "
 ALTER TABLE tasks ADD COLUMN workdir TEXT;
 ALTER TABLE tasks ADD COLUMN profile TEXT NOT NULL DEFAULT 'agentic'";
 
+/// v6: a WhatsApp result goes to the chat session first; the session's
+/// digest is the operator's message. `delivery_inbox_ref` is the
+/// `session_inbox` row of the request while no outbound row exists yet.
+const SCHEMA_V6: &str = "
+ALTER TABLE tasks ADD COLUMN delivery_inbox_ref INTEGER";
+
 /// The columns of [`Task`], in order. Reads name them instead of `SELECT *`:
 /// a connection that prepared a statement before a migration added a column
 /// would otherwise see a different column count than the row it steps.
@@ -469,6 +479,11 @@ pub async fn open(workspace_root: &Path) -> Result<SqlitePool> {
                 version: 5,
                 name: "worker directory and profile",
                 step: crate::migrate::Step::Sql(SCHEMA_V5),
+            },
+            crate::migrate::Migration {
+                version: 6,
+                name: "result digest by the chat session",
+                step: crate::migrate::Step::Sql(SCHEMA_V6),
             },
         ],
     )
@@ -916,6 +931,9 @@ pub async fn sweep(workspace_root: &Path, pool: &SqlitePool, cfg: &TasksConfig) 
             marked.push(t);
         }
     }
+    if let Err(e) = settle_digest_requests(workspace_root, pool, cfg).await {
+        tracing::warn!(err = %format!("{e:#}"), "tasks: settling digest requests failed");
+    }
     if let Err(e) = confirm_whatsapp(workspace_root, pool).await {
         tracing::warn!(err = %format!("{e:#}"), "tasks: reading whatsapp delivery status failed");
     }
@@ -956,10 +974,12 @@ You are a Nucleus background worker. You run one task, unattended. No one \
 watches this session and no one will answer a question.
 
 - Do the whole task described in the brief. Use the tools you need.
-- Your final message is the task result. It is delivered to the operator as \
-you write it and stored in the task ledger. Start with the result itself, \
-with no preamble. Make it as long as the result needs and no longer. Write in \
-the language of the brief.
+- Your final message is the task result. It is stored in the task ledger as \
+you write it. When the task came from a chat, the chat session reads it and \
+sends the operator a short summary; the full text stays available. Start with \
+the result itself, with no preamble. Make it as long as the result needs and \
+no longer, and follow the result format the brief asks for. Write in the \
+language of the brief.
 - If something blocks you, finish what you can, then state what you finished, \
 what blocked you, and what the operator must decide.
 - Do not send messages to the operator or to any chat, and do not start, \
@@ -1443,8 +1463,8 @@ fn clip(s: &str, max: usize) -> String {
 
 // ── delivery ─────────────────────────────────────────────────────────────
 
-/// The operator-facing status line and body for a finished task.
-pub fn outcome_message(t: &Task, texts: &crate::config::TaskTexts) -> String {
+/// The operator-facing status line of a finished task.
+fn status_line(t: &Task, texts: &crate::config::TaskTexts) -> String {
     let template = match t.status() {
         TaskStatus::Done => &texts.done,
         TaskStatus::Failed => &texts.failed,
@@ -1452,7 +1472,12 @@ pub fn outcome_message(t: &Task, texts: &crate::config::TaskTexts) -> String {
         TaskStatus::Interrupted => &texts.interrupted,
         TaskStatus::Queued | TaskStatus::Running => &texts.failed,
     };
-    let head = template.replace("{id}", t.short_id()).replace("{title}", &t.title);
+    template.replace("{id}", t.short_id()).replace("{title}", &t.title)
+}
+
+/// The status line and body for a finished task (the Discord message).
+pub fn outcome_message(t: &Task, texts: &crate::config::TaskTexts) -> String {
+    let head = status_line(t, texts);
     match (t.status(), &t.result, &t.error) {
         (TaskStatus::Done, Some(r), _) => format!("{head}\n\n{}", clip(r, DELIVERY_MAX_CHARS)),
         (TaskStatus::Failed | TaskStatus::Interrupted, _, Some(e)) => format!("{head}\n{}", clip(e, 1_000)),
@@ -1460,23 +1485,66 @@ pub fn outcome_message(t: &Task, texts: &crate::config::TaskTexts) -> String {
     }
 }
 
-/// The body of the context message for the originating chat session. The bot
-/// types it inside the agent-message envelope (sender `task:<id>`, marked as
-/// not written by the operator, every line prefixed), so the conversation can
-/// continue about the result.
-fn injection_body(t: &Task) -> String {
-    let body = match (t.status(), &t.result, &t.error) {
-        (TaskStatus::Done, Some(r), _) => format!("Result:\n{}", clip(r, INJECT_MAX_CHARS)),
-        (_, _, Some(e)) => format!("Reason: {}", clip(e, 1_000)),
-        _ => String::new(),
-    };
-    format!(
-        "Background task {} ({:?}) ended with status {}. The operator already received this in \
-         the chat; do not repeat it.\n{body}",
+/// The task's dashboard page, `<NUCLEUS_PUBLIC_URL>/tasks?task=<id>`;
+/// empty when `NUCLEUS_PUBLIC_URL` is unset.
+pub fn task_link(public_url: Option<&str>, id: &str) -> String {
+    match public_url.map(|u| u.trim().trim_end_matches('/')).filter(|u| !u.is_empty()) {
+        Some(base) => format!("{base}/tasks?task={id}"),
+        None => String::new(),
+    }
+}
+
+fn public_url() -> Option<String> {
+    std::env::var("NUCLEUS_PUBLIC_URL").ok().filter(|v| !v.trim().is_empty())
+}
+
+/// The body of the digest request for the originating chat session: the
+/// facts only. The bot types it inside the agent-message envelope (sender
+/// `task:<id>`, marked as not written by the operator, every line prefixed)
+/// with its code-owned note that tells the session to write the digest; the
+/// session's reply is what the operator gets.
+fn digest_request_body(t: &Task, public_url: Option<&str>) -> String {
+    let mut out = format!(
+        "Background task {} ({:?}) ended with status {}.\nFull result: ./target/release/nucleus tasks output {}",
         t.short_id(),
         t.title,
-        t.status
-    )
+        t.status,
+        t.short_id()
+    );
+    let link = task_link(public_url, &t.id);
+    if !link.is_empty() {
+        out.push_str(&format!("\nDashboard: {link}"));
+    }
+    match (t.status(), &t.result, &t.error) {
+        (TaskStatus::Done, Some(r), _) => {
+            let r = r.trim();
+            if r.chars().count() > INJECT_MAX_CHARS {
+                out.push_str(&format!(
+                    "\nResult, cut at {INJECT_MAX_CHARS} characters (read the full text with the command above \
+                     before you summarize it):\n{}",
+                    clip(r, INJECT_MAX_CHARS)
+                ));
+            } else {
+                out.push_str(&format!("\nResult:\n{r}"));
+            }
+        }
+        (_, _, Some(e)) => out.push_str(&format!("\nReason: {}", clip(e, 1_000))),
+        _ => {}
+    }
+    out
+}
+
+/// The code-owned message the operator gets when the chat session wrote no
+/// digest (it could not take the request, gave no usable reply, or did not
+/// answer within `[tasks] digest_timeout_mins`), and when a digest could not
+/// be sent. Never carries result text.
+pub fn result_notice(t: &Task, texts: &crate::config::TaskTexts, public_url: Option<&str>) -> String {
+    let link = task_link(public_url, &t.id);
+    texts
+        .result_notice
+        .replace("{status}", &status_line(t, texts))
+        .replace("{id}", t.short_id())
+        .replace("{link}", &if link.is_empty() { String::new() } else { format!("\n{link}") })
 }
 
 /// What one delivery attempt achieved.
@@ -1486,6 +1554,10 @@ enum Delivered {
     /// The message is queued for the WhatsApp bot (outbound row id); it is
     /// delivered when the bot marks that row sent ([`confirm_whatsapp`]).
     Queued { outbound_id: i64, note: String },
+    /// The result is queued for the chat session (inbox row id); its digest,
+    /// or the notice that replaces it, becomes the outbound row
+    /// ([`confirm_whatsapp`]).
+    Requested { inbox_id: i64, note: String },
 }
 
 /// Deliver a finished task to its origin, at most once at a time. Never fails
@@ -1557,6 +1629,19 @@ pub async fn deliver(workspace_root: &Path, pool: &SqlitePool, cfg: &TasksConfig
                 .execute(&mut *tx)
                 .await?;
                 add_event_on(&mut tx, &t.id, "delivery_queued", note).await?;
+            }
+            Ok(Delivered::Requested { inbox_id, note }) => {
+                sqlx::query(
+                    "UPDATE tasks SET delivery_queued_at = ?2, delivery_ref = NULL, delivery_inbox_ref = ?3,
+                                      delivery_claimed_at = NULL
+                      WHERE id = ?1",
+                )
+                .bind(&t.id)
+                .bind(crate::timestamp::now())
+                .bind(inbox_id)
+                .execute(&mut *tx)
+                .await?;
+                add_event_on(&mut tx, &t.id, "digest_requested", note).await?;
             }
             Err(e) => {
                 tracing::warn!(task = t.short_id(), err = %format!("{e:#}"), "tasks: delivery failed");
@@ -1632,6 +1717,121 @@ async fn give_up_if_exhausted(tx: &mut sqlx::SqliteConnection, id: &str, reason:
     Ok(())
 }
 
+/// Turn every open digest request into the task's outbound row (ADR-033).
+/// The chat session's reply and the code-owned notice share one outbound
+/// key (`task:<id>:<status>:message`), so the chat gets exactly one of
+/// them:
+///
+/// - a row under the key exists: the session's digest (or a notice an
+///   earlier sweep queued) is the message; it is recorded as `delivery_ref`
+///   and [`confirm_whatsapp`] settles it like any queued row;
+/// - no row yet, and the session cannot answer — the bot could not type
+///   the request, the session's turn gave no usable reply, the request is
+///   gone — or it did not answer in time (`[tasks] digest_timeout_mins`
+///   after the request was queued, and again after it was typed): the
+///   notice ([`result_notice`]) is queued under the key;
+/// - otherwise the request is still waiting.
+///
+/// A reply the bot records as queued whose row is gone has an unknown
+/// outcome: the delivery is given up, as for a vanished outbound row.
+async fn settle_digest_requests(workspace_root: &Path, pool: &SqlitePool, cfg: &TasksConfig) -> Result<()> {
+    let waiting: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT id, delivery_inbox_ref, delivery_queued_at FROM tasks
+          WHERE delivered_at IS NULL AND delivery_failed_at IS NULL AND delivery_queued_at IS NOT NULL
+            AND delivery_ref IS NULL AND delivery_inbox_ref IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    if waiting.is_empty() {
+        return Ok(());
+    }
+    let wa = crate::whatsapp_queue::open(workspace_root).await?;
+    let timeout = Duration::from_secs(u64::from(cfg.digest_timeout_mins.max(1)) * 60);
+    for (id, inbox, queued_at) in waiting {
+        let settled: Result<()> = async {
+            let t = get(pool, &id, &Scope::Operator).await?;
+            let key = format!("task:{}:{}:message", t.id, t.status);
+            let (outbound, kind, note) = match crate::whatsapp_queue::outbound_by_dedup(&wa, &key).await? {
+                Some(o) => (o, "digest_queued", format!("whatsapp outbound #{o}: the chat session's digest")),
+                None => {
+                    let state = crate::whatsapp_queue::reply_request_state(&wa, inbox).await?;
+                    let reason = match &state {
+                        None => Some(format!("chat-session inbox #{inbox} is gone")),
+                        Some(r) if r.status == "failed" => Some(format!(
+                            "the chat session could not take the result: {}",
+                            r.last_error.as_deref().unwrap_or("no error recorded")
+                        )),
+                        Some(r) if r.reply_status.as_deref() == Some("failed") => Some(format!(
+                            "the chat session gave no digest: {}",
+                            r.reply_error.as_deref().unwrap_or("no reason recorded")
+                        )),
+                        Some(r) if r.reply_status.as_deref() == Some("sent") => {
+                            let reason = format!(
+                                "the bot queued the chat session's digest, and no outbound row {key} exists; its \
+                                 outcome is unknown"
+                            );
+                            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                            add_event_on(&mut tx, &t.id, "delivery_failed", &reason).await?;
+                            give_up_on(&mut tx, &t.id, &reason).await?;
+                            tx.commit().await?;
+                            return Ok(());
+                        }
+                        Some(r) => {
+                            let typed = r.status == "delivered";
+                            let since = if typed { r.delivered_at.clone().unwrap_or(queued_at.clone()) } else { queued_at.clone() };
+                            // An unreadable stamp counts as late; one in the
+                            // future (clock skew) does not.
+                            let late = match chrono::DateTime::parse_from_rfc3339(&since) {
+                                Ok(at) => (chrono::Utc::now() - at.with_timezone(&chrono::Utc))
+                                    .to_std()
+                                    .map(|a| a > timeout)
+                                    .unwrap_or(false),
+                                Err(_) => true,
+                            };
+                            late.then(|| {
+                                format!(
+                                    "the chat session gave no digest within {} minutes of {}",
+                                    cfg.digest_timeout_mins.max(1),
+                                    if typed { "reading the result" } else { "the result's arrival" }
+                                )
+                            })
+                        }
+                    };
+                    let Some(reason) = reason else { return Ok(()) };
+                    let chat = whatsapp_chat(workspace_root, &t).await?;
+                    let sender = format!("task:{}", t.short_id());
+                    let body = result_notice(&t, &cfg.texts, public_url().as_deref());
+                    // A digest that arrives between the read above and this
+                    // insert keeps the key; the notice is then not queued.
+                    let o = crate::whatsapp_queue::enqueue_text_once(&wa, &chat, &body, &sender, &key).await?;
+                    (o, "digest_missing", format!("{reason}; whatsapp outbound #{o} under the result key (the notice)"))
+                }
+            };
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+            let n = sqlx::query(
+                "UPDATE tasks SET delivery_ref = ?2
+                  WHERE id = ?1 AND delivered_at IS NULL AND delivery_queued_at IS NOT NULL AND delivery_ref IS NULL",
+            )
+            .bind(&t.id)
+            .bind(outbound)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if n == 1 {
+                add_event_on(&mut tx, &t.id, kind, &note).await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = settled {
+            tracing::warn!(task = %id, err = %format!("{e:#}"), "tasks: settling the digest request failed");
+        }
+    }
+    wa.close().await;
+    Ok(())
+}
+
 /// Settle queued WhatsApp deliveries from the bot's outbound rows:
 ///
 /// - a sent row sets `delivered_at` (also for a delivery given up earlier:
@@ -1644,7 +1844,7 @@ async fn give_up_if_exhausted(tx: &mut sqlx::SqliteConnection, id: &str, reason:
 async fn confirm_whatsapp(workspace_root: &Path, pool: &SqlitePool) -> Result<()> {
     let waiting: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
         "SELECT id, delivery_ref, delivery_failed_at FROM tasks
-          WHERE delivered_at IS NULL AND delivery_queued_at IS NOT NULL",
+          WHERE delivered_at IS NULL AND delivery_queued_at IS NOT NULL AND delivery_ref IS NOT NULL",
     )
     .fetch_all(pool)
     .await?;
@@ -1743,13 +1943,7 @@ async fn note_given_up_deliveries(workspace_root: &Path, pool: &SqlitePool, cfg:
         let noted: Result<bool> = async {
             match t.origin.as_str() {
                 "whatsapp-dm" => {
-                    let chat = match &t.origin_ref {
-                        Some(r) => crate::whatsapp_queue::task_result_chat(
-                            r,
-                            &crate::whatsapp_queue::accepted_operator_lids(&workspace_root.join(crate::whatsapp_queue::WHATSAPP_DB_PATH)).await,
-                        )?,
-                        None => crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM.to_string(),
-                    };
+                    let chat = whatsapp_chat(workspace_root, &t).await?;
                     let wa = crate::whatsapp_queue::open(workspace_root).await?;
                     let r = crate::whatsapp_queue::enqueue_text_once(&wa, &chat, &body, &sender, &key).await;
                     wa.close().await;
@@ -1883,6 +2077,23 @@ where
     }
 }
 
+/// The WhatsApp chat of a task's messages: the exact chat the task came
+/// from, re-validated against the DM allowlist and the operator's LIDs (an
+/// operator LID whose verification expired falls back to his phone JID);
+/// without one (a task started from a shell), the bot's operator-DM
+/// resolution, which the bot uses for the inbox and the outbound queue
+/// alike.
+async fn whatsapp_chat(workspace_root: &Path, t: &Task) -> Result<String> {
+    match &t.origin_ref {
+        Some(r) => crate::whatsapp_queue::task_result_chat(
+            r,
+            &crate::whatsapp_queue::accepted_operator_lids(&workspace_root.join(crate::whatsapp_queue::WHATSAPP_DB_PATH))
+                .await,
+        ),
+        None => Ok(crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM.to_string()),
+    }
+}
+
 async fn deliver_inner(
     workspace_root: &Path,
     pool: &SqlitePool,
@@ -1893,41 +2104,36 @@ async fn deliver_inner(
     let sender = format!("task:{}", t.short_id());
     match t.origin.as_str() {
         "whatsapp-dm" => {
-            // The exact chat the task came from, re-validated against the DM
-            // allowlist and the operator's LIDs (an operator LID whose
-            // verification expired falls back to his phone JID); without
-            // one (a task started from a shell), the bot's operator-DM
-            // resolution, used for both rows.
-            let chat = match &t.origin_ref {
-                Some(r) => crate::whatsapp_queue::task_result_chat(
-                    r,
-                    &crate::whatsapp_queue::accepted_operator_lids(&workspace_root.join(crate::whatsapp_queue::WHATSAPP_DB_PATH)).await,
-                )?,
-                None => crate::whatsapp_queue::INBOX_CHAT_OPERATOR_DM.to_string(),
-            };
+            let chat = whatsapp_chat(workspace_root, t).await?;
             let redrives: i64 = sqlx::query_scalar("SELECT delivery_redrives FROM tasks WHERE id = ?1")
                 .bind(&t.id)
                 .fetch_one(pool)
                 .await?;
             let wa = crate::whatsapp_queue::open(workspace_root).await?;
-            let body = injection_body(t);
-            let (q, i) = crate::whatsapp_queue::enqueue_delivery(
-                &wa,
-                crate::whatsapp_queue::Delivery {
-                    chat: &chat,
-                    message: &outcome_message(t, &cfg.texts),
-                    context: Some((&sender, &body)),
-                    source: &sender,
-                    dedup_key: &key,
-                    message_attempt: redrives.max(0) as u32,
-                },
-            )
-            .await?;
+            let res = if redrives > 0 {
+                // The earlier message (the digest or a notice) failed without
+                // leaving the machine: the code-owned notice goes under a new
+                // key. The session is not asked again; it already has the
+                // result.
+                let key = format!("{key}:message:r{redrives}");
+                crate::whatsapp_queue::enqueue_text_once(&wa, &chat, &result_notice(t, &cfg.texts, public_url().as_deref()), &sender, &key)
+                    .await
+                    .map(|q| Delivered::Queued { outbound_id: q, note: format!("whatsapp outbound #{q} (notice)") })
+            } else {
+                crate::whatsapp_queue::enqueue_reply_request(
+                    &wa,
+                    &chat,
+                    &sender,
+                    &digest_request_body(t, public_url().as_deref()),
+                    &sender,
+                    &format!("{key}:context"),
+                    &format!("{key}:message"),
+                )
+                .await
+                .map(|i| Delivered::Requested { inbox_id: i, note: format!("chat-session inbox #{i}: digest requested") })
+            };
             wa.close().await;
-            Ok(Delivered::Queued {
-                outbound_id: q,
-                note: format!("whatsapp outbound #{q}, chat-session inbox #{}", i.unwrap_or_default()),
-            })
+            res
         }
         "discord-home" => {
             let channel = std::env::var("DISCORD_HOME_CHANNEL_ID")
@@ -2219,48 +2425,192 @@ mod tests {
         rows
     }
 
+    /// What the bot does with a digest request: types it (inbox row
+    /// `delivered`), then queues the session's reply under the request's
+    /// reply key and records it on the inbox row. Returns the outbound id.
+    async fn bot_replies(d: &Path, pool: &SqlitePool, id: &str, reply: &str) -> i64 {
+        let inbox: i64 = sqlx::query_scalar("SELECT delivery_inbox_ref FROM tasks WHERE id = ?1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let wa = crate::whatsapp_queue::open(d).await.unwrap();
+        let (chat, sender, key): (String, String, String) =
+            sqlx::query_as("SELECT chat, sender, reply_key FROM session_inbox WHERE id = ?1")
+                .bind(inbox)
+                .fetch_one(&wa)
+                .await
+                .unwrap();
+        let o = crate::whatsapp_queue::enqueue_text_once(&wa, &chat, reply, &sender, &key).await.unwrap();
+        sqlx::query(
+            "UPDATE session_inbox SET status = 'delivered', delivered_at = ?2, reply_status = 'sent',
+                                      reply_outbound_id = ?3 WHERE id = ?1",
+        )
+        .bind(inbox)
+        .bind(crate::timestamp::now())
+        .bind(o)
+        .execute(&wa)
+        .await
+        .unwrap();
+        wa.close().await;
+        o
+    }
+
+    /// Set the task's digest request's inbox row columns, as the bot does.
+    async fn set_inbox(d: &Path, pool: &SqlitePool, id: &str, set: &str) {
+        let inbox: i64 = sqlx::query_scalar("SELECT delivery_inbox_ref FROM tasks WHERE id = ?1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let wa = crate::whatsapp_queue::open(d).await.unwrap();
+        sqlx::query(&format!("UPDATE session_inbox SET {set} WHERE id = ?1")).bind(inbox).execute(&wa).await.unwrap();
+        wa.close().await;
+    }
+
+    async fn finished_dm_task(d: &tempfile::TempDir, pool: &SqlitePool, result: &str) -> Task {
+        let t = create(pool, dm_task("report", "5511999999999@s.whatsapp.net"), &Scope::Operator).await.unwrap();
+        claim(pool, &t.id, 1, 6).await.unwrap();
+        finish(pool, &t.id, TaskStatus::Done, Some(result), None).await.unwrap();
+        let t = get(pool, &t.id, &Scope::Operator).await.unwrap();
+        deliver(d.path(), pool, &cfg(), &t).await;
+        get(pool, &t.id, &Scope::Operator).await.unwrap()
+    }
+
+    /// The result goes to the origin chat session only; the operator's
+    /// message is the session's digest, sent under the result key.
     #[tokio::test]
-    async fn whatsapp_delivery_goes_to_the_origin_chat_once() {
+    async fn whatsapp_result_goes_to_the_chat_session_and_its_digest_to_the_operator() {
         let (d, pool) = temp_pool().await;
-        let t = create(&pool, dm_task("report", "5511999999999@s.whatsapp.net"), &Scope::Operator).await.unwrap();
-        claim(&pool, &t.id, 1, 6).await.unwrap();
-        finish(&pool, &t.id, TaskStatus::Done, Some("42 lines"), None).await.unwrap();
-        let t = get(&pool, &t.id, &Scope::Operator).await.unwrap();
-        deliver(d.path(), &pool, &cfg(), &t).await;
-        let t = get(&pool, &t.id, &Scope::Operator).await.unwrap();
+        let t = finished_dm_task(&d, &pool, "42 lines").await;
         assert!(t.delivery_queued_at.is_some(), "{:?}", events(&pool, &t.id).await.unwrap());
         // A second delivery (a retry that raced) adds nothing.
         deliver(d.path(), &pool, &cfg(), &t).await;
         sweep(d.path(), &pool, &cfg()).await.unwrap();
+        assert!(outbound_rows(d.path()).await.is_empty(), "no raw result reaches WhatsApp");
         let wa = crate::whatsapp_queue::open(d.path()).await.unwrap();
-        let rows: Vec<(String, String)> = sqlx::query_as("SELECT target, body FROM outbound_queue")
-            .fetch_all(&wa)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, "5511999999999@s.whatsapp.net", "the visible message goes to the origin chat");
-        assert!(rows[0].1.contains("done") && rows[0].1.contains("42 lines"), "{}", rows[0].1);
-        let inbox: Vec<(String, String, String)> =
-            sqlx::query_as("SELECT payload, chat, sender FROM session_inbox").fetch_all(&wa).await.unwrap();
+        let inbox: Vec<(String, String, String, String)> =
+            sqlx::query_as("SELECT payload, chat, sender, reply_key FROM session_inbox").fetch_all(&wa).await.unwrap();
+        wa.close().await;
         assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0].1, "5511999999999@s.whatsapp.net", "the context goes to the same chat");
+        assert_eq!(inbox[0].1, "5511999999999@s.whatsapp.net", "the request goes to the origin chat");
         assert!(inbox[0].2.starts_with("task:"));
-        assert!(!inbox[0].0.contains("[agent-msg"), "the bot builds the envelope, not the producer");
+        assert_eq!(inbox[0].3, format!("task:{}:done:message", t.id));
+        let body = &inbox[0].0;
+        assert!(!body.contains("[agent-msg"), "the bot builds the envelope, not the producer");
+        assert!(body.contains("42 lines") && body.contains(&format!("tasks output {}", t.short_id())), "{body}");
+        assert!(!body.contains("do not repeat") && !body.contains("not sent"), "{body}");
+
+        let o = bot_replies(d.path(), &pool, &t.id, "Done: 42 lines. Nothing to decide.").await;
+        sweep(d.path(), &pool, &cfg()).await.unwrap();
+        let after = get(&pool, &t.id, &Scope::Operator).await.unwrap();
+        assert!(after.delivered_at.is_none(), "queued, not sent yet");
+        set_outbound(d.path(), &pool, &t.id, "sent").await;
+        sweep(d.path(), &pool, &cfg()).await.unwrap();
+        assert!(get(&pool, &t.id, &Scope::Operator).await.unwrap().delivered_at.is_some());
+        let rows = outbound_rows(d.path()).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].1, "Done: 42 lines. Nothing to decide.");
+        let kinds: Vec<String> = events(&pool, &t.id).await.unwrap().into_iter().map(|e| e.kind).collect();
+        assert!(kinds.contains(&"digest_requested".into()) && kinds.contains(&"digest_queued".into()), "{kinds:?}");
+        let _ = o;
     }
 
+    /// The session cannot answer: the operator gets the code-owned notice,
+    /// never the result, at once for a reported failure and after the
+    /// timeout otherwise.
+    #[tokio::test]
+    async fn no_digest_means_a_short_notice() {
+        for (case, set) in [
+            ("typing failed", "status = 'failed', last_error = 'window gone'"),
+            ("no usable reply", "status = 'delivered', delivered_at = '2999-01-01T00:00:00.000Z', reply_status = 'failed', reply_error = 'empty reply'"),
+        ] {
+            let (d, pool) = temp_pool().await;
+            let t = finished_dm_task(&d, &pool, &"a long table row\n".repeat(400)).await;
+            set_inbox(d.path(), &pool, &t.id, set).await;
+            sweep(d.path(), &pool, &cfg()).await.unwrap();
+            let rows = outbound_rows(d.path()).await;
+            assert_eq!(rows.len(), 1, "{case}: {rows:?}");
+            assert_eq!(rows[0].0, format!("task:{}:done:message", t.id), "{case}");
+            assert!(rows[0].1.starts_with(&format!("✅ Task {} done — report\n", t.short_id())), "{case}: {}", rows[0].1);
+            assert!(rows[0].1.contains(&format!("nucleus tasks output {}", t.short_id())), "{}", rows[0].1);
+            assert!(!rows[0].1.contains("table row"), "{case}: no result text");
+            let kinds: Vec<String> = events(&pool, &t.id).await.unwrap().into_iter().map(|e| e.kind).collect();
+            assert!(kinds.contains(&"digest_missing".into()), "{case}: {kinds:?}");
+            // The digest arrives late: the key is taken, nothing more is queued.
+            let late = bot_replies(d.path(), &pool, &t.id, "late digest").await;
+            assert_eq!(outbound_rows(d.path()).await.len(), 1, "{case}");
+            sweep(d.path(), &pool, &cfg()).await.unwrap();
+            set_outbound(d.path(), &pool, &t.id, "sent").await;
+            sweep(d.path(), &pool, &cfg()).await.unwrap();
+            assert!(get(&pool, &t.id, &Scope::Operator).await.unwrap().delivered_at.is_some(), "{case}");
+            let _ = late;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_digest_that_takes_too_long_is_replaced_by_the_notice() {
+        let (d, pool) = temp_pool().await;
+        let t = finished_dm_task(&d, &pool, "r").await;
+        sweep(d.path(), &pool, &cfg()).await.unwrap();
+        assert!(outbound_rows(d.path()).await.is_empty(), "within the limit: wait");
+        // Queued long ago, but typed just now: the session gets its time.
+        sqlx::query("UPDATE tasks SET delivery_queued_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1")
+            .bind(&t.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        set_inbox(d.path(), &pool, &t.id, &format!("status = 'delivered', delivered_at = '{}'", crate::timestamp::now())).await;
+        sweep(d.path(), &pool, &cfg()).await.unwrap();
+        assert!(outbound_rows(d.path()).await.is_empty(), "typed recently: wait");
+        set_inbox(d.path(), &pool, &t.id, "delivered_at = '2020-01-01T00:00:00.000Z'").await;
+        sweep(d.path(), &pool, &cfg()).await.unwrap();
+        let rows = outbound_rows(d.path()).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].1.contains("could not summarize"), "{}", rows[0].1);
+        // Never typed at all (the bot was down): the arrival time counts.
+        let (d, pool) = temp_pool().await;
+        let t = finished_dm_task(&d, &pool, "r").await;
+        sqlx::query("UPDATE tasks SET delivery_queued_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1")
+            .bind(&t.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sweep(d.path(), &pool, &cfg()).await.unwrap();
+        assert_eq!(outbound_rows(d.path()).await.len(), 1);
+    }
+
+    /// The bot recorded the digest as queued, and its row is gone: the
+    /// outcome is unknown, so the delivery is given up and noted once.
+    #[tokio::test]
+    async fn a_vanished_digest_row_is_given_up() {
+        let (d, pool) = temp_pool().await;
+        let t = finished_dm_task(&d, &pool, "r").await;
+        bot_replies(d.path(), &pool, &t.id, "digest").await;
+        let wa = crate::whatsapp_queue::open(d.path()).await.unwrap();
+        sqlx::query("DELETE FROM outbound_queue").execute(&wa).await.unwrap();
+        wa.close().await;
+        sweep(d.path(), &pool, &cfg()).await.unwrap();
+        assert!(get(&pool, &t.id, &Scope::Operator).await.unwrap().delivery_failed_at.is_some());
+        let rows = outbound_rows(d.path()).await;
+        assert!(rows.iter().all(|(k, _)| k.ends_with(":delivery-given-up")) && rows.len() == 1, "{rows:?}");
+    }
+
+    /// Deliver `t` as done and return the chat its digest request (and
+    /// so its digest or notice) goes to.
     async fn deliver_done(d: &tempfile::TempDir, pool: &SqlitePool, t: &Task) -> String {
         claim(pool, &t.id, 1, 6).await.unwrap();
         finish(pool, &t.id, TaskStatus::Done, Some("ok"), None).await.unwrap();
         let t = get(pool, &t.id, &Scope::Operator).await.unwrap();
         deliver(d.path(), pool, &cfg(), &t).await;
         let wa = crate::whatsapp_queue::open(d.path()).await.unwrap();
-        let target: String = sqlx::query_scalar("SELECT target FROM outbound_queue WHERE dedup_key LIKE ?1")
+        let chat: String = sqlx::query_scalar("SELECT chat FROM session_inbox WHERE dedup_key LIKE ?1")
             .bind(format!("task:{}:%", t.id))
             .fetch_one(&wa)
             .await
             .unwrap();
         wa.close().await;
-        target
+        chat
     }
 
     #[tokio::test]
@@ -2337,11 +2687,13 @@ mod tests {
         finish(&pool, &t.id, TaskStatus::Done, Some("r"), None).await.unwrap();
         let t = get(&pool, &t.id, &Scope::Operator).await.unwrap();
         deliver(d.path(), &pool, &cfg(), &t).await;
+        bot_replies(d.path(), &pool, &t.id, "digest").await;
         // Queued, not delivered: the bot has not sent the row.
         sweep(d.path(), &pool, &cfg()).await.unwrap();
         assert!(get(&pool, &t.id, &Scope::Operator).await.unwrap().delivered_at.is_none());
-        // The row failed for good: the message is queued again under a new
-        // key; the context is not repeated.
+        // The digest row failed before any send (the secret filter withheld
+        // it): the code-owned notice is queued under a new key; the session
+        // is not asked again.
         set_outbound(d.path(), &pool, &t.id, "failed").await;
         sweep(d.path(), &pool, &cfg()).await.unwrap();
         let after = get(&pool, &t.id, &Scope::Operator).await.unwrap();
@@ -2354,6 +2706,8 @@ mod tests {
             .unwrap();
         assert_eq!(keys.len(), 2, "{keys:?}");
         assert!(keys[1].ends_with(":message:r1"), "{keys:?}");
+        let bodies = outbound_rows(d.path()).await;
+        assert!(bodies[1].1.contains("could not summarize"), "{bodies:?}");
         let inbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_inbox").fetch_one(&wa).await.unwrap();
         assert_eq!(inbox, 1);
         wa.close().await;
@@ -2379,6 +2733,8 @@ mod tests {
         finish(&pool, &t.id, TaskStatus::Done, Some("r"), None).await.unwrap();
         let t = get(&pool, &t.id, &Scope::Operator).await.unwrap();
         deliver(d.path(), &pool, &cfg(), &t).await;
+        bot_replies(d.path(), &pool, &t.id, "digest").await;
+        sweep(d.path(), &pool, &cfg()).await.unwrap();
         attempt_outbound(d.path(), &pool, &t.id, "in_flight", "sendMessage timed out after 20000ms").await;
         sweep(d.path(), &pool, &cfg()).await.unwrap();
         assert!(get(&pool, &t.id, &Scope::Operator).await.unwrap().delivery_failed_at.is_none(), "in flight: wait");
@@ -2412,6 +2768,8 @@ mod tests {
         finish(&pool, &t.id, TaskStatus::Done, Some("r"), None).await.unwrap();
         let t = get(&pool, &t.id, &Scope::Operator).await.unwrap();
         deliver(d.path(), &pool, &cfg(), &t).await;
+        bot_replies(d.path(), &pool, &t.id, "digest").await;
+        sweep(d.path(), &pool, &cfg()).await.unwrap();
         let wa = crate::whatsapp_queue::open(d.path()).await.unwrap();
         sqlx::query("DELETE FROM outbound_queue").execute(&wa).await.unwrap();
         wa.close().await;
@@ -2431,6 +2789,8 @@ mod tests {
         finish(&pool, &t.id, TaskStatus::Done, Some("r"), None).await.unwrap();
         let t = get(&pool, &t.id, &Scope::Operator).await.unwrap();
         deliver(d.path(), &pool, &cfg(), &t).await;
+        bot_replies(d.path(), &pool, &t.id, "digest").await;
+        sweep(d.path(), &pool, &cfg()).await.unwrap();
         for _ in 0..DELIVERY_MAX_FAILURES {
             set_outbound(d.path(), &pool, &t.id, "failed").await;
             sweep(d.path(), &pool, &cfg()).await.unwrap();
@@ -2584,5 +2944,24 @@ mod tests {
         t.status = "done".into();
         t.result = Some("r".into());
         assert_eq!(outcome_message(&t, &texts), "✅ Task 01234567 done — T\n\nr");
+
+        assert_eq!(
+            result_notice(&t, &texts, None),
+            "✅ Task 01234567 done — T\nThe chat could not summarize the result. Ask for it here, or run \
+             `nucleus tasks output 01234567` in the terminal."
+        );
+        assert!(result_notice(&t, &texts, Some("https://dash.example.invalid/"))
+            .ends_with("in the terminal.\nhttps://dash.example.invalid/tasks?task=0123456789abcdef"));
+        let body = digest_request_body(&t, Some("https://dash.example.invalid"));
+        assert_eq!(
+            body,
+            "Background task 01234567 (\"T\") ended with status done.\nFull result: ./target/release/nucleus tasks \
+             output 01234567\nDashboard: https://dash.example.invalid/tasks?task=0123456789abcdef\nResult:\nr"
+        );
+        t.result = Some("x".repeat(INJECT_MAX_CHARS + 10));
+        let body = digest_request_body(&t, None);
+        assert!(body.contains("cut at 6000 characters") && !body.contains("Dashboard:"), "{body}");
+        t.status = "failed".into();
+        assert!(digest_request_body(&t, None).ends_with("\nReason: boom"));
     }
 }
