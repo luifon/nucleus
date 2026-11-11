@@ -210,3 +210,71 @@ homelab: `restic -r <path> --password-file <root-only file> restore latest
 - **A separate dead-man's switch** (an external monitor pinged on success).
   The heartbeat already reads chore watermarks; a second mechanism would
   duplicate it.
+
+## Amendment: off-site copy (2026-11-11)
+
+**Status:** proposed. Decided by the operator; not set up.
+
+**Relates to:** [[ADR-045]] (the storage key is kept in the secret store),
+[[ADR-047]] (stage 3 moves the control plane to the homelab).
+
+### Context
+
+A check on 2026-11-11 found that both restic repositories, the homelab's
+own and this one (712 MiB), are on the same HDD as the media library.
+Losing that disk loses both backups. The Consequences section above records
+that limit and leaves the off-site copy out of the original decision. The
+limit matters more once the control plane moves to the homelab (ADR-047,
+stage 3), because the homelab then holds the live data as well.
+
+### Decision
+
+1. **Mirroring on the 8 TB HDD.** The backup disk is mirrored, so the
+   failure of one disk does not lose the repositories. To be set up soon.
+2. **An off-site copy of the internal backups** at an off-site object
+   storage provider, within that provider's free tier (10 GB).
+3. **Encrypted before upload.** restic encrypts the data before it leaves
+   the homelab, so the provider stores only ciphertext.
+4. **The provider's application key is kept in the secret store**, in the
+   operational account (ADR-045), not in `.env`. The backup job is a
+   registered code path that gets it through the broker's value verb
+   (ADR-045 §3).
+5. **The restic password does not move.** It stays in the places of the
+   Password section above (the Mac's login Keychain, a root-only file on
+   the homelab, the operator's copy outside both machines). It is recovery
+   material: a restore may be needed when the secret store is unavailable,
+   so it does not depend on the broker (ADR-045 §1).
+
+### Consequences
+
+- The internal backups survive the loss of the homelab's backup disk and of
+  the homelab itself.
+- The off-site copy must stay within the free tier's 10 GB.
+- After a homelab restart the off-site upload fails until the operator
+  unlocks the broker; the locked broker is reported in the "what needs you"
+  view and by a WhatsApp alert (ADR-045 §4, ADR-046).
+
+### Rejected alternatives
+
+- **The key in `.env`.** Rejected by the operator: the key goes into the
+  operational secret store account.
+
+### Open questions / footnotes
+
+1. The mirroring method (filesystem RAID or a second disk with a copy job)
+   and its date.
+2. How the off-site copy is made (restic `copy` to a second repository, or
+   a sync of the repository directory) and on what schedule.
+3. Which repositories go off-site when the two together pass 10 GB.
+
+### Verification
+
+- With the mirror built, removing one disk leaves both repositories
+  readable and `restic check` passes.
+- After an upload, the off-site objects hold no plaintext (a search for a
+  known file's content in the uploaded objects finds nothing).
+- A restore from the off-site copy to an empty directory on another machine
+  succeeds with the restic password.
+- The application key is absent from `.env`, from tracked files and from
+  logs; a locked broker makes the upload fail with an alert.
+- The off-site usage reported by the provider stays under 10 GB.

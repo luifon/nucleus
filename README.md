@@ -530,7 +530,15 @@ nucleus/
 - `docs/ADR-033-turn-engine-and-task-ledger.md` — WhatsApp turn engine (real end of turn, mid-turn messages, ack/progress, quoted replies via the queue, typed input everywhere, outbound idempotency and secret filter) + the background task ledger (`nucleus tasks`, per-chat scopes)
 - `docs/ADR-036-work-items-and-issue-pipeline.md` — work items: source-agnostic events (`nucleus events`, GitHub adapter polled with `gh`) and the issue pipeline: label gate, collaborator-only comments, eval → refinement → implementation → draft PR, short WhatsApp notices with a dashboard link (no per-item groups), the dashboard Work page
 - `docs/ADR-038-skill-suggestions-and-transcript-sweep.md` — the nightly transcript sweep and backfill, skill suggestions the operator accepts or rejects (`nucleus skills suggestions`)
-- `docs/ADR-039-backup-to-homelab.md` — daily encrypted restic backup of Nucleus's state to the homelab HDD: what is backed up, SQLite copies with the backup API, the HDD guard, Keychain password, retention, alerts, restore (`nucleus backup`)
+- `docs/ADR-039-backup-to-homelab.md` — daily encrypted restic backup of Nucleus's state to the homelab HDD: what is backed up, SQLite copies with the backup API, the HDD guard, Keychain password, retention, alerts, restore (`nucleus backup`) Amended 2026-11-11 with a mirror disk and an off-site encrypted copy (proposed).
+- `docs/ADR-040-operator-approvals.md` — (proposed) "ask me first": a third level between allowed and denied for actions with outside effects; a hook holds the exact action, the operator approves in the session chat, WhatsApp or the dashboard, and a one-time grant allows it
+- `docs/ADR-041-delete-guard-and-write-sandbox.md` — (proposed) a global hook that shows the dry-run list before any delete and escalates large or outside deletes, plus Claude Code's write sandbox for every process a command starts
+- `docs/ADR-042-agent-profiles-and-engineers.md` — (proposed) one profile format for venue, engineer and area agents; per-repo engineers with knowledge corrected from review outcomes; automatic edits after a second review; a track record for every agent
+- `docs/ADR-043-update-generations-and-rollback.md` — (proposed) signed build generations, database snapshots before schema changes, a 30-minute check window and rollback
+- `docs/ADR-044-checked-session-output.md` — (proposed) replies that hid a failed tool get a code-written note; statements about Nucleus's own actions are checked against its stores
+- `docs/ADR-045-browser-logins-through-the-secret-store.md` — (proposed) browser logins typed into the page by a memory-only broker per machine; one operational account per machine; cleanup first; a live browser view for steps that need the operator (amends ADR-028)
+- `docs/ADR-046-what-needs-you.md` — (proposed) one code-built list of everything waiting on the operator, on the dashboard and in a daily WhatsApp message
+- `docs/ADR-047-multi-machine-nodes.md` — (proposed) nodes with declared capabilities, a node daemon over the tailnet, placement, four stages, and vault sync with a sync gate
 - `agents.toml` — the agent registry (single source of truth); add/remove an agent by editing it
 - `docs/SECRETS.md` — env-vs-toml policy + pre-commit audit
 - `CLAUDE.md` — workspace-level rules auto-loaded into every claude session
